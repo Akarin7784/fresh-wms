@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 44 处 DEFAULT now()、3 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
---   3. 方言专属行：删除 141 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 53 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 151 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 58 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -894,7 +894,7 @@ CREATE TABLE pod_op (
     media_json          TEXT,                       -- [{object_key, sha256}]
     client_created_at   TIMESTAMP,                  -- 只展示，不参与排序与记账
     -- 冷链签收温度（GB/T 40956-2021）：单位 0.1℃ 的整数，POD_SIGN / POD_REJECT 必填，其他操作必须为空
-    temperature_x10     INTEGER,
+    temperature_x10     INTEGER,      -- 整单到货（车厢）温度，0.1℃；逐行温度见 pod_line.receive_temp_c10
     delivered_at        TIMESTAMP,                  -- UTC，服务端受理成功签收的时间（2xx 签收必填）
     correct_deadline_at TIMESTAMP,                  -- UTC，= delivered_at + 24h（Q-J），服务端写入，不可修改（trg_pod_op_immutable）
     created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
@@ -929,12 +929,14 @@ CREATE TABLE pod_line (
     shipped_qty_milli    BIGINT   NOT NULL,
     rejected_qty_milli   BIGINT   NOT NULL DEFAULT 0,
     reject_reason        VARCHAR(32),
+    receive_temp_c10     INTEGER  NOT NULL,         -- 本行到货实测温度，单位 0.1℃，必填（GB/T 40956-2021）；是否在 SKU 温区 min/max（第 1 篇）内由服务端校验，超出且未以 TEMP_ABNORMAL 拒收 → 42216 POD_TEMP_OUT_OF_RANGE
     CONSTRAINT uq_podl      UNIQUE (pod_id, outbound_line_id, lot_id),
     CONSTRAINT ck_podl_int  CHECK (shipped_qty_milli = CAST(shipped_qty_milli AS BIGINT) AND rejected_qty_milli = CAST(rejected_qty_milli AS BIGINT)),
     CONSTRAINT ck_podl_qty  CHECK (shipped_qty_milli > 0 AND rejected_qty_milli >= 0 AND rejected_qty_milli <= shipped_qty_milli),
+    CONSTRAINT ck_podl_temp CHECK (receive_temp_c10 BETWEEN -400 AND 600 AND receive_temp_c10 = CAST(receive_temp_c10 AS INTEGER)),   -- 物理合理范围兜底，CAST 只在 SQLite 起作用
     CONSTRAINT ck_podl_rsn  CHECK (rejected_qty_milli = 0 OR reject_reason IS NOT NULL),
-    -- 拒收原因；TEMPERATURE_ABNORMAL = 到货温度超出冷链要求（GB/T 40956-2021），只能随带温度的签收使用
-    CONSTRAINT ck_podl_rsn_v CHECK (reject_reason IS NULL OR reject_reason IN ('DAMAGED','QUALITY','EXPIRED','SHORT','WRONG_ITEM','TEMPERATURE_ABNORMAL','CUSTOMER_REFUSED','OTHER'))
+    -- 拒收原因；TEMP_ABNORMAL = 本行到货温度超出 SKU 温区（GB/T 40956-2021）
+    CONSTRAINT ck_podl_rsn_v CHECK (reject_reason IS NULL OR reject_reason IN ('DAMAGED','QUALITY','EXPIRED','SHORT','WRONG_ITEM','TEMP_ABNORMAL','CUSTOMER_REFUSED','OTHER'))
 );
 
 -- 签收更正：只能在线提交 POST /api/v1/approvals（type=POD_CORRECT，第 12 篇 approval_request），按审批单号关联；
@@ -953,8 +955,15 @@ CREATE TABLE pod_correction (
     reason            VARCHAR(256) NOT NULL,
     decided_at        TIMESTAMP,
     correct_seq       SMALLINT,                     -- APPLIED 时 = delivery_order.correct_seq 新值（≥1），服务端分配
+    driver_id         BIGINT       NOT NULL,        -- 提交更正的司机（token 用户）
+    correction_client_id VARCHAR(36) NOT NULL,      -- 客户端生成的 UUID，请求必填；与 driver_id 组成长期去重键，不随 Idempotency-Key 过期
+    request_hash      VARCHAR(64)  NOT NULL,        -- 规范化请求体 SHA-256；同键不同 hash → 40910 key_type=POD_CORRECT
+    response_http     SMALLINT     NOT NULL,        -- 首次返回码：200（容差内 APPLIED）/ 202（PENDING_APPROVAL）；重放原样返回
     created_at        TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT uq_podc_approval UNIQUE (approval_id),
+    CONSTRAINT uq_podc_client   UNIQUE (driver_id, correction_client_id),
+    CONSTRAINT ck_podc_client   CHECK (length(correction_client_id) = 36 AND length(request_hash) = 64),
+    CONSTRAINT ck_podc_http     CHECK (response_http IN (200,202) AND (response_http = 200) = (auto_tolerance = 1)),
     CONSTRAINT ck_podc_status CHECK (status IN ('PENDING','APPLIED','REJECTED','WITHDRAWN','EXPIRED','VOID')),
     CONSTRAINT ck_podc_sod    CHECK (approver_id IS NULL OR approver_id <> requested_by),
     CONSTRAINT ck_podc_auto   CHECK (auto_tolerance IN (0,1)
@@ -966,6 +975,12 @@ CREATE TABLE pod_correction (
                                   OR (status IN ('WITHDRAWN','EXPIRED') AND decided_at IS NOT NULL)),
     CONSTRAINT ck_podc_seq    CHECK ((status = 'APPLIED') = (correct_seq IS NOT NULL) AND (correct_seq IS NULL OR correct_seq > 0))
 );
+-- 重放依据不可改：driver_id / correction_client_id / request_hash / response_http / approval_id / auto_tolerance 建单后只读
+CREATE TRIGGER trg_podc_replay_ro BEFORE UPDATE ON pod_correction
+WHEN NEW.driver_id IS NOT OLD.driver_id OR NEW.correction_client_id IS NOT OLD.correction_client_id
+  OR NEW.request_hash IS NOT OLD.request_hash OR NEW.response_http IS NOT OLD.response_http
+  OR NEW.approval_id IS NOT OLD.approval_id OR NEW.auto_tolerance IS NOT OLD.auto_tolerance
+BEGIN SELECT RAISE(ABORT, 'podc_replay_immutable'); END;
 CREATE UNIQUE INDEX uq_podc_pending ON pod_correction(corrected_pod_id, outbound_id) WHERE status = 'PENDING';
 CREATE UNIQUE INDEX uq_podc_seq     ON pod_correction(outbound_id, correct_seq) WHERE status = 'APPLIED';
 
