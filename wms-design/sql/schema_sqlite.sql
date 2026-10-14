@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 40 处 DEFAULT now()、3 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
---   3. 方言专属行：删除 153 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 58 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 196 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 98 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -297,6 +297,13 @@ CREATE TABLE stock_hold (
         OR (hold_type = 'RETURN_QC' AND op_key LIKE 'CVT:%'
             AND approval_type = 'SCRAP_MISREPORT' AND approval_no IS NOT NULL AND length(approval_no) > 0)
     ),
+    -- 审批单号格式 APR-{仓库编码}-{yyyyMMdd}-{6 位数字}；仓库编码字符集 [A-Z0-9]{1,32}（01 §2 warehouse.code，VARCHAR(32)，单号仓前缀不含 '-'）
+    CONSTRAINT ck_hold_approval_no CHECK (approval_no IS NULL OR (
+        length(approval_no) BETWEEN 21 AND 52 AND substr(approval_no, 1, 4) = 'APR-'
+        AND substr(approval_no, 5, length(approval_no) - 20) NOT GLOB '*[^A-Z0-9]*'
+        AND substr(approval_no, -16) GLOB '-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]'
+        AND (substr(approval_no, -11, 2) GLOB '0[1-9]' OR substr(approval_no, -11, 2) GLOB '1[0-2]')
+        AND (substr(approval_no, -9, 2) GLOB '0[1-9]' OR substr(approval_no, -9, 2) GLOB '[12][0-9]' OR substr(approval_no, -9, 2) GLOB '3[01]'))),
     CONSTRAINT ck_hold_scrap CHECK (
         hold_type <> 'SCRAP_PENDING'
         OR (source_type = 'SCRAP' AND source_id > 0 AND operator_id = 0)
@@ -904,6 +911,9 @@ CREATE TABLE scrap_order (
     -- 审批单号全局格式 APR-{仓库编码}-{yyyyMMdd}-{6位序号}（Q17，所有审批类型共用）
     CONSTRAINT ck_scr_apr_fmt CHECK (void_approval_no IS NULL OR (void_approval_no GLOB 'APR-?*-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]' AND substr(void_approval_no, 5, length(void_approval_no) - 20) NOT GLOB '*[^A-Z0-9]*')),
     CONSTRAINT ck_scr_sod    CHECK (approver_id IS NULL OR approver_id <> applicant_id),
+    -- 小赵复评 S1：审批 / 过账后的人员与时间必须齐
+    CONSTRAINT ck_scr_appr   CHECK (status NOT IN ('APPROVED','POSTED') OR (approver_id IS NOT NULL AND approved_at IS NOT NULL)),
+    CONSTRAINT ck_scr_posted CHECK (status <> 'POSTED' OR posted_at IS NOT NULL),
     CONSTRAINT ck_scr_src_type CHECK (source_type IN ('EXPIRY_SCAN','MANUAL','RETURN_QC','RETURN_HANDOVER','COUNT','EXCEPTION')),
     CONSTRAINT ck_scr_reason CHECK (reason_code IN ('EXPIRED','NEAR_EXPIRY','DAMAGED','QC_REJECT','NATURAL_LOSS','OTHER'))
 );
@@ -928,28 +938,65 @@ CREATE TABLE scrap_line (
     CONSTRAINT ck_scrl_mode  CHECK (ledger_mode IN ('POST_OUT','NONE'))
 );
 CREATE INDEX ix_scrl_stock ON scrap_line(stock_id);
--- 状态只能前进（小赵 I3 / 第二评审 I2）：允许 DRAFT→PENDING_APPROVAL/CANCELLED，PENDING_APPROVAL→APPROVED/REJECTED/DRAFT，APPROVED→POSTED；
--- POSTED/REJECTED/CANCELLED/VOIDED 是终态。RETURN_HANDOVER（交接单）不许撤回（PENDING_APPROVAL→DRAFT）、不许取消、不许驳回到 REJECTED；
--- 唯一例外是误报作废 →VOIDED（只对交接单开放，必须带 SCRAP_MISREPORT 审批单号 ck_scr_void，与 convert_hold SCRAP_PENDING→RETURN_QC 同事务）：
--- 它的 SCRAP_PENDING 来自待回库，释放回可用量会让破损货回到可售；误报走第 10 篇异常单（docs/09 §5.1）
--- 报损行只能在 DRAFT 单下新增或改量（POSTED 单下插 POST_OUT 且 hold_id=0 的行被拦）
+-- 报损单库层守卫（小赵 I3 / 复评 K1–K4、S1；大肥鱼定案）
+-- 状态白名单：DRAFT→PENDING_APPROVAL/CANCELLED，PENDING_APPROVAL→APPROVED/REJECTED/DRAFT，APPROVED→POSTED；POSTED/REJECTED/CANCELLED/VOIDED 是终态。
+-- K1：锁定来源 = RETURN_HANDOVER（待回库交接）和 RETURN_QC（质检不合格）：不许撤回 / 取消 / 驳回（scrap_handover_no_revoke → 40930），
+--     release_scrap_hold(REVOKED) 也拒绝（02 f802a41）；质检或交接判错只走 SCRAP_MISREPORT 审批 → VOIDED（与 convert_hold SCRAP_PENDING→RETURN_QC 同事务）。
+-- K3：code / warehouse_id / source_* / applicant_id 建单后不可改；approver_id / approved_at / posted_at 只能从 NULL 写一次；终态整行只读。
+-- S1：INSERT 只能是 DRAFT。K2：不许 DELETE / TRUNCATE（PG 兜超级用户和迁移脚本），SQLite 另拦 REPLACE。
+-- 报损行（K3/K4）：只能在 DRAFT 单下新增或修改；单据离开 DRAFT 后整行只读；
+-- 带冻结的行（hold_id≠0）数量必须等于冻结余量、库存一致；锁定来源（交接 / 质检）的行冻结写定后数量、库存、hold_id 都不能改
+CREATE TRIGGER trg_scr_handover BEFORE UPDATE ON scrap_order
+WHEN OLD.source_type IN ('RETURN_HANDOVER','RETURN_QC') AND NEW.status <> OLD.status AND NEW.status IN ('DRAFT','CANCELLED','REJECTED')
+BEGIN SELECT RAISE(ABORT, 'scrap_handover_no_revoke'); END;
 CREATE TRIGGER trg_scr_forward BEFORE UPDATE ON scrap_order
 WHEN (NEW.status <> OLD.status AND NOT ((OLD.status = 'DRAFT' AND NEW.status IN ('PENDING_APPROVAL','CANCELLED'))
        OR (OLD.status = 'PENDING_APPROVAL' AND NEW.status IN ('APPROVED','REJECTED','DRAFT'))
        OR (OLD.status = 'APPROVED' AND NEW.status = 'POSTED')
-       OR (OLD.source_type = 'RETURN_HANDOVER' AND OLD.status IN ('DRAFT','PENDING_APPROVAL','APPROVED') AND NEW.status = 'VOIDED')))
+       OR (OLD.source_type IN ('RETURN_HANDOVER','RETURN_QC') AND OLD.status IN ('DRAFT','PENDING_APPROVAL','APPROVED') AND NEW.status = 'VOIDED')))
   OR NEW.source_type IS NOT OLD.source_type OR NEW.source_id IS NOT OLD.source_id
 BEGIN SELECT RAISE(ABORT, 'scrap_state_forward_only'); END;
-CREATE TRIGGER trg_scr_handover BEFORE UPDATE ON scrap_order
-WHEN OLD.source_type = 'RETURN_HANDOVER' AND NEW.status <> OLD.status AND NEW.status IN ('DRAFT','CANCELLED','REJECTED')
-BEGIN SELECT RAISE(ABORT, 'scrap_handover_no_revoke'); END;
+CREATE TRIGGER trg_scr_immutable BEFORE UPDATE ON scrap_order
+WHEN NEW.code IS NOT OLD.code OR NEW.warehouse_id IS NOT OLD.warehouse_id OR NEW.applicant_id IS NOT OLD.applicant_id
+  OR (OLD.approver_id IS NOT NULL AND NEW.approver_id IS NOT OLD.approver_id)
+  OR (OLD.approved_at IS NOT NULL AND NEW.approved_at IS NOT OLD.approved_at)
+  OR (OLD.posted_at IS NOT NULL AND NEW.posted_at IS NOT OLD.posted_at)
+  OR (OLD.status IN ('POSTED','REJECTED','CANCELLED','VOIDED') AND (NEW.reason_code IS NOT OLD.reason_code
+      OR NEW.amount_impact IS NOT OLD.amount_impact OR NEW.void_approval_no IS NOT OLD.void_approval_no OR NEW.work_date IS NOT OLD.work_date))
+BEGIN SELECT RAISE(ABORT, 'scrap_immutable'); END;
+CREATE TRIGGER trg_scr_ins_draft BEFORE INSERT ON scrap_order
+WHEN NEW.status <> 'DRAFT' AND NEW.status IN ('PENDING_APPROVAL','APPROVED','POSTED','REJECTED','CANCELLED','VOIDED')
+BEGIN SELECT RAISE(ABORT, 'scrap_insert_draft_only'); END;
+CREATE TRIGGER trg_scr_no_replace BEFORE INSERT ON scrap_order
+WHEN EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'scrap_duplicate'); END;
+CREATE TRIGGER trg_scr_no_delete BEFORE DELETE ON scrap_order BEGIN SELECT RAISE(ABORT, 'scrap_no_delete'); END;
+CREATE TRIGGER trg_scrl_no_replace BEFORE INSERT ON scrap_line
+WHEN EXISTS (SELECT 1 FROM scrap_line l WHERE l.id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'scrap_duplicate'); END;
+CREATE TRIGGER trg_scrl_no_delete BEFORE DELETE ON scrap_line BEGIN SELECT RAISE(ABORT, 'scrap_no_delete'); END;
 CREATE TRIGGER trg_scrl_draft_ins BEFORE INSERT ON scrap_line
 WHEN NOT EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = NEW.scrap_id AND o.status = 'DRAFT')
 BEGIN SELECT RAISE(ABORT, 'scrap_line_locked'); END;
 CREATE TRIGGER trg_scrl_draft_upd BEFORE UPDATE ON scrap_line
-WHEN (NEW.scrap_qty_milli <> OLD.scrap_qty_milli OR NEW.stock_id <> OLD.stock_id)
-  AND NOT EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = NEW.scrap_id AND o.status = 'DRAFT')
+WHEN (NEW.scrap_id IS NOT OLD.scrap_id OR NEW.line_no IS NOT OLD.line_no OR NEW.stock_id IS NOT OLD.stock_id OR NEW.sku_id IS NOT OLD.sku_id
+      OR NEW.lot_id IS NOT OLD.lot_id OR NEW.scrap_qty_milli IS NOT OLD.scrap_qty_milli OR NEW.hold_id IS NOT OLD.hold_id
+      OR NEW.ledger_mode IS NOT OLD.ledger_mode OR NEW.cost_amount IS NOT OLD.cost_amount)
+  AND NOT EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = OLD.scrap_id AND o.status = 'DRAFT')
 BEGIN SELECT RAISE(ABORT, 'scrap_line_locked'); END;
+CREATE TRIGGER trg_scrl_hold_lock BEFORE UPDATE ON scrap_line
+WHEN OLD.hold_id <> 0 AND (NEW.scrap_qty_milli <> OLD.scrap_qty_milli OR NEW.stock_id <> OLD.stock_id OR NEW.hold_id <> OLD.hold_id)
+  AND EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = OLD.scrap_id AND o.source_type IN ('RETURN_HANDOVER','RETURN_QC'))
+BEGIN SELECT RAISE(ABORT, 'scrap_line_hold_locked'); END;
+CREATE TRIGGER trg_scrl_hold_ins BEFORE INSERT ON scrap_line
+WHEN NEW.hold_id <> 0 AND NOT EXISTS (SELECT 1 FROM stock_hold h WHERE h.id = NEW.hold_id AND h.stock_id = NEW.stock_id
+      AND h.status = 'HELD' AND h.hold_qty_milli - h.released_qty_milli = NEW.scrap_qty_milli)
+BEGIN SELECT RAISE(ABORT, 'scrap_line_hold_mismatch'); END;
+CREATE TRIGGER trg_scrl_hold_upd BEFORE UPDATE ON scrap_line
+WHEN NEW.hold_id <> 0 AND OLD.hold_id = 0
+  AND NOT EXISTS (SELECT 1 FROM stock_hold h WHERE h.id = NEW.hold_id AND h.stock_id = NEW.stock_id
+      AND h.status = 'HELD' AND h.hold_qty_milli - h.released_qty_milli = NEW.scrap_qty_milli)
+BEGIN SELECT RAISE(ABORT, 'scrap_line_hold_mismatch'); END;
 -- 授权（I4）：不给 DELETE/TRUNCATE，作废走状态
 -- -----------------------------------------------------------------------------
 -- 幂等 / 集成 / 审计
