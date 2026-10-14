@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 43 处 DEFAULT now() → DEFAULT (datetime('now'))（表达式默认值需括号）
---   3. 方言专属行：删除 130 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 51 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 133 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 53 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -264,6 +264,8 @@ CREATE TABLE stock_hold (
     released_qty_milli  BIGINT          NOT NULL DEFAULT 0,
     status              VARCHAR(16)     NOT NULL DEFAULT 'HELD',      -- HELD/RELEASED，由余量决定
     operator_id         BIGINT          NOT NULL,   -- 系统冻结填 0
+    approval_type       VARCHAR(24),                -- 需要审批的转换才填：SCRAP_MISREPORT（SCRAP_PENDING → RETURN_QC 误报回转）
+    approval_no         VARCHAR(64),                -- 审批单号
     version             BIGINT          NOT NULL DEFAULT 0,
     created_at          TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     updated_at          TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
@@ -288,6 +290,12 @@ CREATE TABLE stock_hold (
     CONSTRAINT ck_hold_retqc CHECK (
         hold_type <> 'RETURN_QC'
         OR (source_type = 'QC' AND source_id > 0 AND operator_id = 0)
+    ),
+    -- 误报回转（SCRAP_PENDING → RETURN_QC，convert_hold 生成 op_key=CVT:{原 hold_id}）必须带 SCRAP_MISREPORT 审批单号；其余明细不带审批
+    CONSTRAINT ck_hold_approval CHECK (
+        (NOT (hold_type = 'RETURN_QC' AND op_key LIKE 'CVT:%') AND approval_type IS NULL AND approval_no IS NULL)
+        OR (hold_type = 'RETURN_QC' AND op_key LIKE 'CVT:%'
+            AND approval_type = 'SCRAP_MISREPORT' AND approval_no IS NOT NULL AND length(approval_no) > 0)
     ),
     CONSTRAINT ck_hold_scrap CHECK (
         hold_type <> 'SCRAP_PENDING'
@@ -457,6 +465,7 @@ CREATE TRIGGER trg_hold_immutable BEFORE UPDATE ON stock_hold
 WHEN NEW.id IS NOT OLD.id OR NEW.stock_id IS NOT OLD.stock_id OR NEW.hold_type IS NOT OLD.hold_type OR NEW.reason_code IS NOT OLD.reason_code
   OR NEW.source_type IS NOT OLD.source_type OR NEW.source_id IS NOT OLD.source_id OR NEW.op_key IS NOT OLD.op_key
   OR NEW.hold_qty_milli IS NOT OLD.hold_qty_milli OR NEW.operator_id IS NOT OLD.operator_id OR NEW.created_at IS NOT OLD.created_at
+  OR NEW.approval_type IS NOT OLD.approval_type OR NEW.approval_no IS NOT OLD.approval_no
   OR NEW.released_qty_milli < OLD.released_qty_milli OR (OLD.status = 'RELEASED' AND NEW.status <> 'RELEASED')
 BEGIN SELECT RAISE(ABORT, 'hold_immutable'); END;
 -- R2（SQLite）：拒删除；REPLACE 冲突时删旧行在 recursive_triggers=OFF（默认，且是连接级开关）下不触发 DELETE 触发器，
@@ -886,10 +895,12 @@ CREATE TABLE scrap_order (
     approver_id     BIGINT,
     approved_at     TIMESTAMP,
     posted_at       TIMESTAMP,
+    void_approval_no VARCHAR(64),               -- 交接误报作废（SCRAP_MISREPORT 审批单号，第 12 篇）；只有 VOIDED 才有
     version         BIGINT          NOT NULL DEFAULT 0,
     created_at      TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT uq_scr_code   UNIQUE (code),
-    CONSTRAINT ck_scr_status CHECK (status IN ('DRAFT','PENDING_APPROVAL','APPROVED','POSTED','REJECTED','CANCELLED')),
+    CONSTRAINT ck_scr_status CHECK (status IN ('DRAFT','PENDING_APPROVAL','APPROVED','POSTED','REJECTED','CANCELLED','VOIDED')),
+    CONSTRAINT ck_scr_void   CHECK ((status = 'VOIDED') = (void_approval_no IS NOT NULL AND length(void_approval_no) > 0)),
     CONSTRAINT ck_scr_sod    CHECK (approver_id IS NULL OR approver_id <> applicant_id),
     CONSTRAINT ck_scr_src_type CHECK (source_type IN ('EXPIRY_SCAN','MANUAL','RETURN_QC','RETURN_HANDOVER','COUNT','EXCEPTION')),
     CONSTRAINT ck_scr_reason CHECK (reason_code IN ('EXPIRED','NEAR_EXPIRY','DAMAGED','QC_REJECT','NATURAL_LOSS','OTHER'))
@@ -916,13 +927,15 @@ CREATE TABLE scrap_line (
 );
 CREATE INDEX ix_scrl_stock ON scrap_line(stock_id);
 -- 状态只能前进（小赵 I3 / 第二评审 I2）：允许 DRAFT→PENDING_APPROVAL/CANCELLED，PENDING_APPROVAL→APPROVED/REJECTED/DRAFT，APPROVED→POSTED；
--- POSTED/REJECTED/CANCELLED 是终态。RETURN_HANDOVER（交接单）不许撤回（PENDING_APPROVAL→DRAFT）、不许取消、不许驳回到 REJECTED：
+-- POSTED/REJECTED/CANCELLED/VOIDED 是终态。RETURN_HANDOVER（交接单）不许撤回（PENDING_APPROVAL→DRAFT）、不许取消、不许驳回到 REJECTED；
+-- 唯一例外是误报作废 →VOIDED（只对交接单开放，必须带 SCRAP_MISREPORT 审批单号 ck_scr_void，与 convert_hold SCRAP_PENDING→RETURN_QC 同事务）：
 -- 它的 SCRAP_PENDING 来自待回库，释放回可用量会让破损货回到可售；误报走第 10 篇异常单（docs/09 §5.1）
 -- 报损行只能在 DRAFT 单下新增或改量（POSTED 单下插 POST_OUT 且 hold_id=0 的行被拦）
 CREATE TRIGGER trg_scr_forward BEFORE UPDATE ON scrap_order
 WHEN (NEW.status <> OLD.status AND NOT ((OLD.status = 'DRAFT' AND NEW.status IN ('PENDING_APPROVAL','CANCELLED'))
        OR (OLD.status = 'PENDING_APPROVAL' AND NEW.status IN ('APPROVED','REJECTED','DRAFT'))
-       OR (OLD.status = 'APPROVED' AND NEW.status = 'POSTED')))
+       OR (OLD.status = 'APPROVED' AND NEW.status = 'POSTED')
+       OR (OLD.source_type = 'RETURN_HANDOVER' AND OLD.status IN ('DRAFT','PENDING_APPROVAL','APPROVED') AND NEW.status = 'VOIDED')))
   OR NEW.source_type IS NOT OLD.source_type OR NEW.source_id IS NOT OLD.source_id
 BEGIN SELECT RAISE(ABORT, 'scrap_state_forward_only'); END;
 CREATE TRIGGER trg_scr_handover BEFORE UPDATE ON scrap_order

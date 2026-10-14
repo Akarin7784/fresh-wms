@@ -257,6 +257,8 @@ CREATE TABLE stock_hold (
     released_qty_milli  BIGINT          NOT NULL DEFAULT 0,
     status              VARCHAR(16)     NOT NULL DEFAULT 'HELD',      -- HELD/RELEASED，由余量决定
     operator_id         BIGINT          NOT NULL,   -- 系统冻结填 0
+    approval_type       VARCHAR(24),                -- 需要审批的转换才填：SCRAP_MISREPORT（SCRAP_PENDING → RETURN_QC 误报回转）
+    approval_no         VARCHAR(64),                -- 审批单号
     version             BIGINT          NOT NULL DEFAULT 0,
     created_at          TIMESTAMP       NOT NULL DEFAULT now(),
     updated_at          TIMESTAMP       NOT NULL DEFAULT now(),
@@ -281,6 +283,12 @@ CREATE TABLE stock_hold (
     CONSTRAINT ck_hold_retqc CHECK (
         hold_type <> 'RETURN_QC'
         OR (source_type = 'QC' AND source_id > 0 AND operator_id = 0)
+    ),
+    -- 误报回转（SCRAP_PENDING → RETURN_QC，convert_hold 生成 op_key=CVT:{原 hold_id}）必须带 SCRAP_MISREPORT 审批单号；其余明细不带审批
+    CONSTRAINT ck_hold_approval CHECK (
+        (NOT (hold_type = 'RETURN_QC' AND op_key LIKE 'CVT:%') AND approval_type IS NULL AND approval_no IS NULL)
+        OR (hold_type = 'RETURN_QC' AND op_key LIKE 'CVT:%'
+            AND approval_type = 'SCRAP_MISREPORT' AND approval_no IS NOT NULL AND length(approval_no) > 0)
     ),
     CONSTRAINT ck_hold_scrap CHECK (
         hold_type <> 'SCRAP_PENDING'
@@ -474,6 +482,7 @@ BEGIN                                                                           
        OR NEW.source_type IS DISTINCT FROM OLD.source_type OR NEW.source_id IS DISTINCT FROM OLD.source_id    -- @pg-only
        OR NEW.op_key IS DISTINCT FROM OLD.op_key OR NEW.hold_qty_milli IS DISTINCT FROM OLD.hold_qty_milli   -- @pg-only
        OR NEW.operator_id IS DISTINCT FROM OLD.operator_id OR NEW.created_at IS DISTINCT FROM OLD.created_at  -- @pg-only
+       OR NEW.approval_type IS DISTINCT FROM OLD.approval_type OR NEW.approval_no IS DISTINCT FROM OLD.approval_no  -- @pg-only
        OR NEW.released_qty_milli < OLD.released_qty_milli  -- R1 释放量只增不减 -- @pg-only
        OR (OLD.status = 'RELEASED' AND NEW.status <> 'RELEASED') THEN  -- R1 RELEASED 不能回 HELD -- @pg-only
         RAISE EXCEPTION 'hold_immutable' USING ERRCODE = '23514';                                            -- @pg-only
@@ -495,6 +504,7 @@ CREATE TRIGGER trg_hr_append_only BEFORE UPDATE OR DELETE ON stock_hold_release 
 -- @sqlite-only WHEN NEW.id IS NOT OLD.id OR NEW.stock_id IS NOT OLD.stock_id OR NEW.hold_type IS NOT OLD.hold_type OR NEW.reason_code IS NOT OLD.reason_code
 -- @sqlite-only   OR NEW.source_type IS NOT OLD.source_type OR NEW.source_id IS NOT OLD.source_id OR NEW.op_key IS NOT OLD.op_key
 -- @sqlite-only   OR NEW.hold_qty_milli IS NOT OLD.hold_qty_milli OR NEW.operator_id IS NOT OLD.operator_id OR NEW.created_at IS NOT OLD.created_at
+-- @sqlite-only   OR NEW.approval_type IS NOT OLD.approval_type OR NEW.approval_no IS NOT OLD.approval_no
 -- @sqlite-only   OR NEW.released_qty_milli < OLD.released_qty_milli OR (OLD.status = 'RELEASED' AND NEW.status <> 'RELEASED')
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'hold_immutable'); END;
 -- R2（SQLite）：拒删除；REPLACE 冲突时删旧行在 recursive_triggers=OFF（默认，且是连接级开关）下不触发 DELETE 触发器，
@@ -942,10 +952,12 @@ CREATE TABLE scrap_order (
     approver_id     BIGINT,
     approved_at     TIMESTAMP,
     posted_at       TIMESTAMP,
+    void_approval_no VARCHAR(64),               -- 交接误报作废（SCRAP_MISREPORT 审批单号，第 12 篇）；只有 VOIDED 才有
     version         BIGINT          NOT NULL DEFAULT 0,
     created_at      TIMESTAMP       NOT NULL DEFAULT now(),
     CONSTRAINT uq_scr_code   UNIQUE (code),
-    CONSTRAINT ck_scr_status CHECK (status IN ('DRAFT','PENDING_APPROVAL','APPROVED','POSTED','REJECTED','CANCELLED')),
+    CONSTRAINT ck_scr_status CHECK (status IN ('DRAFT','PENDING_APPROVAL','APPROVED','POSTED','REJECTED','CANCELLED','VOIDED')),
+    CONSTRAINT ck_scr_void   CHECK ((status = 'VOIDED') = (void_approval_no IS NOT NULL AND length(void_approval_no) > 0)),
     CONSTRAINT ck_scr_sod    CHECK (approver_id IS NULL OR approver_id <> applicant_id),
     CONSTRAINT ck_scr_src_type CHECK (source_type IN ('EXPIRY_SCAN','MANUAL','RETURN_QC','RETURN_HANDOVER','COUNT','EXCEPTION')),
     CONSTRAINT ck_scr_reason CHECK (reason_code IN ('EXPIRED','NEAR_EXPIRY','DAMAGED','QC_REJECT','NATURAL_LOSS','OTHER'))
@@ -972,14 +984,17 @@ CREATE TABLE scrap_line (
 );
 CREATE INDEX ix_scrl_stock ON scrap_line(stock_id);
 -- 状态只能前进（小赵 I3 / 第二评审 I2）：允许 DRAFT→PENDING_APPROVAL/CANCELLED，PENDING_APPROVAL→APPROVED/REJECTED/DRAFT，APPROVED→POSTED；
--- POSTED/REJECTED/CANCELLED 是终态。RETURN_HANDOVER（交接单）不许撤回（PENDING_APPROVAL→DRAFT）、不许取消、不许驳回到 REJECTED：
+-- POSTED/REJECTED/CANCELLED/VOIDED 是终态。RETURN_HANDOVER（交接单）不许撤回（PENDING_APPROVAL→DRAFT）、不许取消、不许驳回到 REJECTED；
+-- 唯一例外是误报作废 →VOIDED（只对交接单开放，必须带 SCRAP_MISREPORT 审批单号 ck_scr_void，与 convert_hold SCRAP_PENDING→RETURN_QC 同事务）：
 -- 它的 SCRAP_PENDING 来自待回库，释放回可用量会让破损货回到可售；误报走第 10 篇异常单（docs/09 §5.1）
 CREATE FUNCTION trg_scr_forward() RETURNS trigger LANGUAGE plpgsql AS $$                                    -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF NEW.status <> OLD.status AND NOT (                                                                     -- @pg-only
           (OLD.status = 'DRAFT' AND NEW.status IN ('PENDING_APPROVAL','CANCELLED'))                           -- @pg-only
        OR (OLD.status = 'PENDING_APPROVAL' AND NEW.status IN ('APPROVED','REJECTED','DRAFT'))                 -- @pg-only
-       OR (OLD.status = 'APPROVED' AND NEW.status = 'POSTED')) THEN                                           -- @pg-only
+       OR (OLD.status = 'APPROVED' AND NEW.status = 'POSTED')                                                 -- @pg-only
+       OR (OLD.source_type = 'RETURN_HANDOVER' AND OLD.status IN ('DRAFT','PENDING_APPROVAL','APPROVED')      -- @pg-only
+           AND NEW.status = 'VOIDED')) THEN   -- 唯一的作废：交接误报（SCRAP_MISREPORT 审批通过，同事务 convert_hold） -- @pg-only
         RAISE EXCEPTION 'scrap_state_forward_only' USING ERRCODE = '23514';                                  -- @pg-only
     END IF;                                                                                                   -- @pg-only
     IF OLD.source_type = 'RETURN_HANDOVER' AND NEW.status <> OLD.status                                       -- @pg-only
@@ -1005,7 +1020,8 @@ CREATE TRIGGER trg_scrl_draft_only BEFORE INSERT OR UPDATE ON scrap_line FOR EAC
 -- @sqlite-only CREATE TRIGGER trg_scr_forward BEFORE UPDATE ON scrap_order
 -- @sqlite-only WHEN (NEW.status <> OLD.status AND NOT ((OLD.status = 'DRAFT' AND NEW.status IN ('PENDING_APPROVAL','CANCELLED'))
 -- @sqlite-only        OR (OLD.status = 'PENDING_APPROVAL' AND NEW.status IN ('APPROVED','REJECTED','DRAFT'))
--- @sqlite-only        OR (OLD.status = 'APPROVED' AND NEW.status = 'POSTED')))
+-- @sqlite-only        OR (OLD.status = 'APPROVED' AND NEW.status = 'POSTED')
+-- @sqlite-only        OR (OLD.source_type = 'RETURN_HANDOVER' AND OLD.status IN ('DRAFT','PENDING_APPROVAL','APPROVED') AND NEW.status = 'VOIDED')))
 -- @sqlite-only   OR NEW.source_type IS NOT OLD.source_type OR NEW.source_id IS NOT OLD.source_id
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'scrap_state_forward_only'); END;
 -- @sqlite-only CREATE TRIGGER trg_scr_handover BEFORE UPDATE ON scrap_order
