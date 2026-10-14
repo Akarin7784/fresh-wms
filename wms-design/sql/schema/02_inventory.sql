@@ -196,7 +196,7 @@ CREATE UNIQUE INDEX uq_hold_return ON stock_hold(source_id) WHERE hold_type = 'R
 -- 非唯一：一条父冻结可以多次部分转出，多条子明细共享同一个 from_hold_id
 CREATE INDEX ix_hold_from ON stock_hold(from_hold_id) WHERE from_hold_id IS NOT NULL;
 
--- 冻结部分释放的操作去重（A3，release_qc_hold / release_hold）：一次释放一行，op_key 由调用方传入（质检如 QCR:{inbound_line_id}:{op_seq}），
+-- 冻结部分释放的操作去重（A3，release_qc_hold / release_hold / release_live_hold）：一次释放一行，op_key 由调用方传入（质检如 QCR:{inbound_line_id}:{op_seq}；整池解锁如 LTH:{live_tank_hold_id}:{inspection_id}:{hold_id}），
 -- 与 inbound_line.qc_passed 累加、stock_hold 释放、stock.quality_hold 扣减同一事务；重放撞 uq_hr_op → 整个事务回滚，不重复解冻。只追加。
 -- 没有 qc_line 表。质检单 = inbound_order，质检行 = inbound_line（第 3/10 篇）。本表 source 不存行 id。
 CREATE TABLE stock_hold_release (

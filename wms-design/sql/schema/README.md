@@ -2,7 +2,9 @@
 
 `verify.sh` 与 `verify_sqlite.py` 按下面的文件名顺序拼接后执行。PostgreSQL 源以这些文件为准；`schema_sqlite.sql` 由翻译器生成，不要手改。`schema_postgres.sql` 只是指针。
 
-后续篇章只新增自己的 `NN_*.sql`（编号与篇号对齐），在本清单和两个 verify 脚本的加载列表里按序插进去，并在该文件末尾写本篇表的 `GRANT`（`-- @pg-only`）。不要再改别人的篇文件，也不要恢复成单文件 `schema_postgres.sql`。
+各篇只改自己的 `sql/schema/NN_*.sql`（编号与篇号对齐）。不要改别人的篇文件，也不要恢复成单文件 `schema_postgres.sql`。
+
+下游 PR 把自己的文件加进 **两个** verify 的加载列表（`verify.sh` 的 `SCHEMA_PARTS` 和 `verify_sqlite.py` 的 `SCHEMA_PARTS`），两处名单和顺序必须一致，并在本表补一行。文件插在 `90_available_view.sql` 之前。本篇表的 `GRANT` 写在自己文件末尾（`-- @pg-only`）。
 
 | 文件 | 内容 |
 |---|---|
@@ -16,7 +18,15 @@
 | `08_count.sql` | 盘点、调整 |
 | `11_integration.sql` | 幂等、入站消息、outbox、审计、取号 |
 | `12_auth.sql` | 用户、角色、权限、API 凭证 |
-| `90_available_view.sql` | `v_stock_available`、`COMMIT` |
-| `99_grants.sql` | `wms_purge_owner` / `wms_cleaner` / `purge_expired()` |
+| `90_available_view.sql` | `v_stock_available`，然后 `COMMIT` |
+| `99_grants.sql` | 事务外执行：`wms_purge_owner` / `wms_cleaner` / `purge_expired()` |
 
-第 7、9、10、13–18 篇的表加在对应编号的新文件里，插在 `90_available_view.sql` 之前（视图和 COMMIT 保持在最后两档之前）。清理函数仍放在 `99_grants.sql`，因为它要等所有表建完。
+`COMMIT` 在 `90_available_view.sql` 里，视图建完就结束事务。`99_grants.sql` 排在它后面，在事务外执行：清理函数要等所有表建完，而且 `CREATE ROLE` 一类语句放在已提交的库上。新篇章插在 90 之前，所以仍在同一个事务里建表、授权。
+
+## 跨篇加列
+
+需要给别篇的表加列时，在**自己的** `NN_*.sql` 里写 `ALTER TABLE`（PostgreSQL 和 SQLite 两条都要写，SQLite 侧用 `-- @sqlite-only` / `-- @pg-only` 拆开），并在下面的登记表写上列名和原因。不要直接改那张表所在的篇文件。
+
+| 列 | 表 | 由哪一篇的文件 ALTER | 原因 | 状态 |
+|---|---|---|---|---|
+| `received_qty_milli`、`qc_passed_qty_milli`、`qc_failed_qty_milli` | `inbound_line` | 第 10 篇 `10_returns.sql`（尚未加入加载列表） | 02 §7.1.3 `release_qc_hold` 按这些 milli 列累加质检合格量。`03_inbound.sql` 里现有的 `received_qty` 仍是 `NUMERIC(14,3)`，本篇不改 03 | 待 #5 落库 |
