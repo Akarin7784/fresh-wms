@@ -958,6 +958,9 @@ CREATE TABLE scrap_order (
     CONSTRAINT uq_scr_code   UNIQUE (code),
     CONSTRAINT ck_scr_status CHECK (status IN ('DRAFT','PENDING_APPROVAL','APPROVED','POSTED','REJECTED','CANCELLED','VOIDED')),
     CONSTRAINT ck_scr_void   CHECK ((status = 'VOIDED') = (void_approval_no IS NOT NULL AND length(void_approval_no) > 0)),
+    -- 审批单号全局格式 APR-{仓库编码}-{yyyyMMdd}-{6位序号}（Q17，所有审批类型共用）
+    CONSTRAINT ck_scr_apr_fmt CHECK (void_approval_no IS NULL OR void_approval_no ~ '^APR-[A-Z0-9]+-[0-9]{8}-[0-9]{6}$'),  -- @pg-only
+-- @sqlite-only     CONSTRAINT ck_scr_apr_fmt CHECK (void_approval_no IS NULL OR (void_approval_no GLOB 'APR-?*-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]' AND substr(void_approval_no, 5, length(void_approval_no) - 20) NOT GLOB '*[^A-Z0-9]*')),
     CONSTRAINT ck_scr_sod    CHECK (approver_id IS NULL OR approver_id <> applicant_id),
     CONSTRAINT ck_scr_src_type CHECK (source_type IN ('EXPIRY_SCAN','MANUAL','RETURN_QC','RETURN_HANDOVER','COUNT','EXCEPTION')),
     CONSTRAINT ck_scr_reason CHECK (reason_code IN ('EXPIRED','NEAR_EXPIRY','DAMAGED','QC_REJECT','NATURAL_LOSS','OTHER'))
