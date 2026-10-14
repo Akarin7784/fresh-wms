@@ -191,8 +191,8 @@ outbox 每条：`{ op_id(uuid), local_seq, format_version, idem_key, device_inst
 | `50000` 内部错误 | 服务端异常 | 通用错误提示 + `trace_id`；条目保持 `pending`，按退避同 Key 重试（不缓存，重新执行，业务键兜底） |
 | `50010` 不变量违反 | 服务端断言失败 | 通用错误提示 + `trace_id`；**不自动重试**，条目置 `failed` 红条交主管，上报日志 |
 | `42214` 且 `detail.reason=OVER_PICK`（拣货确认：已确认量 + 本次数量 > 计划量） | 数量录入错误或重复拣 | `failed` 红条，**不自动重试**，提示「请复核数量或联系主管」；复核后改数量为新操作（新 Key、新 `op_seq`，关联原条目） |
-| `42214` 且 `detail.reason=OVER_REVERSE`（撤销拣货：撤销量超过已拣未撤销量） | 撤销重复或数量错误 | `failed` 红条，**不自动重试**；红条显示出库行、已拣量、已撤销量、本次申请撤销量（取自 `detail`，字段名待 #2，Q17），提示复核或联系主管 |
-| `42214` 且 `detail.reason` 缺失/未知 | 契约异常 | `failed` 红条交人工，**不自动重试、不生成新 Key**，上报日志 |
+| `42214` 且 `detail.reason=OVER_REVERSE`（撤销拣货：撤销量超过已拣未撤销量） | 撤销重复或数量错误 | `failed` 红条，**不自动重试**；红条显示「出库行 {outbound_line_id}：已拣 {picked_qty}，已撤销 {reversed_qty}，本次申请撤销 {requested_qty}」（`detail` 字段，数量为 3 位小数字符串，经 `formatQty` + `base_uom` 显示），提示复核或联系主管 |
+| `42214` 且 `detail.reason` 缺失或不是 `OVER_PICK`/`OVER_REVERSE` | 契约异常（`42214 OVER_QTY` 的 reason 只有这两个值） | `failed` 红条交人工，**不自动重试、不生成新 Key**，上报日志 |
 | 409 `40920 TASK_REASSIGNED` | 离线超时回收或主管改派 | 见 §9.4.1 |
 | 409 `40921 TASK_CANCELLED` | 任务/出库单已取消 | 见 §9.4.1 |
 | 409 `40922 TASK_CLOSED` | 任务已关闭 | 见 §9.4.1 |
@@ -288,7 +288,7 @@ stateDiagram-v2
 |---|---|---|
 | 单元 | Vitest + fake-indexeddb | outbox 写入原子性；Key 与 `op_seq` 在失败/重启/退避后不变；`local_seq` 排序（时钟回拨后顺序不变）；串行与失败暂停只影响本账号同任务；`failed` 不被 24h 清理、只在服务端回执后删除；撤销在确认被拒后置 `superseded`；重扫生成新条目并关联；`format_version` 迁移（含迁移失败标红）；数量字符串计算 |
 | 组件 | Vitest + @vue/test-utils | 三步扫码不可跳步、缺货跳行、30 秒撤销、BigButton ≥56dp、离线确认即时反馈；计件模式 1 秒扫 5 件得 5（不被去抖）；非计件模式壳重复广播被丢弃；outbox 非空不能登出、可交主管；首页显示其他账号待补交数 |
-| 模拟弱网 | MSW | `42214` 按 `detail.reason` 分支：`OVER_PICK` 超拣红条、`OVER_REVERSE` 红条显示出库行/已拣/已撤销/本次申请量、缺失/未知红条交人工，三种情况均不自动重试（断言无二次请求）；超时后重试同 Key；响应丢失；**Key 过期（服务端无 Key 记录）后补交按四元组重放，不重复扣减**；`40932` 按 `resolution` 分支：`CONFIRMED`/`RETURNED_TO_ORIGINAL` 立即删除、`NEARBY_PUTBACK` 红条保留直到 `putback-ack` 成功（扫错 `42212` 重扫、ack 不写流水）、`SCRAP_HANDOVER` 红条保留直到 GET 详情 `handover_confirmed_at` 非空（为空保留）、缺失/未知保留；`40910` 的 `POD_OP`/`POD_CORRECT`/`SOURCE_ORDER` 按契约异常处理；断网时用缓存的 endpoint + epoch 继续作业且写请求带 `X-Write-Epoch`；`50303 STALE_WRITE_NODE` → 暂停 outbox、重取 write-endpoint、按 `local_seq` 原 Key 重放，不标红；`50302 ID_CLOCK_BACKWARD` 不触发重取地址、不与 STALE 混淆（只退避重试）；非计划切换后按原业务键重提交补数且新节点号无影响；`50301` 或 `epoch` 变化 → 重取 write-endpoint 后按 `local_seq` 用原 Key/`op_seq` 重提交，切换前已成功的操作得到重放不重复扣减；切换期间不标红；40920/40921/40922 返回 `confirmedLines` + `returnRecordId`，重复被拒返回同一 id（按四元组）；confirm 扫错库位 `42212` 红条保留并提示重扫原库位；confirm 成功后删除 failed 条目；confirm 与主管 resolve 并发：**`40930` 不删除、红条保留**；`40910` 按 `detail.key_type` 分支（`PDA_OP` 交主管、`IDEMPOTENCY_KEY` 上报；缺失/未知时红条、不自动重试、不生成新 Key）；`50000` 退避同 Key 重试；`50010` 不自动重试、红条；`42214` 超拣红条且不自动重试；`42212` 后修正重扫用同 Key 被重新执行（422 不缓存）；5xx/429 后同 Key 重试被重新执行且由业务键兜底不重复扣减；confirm 网络失败同 Key 重试；401 中途失效 |
+| 模拟弱网 | MSW | `42214` 按 `detail.reason` 分支：`OVER_PICK` 超拣红条、`OVER_REVERSE` 红条按 `detail{outbound_line_id, picked_qty, reversed_qty, requested_qty}` 渲染且数量经 `formatQty` 显示（不做浮点运算）、缺失/未知红条交人工，三种情况均不自动重试（断言无二次请求）；超时后重试同 Key；响应丢失；**Key 过期（服务端无 Key 记录）后补交按四元组重放，不重复扣减**；`40932` 按 `resolution` 分支：`CONFIRMED`/`RETURNED_TO_ORIGINAL` 立即删除、`NEARBY_PUTBACK` 红条保留直到 `putback-ack` 成功（扫错 `42212` 重扫、ack 不写流水）、`SCRAP_HANDOVER` 红条保留直到 GET 详情 `handover_confirmed_at` 非空（为空保留）、缺失/未知保留；`40910` 的 `POD_OP`/`POD_CORRECT`/`SOURCE_ORDER` 按契约异常处理；断网时用缓存的 endpoint + epoch 继续作业且写请求带 `X-Write-Epoch`；`50303 STALE_WRITE_NODE` → 暂停 outbox、重取 write-endpoint、按 `local_seq` 原 Key 重放，不标红；`50302 ID_CLOCK_BACKWARD` 不触发重取地址、不与 STALE 混淆（只退避重试）；非计划切换后按原业务键重提交补数且新节点号无影响；`50301` 或 `epoch` 变化 → 重取 write-endpoint 后按 `local_seq` 用原 Key/`op_seq` 重提交，切换前已成功的操作得到重放不重复扣减；切换期间不标红；40920/40921/40922 返回 `confirmedLines` + `returnRecordId`，重复被拒返回同一 id（按四元组）；confirm 扫错库位 `42212` 红条保留并提示重扫原库位；confirm 成功后删除 failed 条目；confirm 与主管 resolve 并发：**`40930` 不删除、红条保留**；`40910` 按 `detail.key_type` 分支（`PDA_OP` 交主管、`IDEMPOTENCY_KEY` 上报；缺失/未知时红条、不自动重试、不生成新 Key）；`50000` 退避同 Key 重试；`50010` 不自动重试、红条；`42214` 超拣红条且不自动重试；`42212` 后修正重扫用同 Key 被重新执行（422 不缓存）；5xx/429 后同 Key 重试被重新执行且由业务键兜底不重复扣减；confirm 网络失败同 Key 重试；401 中途失效 |
 | 真机 | 手工清单 | 冷库断网 30 分钟及跨夜（>24h）后补交；拔电池/杀 WebView 后恢复；手动改系统时间后上传顺序；换班换账号；outbox 非空时强制更新 |
 
 覆盖率目标：`offline/`、`utils/`、`composables/` 行 ≥ 85%、分支 ≥ 75%；组件 ≥ 70%。
@@ -313,4 +313,4 @@ stateDiagram-v2
 | Q14 | ~~报损交接完成依据~~ **已定**：GET 详情 `handover_confirmed_at`/`_by` 非空，见 §9.4.2 | 已关闭 |
 | Q15 | ~~切换后继承与地址获取~~ **已定**：随库迁移继承；`write-endpoint` + `epoch`，见 §9.5 | 已关闭 |
 | Q16 | ~~`STALE_WRITE_NODE` 码值~~ **已定**：`50303`，`50302` 仍为 `ID_CLOCK_BACKWARD`（00 §6.4 @8314830） | 已关闭 |
-| Q17 | `42214 OVER_REVERSE` 的 `detail` 字段名（出库行、已拣量、已撤销量、申请撤销量） | #2 总体设计 §6.4 / 第 5 篇 |
+| Q17 | ~~`OVER_REVERSE` detail 字段~~ **已定**：`{outbound_line_id, picked_qty, reversed_qty, requested_qty}`，数量为 3 位小数字符串（00 §6.4 @5e44905） | 已关闭 |
