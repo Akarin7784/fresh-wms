@@ -25,6 +25,7 @@ SCHEMA_PARTS=(
   08_count.sql
   11_integration.sql
   12_auth.sql
+  12b_auth_audit.sql
   90_available_view.sql
   99_grants.sql
 )
@@ -32,7 +33,7 @@ SCHEMA_PARTS=(
 # stock_movement_key、stock_ledger_line → 42 表 / 114 索引（含 PK、UNIQUE 自动索引和分区父表上的分区索引；
 # 分区子表及其继承来的索引不计）/ 1 视图。二轮 C2 加 uq_mvk_mv（外键被引用键）→ 115；A3 加 stock_hold_release（PK、uq_hr_op、ix_hr_hold）→ 43 表 / 118。ix_hold_from（from_hold_id 部分索引，非唯一）→ 119。改 DDL 必须同步改这里。
 # 必须用新建的空库跑（DROP SCHEMA public 重建会丢 wms_app 的 USAGE；schema 里已 GRANT USAGE 兜底，小赵 C6）。
-# docs/12 在 43 表 / 119 索引上增加 user_device_binding、offline_token、approval_request（3 主键 + uq_offline_jti + uq_apr_code + uq_audit_node_seq + 7 个显式索引）→ 46 表 / 132 索引。
+# docs/12 的 DDL 在 12b_auth_audit.sql：在 43 表 / 119 索引上增加 user_device_binding、offline_token、approval_request（3 主键 + uq_offline_jti + uq_apr_code + uq_audit_node_seq + 7 个显式索引）→ 46 表 / 132 索引。以 PG 实测为准。
 EXPECT_TABLES=46
 EXPECT_INDEXES=132
 EXPECT_VIEWS=1
@@ -911,6 +912,23 @@ echo "  → 成功 $succ / 拒绝 $rej / 剩余 $FINAL / version $VER"
 [ "$succ" = "33" ] && [ "$rej" = "17" ] && [ "$FINAL" = "1000" ] && [ "$VER" = "33" ] \
   && ok "无超卖、无负库存、无丢更新（33×3000 + 1000 = 100000 milli）" \
   || bad "并发结果偏离预期"
+
+echo "=== 2g2. 新审批类型 + audit node 必填 ==="
+# 权限点 offline.paper.approve 等已在 2e 以 id 5–8 授予角色 1（uq_perm_code），这里不再插 11–14。
+H=$(printf 'a%.0s' $(seq 64))
+i=0
+for T in PAPER_BACKFILL BOX_VOID PROCESS_YIELD_DEVIATION LIVE_DEATH_OVER; do
+  A=$((71+i)); B=$((75+i))
+  seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES ($A,'APR-WHSH01-20261015-0000$A','$T',1,'$T','$A','{}','$H','r',201,'2099-01-01'),($B,'APR-WHSH01-20261015-0000$B','$T',1,'$T','$B','{}','$H','r',202,'2099-01-01');"
+  APP="UPDATE approval_request SET status='APPROVED', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00'"
+  expect_block "12 $T：无该审批权限点（质检主管 205）" "$APP, first_approver_id=205, first_approver_role='QC_SUPERVISOR' WHERE id=$A;" "approval_perm_not_held"
+  expect_block "12 $T：申请人 202 自批" "$APP, first_approver_id=202, first_approver_role='WH_SUPERVISOR' WHERE id=$B;" "ck_apr_sod"
+  expect_allow "12 $T 正向：本仓主管 202 审批 201 的申请" "$APP, first_approver_id=202, first_approver_role='WH_SUPERVISOR' WHERE id=$A;"
+  i=$((i+1))
+done
+expect_block "12 audit_log 新写入省略 node_id/node_seq → 40001" "INSERT INTO audit_log (id,action,warehouse_id) VALUES (900,'x',1);" "audit_node_required"
+expect_block "12 audit_log node_seq=0 → 40001" "INSERT INTO audit_log (id,action,node_id,node_seq,warehouse_id) VALUES (901,'x',7,0,1);" "audit_node_required"
+expect_allow "12 audit_log node_id/node_seq > 0 正向" "INSERT INTO audit_log (id,action,node_id,node_seq,warehouse_id) VALUES (902,'x',7,902,1);"
 
 echo "=== 汇总 ==="
 echo "  通过 $pass 项 / 失败 $fail 项"

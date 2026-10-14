@@ -36,6 +36,7 @@ SCHEMA_PARTS = (
     "08_count.sql",
     "11_integration.sql",
     "12_auth.sql",
+    "12b_auth_audit.sql",
     "90_available_view.sql",
     "99_grants.sql",
 )
@@ -993,6 +994,25 @@ if tot == 600:
     ok(f"整数最小单位（厘）累加 0.1+0.2+0.3 = {tot}/1000 = {tot / 1000}，精确")
 else:
     bad(f"整数存法结果异常：{tot}")
+
+print("=== 2g2. 新审批类型（PAPER_BACKFILL/BOX_VOID/PROCESS_YIELD_DEVIATION/LIVE_DEATH_OVER）+ audit node 必填 ===")
+# 权限点 5–8 已在 2g 种子里授予角色 1，code 有 uq_perm_code，这里不再插 11–14。
+_H = "a" * 64
+for _i, _t in enumerate(["PAPER_BACKFILL", "BOX_VOID", "PROCESS_YIELD_DEVIATION", "LIVE_DEATH_OVER"]):
+    for _id, _req in ((71 + _i, 201), (75 + _i, 202)):
+        conn.execute(
+            "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) "
+            f"VALUES ({_id},'APR-WHSH01-20261015-0000{_id}','{_t}',1,'{_t}','{_id}','{{}}','{_H}','r',{_req},'2099-01-01')"
+        )
+conn.commit()
+_APP = "UPDATE approval_request SET status='APPROVED', first_approver_id={u}, first_approver_role='{r}', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id={i}"
+for _i, _t in enumerate(["PAPER_BACKFILL", "BOX_VOID", "PROCESS_YIELD_DEVIATION", "LIVE_DEATH_OVER"]):
+    expect_block_tx(f"12 {_t}：无该审批权限点（质检主管 205）", [_APP.format(u=205, r="QC_SUPERVISOR", i=71 + _i)], "approval_perm_not_held")
+    expect_block_tx(f"12 {_t}：申请人 202 自批", [_APP.format(u=202, r="WH_SUPERVISOR", i=75 + _i)], "ck_apr_sod")
+    expect_allow_tx(f"12 {_t} 正向：本仓主管 202 审批 201 的申请", [_APP.format(u=202, r="WH_SUPERVISOR", i=71 + _i)])
+expect_block_tx("12 audit_log 新写入省略 node_id/node_seq（默认 0）→ 40001", ["INSERT INTO audit_log (id,action,warehouse_id) VALUES (900,'x',1)"], "audit_node_required: 40001")
+expect_block_tx("12 audit_log node_seq=0 → 40001", ["INSERT INTO audit_log (id,action,node_id,node_seq,warehouse_id) VALUES (901,'x',7,0,1)"], "audit_node_required: 40001")
+expect_allow_tx("12 audit_log node_id/node_seq > 0 正向", ["INSERT INTO audit_log (id,action,node_id,node_seq,warehouse_id) VALUES (902,'x',7,902,1)"])
 
 print("=== 汇总 ===")
 print(f"  通过 {passed} 项 / 失败 {failed} 项")

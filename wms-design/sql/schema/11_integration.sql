@@ -132,30 +132,10 @@ CREATE TABLE audit_log (
     warehouse_id    BIGINT,
     trace_id        VARCHAR(32),
     ip              VARCHAR(45),
-    occurred_at     TIMESTAMP    NOT NULL DEFAULT now(),
-    node_id         INT          NOT NULL,           -- 产生审计的节点（docs/12 §6.4，边缘回传按 (node_id, node_seq) 去重）
-    node_seq        BIGINT       NOT NULL,           -- 节点内单调递增
-    device_instance_id VARCHAR(64),                  -- PDA/司机端操作时必填（应用层）
-    approval_id     BIGINT,                          -- 经审批的操作关联 approval_request.id
-    CONSTRAINT uq_audit_node_seq UNIQUE (node_id, node_seq)
+    occurred_at     TIMESTAMP    NOT NULL DEFAULT now()
 );
 CREATE INDEX ix_audit_target ON audit_log(target_type, target_id, occurred_at DESC);
 CREATE INDEX ix_audit_actor  ON audit_log(actor_id, occurred_at DESC);
-CREATE INDEX ix_audit_wh     ON audit_log(warehouse_id, occurred_at DESC);
--- audit_log 只追加（docs/12 §6.4）：行级 UPDATE/DELETE 与 TRUNCATE 都拦；归档走按月导出 + 维护窗口内专用角色
-CREATE FUNCTION trg_audit_append_only() RETURNS trigger LANGUAGE plpgsql AS $$                             -- @pg-only
-BEGIN                                                                                                         -- @pg-only
-    RAISE EXCEPTION 'append_only_violation: audit_log' USING ERRCODE = '42501';                             -- @pg-only
-END $$;                                                                                                       -- @pg-only
-CREATE TRIGGER trg_audit_append_only BEFORE UPDATE OR DELETE ON audit_log FOR EACH ROW EXECUTE FUNCTION trg_audit_append_only();  -- @pg-only
-CREATE TRIGGER trg_audit_no_truncate BEFORE TRUNCATE ON audit_log FOR EACH STATEMENT EXECUTE FUNCTION trg_audit_append_only();  -- @pg-only
--- @sqlite-only CREATE TRIGGER trg_audit_no_update BEFORE UPDATE ON audit_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: audit_log'); END;
--- @sqlite-only CREATE TRIGGER trg_audit_no_delete BEFORE DELETE ON audit_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: audit_log'); END;
--- 小赵 B1：SQLite REPLACE 删旧行不触发 DELETE 触发器（recursive_triggers=OFF），id 或 (node_id,node_seq) 已存在就直接 ABORT
--- @sqlite-only CREATE TRIGGER trg_audit_no_replace BEFORE INSERT ON audit_log
--- @sqlite-only WHEN EXISTS (SELECT 1 FROM audit_log a WHERE a.id = NEW.id OR (a.node_id = NEW.node_id AND a.node_seq = NEW.node_seq))
--- @sqlite-only BEGIN SELECT RAISE(ABORT, 'append_only_violation: audit_log'); END;
-
 
 CREATE TABLE numbering_segment (
     biz_prefix   VARCHAR(16)  NOT NULL,

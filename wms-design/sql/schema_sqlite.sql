@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 39 处 DEFAULT now()、5 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
---   3. 方言专属行：删除 307 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 187 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 314 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 189 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -997,24 +997,10 @@ CREATE TABLE audit_log (
     warehouse_id    BIGINT,
     trace_id        VARCHAR(32),
     ip              VARCHAR(45),
-    occurred_at     TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
-    node_id         INT          NOT NULL,           -- 产生审计的节点（docs/12 §6.4，边缘回传按 (node_id, node_seq) 去重）
-    node_seq        BIGINT       NOT NULL,           -- 节点内单调递增
-    device_instance_id VARCHAR(64),                  -- PDA/司机端操作时必填（应用层）
-    approval_id     BIGINT,                          -- 经审批的操作关联 approval_request.id
-    CONSTRAINT uq_audit_node_seq UNIQUE (node_id, node_seq)
+    occurred_at     TIMESTAMP    NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX ix_audit_target ON audit_log(target_type, target_id, occurred_at DESC);
 CREATE INDEX ix_audit_actor  ON audit_log(actor_id, occurred_at DESC);
-CREATE INDEX ix_audit_wh     ON audit_log(warehouse_id, occurred_at DESC);
--- audit_log 只追加（docs/12 §6.4）：行级 UPDATE/DELETE 与 TRUNCATE 都拦；归档走按月导出 + 维护窗口内专用角色
-CREATE TRIGGER trg_audit_no_update BEFORE UPDATE ON audit_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: audit_log'); END;
-CREATE TRIGGER trg_audit_no_delete BEFORE DELETE ON audit_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: audit_log'); END;
--- 小赵 B1：SQLite REPLACE 删旧行不触发 DELETE 触发器（recursive_triggers=OFF），id 或 (node_id,node_seq) 已存在就直接 ABORT
-CREATE TRIGGER trg_audit_no_replace BEFORE INSERT ON audit_log
-WHEN EXISTS (SELECT 1 FROM audit_log a WHERE a.id = NEW.id OR (a.node_id = NEW.node_id AND a.node_seq = NEW.node_seq))
-BEGIN SELECT RAISE(ABORT, 'append_only_violation: audit_log'); END;
-
 
 CREATE TABLE numbering_segment (
     biz_prefix   VARCHAR(16)  NOT NULL,
@@ -1027,6 +1013,10 @@ CREATE TABLE numbering_segment (
 -- 取号（号段预取，两库语义一致）：
 --   UPDATE numbering_segment SET next_value = next_value + step WHERE biz_prefix=? AND date_key=?
 --   然后 SELECT next_value - step 作为本段起点。多实例安全，不依赖 Redis 持久化。
+-- -----------------------------------------------------------------------------
+-- 权限（RBAC + 数据权限）
+-- -----------------------------------------------------------------------------
+
 CREATE TABLE sys_user (
     id              BIGINT       PRIMARY KEY,
     username        VARCHAR(64)  NOT NULL,
@@ -1036,11 +1026,9 @@ CREATE TABLE sys_user (
     mp_openid       VARCHAR(64),
     status          VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
     last_login_at   TIMESTAMP,
-    perm_version    BIGINT       NOT NULL DEFAULT 1,   -- docs/12 §3.1：角色/权限/仓分配任何变化 +1，只升不降
     created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     deleted_at      TIMESTAMP,
-    CONSTRAINT uq_user_name UNIQUE (username),
-    CONSTRAINT ck_user_perm_ver CHECK (perm_version > 0)
+    CONSTRAINT uq_user_name UNIQUE (username)
 );
 CREATE INDEX ix_user_openid ON sys_user(mp_openid) WHERE mp_openid IS NOT NULL;
 
@@ -1077,6 +1065,33 @@ CREATE TABLE api_credential (
     last_used_at     TIMESTAMP,
     CONSTRAINT uq_api_key UNIQUE (api_key)
 );
+-- =============================================================================
+-- 12b_auth_audit.sql —— 第 12 篇（权限与审计，PR #9）自有 DDL
+-- 加载顺序：紧跟 12_auth.sql 之后、90_available_view.sql 之前。
+-- 跨篇加列一律 ALTER（README「跨篇 ALTER 登记表」已登记）。
+-- =============================================================================
+
+-- [跨篇 ALTER] audit_log（表主人：11_integration.sql）
+ALTER TABLE audit_log ADD COLUMN node_id INT NOT NULL DEFAULT 0;            -- 0 = 未登记节点，应用层必填真实 node_id
+ALTER TABLE audit_log ADD COLUMN node_seq BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE audit_log ADD COLUMN device_instance_id VARCHAR(64);
+ALTER TABLE audit_log ADD COLUMN approval_id BIGINT;
+CREATE UNIQUE INDEX uq_audit_node_seq ON audit_log(node_id, node_seq);
+CREATE INDEX ix_audit_wh ON audit_log(warehouse_id, occurred_at DESC);
+-- Doro 定：DEFAULT 0 只为兼容存量行；新写入 node_id/node_seq 必须 > 0（应用层映射 40001 PARAM_INVALID）
+CREATE TRIGGER trg_audit_node_required BEFORE INSERT ON audit_log
+WHEN NEW.node_id <= 0 OR NEW.node_seq <= 0
+BEGIN SELECT RAISE(ABORT, 'audit_node_required: 40001'); END;
+-- audit_log 只追加（docs/12 §6.4）：行级 UPDATE/DELETE 与 TRUNCATE 都拦；归档走按月导出 + 维护窗口内专用角色
+CREATE TRIGGER trg_audit_no_update BEFORE UPDATE ON audit_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: audit_log'); END;
+CREATE TRIGGER trg_audit_no_delete BEFORE DELETE ON audit_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: audit_log'); END;
+-- 小赵 B1：SQLite REPLACE 删旧行不触发 DELETE 触发器（recursive_triggers=OFF），id 或 (node_id,node_seq) 已存在就直接 ABORT
+CREATE TRIGGER trg_audit_no_replace BEFORE INSERT ON audit_log
+WHEN EXISTS (SELECT 1 FROM audit_log a WHERE a.id = NEW.id OR (a.node_id = NEW.node_id AND a.node_seq = NEW.node_seq))
+BEGIN SELECT RAISE(ABORT, 'append_only_violation: audit_log'); END;
+
+-- [本篇表，12_auth.sql 由 #2 拆分建立] sys_user 加 perm_version
+ALTER TABLE sys_user ADD COLUMN perm_version BIGINT NOT NULL DEFAULT 1 CONSTRAINT ck_user_perm_ver CHECK (perm_version > 0);
 
 -- -----------------------------------------------------------------------------
 -- docs/12 权限与审计：设备绑定、离线令牌、主管审批
@@ -1129,7 +1144,7 @@ CREATE INDEX ix_offline_binding ON offline_token(binding_id) WHERE revoked_at IS
 CREATE TABLE approval_request (
     id                  BIGINT       PRIMARY KEY,
     code                VARCHAR(64)  NOT NULL,       -- 审批单号 APR-{warehouse_code}-{yyyyMMdd}-{6 位序号}（ck_apr_code）；02 stock_hold.approval_no 存本列
-    approval_type       VARCHAR(32)  NOT NULL,       -- POD_CORRECT / CANCEL_AFTER_PICK / UNPLANNED_FAILOVER / DEVICE_BIND / SCRAP_MISREPORT / PAPER_BACKFILL / BOX_VOID / PROCESS_YIELD_DEVIATION / LIVE_DEATH_OVER
+    approval_type       VARCHAR(32)  NOT NULL,       -- POD_CORRECT / CANCEL_AFTER_PICK / UNPLANNED_FAILOVER / DEVICE_BIND / SCRAP_MISREPORT
     warehouse_id        BIGINT       NOT NULL,
     target_type         VARCHAR(32)  NOT NULL,
     target_id           VARCHAR(64)  NOT NULL,
@@ -1151,7 +1166,8 @@ CREATE TABLE approval_request (
     version             INT          NOT NULL DEFAULT 0,
     created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- UTC；expires_at 等时间列一律存 UTC（对齐 02 ad8ec1b P1）
     CONSTRAINT uq_apr_code UNIQUE (code),
-    CONSTRAINT ck_apr_type CHECK (approval_type IN ('POD_CORRECT','CANCEL_AFTER_PICK','UNPLANNED_FAILOVER','DEVICE_BIND','SCRAP_MISREPORT','PAPER_BACKFILL','BOX_VOID','PROCESS_YIELD_DEVIATION','LIVE_DEATH_OVER')),
+    CONSTRAINT ck_apr_type CHECK (approval_type IN ('POD_CORRECT','CANCEL_AFTER_PICK','UNPLANNED_FAILOVER','DEVICE_BIND','SCRAP_MISREPORT',
+        'PAPER_BACKFILL','BOX_VOID','PROCESS_YIELD_DEVIATION','LIVE_DEATH_OVER')),   -- 【ck_apr_type 变更】00 已登记的 4 类
     -- 非计划切换 = 发起人 + 仓库主管 + 中心运维三人（00 §9.1），角色字符串固定；是否真持有该角色由 trg_apr_transition 查 sys_user_role
     CONSTRAINT ck_apr_failover_roles CHECK (approval_type <> 'UNPLANNED_FAILOVER'
         OR ((first_approver_id IS NULL OR first_approver_role = 'WH_SUPERVISOR')
@@ -1252,12 +1268,11 @@ WHEN NEW.approval_type IN ('DEVICE_BIND','POD_CORRECT','CANCEL_AFTER_PICK','PAPE
             WHERE uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id))
        AND p.code = CASE NEW.approval_type WHEN 'DEVICE_BIND' THEN 'device.binding.approve'
                                            WHEN 'POD_CORRECT' THEN 'delivery.pod.correct.approve'
-                                           WHEN 'CANCEL_AFTER_PICK' THEN 'outbound.order.cancel_after_pick.approve'
                                            WHEN 'PAPER_BACKFILL' THEN 'offline.paper.approve'
                                            WHEN 'BOX_VOID' THEN 'pack.box.void.approve'
                                            WHEN 'PROCESS_YIELD_DEVIATION' THEN 'process.yield.approve'
                                            WHEN 'LIVE_DEATH_OVER' THEN 'live.death.approve'
-                                           ELSE NULL END)
+                                           ELSE 'outbound.order.cancel_after_pick.approve' END)
 BEGIN SELECT RAISE(ABORT, 'approval_perm_not_held'); END;
 CREATE TRIGGER trg_apr_scrap_role BEFORE UPDATE ON approval_request
 WHEN NEW.approval_type = 'SCRAP_MISREPORT' AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL
@@ -1309,6 +1324,7 @@ CREATE TRIGGER trg_user_no_replace BEFORE INSERT ON sys_user
 WHEN EXISTS (SELECT 1 FROM sys_user u WHERE u.id = NEW.id OR u.username = NEW.username)
 BEGIN SELECT RAISE(ABORT, 'sys_user_duplicate'); END;
 
+-- 授权（PG）
 -- docs/12 新表 wms_app 最小授权：不给 DELETE/TRUNCATE；离线令牌只能写吊销时间；审批只能改决策相关列
 -- -----------------------------------------------------------------------------
 -- 视图：可用量（避免每个查询手写减法，也避免算错）
