@@ -73,7 +73,8 @@ ACT=$(psql -t -A -c "SELECT string_agg(x, ' ' ORDER BY x) FROM (SELECT c.relname
 if [ "$ACT" = "$EXPECT_PRIVS" ]; then ok "S4 wms_app 权限矩阵与期望逐表一致（$(echo "$ACT" | wc -w) 个对象；列级 UPDATE 另测）"
 else bad "S4 wms_app 权限矩阵不符：$(diff <(echo "$EXPECT_PRIVS" | tr ' ' '\n') <(echo "$ACT" | tr ' ' '\n') | grep '^[<>]' | tr '\n' ' ')"; fi
 echo "=== 2. 库层不变量断言（§4.1 I1–I5 + §2.2 SoD + §4.6 幂等）==="
-seed() { psql -q -c "$1" >/dev/null; }
+# 大肥鱼：seed 任一步失败立即非零退出（后续断言建立在 seed 之上，带病跑下去只会产生误导性的通过/失败）
+seed() { if ! psql -q -v ON_ERROR_STOP=1 -c "$1" >/dev/null; then echo "  ✗ seed 失败，立即退出：$1" >&2; exit 2; fi; }
 seed "INSERT INTO warehouse (id,code,name,cutoff_time,work_date_offset) VALUES (1,'WHSH01','上海青浦仓','20:00',-1);"
 seed "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (1,1,'Z-C1','冷藏拣货区','CHILLED','PICK'),(2,1,'Z-C2','冷藏存储区','CHILLED','STORAGE');"
 seed "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (1,1,1,'A01-02-03','BIN',2,'A010'),(2,1,1,'A01-03-01','BIN',2,'A020'),(3,1,2,'B02-01-05','PALLET',8,'B010');"
@@ -526,9 +527,9 @@ expect_block "10 L2 建单后改上报人" "UPDATE exception_case SET reporter_i
 expect_block "10 L2 建单后改单号" "UPDATE exception_case SET code='EXC-X' WHERE id=141;" "exc_immutable"
 expect_block "10 L3 DELETE 已关闭异常单（去重键不能被释放）" "DELETE FROM exception_case WHERE id=100;" "exc_no_delete"
 expect_block "10 L3 DELETE 已取消异常单" "DELETE FROM exception_case WHERE id=110;" "exc_no_delete"
-expect_allow "10 质检单来源 SCRAP_MISREPORT（第 9 篇交接 / 质检误报回转）" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8010,'RTN-10',1,'RETURN','SCRAP_MISREPORT','APR-SH01-20261015-000001','CREATED','2026-10-15');"
-expect_block "10 质检单来源拼错（SCRAP_MISREPORTX）" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8011,'RTN-11',1,'RETURN','SCRAP_MISREPORTX','APR-SH01-20261015-000002','CREATED','2026-10-15');" "ck_inb_rtn_src"
-expect_allow "10 异常单来源 SCRAP_MISREPORT" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (142,'EXC-142',1,'RETURN_COUNT_DIFF','SCRAP_MISREPORT','APR-SH01-20261015-000001','0000000000000000000000000000000000000000000000000000000000000084',1,1,0,0,0,'2026-10-15 12:00:00',7);"
+expect_allow "10 质检单来源 SCRAP_MISREPORT（第 9 篇交接 / 质检误报回转）" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8010,'RTN-10',1,'RETURN','SCRAP_MISREPORT','APR-WHSH01-20261015-000001','CREATED','2026-10-15');"
+expect_block "10 质检单来源拼错（SCRAP_MISREPORTX）" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8011,'RTN-11',1,'RETURN','SCRAP_MISREPORTX','APR-WHSH01-20261015-000002','CREATED','2026-10-15');" "ck_inb_rtn_src"
+expect_allow "10 异常单来源 SCRAP_MISREPORT" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (142,'EXC-142',1,'RETURN_COUNT_DIFF','SCRAP_MISREPORT','APR-WHSH01-20261015-000001','0000000000000000000000000000000000000000000000000000000000000084',1,1,0,0,0,'2026-10-15 12:00:00',7);"
 expect_block "10 L3 PG TRUNCATE 异常单（超级用户 / 迁移脚本）" "TRUNCATE exception_case;" "exc_no_delete"
 expect_allow "10 STORE_RETURN 门店退货回仓 RTN" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8002,'RTN-2',1,'RETURN','STORE_RETURN','ST01:R-001','CREATED','2026-10-15');"
 expect_block "10 STORE_RETURN 之外的未登记退货来源" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8003,'RTN-3',1,'RETURN','WHATEVER','X-1','CREATED','2026-10-15');" "ck_inb_rtn_src"

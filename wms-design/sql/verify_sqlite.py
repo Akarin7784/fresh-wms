@@ -203,8 +203,13 @@ seed = [
     "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000)",
     "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (1,'OBT1',1,'SALE','MALL','M-2026-001','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'CREATED','2026-10-16')",
 ]
+# 大肥鱼：seed 任一步失败立即非零退出
 for s in seed:
-    conn.execute(s)
+    try:
+        conn.execute(s)
+    except sqlite3.Error as e:
+        print(f"  ✗ seed 失败，立即退出：{e}：{s}")
+        sys.exit(2)
 conn.commit()
 ok("种子数据写入（含 TIME/DATE/TIMESTAMP/BOOLEAN/NUMERIC 列，未做任何列型改写）")
 
@@ -622,9 +627,9 @@ expect_block('10 L2 建单后改上报人', 'UPDATE exception_case SET reporter_
 expect_block('10 L2 建单后改单号', "UPDATE exception_case SET code='EXC-X' WHERE id=141", 'exc_immutable')
 expect_block('10 L3 DELETE 已关闭异常单（去重键不能被释放）', 'DELETE FROM exception_case WHERE id=100', 'exc_no_delete')
 expect_block('10 L3 DELETE 已取消异常单', 'DELETE FROM exception_case WHERE id=110', 'exc_no_delete')
-expect_allow('10 质检单来源 SCRAP_MISREPORT（第 9 篇交接 / 质检误报回转）', "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8010,'RTN-10',1,'RETURN','SCRAP_MISREPORT','APR-SH01-20261015-000001','CREATED','2026-10-15')")
-expect_block('10 质检单来源拼错（SCRAP_MISREPORTX）', "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8011,'RTN-11',1,'RETURN','SCRAP_MISREPORTX','APR-SH01-20261015-000002','CREATED','2026-10-15')", 'ck_inb_rtn_src')
-expect_allow('10 异常单来源 SCRAP_MISREPORT', "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (142,'EXC-142',1,'RETURN_COUNT_DIFF','SCRAP_MISREPORT','APR-SH01-20261015-000001','0000000000000000000000000000000000000000000000000000000000000084',1,1,0,0,0,'2026-10-15 12:00:00',7)")
+expect_allow('10 质检单来源 SCRAP_MISREPORT（第 9 篇交接 / 质检误报回转）', "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8010,'RTN-10',1,'RETURN','SCRAP_MISREPORT','APR-WHSH01-20261015-000001','CREATED','2026-10-15')")
+expect_block('10 质检单来源拼错（SCRAP_MISREPORTX）', "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8011,'RTN-11',1,'RETURN','SCRAP_MISREPORTX','APR-WHSH01-20261015-000002','CREATED','2026-10-15')", 'ck_inb_rtn_src')
+expect_allow('10 异常单来源 SCRAP_MISREPORT', "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (142,'EXC-142',1,'RETURN_COUNT_DIFF','SCRAP_MISREPORT','APR-WHSH01-20261015-000001','0000000000000000000000000000000000000000000000000000000000000084',1,1,0,0,0,'2026-10-15 12:00:00',7)")
 expect_block('10 L3 SQLite INSERT OR REPLACE 把已关闭异常单重置为 OPEN', "INSERT OR REPLACE INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (100,'EXC-100',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','POD:1610:0','0000000000000000000000000000000000000000000000000000000000000001',1,1,5000,5000,0,'2026-10-15 12:00:00',7)", 'exc_duplicate')
 expect_block('10 L3 SQLite REPLACE 换 id 复用旧键 POD:1610:0', "REPLACE INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (199,'EXC-199',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','POD:1610:0','0000000000000000000000000000000000000000000000000000000000000001',1,1,5000,5000,0,'2026-10-15 12:00:00',7)", 'exc_duplicate')
 expect_block('10 L3 SQLite INSERT OR IGNORE 也不能静默吞掉（触发器 ABORT）', "INSERT OR IGNORE INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (100,'EXC-100',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','POD:1610:0','0000000000000000000000000000000000000000000000000000000000000001',1,1,5000,5000,0,'2026-10-15 12:00:00',7)", 'exc_duplicate')
