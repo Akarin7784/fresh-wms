@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 39 处 DEFAULT now()、3 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
---   3. 方言专属行：删除 122 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 40 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 123 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 46 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -297,6 +297,13 @@ CREATE TABLE stock_hold (
         OR (hold_type = 'RETURN_QC' AND op_key LIKE 'CVT:%'
             AND approval_type = 'SCRAP_MISREPORT' AND approval_no IS NOT NULL AND length(approval_no) > 0)
     ),
+    -- 审批单号格式 APR-{仓库编码}-{yyyyMMdd}-{6 位数字}；仓库编码字符集 [A-Z0-9]{1,32}（01 §2 warehouse.code，VARCHAR(32)，单号仓前缀不含 '-'）
+    CONSTRAINT ck_hold_approval_no CHECK (approval_no IS NULL OR (
+        length(approval_no) BETWEEN 21 AND 52 AND substr(approval_no, 1, 4) = 'APR-'
+        AND substr(approval_no, 5, length(approval_no) - 20) NOT GLOB '*[^A-Z0-9]*'
+        AND substr(approval_no, -16) GLOB '-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]'
+        AND (substr(approval_no, -11, 2) GLOB '0[1-9]' OR substr(approval_no, -11, 2) GLOB '1[0-2]')
+        AND (substr(approval_no, -9, 2) GLOB '0[1-9]' OR substr(approval_no, -9, 2) GLOB '[12][0-9]' OR substr(approval_no, -9, 2) GLOB '3[01]'))),
     CONSTRAINT ck_hold_scrap CHECK (
         hold_type <> 'SCRAP_PENDING'
         OR (source_type = 'SCRAP' AND source_id > 0 AND operator_id = 0)

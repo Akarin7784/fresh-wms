@@ -290,6 +290,14 @@ CREATE TABLE stock_hold (
         OR (hold_type = 'RETURN_QC' AND op_key LIKE 'CVT:%'
             AND approval_type = 'SCRAP_MISREPORT' AND approval_no IS NOT NULL AND length(approval_no) > 0)
     ),
+    -- 审批单号格式 APR-{仓库编码}-{yyyyMMdd}-{6 位数字}；仓库编码字符集 [A-Z0-9]{1,32}（01 §2 warehouse.code，VARCHAR(32)，单号仓前缀不含 '-'）
+    CONSTRAINT ck_hold_approval_no CHECK (approval_no IS NULL OR approval_no ~ '^APR-[A-Z0-9]{1,32}-[0-9]{4}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])-[0-9]{6}$'),  -- @pg-only
+-- @sqlite-only     CONSTRAINT ck_hold_approval_no CHECK (approval_no IS NULL OR (
+-- @sqlite-only         length(approval_no) BETWEEN 21 AND 52 AND substr(approval_no, 1, 4) = 'APR-'
+-- @sqlite-only         AND substr(approval_no, 5, length(approval_no) - 20) NOT GLOB '*[^A-Z0-9]*'
+-- @sqlite-only         AND substr(approval_no, -16) GLOB '-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]'
+-- @sqlite-only         AND (substr(approval_no, -11, 2) GLOB '0[1-9]' OR substr(approval_no, -11, 2) GLOB '1[0-2]')
+-- @sqlite-only         AND (substr(approval_no, -9, 2) GLOB '0[1-9]' OR substr(approval_no, -9, 2) GLOB '[12][0-9]' OR substr(approval_no, -9, 2) GLOB '3[01]'))),
     CONSTRAINT ck_hold_scrap CHECK (
         hold_type <> 'SCRAP_PENDING'
         OR (source_type = 'SCRAP' AND source_id > 0 AND operator_id = 0)
