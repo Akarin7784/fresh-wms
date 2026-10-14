@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 39 处 DEFAULT now()、5 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
---   3. 方言专属行：删除 302 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 182 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 307 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 187 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -1243,7 +1243,7 @@ WHEN NEW.approval_type = 'UNPLANNED_FAILOVER' AND (
         WHERE ur.user_id = NEW.second_approver_id AND r.code = 'CENTER_OPS')))
 BEGIN SELECT RAISE(ABORT, 'approval_role_not_held'); END;
 CREATE TRIGGER trg_apr_perm BEFORE UPDATE ON approval_request
-WHEN NEW.approval_type IN ('DEVICE_BIND','POD_CORRECT','CANCEL_AFTER_PICK')
+WHEN NEW.approval_type IN ('DEVICE_BIND','POD_CORRECT','CANCEL_AFTER_PICK','PAPER_BACKFILL','BOX_VOID','PROCESS_YIELD_DEVIATION','LIVE_DEATH_OVER')
   AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL AND NEW.first_approver_role IS NOT NULL AND NOT EXISTS (
     SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
       JOIN sys_role_perm rp ON rp.role_id = r.id JOIN sys_permission p ON p.id = rp.perm_id
@@ -1252,7 +1252,12 @@ WHEN NEW.approval_type IN ('DEVICE_BIND','POD_CORRECT','CANCEL_AFTER_PICK')
             WHERE uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id))
        AND p.code = CASE NEW.approval_type WHEN 'DEVICE_BIND' THEN 'device.binding.approve'
                                            WHEN 'POD_CORRECT' THEN 'delivery.pod.correct.approve'
-                                           ELSE 'outbound.order.cancel_after_pick.approve' END)
+                                           WHEN 'CANCEL_AFTER_PICK' THEN 'outbound.order.cancel_after_pick.approve'
+                                           WHEN 'PAPER_BACKFILL' THEN 'offline.paper.approve'
+                                           WHEN 'BOX_VOID' THEN 'pack.box.void.approve'
+                                           WHEN 'PROCESS_YIELD_DEVIATION' THEN 'process.yield.approve'
+                                           WHEN 'LIVE_DEATH_OVER' THEN 'live.death.approve'
+                                           ELSE NULL END)
 BEGIN SELECT RAISE(ABORT, 'approval_perm_not_held'); END;
 CREATE TRIGGER trg_apr_scrap_role BEFORE UPDATE ON approval_request
 WHEN NEW.approval_type = 'SCRAP_MISREPORT' AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL

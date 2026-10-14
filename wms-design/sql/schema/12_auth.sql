@@ -219,7 +219,7 @@ BEGIN                                                                           
         RAISE EXCEPTION 'approval_role_not_held' USING ERRCODE = '23514';                                    -- @pg-only
     END IF;                                                                                                   -- @pg-only
     -- 小赵 T2：单人审批类型按角色权限表核对审批人持有对应审批权限点（审批时使用的角色 = first_approver_role，且在本仓）  -- @pg-only
-    IF NEW.approval_type IN ('DEVICE_BIND','POD_CORRECT','CANCEL_AFTER_PICK')                                -- @pg-only
+    IF NEW.approval_type IN ('DEVICE_BIND','POD_CORRECT','CANCEL_AFTER_PICK','PAPER_BACKFILL','BOX_VOID','PROCESS_YIELD_DEVIATION','LIVE_DEATH_OVER')  -- @pg-only
        AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL AND NEW.first_approver_role IS NOT NULL AND NOT EXISTS (  -- 角色缺失交给 ck_apr_pair  -- @pg-only
          SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id                                  -- @pg-only
            JOIN sys_role_perm rp ON rp.role_id = r.id JOIN sys_permission p ON p.id = rp.perm_id              -- @pg-only
@@ -228,7 +228,12 @@ BEGIN                                                                           
                  WHERE uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id))   -- CENTER_OPS 数据范围 ALL  -- @pg-only
             AND p.code = CASE NEW.approval_type WHEN 'DEVICE_BIND' THEN 'device.binding.approve'              -- @pg-only
                                                 WHEN 'POD_CORRECT' THEN 'delivery.pod.correct.approve'        -- @pg-only
-                                                ELSE 'outbound.order.cancel_after_pick.approve' END) THEN             -- @pg-only
+                                                WHEN 'CANCEL_AFTER_PICK' THEN 'outbound.order.cancel_after_pick.approve'  -- @pg-only
+                                                WHEN 'PAPER_BACKFILL' THEN 'offline.paper.approve'            -- @pg-only
+                                                WHEN 'BOX_VOID' THEN 'pack.box.void.approve'                  -- @pg-only
+                                                WHEN 'PROCESS_YIELD_DEVIATION' THEN 'process.yield.approve'   -- @pg-only
+                                                WHEN 'LIVE_DEATH_OVER' THEN 'live.death.approve'              -- @pg-only
+                                                ELSE NULL END) THEN                                           -- @pg-only
         RAISE EXCEPTION 'approval_perm_not_held' USING ERRCODE = '23514';                                    -- @pg-only
     END IF;                                                                                                   -- @pg-only
     IF NEW.approval_type = 'SCRAP_MISREPORT' AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL  -- @pg-only
@@ -293,7 +298,7 @@ CREATE TRIGGER trg_apr_final BEFORE UPDATE ON approval_request FOR EACH ROW EXEC
 -- @sqlite-only         WHERE ur.user_id = NEW.second_approver_id AND r.code = 'CENTER_OPS')))
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'approval_role_not_held'); END;
 -- @sqlite-only CREATE TRIGGER trg_apr_perm BEFORE UPDATE ON approval_request
--- @sqlite-only WHEN NEW.approval_type IN ('DEVICE_BIND','POD_CORRECT','CANCEL_AFTER_PICK')
+-- @sqlite-only WHEN NEW.approval_type IN ('DEVICE_BIND','POD_CORRECT','CANCEL_AFTER_PICK','PAPER_BACKFILL','BOX_VOID','PROCESS_YIELD_DEVIATION','LIVE_DEATH_OVER')
 -- @sqlite-only   AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL AND NEW.first_approver_role IS NOT NULL AND NOT EXISTS (
 -- @sqlite-only     SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
 -- @sqlite-only       JOIN sys_role_perm rp ON rp.role_id = r.id JOIN sys_permission p ON p.id = rp.perm_id
@@ -302,7 +307,12 @@ CREATE TRIGGER trg_apr_final BEFORE UPDATE ON approval_request FOR EACH ROW EXEC
 -- @sqlite-only             WHERE uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id))
 -- @sqlite-only        AND p.code = CASE NEW.approval_type WHEN 'DEVICE_BIND' THEN 'device.binding.approve'
 -- @sqlite-only                                            WHEN 'POD_CORRECT' THEN 'delivery.pod.correct.approve'
--- @sqlite-only                                            ELSE 'outbound.order.cancel_after_pick.approve' END)
+-- @sqlite-only                                            WHEN 'CANCEL_AFTER_PICK' THEN 'outbound.order.cancel_after_pick.approve'
+-- @sqlite-only                                            WHEN 'PAPER_BACKFILL' THEN 'offline.paper.approve'
+-- @sqlite-only                                            WHEN 'BOX_VOID' THEN 'pack.box.void.approve'
+-- @sqlite-only                                            WHEN 'PROCESS_YIELD_DEVIATION' THEN 'process.yield.approve'
+-- @sqlite-only                                            WHEN 'LIVE_DEATH_OVER' THEN 'live.death.approve'
+-- @sqlite-only                                            ELSE NULL END)
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'approval_perm_not_held'); END;
 -- @sqlite-only CREATE TRIGGER trg_apr_scrap_role BEFORE UPDATE ON approval_request
 -- @sqlite-only WHEN NEW.approval_type = 'SCRAP_MISREPORT' AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL
