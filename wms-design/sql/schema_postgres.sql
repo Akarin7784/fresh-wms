@@ -855,7 +855,7 @@ CREATE TABLE shipment_order (
 
 -- -----------------------------------------------------------------------------
 -- 配送与签收（docs/16）：运单、站点、出库单签收状态、司机端作业（POD_OP 业务键）、
--- 签收行、签收更正（POD_CORRECT）、拒收回仓交接。数量一律 *_qty_milli（00 R2）。
+-- 签收行、签收更正（POD_CORRECT，经第 12 篇审批）、拒收回仓交接。数量一律 *_qty_milli（00 R2）。
 -- 新增 8 表 / 25 索引（8 PK + 9 UNIQUE 约束 + 2 部分唯一 uq_podc_pending/uq_podc_seq + 6 普通/部分）。
 -- -----------------------------------------------------------------------------
 
@@ -886,13 +886,13 @@ CREATE TABLE delivery_stop (
     waybill_id      BIGINT       NOT NULL,
     stop_no         SMALLINT     NOT NULL,
     customer_id     BIGINT       NOT NULL,
-    display_status  VARCHAR(20)  NOT NULL DEFAULT 'PENDING', -- 只是展示汇总（Q14），由站点下出库单状态推导，任何业务判断不得读它
+    display_status  VARCHAR(20)  NOT NULL DEFAULT 'PENDING', -- 只是展示汇总（Q14），由站点下出库单 delivery_result（04）推导，任何业务判断不得读它
     arrived_at      TIMESTAMP,
     departed_at     TIMESTAMP,
     arrive_note     VARCHAR(256),                   -- 定位偏差说明，仅备注（第 15 篇 GeoStamp）
     CONSTRAINT uq_dstop     UNIQUE (waybill_id, stop_no),
     CONSTRAINT ck_dstop_no  CHECK (stop_no > 0),
-    CONSTRAINT ck_dstop_st  CHECK (display_status IN ('PENDING','ARRIVED','DELIVERED','PARTIALLY_REJECTED','REJECTED','MIXED'))
+    CONSTRAINT ck_dstop_st  CHECK (display_status IN ('PENDING','ARRIVED','DEPARTED_UNSIGNED','FULL','PARTIAL_REJECT','FULL_REJECT','MIXED'))
 );
 
 CREATE TABLE delivery_order (
@@ -900,22 +900,22 @@ CREATE TABLE delivery_order (
     waybill_id      BIGINT       NOT NULL,
     stop_no         SMALLINT     NOT NULL,
     outbound_id     BIGINT       NOT NULL,
-    status          VARCHAR(20)  NOT NULL DEFAULT 'SHIPPED',   -- 签收状态以出库单为粒度（Q14）
-    valid_pod_id    BIGINT,                         -- 当前生效签收（pod_op.id）；POD_CORRECT 的条件更新以它为栅栏
+    status          VARCHAR(20)  NOT NULL DEFAULT 'SHIPPED',   -- 与 outbound_order 同步 SHIPPED→DELIVERED（04 T17）；签收结论在 outbound_order.delivery_result（04 列，本篇只引用）
+    valid_pod_id    BIGINT,                         -- 当前生效签收 id（首签 = pod_op.id；更正后 = pod_correction.id）；更正执行的条件更新以它为栅栏
     root_pod_id     BIGINT,                         -- 首次签收的 pod_id，更正后不变；异常单 source_key = POD:{root_pod_id}:{correct_seq}
-    correct_seq     SMALLINT     NOT NULL DEFAULT 0, -- 首次签收 0，每次 APPLIED 更正 +1
+    correct_seq     SMALLINT     NOT NULL DEFAULT 0, -- 首次签收 0；更正执行时由服务端 +1 分配
     version         BIGINT       NOT NULL DEFAULT 0,
     signed_at       TIMESTAMP,
     CONSTRAINT uq_dord_outbound UNIQUE (outbound_id),          -- 一张出库单只在一张有效运单上（改派=换 waybill_id）
-    CONSTRAINT ck_dord_status CHECK (status IN ('SHIPPED','DELIVERED','PARTIALLY_REJECTED','REJECTED')),
+    CONSTRAINT ck_dord_status CHECK (status IN ('SHIPPED','DELIVERED')),
     CONSTRAINT ck_dord_pod    CHECK ((status = 'SHIPPED') = (valid_pod_id IS NULL) AND (valid_pod_id IS NULL) = (root_pod_id IS NULL)),
     CONSTRAINT ck_dord_cseq   CHECK (correct_seq >= 0 AND (root_pod_id IS NOT NULL OR correct_seq = 0))
 );
 CREATE INDEX ix_dord_stop ON delivery_order(waybill_id, stop_no);
 
--- 司机端每一次写操作（LOAD/ARRIVE/POD_SIGN/POD_REJECT/POD_CORRECT/DEPART/CONTAINER/RETURN_COUNT）一行。
+-- 司机端每一次现场写操作（LOAD/ARRIVE/POD_SIGN/POD_REJECT/DEPART/CONTAINER/RETURN_COUNT）一行，可离线排队补传。
 -- 业务唯一键 (waybill_no, stop_no, device_instance_id, op_seq)（00 §6.5）；同键同 req_hash → 回放 response；
--- 同键不同 req_hash → 40910（key_type = POD_CORRECT 若 op_type=POD_CORRECT，否则 POD_OP）。
+-- 同键不同 req_hash → 40910 key_type=POD_OP。签收更正不走这里（只能在线 POST /approvals，第 12 篇）。
 -- 只缓存确定性结果：HTTP 2xx、400（400xx）、409（409xx）；422/5xx/429/401/403 不落行（随事务回滚）。
 CREATE TABLE pod_op (
     id                  BIGINT       PRIMARY KEY,   -- 签收类操作的 id 即 pod_id
@@ -930,18 +930,16 @@ CREATE TABLE pod_op (
     http_status         SMALLINT     NOT NULL,
     biz_code            VARCHAR(8)   NOT NULL,      -- "0" 或 400xx/409xx
     response            TEXT         NOT NULL,
-    corrected_pod_id    BIGINT,                     -- 仅 POD_CORRECT
     signer_type         VARCHAR(16),                -- CUSTOMER_SCAN / DRIVER_PROXY（仅签收类）
     media_json          TEXT,                       -- [{object_key, sha256}]
     client_created_at   TIMESTAMP,                  -- 只展示，不参与排序与记账
     created_at          TIMESTAMP    NOT NULL DEFAULT now(),
     CONSTRAINT uq_pod_op_key  UNIQUE (waybill_no, stop_no, device_instance_id, op_seq),
-    CONSTRAINT ck_pod_op_type CHECK (op_type IN ('LOAD','ARRIVE','POD_SIGN','POD_REJECT','POD_CORRECT','DEPART','CONTAINER','RETURN_COUNT')),
+    CONSTRAINT ck_pod_op_type CHECK (op_type IN ('LOAD','ARRIVE','POD_SIGN','POD_REJECT','DEPART','CONTAINER','RETURN_COUNT')),
     CONSTRAINT ck_pod_op_seq  CHECK (op_seq > 0 AND stop_no >= 0),
     CONSTRAINT ck_pod_op_cache CHECK ((http_status BETWEEN 200 AND 299 AND biz_code = '0')
                                    OR (http_status = 400 AND biz_code LIKE '400__')
-                                   OR (http_status = 409 AND biz_code LIKE '409__')),
-    CONSTRAINT ck_pod_op_corr CHECK ((op_type = 'POD_CORRECT') = (corrected_pod_id IS NOT NULL))
+                                   OR (http_status = 409 AND biz_code LIKE '409__'))
 );
 CREATE INDEX ix_pod_op_dev ON pod_op(device_instance_id, waybill_no, stop_no, op_seq);   -- GET /devices/{id}/op-seq-hwm（Q13）
 CREATE INDEX ix_pod_op_stop ON pod_op(waybill_no, stop_no, created_at);
@@ -949,7 +947,7 @@ CREATE INDEX ix_pod_op_stop ON pod_op(waybill_no, stop_no, created_at);
 -- 签收结论的行明细：对每条出库行记 实收 / 司机登记拒收。拒收数只是暂记，入账以回仓实点为准（Q15）
 CREATE TABLE pod_line (
     id                   BIGINT   PRIMARY KEY,
-    pod_id               BIGINT   NOT NULL,         -- pod_op.id（POD_SIGN / POD_REJECT / 审批通过的 POD_CORRECT）
+    pod_id               BIGINT   NOT NULL,         -- 签收 id：pod_op.id（POD_SIGN / POD_REJECT）或 pod_correction.id（审批通过执行的更正）
     outbound_id          BIGINT   NOT NULL,
     outbound_line_id     BIGINT   NOT NULL,
     sku_id               BIGINT   NOT NULL,
@@ -963,10 +961,12 @@ CREATE TABLE pod_line (
     CONSTRAINT ck_podl_rsn  CHECK (rejected_qty_milli = 0 OR reject_reason IS NOT NULL)
 );
 
--- 签收更正：司机发起（pod_op.op_type=POD_CORRECT），主管审批；一条生效签收同时只能有一条待审批更正
+-- 签收更正：只能在线提交 POST /api/v1/approvals（type=POD_CORRECT，第 12 篇 approval_request），按审批单号关联；
+-- 审批通过时同一事务执行更正（条件更新 delivery_order … AND valid_pod_id=:corrected_pod_id），correct_seq 由服务端此时分配。
+-- 状态镜像审批单：PENDING / APPLIED / REJECTED / WITHDRAWN / EXPIRED / VOID（执行时原签收已变 → 40951，审批显示作废）
 CREATE TABLE pod_correction (
-    id                BIGINT       PRIMARY KEY,
-    correct_op_id     BIGINT       NOT NULL,        -- pod_op.id（POD_CORRECT）
+    id                BIGINT       PRIMARY KEY,     -- 也是更正后的签收 id（valid_pod_id、pod_line.pod_id 指向它）
+    approval_id       BIGINT       NOT NULL,        -- 第 12 篇 approval_request.id
     corrected_pod_id  BIGINT       NOT NULL,
     outbound_id       BIGINT       NOT NULL,
     status            VARCHAR(16)  NOT NULL DEFAULT 'PENDING',
@@ -974,13 +974,14 @@ CREATE TABLE pod_correction (
     approver_id       BIGINT,
     reason            VARCHAR(256) NOT NULL,
     decided_at        TIMESTAMP,
-    fail_code         VARCHAR(8),                   -- 审批通过但条件更新 0 行：40951
-    correct_seq       SMALLINT,                     -- APPLIED 时 = delivery_order.correct_seq 新值（≥1）
+    correct_seq       SMALLINT,                     -- APPLIED 时 = delivery_order.correct_seq 新值（≥1），服务端分配
     created_at        TIMESTAMP    NOT NULL DEFAULT now(),
-    CONSTRAINT uq_podc_op     UNIQUE (correct_op_id),
-    CONSTRAINT ck_podc_status CHECK (status IN ('PENDING','APPLIED','REJECTED','FAILED')),
+    CONSTRAINT uq_podc_approval UNIQUE (approval_id),
+    CONSTRAINT ck_podc_status CHECK (status IN ('PENDING','APPLIED','REJECTED','WITHDRAWN','EXPIRED','VOID')),
     CONSTRAINT ck_podc_sod    CHECK (approver_id IS NULL OR approver_id <> requested_by),
-    CONSTRAINT ck_podc_decide CHECK (status = 'PENDING' OR (approver_id IS NOT NULL AND decided_at IS NOT NULL)),
+    CONSTRAINT ck_podc_decide CHECK (status = 'PENDING'
+                                  OR (status IN ('APPLIED','REJECTED','VOID') AND approver_id IS NOT NULL AND decided_at IS NOT NULL)
+                                  OR (status IN ('WITHDRAWN','EXPIRED') AND decided_at IS NOT NULL)),
     CONSTRAINT ck_podc_seq    CHECK ((status = 'APPLIED') = (correct_seq IS NOT NULL) AND (correct_seq IS NULL OR correct_seq > 0))
 );
 CREATE UNIQUE INDEX uq_podc_pending ON pod_correction(corrected_pod_id, outbound_id) WHERE status = 'PENDING';
