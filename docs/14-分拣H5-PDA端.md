@@ -151,7 +151,7 @@ outbox 每条：`{ op_id(uuid), local_seq, format_version, idem_key, device_inst
 1. **第一层：`Idempotency-Key`**。用户点确认时生成 uuid，与 payload 在同一个 IndexedDB 事务里写入；重试、重连、重启、退避都复用同一个 Key，不重新生成。服务端 Key 只保留 24h，**它只是第一层**。
 2. **第二层：服务端业务唯一键（四元组）`(task_id, line_no, device_instance_id, op_seq)`**。这是兜底：Key 过期后再补交，服务端仍按四元组判重，不会重复扣减。
    - 四元组相同、数量相同 → 重放首次结果，视为成功；
-   - 四元组相同、数量不同 → 409，条目转人工。
+   - 四元组相同、数量不同 → `40910`，条目转人工。
    - `op_seq`：PDA 按任务行单调递增生成，写入 outbox 后不再改变，重试原样发送。
    - `device_instance_id`：设备安装实例 id，重装或清数据时重新生成，与 `op_seq` 一起进入业务唯一键，避免重装后 `op_seq` 从头计数与旧操作撞号（小赵的反例）。已定，见 Q10。
 - 因此不再依赖「补交一定落在 Key 有效期内」；离线超过 24h 的条目仍自动补交，由业务键兜底。
@@ -184,7 +184,7 @@ outbox 每条：`{ op_id(uuid), local_seq, format_version, idem_key, device_inst
 |---|---|---|
 | 幂等命中 / 业务键重放（同四元组同数量） | 已处理过 | 视为成功 |
 | `40910` 同 Key 不同 body | 本地数据异常或 bug | `failed`，不重试，上报日志 |
-| 409 同四元组不同数量 | `op_seq` 冲突 | `failed`，交主管 |
+| `40910` 同四元组不同数量 | `op_seq` 冲突 | `failed`，交主管 |
 | 409 `40920 TASK_REASSIGNED` | 离线超时回收或主管改派 | 见 §9.4.1 |
 | 409 `40921 TASK_CANCELLED` | 任务/出库单已取消 | 见 §9.4.1 |
 | 409 `40922 TASK_CLOSED` | 任务已关闭 | 见 §9.4.1 |
@@ -228,7 +228,11 @@ flowchart LR
 
 PDA 规则：
 - confirm 扫错库位 → 422：红条保留，提示「请扫原库位 XX」重扫。**PDA 不提供就近放回**，就近放回只能主管在后台 resolve。
-- confirm 和 resolve 都是 `status=OPEN` 条件更新，只有一方成功。输的一方收到 409，响应带当前状态、处理人、处理时间；**PDA 把这个 409 视为已闭环**，删除本地 `failed` 条目并提示「已由 XX 于 HH:mm 处理」。
+- confirm 和 resolve 都是 `status=OPEN` 条件更新，只有一方成功。输的一方收到 `40930`（通用非法状态迁移），响应体带 `currentStatus`、`handledBy`、`handledAt`。
+- PDA **仅当同时满足**以下两条时才视为已闭环、删除本地 `failed` 条目并提示「已由 XX 于 HH:mm 处理」：
+  1. 该 `40930` 来自 return-records 接口（confirm 或 GET 详情相关调用）；
+  2. `currentStatus` 为 `CONFIRMED` 或 `RESOLVED`。
+- 其它情况（`40930` 来自其他接口，或 `currentStatus` 仍为 `OPEN`、缺失、未知）一律**保留红条**，按普通业务失败处理，不删除条目。
 - confirm 或 resolve 成功回执后（含通过 GET 查到已非 OPEN），PDA 删除对应 `failed` 条目。
 - confirm 网络失败按 outbox 规则同 Key 重试。
 
@@ -255,7 +259,7 @@ stateDiagram-v2
 |---|---|---|
 | 单元 | Vitest + fake-indexeddb | outbox 写入原子性；Key 与 `op_seq` 在失败/重启/退避后不变；`local_seq` 排序（时钟回拨后顺序不变）；串行与失败暂停只影响本账号同任务；`failed` 不被 24h 清理、只在服务端回执后删除；撤销在确认被拒后置 `superseded`；重扫生成新条目并关联；`format_version` 迁移（含迁移失败标红）；数量字符串计算 |
 | 组件 | Vitest + @vue/test-utils | 三步扫码不可跳步、缺货跳行、30 秒撤销、BigButton ≥56dp、离线确认即时反馈；计件模式 1 秒扫 5 件得 5（不被去抖）；非计件模式壳重复广播被丢弃；outbox 非空不能登出、可交主管；首页显示其他账号待补交数 |
-| 模拟弱网 | MSW | 超时后重试同 Key；响应丢失；**Key 过期（服务端无 Key 记录）后补交按四元组重放，不重复扣减**；同四元组不同数量 409；40920/40921/40922 返回 `confirmedLines` + `returnRecordId`，重复被拒返回同一 id（按四元组）；confirm 扫错库位 422 红条保留并提示重扫原库位；confirm 成功后删除 failed 条目；confirm 与主管 resolve 并发，输方 409（带状态/处理人/时间）被 PDA 视为已闭环并删除条目；confirm 网络失败同 Key 重试；401 中途失效 |
+| 模拟弱网 | MSW | 超时后重试同 Key；响应丢失；**Key 过期（服务端无 Key 记录）后补交按四元组重放，不重复扣减**；同四元组不同数量 409；40920/40921/40922 返回 `confirmedLines` + `returnRecordId`，重复被拒返回同一 id（按四元组）；confirm 扫错库位 422 红条保留并提示重扫原库位；confirm 成功后删除 failed 条目；confirm 与主管 resolve 并发：return-records 接口返回 `40930` 且 `currentStatus=CONFIRMED/RESOLVED` 时删除条目；**其他接口返回的 `40930` 不删除、红条保留**；**`40930` 且 `currentStatus=OPEN`（或缺失/未知）不删除、红条保留**；同四元组不同数量返回 `40910` 转人工；confirm 网络失败同 Key 重试；401 中途失效 |
 | 真机 | 手工清单 | 冷库断网 30 分钟及跨夜（>24h）后补交；拔电池/杀 WebView 后恢复；手动改系统时间后上传顺序；换班换账号；outbox 非空时强制更新 |
 
 覆盖率目标：`offline/`、`utils/`、`composables/` 行 ≥ 85%、分支 ≥ 75%；组件 ≥ 70%。
