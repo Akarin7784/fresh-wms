@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 43 处 DEFAULT now() → DEFAULT (datetime('now'))（表达式默认值需括号）
---   3. 方言专属行：删除 102 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 35 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 130 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 51 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -876,9 +876,9 @@ CREATE TABLE scrap_order (
     id              BIGINT          PRIMARY KEY,
     code            VARCHAR(64)     NOT NULL,   -- SCR-{仓}-{节点}-{作业日}-{序号}
     warehouse_id    BIGINT          NOT NULL,
-    source_type     VARCHAR(24)     NOT NULL,   -- EXPIRY_SCAN/MANUAL/RETURN_QC/RETURN_HANDOVER(04 交接，source_id=待回库记录 id)/COUNT
+    source_type     VARCHAR(24)     NOT NULL,   -- 取值见 ck_scr_src_type；RETURN_HANDOVER：04 交接，source_id=待回库记录 id；RETURN_QC：10 质检不合格，source_id=inbound_line.id
     source_id       BIGINT          NOT NULL DEFAULT 0,
-    reason_code     VARCHAR(24)     NOT NULL,   -- EXPIRED/NEAR_EXPIRY/DAMAGED/QC_REJECT/NATURAL_LOSS/OTHER
+    reason_code     VARCHAR(24)     NOT NULL,   -- 取值见 ck_scr_reason
     status          VARCHAR(16)     NOT NULL DEFAULT 'DRAFT',
     work_date       DATE            NOT NULL,   -- 仓库时区作业日
     amount_impact   BIGINT          NOT NULL DEFAULT 0,   -- 分
@@ -890,7 +890,9 @@ CREATE TABLE scrap_order (
     created_at      TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT uq_scr_code   UNIQUE (code),
     CONSTRAINT ck_scr_status CHECK (status IN ('DRAFT','PENDING_APPROVAL','APPROVED','POSTED','REJECTED','CANCELLED')),
-    CONSTRAINT ck_scr_sod    CHECK (approver_id IS NULL OR approver_id <> applicant_id)
+    CONSTRAINT ck_scr_sod    CHECK (approver_id IS NULL OR approver_id <> applicant_id),
+    CONSTRAINT ck_scr_src_type CHECK (source_type IN ('EXPIRY_SCAN','MANUAL','RETURN_QC','RETURN_HANDOVER','COUNT','EXCEPTION')),
+    CONSTRAINT ck_scr_reason CHECK (reason_code IN ('EXPIRED','NEAR_EXPIRY','DAMAGED','QC_REJECT','NATURAL_LOSS','OTHER'))
 );
 CREATE INDEX ix_scr_wh_status ON scrap_order(warehouse_id, status, work_date);
 CREATE UNIQUE INDEX uq_scr_source ON scrap_order(source_type, source_id) WHERE source_id <> 0 AND status NOT IN ('REJECTED','CANCELLED');
@@ -898,22 +900,42 @@ CREATE UNIQUE INDEX uq_scr_source ON scrap_order(source_type, source_id) WHERE s
 
 CREATE TABLE scrap_line (
     id              BIGINT          PRIMARY KEY,
-    scrap_id        BIGINT          NOT NULL,
+    scrap_id        BIGINT          NOT NULL REFERENCES scrap_order(id),
     line_no         INT             NOT NULL,
     stock_id        BIGINT          NOT NULL,
     sku_id          BIGINT          NOT NULL,
     lot_id          BIGINT          NOT NULL,
-    qty_milli       BIGINT          NOT NULL,
+    scrap_qty_milli BIGINT          NOT NULL,
     hold_id         BIGINT          NOT NULL DEFAULT 0,   -- SCRAP_PENDING 冻结；0 = 已出库待报损（不冻结）
     ledger_mode     VARCHAR(16)     NOT NULL DEFAULT 'POST_OUT',   -- POST_OUT 出账 / NONE 已扣账只记损耗
     cost_amount     BIGINT          NOT NULL DEFAULT 0,
     CONSTRAINT uq_scr_line   UNIQUE (scrap_id, line_no),
-    CONSTRAINT ck_scrl_int   CHECK (qty_milli = CAST(qty_milli AS BIGINT)),
-    CONSTRAINT ck_scrl_qty   CHECK (qty_milli > 0),
+    CONSTRAINT ck_scrl_int   CHECK (scrap_qty_milli = CAST(scrap_qty_milli AS BIGINT)),   -- CAST 只在 SQLite 起作用，PG 恒真
+    CONSTRAINT ck_scrl_qty   CHECK (scrap_qty_milli > 0),
     CONSTRAINT ck_scrl_mode  CHECK (ledger_mode IN ('POST_OUT','NONE'))
 );
 CREATE INDEX ix_scrl_stock ON scrap_line(stock_id);
-
+-- 状态只能前进（小赵 I3 / 第二评审 I2）：允许 DRAFT→PENDING_APPROVAL/CANCELLED，PENDING_APPROVAL→APPROVED/REJECTED/DRAFT，APPROVED→POSTED；
+-- POSTED/REJECTED/CANCELLED 是终态。RETURN_HANDOVER（交接单）不许撤回（PENDING_APPROVAL→DRAFT）、不许取消、不许驳回到 REJECTED：
+-- 它的 SCRAP_PENDING 来自待回库，释放回可用量会让破损货回到可售；误报走第 10 篇异常单（docs/09 §5.1）
+-- 报损行只能在 DRAFT 单下新增或改量（POSTED 单下插 POST_OUT 且 hold_id=0 的行被拦）
+CREATE TRIGGER trg_scr_forward BEFORE UPDATE ON scrap_order
+WHEN (NEW.status <> OLD.status AND NOT ((OLD.status = 'DRAFT' AND NEW.status IN ('PENDING_APPROVAL','CANCELLED'))
+       OR (OLD.status = 'PENDING_APPROVAL' AND NEW.status IN ('APPROVED','REJECTED','DRAFT'))
+       OR (OLD.status = 'APPROVED' AND NEW.status = 'POSTED')))
+  OR NEW.source_type IS NOT OLD.source_type OR NEW.source_id IS NOT OLD.source_id
+BEGIN SELECT RAISE(ABORT, 'scrap_state_forward_only'); END;
+CREATE TRIGGER trg_scr_handover BEFORE UPDATE ON scrap_order
+WHEN OLD.source_type = 'RETURN_HANDOVER' AND NEW.status <> OLD.status AND NEW.status IN ('DRAFT','CANCELLED','REJECTED')
+BEGIN SELECT RAISE(ABORT, 'scrap_handover_no_revoke'); END;
+CREATE TRIGGER trg_scrl_draft_ins BEFORE INSERT ON scrap_line
+WHEN NOT EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = NEW.scrap_id AND o.status = 'DRAFT')
+BEGIN SELECT RAISE(ABORT, 'scrap_line_locked'); END;
+CREATE TRIGGER trg_scrl_draft_upd BEFORE UPDATE ON scrap_line
+WHEN (NEW.scrap_qty_milli <> OLD.scrap_qty_milli OR NEW.stock_id <> OLD.stock_id)
+  AND NOT EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = NEW.scrap_id AND o.status = 'DRAFT')
+BEGIN SELECT RAISE(ABORT, 'scrap_line_locked'); END;
+-- 授权（I4）：不给 DELETE/TRUNCATE，作废走状态
 -- -----------------------------------------------------------------------------
 -- 幂等 / 集成 / 审计
 -- -----------------------------------------------------------------------------

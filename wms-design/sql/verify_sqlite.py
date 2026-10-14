@@ -138,7 +138,7 @@ def expect_block(desc: str, sql: str, want: str) -> None:
     except sqlite3.IntegrityError as e:
         conn.rollback()
         msg = str(e)
-        if msg.endswith(": " + want):
+        if msg.endswith(": " + want) or msg == want:   # 触发器 RAISE / 外键报错没有前缀，整句精确匹配
             ok(f"{desc} → 已拦截（{msg}）")
         else:
             bad(f"{desc} → 被拦了但约束不对：期望 {want!r}，实际 {msg!r}")
@@ -458,16 +458,43 @@ expect_block(
 D = one("SELECT diff_qty_milli FROM count_line WHERE id=1")[0]
 ok(f"§5.6 差异生成列 diff_qty_milli = {D}（预期 -2000）") if D == -2000 else bad(f"差异列 = {D}")
 
-print("=== 2f. docs/09 效期与损耗：报损单、SCRAP 冻结 ===")
+print("=== 2f. docs/09 效期与损耗：报损单状态前进、交接单不可撤回、来源/原因 CHECK、外键 ===")
 expect_allow('09 报损单建单（DRAFT，来源=效期扫描 501）', "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (100,'SCR-1',1,'EXPIRY_SCAN',501,'EXPIRED','2026-10-15',7)")
 expect_block('09 同一来源重复建有效报损单', "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (101,'SCR-2',1,'EXPIRY_SCAN',501,'EXPIRED','2026-10-15',7)", 'scrap_order.source_type, scrap_order.source_id')
+expect_block('09 I3 来源类型非法', "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (109,'SCR-9',1,'WHATEVER',9,'EXPIRED','2026-10-15',7)", 'ck_scr_src_type')
+expect_block('09 I3 原因码非法', "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (109,'SCR-9',1,'MANUAL',9,'ANY','2026-10-15',7)", 'ck_scr_reason')
+expect_block('09 报损单非法状态值（建单）', "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id,status) VALUES (109,'SCR-9',1,'MANUAL',9,'OTHER','2026-10-15',7,'DONE')", 'ck_scr_status')
+expect_allow('09 DRAFT 单下加报损行', "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (100,100,1,14,1,1,5000,0,'POST_OUT')")
+expect_block('09 报损行数量 0', "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (101,100,2,14,1,1,0,0,'POST_OUT')", 'ck_scrl_qty')
+expect_block('09 报损行数量非整数 milli（SQLite REAL）', "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (102,100,3,14,1,1,1.5,0,'POST_OUT')", 'ck_scrl_int')
+expect_block('09 I3 报损行挂到不存在的报损单（外键）', 'UPDATE scrap_line SET scrap_id=999 WHERE id=100', 'FOREIGN KEY constraint failed')
+expect_block('09 I3 新增报损行挂到不存在的报损单', "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (103,999,1,14,1,1,1000,0,'POST_OUT')", 'scrap_line_locked')
+expect_allow('09 S1 DRAFT → PENDING_APPROVAL', "UPDATE scrap_order SET status='PENDING_APPROVAL', version=version+1 WHERE id=100 AND status='DRAFT'")
+expect_block('09 I3 提交后不能再加行', "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (104,100,2,14,1,1,1000,0,'POST_OUT')", 'scrap_line_locked')
+expect_block('09 I3 提交后不能改量', 'UPDATE scrap_line SET scrap_qty_milli=4000 WHERE id=100', 'scrap_line_locked')
 expect_block('09 报损审批 SoD（审批人=申请人）', "UPDATE scrap_order SET approver_id=7, status='APPROVED' WHERE id=100", 'ck_scr_sod')
-expect_block('09 报损单非法状态值', "UPDATE scrap_order SET status='DONE' WHERE id=100", 'ck_scr_status')
-expect_block('09 报损行数量非整数 milli（SQLite REAL）', 'INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,qty_milli) VALUES (100,100,1,14,1,1,1.5)', 'ck_scrl_int')
-expect_block('09 报损行数量 0', 'INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,qty_milli) VALUES (101,100,1,14,1,1,0)', 'ck_scrl_qty')
-
-expect_allow('09 交接报损单 DRAFT（origin=RETURN_HANDOVER，source_id=待回库 701）', "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (102,'SCR-3',1,'RETURN_HANDOVER',701,'DAMAGED','2026-10-15',8)")
+expect_allow('09 S2 审批（审批人 8）', "UPDATE scrap_order SET approver_id=8, status='APPROVED' WHERE id=100 AND status='PENDING_APPROVAL'")
+expect_block('09 I3 APPROVED → DRAFT（跳回）', "UPDATE scrap_order SET status='DRAFT' WHERE id=100", 'scrap_state_forward_only')
+expect_allow('09 S3 APPROVED → POSTED', "UPDATE scrap_order SET status='POSTED' WHERE id=100 AND status='APPROVED'")
+expect_block('09 I3 POSTED → DRAFT', "UPDATE scrap_order SET status='DRAFT' WHERE id=100", 'scrap_state_forward_only')
+expect_block('09 I3 POSTED → CANCELLED', "UPDATE scrap_order SET status='CANCELLED' WHERE id=100", 'scrap_state_forward_only')
+expect_block('09 I3 POSTED 单下插 POST_OUT 且 hold_id=0 的行', "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (105,100,9,14,1,1,1000,0,'POST_OUT')", 'scrap_line_locked')
+expect_block('09 报损单非法状态值（更新）', "UPDATE scrap_order SET status='DONE' WHERE id=100", 'scrap_state_forward_only')
+expect_allow('09 交接报损单 DRAFT（RETURN_HANDOVER，source_id=待回库 701）', "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (102,'SCR-3',1,'RETURN_HANDOVER',701,'DAMAGED','2026-10-15',8)")
 expect_block('09 同一待回库记录重复交接报损', "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (103,'SCR-4',1,'RETURN_HANDOVER',701,'DAMAGED','2026-10-15',8)", 'scrap_order.source_type, scrap_order.source_id')
+expect_block('09 交接单不许取消（DRAFT → CANCELLED）', "UPDATE scrap_order SET status='CANCELLED' WHERE id=102", 'scrap_handover_no_revoke')
+expect_allow('09 交接单提交', "UPDATE scrap_order SET status='PENDING_APPROVAL' WHERE id=102 AND status='DRAFT'")
+expect_block('09 交接单不许撤回（PENDING_APPROVAL → DRAFT，→ 40930）', "UPDATE scrap_order SET status='DRAFT' WHERE id=102", 'scrap_handover_no_revoke')
+expect_block('09 交接单不许驳回到 REJECTED', "UPDATE scrap_order SET status='REJECTED' WHERE id=102", 'scrap_handover_no_revoke')
+expect_block('09 来源不可改（交接单改成 MANUAL 绕过）', "UPDATE scrap_order SET source_type='MANUAL' WHERE id=102", 'scrap_state_forward_only')
+expect_allow_tx('09 准备：交接单 102 / 手工单 104 各挂一条 SCRAP_PENDING', ["INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (80,1,1,2,4,'KG',4000,4000)", "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (104,'SCR-5',1,'MANUAL',0,'DAMAGED','2026-10-15',7)", "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (80,80,'SCRAP_PENDING','SCRAP','SCRAP',102,'CVT:80',2000,0,'HELD',0)", "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (81,80,'SCRAP_PENDING','SCRAP','SCRAP',104,'SCRH:81',2000,0,'HELD',0)"])
+_c = conn.execute("UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 80 AND hold_type = 'SCRAP_PENDING' AND source_type = 'SCRAP' AND source_id = 102 AND status = 'HELD' AND EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = 102 AND o.source_type <> 'RETURN_HANDOVER')").rowcount; conn.commit()
+ok('09 release_scrap_hold(REVOKED) 对交接单拒绝（→ 40930）' + ' rowcount=' + str(_c)) if _c == 0 else bad('09 release_scrap_hold(REVOKED) 对交接单拒绝（→ 40930）' + ' rowcount=' + str(_c) + '，期望 0')
+_c = conn.execute("UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 81 AND hold_type = 'SCRAP_PENDING' AND source_type = 'SCRAP' AND source_id = 104 AND status = 'HELD' AND EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = 104 AND o.source_type <> 'RETURN_HANDOVER')").rowcount; conn.commit()
+ok('09 release_scrap_hold(REVOKED) 对手工单放行' + ' rowcount=' + str(_c)) if _c == 1 else bad('09 release_scrap_hold(REVOKED) 对手工单放行' + ' rowcount=' + str(_c) + '，期望 1')
+_c = conn.execute("UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 80 AND status = 'HELD' AND hold_type IN ('QUALITY','MANUAL')").rowcount; conn.commit()
+ok('09 人工解冻路径对 SCRAP_PENDING（→ 40933）' + ' rowcount=' + str(_c)) if _c == 0 else bad('09 人工解冻路径对 SCRAP_PENDING（→ 40933）' + ' rowcount=' + str(_c) + '，期望 0')
+expect_allow('09 A1 质检不合格报损单 DRAFT（RETURN_QC，source_id=退货行 8101）', "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (105,'SCR-6',1,'RETURN_QC',8101,'QC_REJECT','2026-10-15',9)")
 
 print("=== 3. §4.4 FEFO 候选池排序（视图 + 排序键）===")
 rows = conn.execute(

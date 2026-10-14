@@ -932,9 +932,9 @@ CREATE TABLE scrap_order (
     id              BIGINT          PRIMARY KEY,
     code            VARCHAR(64)     NOT NULL,   -- SCR-{仓}-{节点}-{作业日}-{序号}
     warehouse_id    BIGINT          NOT NULL,
-    source_type     VARCHAR(24)     NOT NULL,   -- EXPIRY_SCAN/MANUAL/RETURN_QC/RETURN_HANDOVER(04 交接，source_id=待回库记录 id)/COUNT
+    source_type     VARCHAR(24)     NOT NULL,   -- 取值见 ck_scr_src_type；RETURN_HANDOVER：04 交接，source_id=待回库记录 id；RETURN_QC：10 质检不合格，source_id=inbound_line.id
     source_id       BIGINT          NOT NULL DEFAULT 0,
-    reason_code     VARCHAR(24)     NOT NULL,   -- EXPIRED/NEAR_EXPIRY/DAMAGED/QC_REJECT/NATURAL_LOSS/OTHER
+    reason_code     VARCHAR(24)     NOT NULL,   -- 取值见 ck_scr_reason
     status          VARCHAR(16)     NOT NULL DEFAULT 'DRAFT',
     work_date       DATE            NOT NULL,   -- 仓库时区作业日
     amount_impact   BIGINT          NOT NULL DEFAULT 0,   -- 分
@@ -946,7 +946,9 @@ CREATE TABLE scrap_order (
     created_at      TIMESTAMP       NOT NULL DEFAULT now(),
     CONSTRAINT uq_scr_code   UNIQUE (code),
     CONSTRAINT ck_scr_status CHECK (status IN ('DRAFT','PENDING_APPROVAL','APPROVED','POSTED','REJECTED','CANCELLED')),
-    CONSTRAINT ck_scr_sod    CHECK (approver_id IS NULL OR approver_id <> applicant_id)
+    CONSTRAINT ck_scr_sod    CHECK (approver_id IS NULL OR approver_id <> applicant_id),
+    CONSTRAINT ck_scr_src_type CHECK (source_type IN ('EXPIRY_SCAN','MANUAL','RETURN_QC','RETURN_HANDOVER','COUNT','EXCEPTION')),
+    CONSTRAINT ck_scr_reason CHECK (reason_code IN ('EXPIRED','NEAR_EXPIRY','DAMAGED','QC_REJECT','NATURAL_LOSS','OTHER'))
 );
 CREATE INDEX ix_scr_wh_status ON scrap_order(warehouse_id, status, work_date);
 CREATE UNIQUE INDEX uq_scr_source ON scrap_order(source_type, source_id) WHERE source_id <> 0 AND status NOT IN ('REJECTED','CANCELLED');
@@ -954,21 +956,70 @@ CREATE UNIQUE INDEX uq_scr_source ON scrap_order(source_type, source_id) WHERE s
 
 CREATE TABLE scrap_line (
     id              BIGINT          PRIMARY KEY,
-    scrap_id        BIGINT          NOT NULL,
+    scrap_id        BIGINT          NOT NULL REFERENCES scrap_order(id),
     line_no         INT             NOT NULL,
     stock_id        BIGINT          NOT NULL,
     sku_id          BIGINT          NOT NULL,
     lot_id          BIGINT          NOT NULL,
-    qty_milli       BIGINT          NOT NULL,
+    scrap_qty_milli BIGINT          NOT NULL,
     hold_id         BIGINT          NOT NULL DEFAULT 0,   -- SCRAP_PENDING 冻结；0 = 已出库待报损（不冻结）
     ledger_mode     VARCHAR(16)     NOT NULL DEFAULT 'POST_OUT',   -- POST_OUT 出账 / NONE 已扣账只记损耗
     cost_amount     BIGINT          NOT NULL DEFAULT 0,
     CONSTRAINT uq_scr_line   UNIQUE (scrap_id, line_no),
-    CONSTRAINT ck_scrl_int   CHECK (qty_milli = CAST(qty_milli AS BIGINT)),
-    CONSTRAINT ck_scrl_qty   CHECK (qty_milli > 0),
+    CONSTRAINT ck_scrl_int   CHECK (scrap_qty_milli = CAST(scrap_qty_milli AS BIGINT)),   -- CAST 只在 SQLite 起作用，PG 恒真
+    CONSTRAINT ck_scrl_qty   CHECK (scrap_qty_milli > 0),
     CONSTRAINT ck_scrl_mode  CHECK (ledger_mode IN ('POST_OUT','NONE'))
 );
 CREATE INDEX ix_scrl_stock ON scrap_line(stock_id);
+-- 状态只能前进（小赵 I3 / 第二评审 I2）：允许 DRAFT→PENDING_APPROVAL/CANCELLED，PENDING_APPROVAL→APPROVED/REJECTED/DRAFT，APPROVED→POSTED；
+-- POSTED/REJECTED/CANCELLED 是终态。RETURN_HANDOVER（交接单）不许撤回（PENDING_APPROVAL→DRAFT）、不许取消、不许驳回到 REJECTED：
+-- 它的 SCRAP_PENDING 来自待回库，释放回可用量会让破损货回到可售；误报走第 10 篇异常单（docs/09 §5.1）
+CREATE FUNCTION trg_scr_forward() RETURNS trigger LANGUAGE plpgsql AS $$                                    -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    IF NEW.status <> OLD.status AND NOT (                                                                     -- @pg-only
+          (OLD.status = 'DRAFT' AND NEW.status IN ('PENDING_APPROVAL','CANCELLED'))                           -- @pg-only
+       OR (OLD.status = 'PENDING_APPROVAL' AND NEW.status IN ('APPROVED','REJECTED','DRAFT'))                 -- @pg-only
+       OR (OLD.status = 'APPROVED' AND NEW.status = 'POSTED')) THEN                                           -- @pg-only
+        RAISE EXCEPTION 'scrap_state_forward_only' USING ERRCODE = '23514';                                  -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    IF OLD.source_type = 'RETURN_HANDOVER' AND NEW.status <> OLD.status                                       -- @pg-only
+       AND NEW.status IN ('DRAFT','CANCELLED','REJECTED') THEN                                                -- @pg-only
+        RAISE EXCEPTION 'scrap_handover_no_revoke' USING ERRCODE = '23514';                                  -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    IF NEW.source_type IS DISTINCT FROM OLD.source_type OR NEW.source_id IS DISTINCT FROM OLD.source_id THEN  -- @pg-only
+        RAISE EXCEPTION 'scrap_state_forward_only' USING ERRCODE = '23514';                                  -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    RETURN NEW;                                                                                               -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_scr_forward BEFORE UPDATE ON scrap_order FOR EACH ROW EXECUTE FUNCTION trg_scr_forward();  -- @pg-only
+-- 报损行只能在 DRAFT 单下新增或改量（POSTED 单下插 POST_OUT 且 hold_id=0 的行被拦）
+CREATE FUNCTION trg_scrl_draft_only() RETURNS trigger LANGUAGE plpgsql AS $$                                -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    IF (TG_OP = 'INSERT' OR NEW.scrap_qty_milli <> OLD.scrap_qty_milli OR NEW.stock_id <> OLD.stock_id)       -- @pg-only
+       AND NOT EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = NEW.scrap_id AND o.status = 'DRAFT') THEN     -- @pg-only
+        RAISE EXCEPTION 'scrap_line_locked' USING ERRCODE = '23514';                                         -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    RETURN NEW;                                                                                               -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_scrl_draft_only BEFORE INSERT OR UPDATE ON scrap_line FOR EACH ROW EXECUTE FUNCTION trg_scrl_draft_only();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_scr_forward BEFORE UPDATE ON scrap_order
+-- @sqlite-only WHEN (NEW.status <> OLD.status AND NOT ((OLD.status = 'DRAFT' AND NEW.status IN ('PENDING_APPROVAL','CANCELLED'))
+-- @sqlite-only        OR (OLD.status = 'PENDING_APPROVAL' AND NEW.status IN ('APPROVED','REJECTED','DRAFT'))
+-- @sqlite-only        OR (OLD.status = 'APPROVED' AND NEW.status = 'POSTED')))
+-- @sqlite-only   OR NEW.source_type IS NOT OLD.source_type OR NEW.source_id IS NOT OLD.source_id
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'scrap_state_forward_only'); END;
+-- @sqlite-only CREATE TRIGGER trg_scr_handover BEFORE UPDATE ON scrap_order
+-- @sqlite-only WHEN OLD.source_type = 'RETURN_HANDOVER' AND NEW.status <> OLD.status AND NEW.status IN ('DRAFT','CANCELLED','REJECTED')
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'scrap_handover_no_revoke'); END;
+-- @sqlite-only CREATE TRIGGER trg_scrl_draft_ins BEFORE INSERT ON scrap_line
+-- @sqlite-only WHEN NOT EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = NEW.scrap_id AND o.status = 'DRAFT')
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'scrap_line_locked'); END;
+-- @sqlite-only CREATE TRIGGER trg_scrl_draft_upd BEFORE UPDATE ON scrap_line
+-- @sqlite-only WHEN (NEW.scrap_qty_milli <> OLD.scrap_qty_milli OR NEW.stock_id <> OLD.stock_id)
+-- @sqlite-only   AND NOT EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = NEW.scrap_id AND o.status = 'DRAFT')
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'scrap_line_locked'); END;
+-- 授权（I4）：不给 DELETE/TRUNCATE，作废走状态
+GRANT SELECT, INSERT, UPDATE ON scrap_order, scrap_line TO wms_app;                                           -- @pg-only
 
 -- -----------------------------------------------------------------------------
 -- 幂等 / 集成 / 审计

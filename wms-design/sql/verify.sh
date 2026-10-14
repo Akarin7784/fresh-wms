@@ -67,7 +67,7 @@ echo "  → 表 $T 张 / 索引 $I 个 / 视图 $V 个"
 [ "$V" = "$EXPECT_VIEWS" ]   && ok "视图数 = $V" || bad "视图数 = $V，期望 $EXPECT_VIEWS"
 
 # 小赵 S4：按期望权限矩阵逐表核对 wms_app（表、分区父表、视图、物化视图；序列查 USAGE），多给、少给、漏表都失败
-EXPECT_PRIVS="adjust_line:SELECT,INSERT,UPDATE adjust_order:SELECT,INSERT,UPDATE api_credential:SELECT,INSERT,UPDATE audit_log:SELECT,INSERT count_line:SELECT,INSERT,UPDATE count_order:SELECT,INSERT,UPDATE idempotency_record:SELECT,INSERT,UPDATE inbound_line:SELECT,INSERT,UPDATE inbound_message:SELECT,INSERT,UPDATE inbound_order:SELECT,INSERT,UPDATE location:SELECT,INSERT,UPDATE lot:SELECT,INSERT,UPDATE numbering_segment:SELECT,INSERT,UPDATE outbound_line:SELECT,INSERT,UPDATE outbound_order:SELECT,INSERT,UPDATE outbox_event:SELECT,INSERT,UPDATE pack_box:SELECT,INSERT,UPDATE pack_box_line:SELECT,INSERT,UPDATE pick_task:SELECT,INSERT,UPDATE pick_task_line:SELECT,INSERT,UPDATE shipment:SELECT,INSERT,UPDATE shipment_order:SELECT,INSERT,UPDATE sku:SELECT,INSERT,UPDATE sku_barcode:SELECT,INSERT,UPDATE sku_unit:SELECT,INSERT,UPDATE stock:SELECT,INSERT,UPDATE stock_hold:SELECT,INSERT stock_hold_release:SELECT,INSERT stock_ledger_line:SELECT,INSERT stock_movement:SELECT,INSERT stock_movement_key:SELECT,INSERT stock_recon_alert:SELECT,INSERT,UPDATE stock_reservation:SELECT,INSERT,UPDATE stock_snapshot_daily:SELECT,INSERT sys_permission:SELECT,INSERT,UPDATE sys_role:SELECT,INSERT,UPDATE sys_role_perm:SELECT,INSERT,UPDATE sys_user:SELECT,INSERT,UPDATE sys_user_role:SELECT,INSERT,UPDATE sys_user_warehouse:SELECT,INSERT,UPDATE v_stock_available:SELECT warehouse:SELECT,INSERT,UPDATE wave:SELECT,INSERT,UPDATE zone:SELECT,INSERT,UPDATE"
+EXPECT_PRIVS="adjust_line:SELECT,INSERT,UPDATE adjust_order:SELECT,INSERT,UPDATE api_credential:SELECT,INSERT,UPDATE audit_log:SELECT,INSERT count_line:SELECT,INSERT,UPDATE count_order:SELECT,INSERT,UPDATE idempotency_record:SELECT,INSERT,UPDATE inbound_line:SELECT,INSERT,UPDATE inbound_message:SELECT,INSERT,UPDATE inbound_order:SELECT,INSERT,UPDATE location:SELECT,INSERT,UPDATE lot:SELECT,INSERT,UPDATE numbering_segment:SELECT,INSERT,UPDATE outbound_line:SELECT,INSERT,UPDATE outbound_order:SELECT,INSERT,UPDATE outbox_event:SELECT,INSERT,UPDATE pack_box:SELECT,INSERT,UPDATE pack_box_line:SELECT,INSERT,UPDATE pick_task:SELECT,INSERT,UPDATE pick_task_line:SELECT,INSERT,UPDATE scrap_line:SELECT,INSERT,UPDATE scrap_order:SELECT,INSERT,UPDATE shipment:SELECT,INSERT,UPDATE shipment_order:SELECT,INSERT,UPDATE sku:SELECT,INSERT,UPDATE sku_barcode:SELECT,INSERT,UPDATE sku_unit:SELECT,INSERT,UPDATE stock:SELECT,INSERT,UPDATE stock_hold:SELECT,INSERT stock_hold_release:SELECT,INSERT stock_ledger_line:SELECT,INSERT stock_movement:SELECT,INSERT stock_movement_key:SELECT,INSERT stock_recon_alert:SELECT,INSERT,UPDATE stock_reservation:SELECT,INSERT,UPDATE stock_snapshot_daily:SELECT,INSERT sys_permission:SELECT,INSERT,UPDATE sys_role:SELECT,INSERT,UPDATE sys_role_perm:SELECT,INSERT,UPDATE sys_user:SELECT,INSERT,UPDATE sys_user_role:SELECT,INSERT,UPDATE sys_user_warehouse:SELECT,INSERT,UPDATE v_stock_available:SELECT warehouse:SELECT,INSERT,UPDATE wave:SELECT,INSERT,UPDATE zone:SELECT,INSERT,UPDATE"
 ACT=$(psql -t -A -c "SELECT string_agg(x, ' ' ORDER BY x) FROM (SELECT c.relname || ':' || COALESCE(NULLIF(concat_ws(',', CASE WHEN c.relkind='S' THEN (CASE WHEN has_sequence_privilege('wms_app', c.oid, 'USAGE') THEN 'USAGE' END) ELSE (CASE WHEN has_table_privilege('wms_app', c.oid, 'SELECT') THEN 'SELECT' END) END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'INSERT') THEN 'INSERT' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'UPDATE') THEN 'UPDATE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'DELETE') THEN 'DELETE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'TRUNCATE') THEN 'TRUNCATE' END), ''), 'NONE') AS x FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','S') AND NOT c.relispartition) t")
 if [ "$ACT" = "$EXPECT_PRIVS" ]; then ok "S4 wms_app 权限矩阵与期望逐表一致（$(echo "$ACT" | wc -w) 个对象；列级 UPDATE 另测）"
 else bad "S4 wms_app 权限矩阵不符：$(diff <(echo "$EXPECT_PRIVS" | tr ' ' '\n') <(echo "$ACT" | tr ' ' '\n') | grep '^[<>]' | tr '\n' ' ')"; fi
@@ -397,28 +397,42 @@ Q7=$(psql -q -t -A -c "CREATE TEMP TABLE q7 (v BIGINT); INSERT INTO q7 VALUES (3
 [ "$Q7" = "4,3,2" ] && ok "numeric 3.5→4、2.5→3（四舍五入），float8 2.5→2（银行家舍入）→ 应用层只绑定整数" \
                   || bad "Q7 取整结果 = $Q7（期望 4,3,2）"
 
-echo "=== 2f. docs/09 效期与损耗：报损单、SCRAP 冻结 ==="
-expect_allow "09 报损单建单（DRAFT，来源=效期扫描 501）" \
-  "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (100,'SCR-1',1,'EXPIRY_SCAN',501,'EXPIRED','2026-10-15',7);"
-expect_block "09 同一来源重复建有效报损单" \
-  "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (101,'SCR-2',1,'EXPIRY_SCAN',501,'EXPIRED','2026-10-15',7);" \
-  "uq_scr_source"
-expect_block "09 报损审批 SoD（审批人=申请人）" \
-  "UPDATE scrap_order SET approver_id=7, status='APPROVED' WHERE id=100;" \
-  "ck_scr_sod"
-expect_block "09 报损单非法状态值" \
-  "UPDATE scrap_order SET status='DONE' WHERE id=100;" \
-  "ck_scr_status"
-# 非整数 milli 只在 SQLite 断言（PG bigint 会把 1.5 舍入成 2，见 02 Q7；应用层只绑定 int）
-expect_block "09 报损行数量 0" \
-  "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,qty_milli) VALUES (101,100,1,14,1,1,0);" \
-  "ck_scrl_qty"
-
-expect_allow "09 交接报损单 DRAFT（origin=RETURN_HANDOVER，source_id=待回库 701）" \
-  "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (102,'SCR-3',1,'RETURN_HANDOVER',701,'DAMAGED','2026-10-15',8);"
-expect_block "09 同一待回库记录重复交接报损" \
-  "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (103,'SCR-4',1,'RETURN_HANDOVER',701,'DAMAGED','2026-10-15',8);" \
-  "uq_scr_source"
+echo "=== 2f. docs/09 效期与损耗：报损单状态前进、交接单不可撤回、来源/原因 CHECK、外键 ==="
+expect_allow "09 报损单建单（DRAFT，来源=效期扫描 501）" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (100,'SCR-1',1,'EXPIRY_SCAN',501,'EXPIRED','2026-10-15',7);"
+expect_block "09 同一来源重复建有效报损单" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (101,'SCR-2',1,'EXPIRY_SCAN',501,'EXPIRED','2026-10-15',7);" "uq_scr_source"
+expect_block "09 I3 来源类型非法" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (109,'SCR-9',1,'WHATEVER',9,'EXPIRED','2026-10-15',7);" "ck_scr_src_type"
+expect_block "09 I3 原因码非法" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (109,'SCR-9',1,'MANUAL',9,'ANY','2026-10-15',7);" "ck_scr_reason"
+expect_block "09 报损单非法状态值（建单）" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id,status) VALUES (109,'SCR-9',1,'MANUAL',9,'OTHER','2026-10-15',7,'DONE');" "ck_scr_status"
+expect_allow "09 DRAFT 单下加报损行" "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (100,100,1,14,1,1,5000,0,'POST_OUT');"
+expect_block "09 报损行数量 0" "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (101,100,2,14,1,1,0,0,'POST_OUT');" "ck_scrl_qty"
+expect_block "09 I3 报损行挂到不存在的报损单（外键）" "UPDATE scrap_line SET scrap_id=999 WHERE id=100;" "scrap_line_scrap_id_fkey"
+expect_block "09 I3 新增报损行挂到不存在的报损单" "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (103,999,1,14,1,1,1000,0,'POST_OUT');" "scrap_line_locked"
+expect_allow "09 S1 DRAFT → PENDING_APPROVAL" "UPDATE scrap_order SET status='PENDING_APPROVAL', version=version+1 WHERE id=100 AND status='DRAFT';"
+expect_block "09 I3 提交后不能再加行" "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (104,100,2,14,1,1,1000,0,'POST_OUT');" "scrap_line_locked"
+expect_block "09 I3 提交后不能改量" "UPDATE scrap_line SET scrap_qty_milli=4000 WHERE id=100;" "scrap_line_locked"
+expect_block "09 报损审批 SoD（审批人=申请人）" "UPDATE scrap_order SET approver_id=7, status='APPROVED' WHERE id=100;" "ck_scr_sod"
+expect_allow "09 S2 审批（审批人 8）" "UPDATE scrap_order SET approver_id=8, status='APPROVED' WHERE id=100 AND status='PENDING_APPROVAL';"
+expect_block "09 I3 APPROVED → DRAFT（跳回）" "UPDATE scrap_order SET status='DRAFT' WHERE id=100;" "scrap_state_forward_only"
+expect_allow "09 S3 APPROVED → POSTED" "UPDATE scrap_order SET status='POSTED' WHERE id=100 AND status='APPROVED';"
+expect_block "09 I3 POSTED → DRAFT" "UPDATE scrap_order SET status='DRAFT' WHERE id=100;" "scrap_state_forward_only"
+expect_block "09 I3 POSTED → CANCELLED" "UPDATE scrap_order SET status='CANCELLED' WHERE id=100;" "scrap_state_forward_only"
+expect_block "09 I3 POSTED 单下插 POST_OUT 且 hold_id=0 的行" "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (105,100,9,14,1,1,1000,0,'POST_OUT');" "scrap_line_locked"
+expect_block "09 报损单非法状态值（更新）" "UPDATE scrap_order SET status='DONE' WHERE id=100;" "scrap_state_forward_only"
+expect_allow "09 交接报损单 DRAFT（RETURN_HANDOVER，source_id=待回库 701）" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (102,'SCR-3',1,'RETURN_HANDOVER',701,'DAMAGED','2026-10-15',8);"
+expect_block "09 同一待回库记录重复交接报损" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (103,'SCR-4',1,'RETURN_HANDOVER',701,'DAMAGED','2026-10-15',8);" "uq_scr_source"
+expect_block "09 交接单不许取消（DRAFT → CANCELLED）" "UPDATE scrap_order SET status='CANCELLED' WHERE id=102;" "scrap_handover_no_revoke"
+expect_allow "09 交接单提交" "UPDATE scrap_order SET status='PENDING_APPROVAL' WHERE id=102 AND status='DRAFT';"
+expect_block "09 交接单不许撤回（PENDING_APPROVAL → DRAFT，→ 40930）" "UPDATE scrap_order SET status='DRAFT' WHERE id=102;" "scrap_handover_no_revoke"
+expect_block "09 交接单不许驳回到 REJECTED" "UPDATE scrap_order SET status='REJECTED' WHERE id=102;" "scrap_handover_no_revoke"
+expect_block "09 来源不可改（交接单改成 MANUAL 绕过）" "UPDATE scrap_order SET source_type='MANUAL' WHERE id=102;" "scrap_state_forward_only"
+expect_allow "09 准备：交接单 102 / 手工单 104 各挂一条 SCRAP_PENDING" "BEGIN; INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (80,1,1,2,4,'KG',4000,4000); INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (104,'SCR-5',1,'MANUAL',0,'DAMAGED','2026-10-15',7); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (80,80,'SCRAP_PENDING','SCRAP','SCRAP',102,'CVT:80',2000,0,'HELD',0); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (81,80,'SCRAP_PENDING','SCRAP','SCRAP',104,'SCRH:81',2000,0,'HELD',0); COMMIT;"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 80 AND hold_type = 'SCRAP_PENDING' AND source_type = 'SCRAP' AND source_id = 102 AND status = 'HELD' AND EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = 102 AND o.source_type <> 'RETURN_HANDOVER')")
+[ "$R" = "UPDATE 0" ] && ok "09 release_scrap_hold(REVOKED) 对交接单拒绝（→ 40930） rowcount=0" || bad "09 release_scrap_hold(REVOKED) 对交接单拒绝（→ 40930）：$R（期望 UPDATE 0）"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 81 AND hold_type = 'SCRAP_PENDING' AND source_type = 'SCRAP' AND source_id = 104 AND status = 'HELD' AND EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = 104 AND o.source_type <> 'RETURN_HANDOVER')")
+[ "$R" = "UPDATE 1" ] && ok "09 release_scrap_hold(REVOKED) 对手工单放行 rowcount=1" || bad "09 release_scrap_hold(REVOKED) 对手工单放行：$R（期望 UPDATE 1）"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 80 AND status = 'HELD' AND hold_type IN ('QUALITY','MANUAL')")
+[ "$R" = "UPDATE 0" ] && ok "09 人工解冻路径对 SCRAP_PENDING（→ 40933） rowcount=0" || bad "09 人工解冻路径对 SCRAP_PENDING（→ 40933）：$R（期望 UPDATE 0）"
+expect_allow "09 A1 质检不合格报损单 DRAFT（RETURN_QC，source_id=退货行 8101）" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (105,'SCR-6',1,'RETURN_QC',8101,'QC_REJECT','2026-10-15',9);"
 
 echo "=== 3. §5.6 盘点差异生成列（实盘 − 基准账面 − 期间流水）==="
 seed "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000);"
