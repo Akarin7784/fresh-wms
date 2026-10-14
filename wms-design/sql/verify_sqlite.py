@@ -70,6 +70,9 @@ def translate(pg: str) -> tuple[str, list[str]]:
     return s, deltas
 
 
+if not PG_SQL.is_file():
+    print(f"  ✗ 找不到 {PG_SQL}")
+    sys.exit(1)
 src = PG_SQL.read_text(encoding="utf-8")
 sqlite_ddl, deltas = translate(src)
 OUT_SQL.write_text(
@@ -106,20 +109,30 @@ NT = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='table'").fetch
 NI = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='index' AND sql IS NOT NULL").fetchone()[0]
 NV = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='view'").fetchone()[0]
 print(f"  → 表 {NT} 张 / 手工建索引 {NI} 个 / 视图 {NV} 个")
+# 期望值：main 8ed5f0c 为 38 表；docs/02 新增 stock_hold、stock_recon_alert → 40 表。改表数必须同步改这里和 verify.sh
+EXPECT_TABLES, EXPECT_VIEWS = 40, 1
+ok(f"表数 = {NT}（期望 {EXPECT_TABLES}）") if NT == EXPECT_TABLES else bad(f"表数 = {NT}，期望 {EXPECT_TABLES}")
+ok(f"视图数 = {NV}") if NV == EXPECT_VIEWS else bad(f"视图数 = {NV}，期望 {EXPECT_VIEWS}")
 
 
 def one(sql, *a):
     return conn.execute(sql, a).fetchone()
 
 
-def expect_block(desc: str, sql: str) -> None:
+def expect_block(desc: str, sql: str, want: str) -> None:
+    """want = 期望的约束名（CHECK）或列清单（UNIQUE，SQLite 报错只给列不给约束名）。
+    只有错误信息精确命中 want 才算通过：被别的约束拦下 = 断言没测到它声称测的东西。"""
     try:
         conn.execute(sql)
         conn.commit()
         bad(f"{desc} → 未拦截（SQLite 侧有洞）")
     except sqlite3.IntegrityError as e:
-        ok(f"{desc} → 已拦截（{str(e).split(':')[0]}）")
         conn.rollback()
+        msg = str(e)
+        if msg.endswith(": " + want):
+            ok(f"{desc} → 已拦截（{msg}）")
+        else:
+            bad(f"{desc} → 被拦了但约束不对：期望 {want!r}，实际 {msg!r}")
 
 
 def expect_allow(desc: str, sql: str) -> None:
@@ -142,8 +155,8 @@ seed = [
     "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (1,1,1,'A01-02-03','BIN',2,'A010'),(2,1,1,'A01-03-01','BIN',2,'A020'),(3,1,2,'B02-01-05','PALLET',8,'B010')",
     "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life) VALUES (1,'SKU-APPLE','山东红富士 80#','KG','CHILLED',30,10)",
     "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date,quality_status,remaining_life_days) VALUES (1,1,'LOT-1008','2026-10-25','2026-10-08','QUALIFIED',10),(2,1,'LOT-1012','2026-10-29','2026-10-12','QUALIFIED',14),(3,1,'LOT-1014','2026-10-31','2026-10-14','QUALIFIED',16)",
-    "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand,allocated) VALUES (11,1,1,1,2,'KG',50,0),(12,1,2,1,1,'KG',30,10),(13,1,3,1,3,'KG',200,0),(14,1,3,1,1,'KG',80,0)",
-    "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty,movement_qty,actual_qty) VALUES (1,1,1,1,1,100,-30,68)",
+    "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,allocated_qty_milli) VALUES (11,1,1,1,2,'KG',50000,0),(12,1,2,1,1,'KG',30000,10000),(13,1,3,1,3,'KG',200000,0),(14,1,3,1,1,'KG',80000,0)",
+    "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000)",
     "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,customer_id,status,work_date) VALUES (1,'OBT1',1,'SALE','MALL','M-2026-001',1,'CREATED','2026-10-16')",
 ]
 for s in seed:
@@ -153,41 +166,123 @@ ok("种子数据写入（含 TIME/DATE/TIMESTAMP/BOOLEAN/NUMERIC 列，未做任
 
 expect_block(
     "I2 超占（allocated>on_hand）",
-    "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand,allocated) VALUES (900,1,1,1,1,'KG',10,99)",
+    "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,allocated_qty_milli) VALUES (900,1,1,1,1,'KG',10000,99000)",
+    'ck_stock_nonneg',
 )
 expect_block(
     "I5 流水平衡（after<>before+qty*dir）",
-    "INSERT INTO stock_movement (id,biz_no,biz_type,direction,warehouse_id,location_id,sku_id,lot_id,quantity,on_hand_before,on_hand_after,occurred_at,idempotency_key) VALUES (1,'PK1','PICK',-1,1,1,1,1,3,100,98,'2026-10-15','k1')",
+    "INSERT INTO stock_movement (id,biz_no,line_no,leg,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (1,'PK1',1,1,'PICK',-1,11,1,1,1,1,1,3000,100000,98000,'2026-10-15','k1')",
+    'ck_mv_balance',
 )
 expect_allow(
     "写入一条平衡的合法流水",
-    "INSERT INTO stock_movement (id,biz_no,biz_type,direction,warehouse_id,location_id,sku_id,lot_id,quantity,on_hand_before,on_hand_after,occurred_at,idempotency_key) VALUES (2,'PK1','PICK',-1,1,1,1,1,3,100,97,'2026-10-15','k2')",
+    "INSERT INTO stock_movement (id,biz_no,line_no,leg,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (2,'PK1',1,1,'PICK',-1,11,1,1,1,1,1,3000,100000,97000,'2026-10-15','k2')",
 )
 expect_block(
     "§4.6③ 记账层幂等（idempotency_key 重复）",
-    "INSERT INTO stock_movement (id,biz_no,biz_type,direction,warehouse_id,location_id,sku_id,lot_id,quantity,on_hand_before,on_hand_after,occurred_at,idempotency_key) VALUES (3,'PK1','PICK',-1,1,1,1,1,3,100,97,'2026-10-15','k2')",
+    "INSERT INTO stock_movement (id,biz_no,line_no,leg,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (3,'PK1',2,1,'PICK',-1,11,2,1,1,1,1,3000,97000,94000,'2026-10-15','k2')",
+    'stock_movement.idempotency_key',
 )
 expect_block(
     "§4.6② 业务层幂等（source_system+source_order_no 重复）",
     "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,customer_id,status,work_date) VALUES (2,'OBT2',1,'SALE','MALL','M-2026-001',1,'CREATED','2026-10-16')",
+    'outbound_order.source_system, outbound_order.source_order_no',
 )
 expect_block(
     "§2.2 职责分离（拣货人=复核人）",
     "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,customer_id,status,work_date,picker_id,checker_id) VALUES (3,'OBT3',1,'SALE','MALL','M-2026-003',1,'CREATED','2026-10-16',77,77)",
+    'ck_obo_sod',
 )
 expect_block(
     "I6 同维度重复库存行（container_id 用 0 哨兵后应被拦）",
-    "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,container_id,uom,on_hand) VALUES (21,1,3,1,1,0,'KG',5)",
+    "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,container_id,uom,on_hand_qty_milli) VALUES (21,1,3,1,1,0,'KG',5000)",
+    'stock.warehouse_id, stock.location_id, stock.sku_id, stock.lot_id, stock.container_id',
 )
 
-D = one("SELECT diff_qty FROM count_line WHERE id=1")[0]
-ok(f"§5.6 差异生成列 diff_qty = {D}（预期 -2.000）") if D == -2 else bad(f"差异列 = {D}")
+
+print("=== 2b. docs/02 库存核心：BIGINT *_qty_milli 与记账链断言 ===")
+expect_block(
+    "02 重复过账（同 biz_no+line_no+leg，换一个 idempotency_key）",
+    "INSERT INTO stock_movement (id,biz_no,line_no,leg,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (4,'PK1',1,1,'PICK',-1,11,9,1,1,1,1,3000,100000,97000,'2026-10-15','k-other')",
+    'stock_movement.biz_no, stock_movement.line_no, stock_movement.leg',
+)
+expect_block(
+    "02 记账链分叉（同 stock_id+stock_seq 两条改 on_hand 的流水）",
+    "INSERT INTO stock_movement (id,biz_no,line_no,leg,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (5,'PK9',1,1,'PICK',-1,11,1,1,1,1,1,1000,100000,99000,'2026-10-15','k5')",
+    'stock_movement.stock_id, stock_movement.stock_seq',
+)
+expect_allow(
+    "02 direction=0 纯事件流水不入链（SHIP，before=after）",
+    "INSERT INTO stock_movement (id,biz_no,line_no,leg,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (6,'SHP1',1,1,'SHIP',0,11,1,1,1,1,1,3000,97000,97000,'2026-10-15','k6')",
+)
+expect_allow(
+    "02 PDA 拣货流水带第 5 篇业务键",
+    "INSERT INTO stock_movement (id,biz_no,line_no,leg,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (7,'PK2',3,1,'PICK',-1,12,1,1,2,1,1,77,3,'DEV-A',1,1000,30000,29000,'2026-10-15','PICK:PK2:3:1')",
+)
+expect_block(
+    "02 Idempotency-Key 过期后 PDA 重放同一操作（换 idempotency_key、同业务键）→ 业务键兜底",
+    "INSERT INTO stock_movement (id,biz_no,line_no,leg,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (8,'PK2',3,1,'PICK',-1,12,2,1,2,1,1,77,3,'DEV-A',1,1000,29000,28000,'2026-10-15','PICK:PK2:3:2')",
+    'stock_movement.src_task_id, stock_movement.src_line_no, stock_movement.device_instance_id, stock_movement.src_op_seq, stock_movement.leg',
+)
+expect_block(
+    "02 PDA 业务键半截（device_instance_id 为 NULL）",
+    "INSERT INTO stock_movement (id,biz_no,line_no,leg,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (9,'PK2',4,1,'PICK',-1,12,3,1,2,1,1,77,4,NULL,1,1000,28000,27000,'2026-10-15','PICK:PK2:4:1')",
+    'ck_mv_pda_src',
+)
+expect_block(
+    "02 SQLite 非整数写入 BIGINT（3.5 会被存成 REAL）→ ck_stock_int",
+    "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,container_id,uom,on_hand_qty_milli) VALUES (31,1,3,1,1,7,'KG',3.5)",
+    'ck_stock_int',
+)
+expect_block(
+    "02 SQLite 文本小数写入 BIGINT（'12.500'）→ ck_stock_int",
+    "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,container_id,uom,on_hand_qty_milli) VALUES (32,1,3,1,1,8,'KG','12.500')",
+    'ck_stock_int',
+)
+expect_allow(
+    "02 文本整数 '12500' 被 INTEGER 亲和性转成整数（合法）",
+    "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,container_id,uom,on_hand_qty_milli) VALUES (33,1,3,1,1,9,'KG','12500')",
+)
+T33 = one("SELECT typeof(on_hand_qty_milli) FROM stock WHERE id=33")[0]
+ok(f"stock 33 存储类型 = {T33}") if T33 == "integer" else bad(f"stock 33 存储类型 = {T33}")
+expect_allow(
+    "02 占用写入（RESERVE 10000）",
+    "INSERT INTO stock_reservation (id,stock_id,stage,source_type,source_id,source_line_id,op_key,reserve_qty_milli) VALUES (1,11,'RESERVE','OUTBOUND_LINE',1,1,'RES:OBT1:1:1',10000)",
+)
+expect_block(
+    "02 占用幂等（同 op_key 重复占用）",
+    "INSERT INTO stock_reservation (id,stock_id,stage,source_type,source_id,source_line_id,op_key,reserve_qty_milli) VALUES (2,11,'RESERVE','OUTBOUND_LINE',1,1,'RES:OBT1:1:1',10000)",
+    'stock_reservation.op_key',
+)
+expect_block(
+    "02 占用超消耗（consumed+released > reserve）",
+    "UPDATE stock_reservation SET consumed_qty_milli = 6000, released_qty_milli = 5000 WHERE id = 1",
+    'ck_res',
+)
+expect_block(
+    "02 冻结明细超释放（released > hold）",
+    "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,op_key,hold_qty_milli,released_qty_milli,operator_id) VALUES (1,11,'MANUAL','DAMAGE','MANUAL','HOLD:1',1000,2000,7)",
+    'ck_hold',
+)
+c = conn.execute("UPDATE stock SET reserved_qty_milli = reserved_qty_milli + 50000 WHERE id = 11 AND on_hand_qty_milli - allocated_qty_milli - reserved_qty_milli - quality_hold_qty_milli - frozen_qty_milli >= 50000").rowcount
+conn.commit()
+ok("02 条件预占：available(50000) 恰好够 50000 → rowcount=1") if c == 1 else bad(f"条件预占 rowcount={c}")
+c = conn.execute("UPDATE stock SET reserved_qty_milli = reserved_qty_milli + 1 WHERE id = 11 AND on_hand_qty_milli - allocated_qty_milli - reserved_qty_milli - quality_hold_qty_milli - frozen_qty_milli >= 1").rowcount
+conn.commit()
+ok("02 条件预占：available=0 再占 1 milli → rowcount=0（走 40904，不靠 CHECK 报错）") if c == 0 else bad(f"超占 rowcount={c}")
+# 复原，避免干扰后面的 FEFO 排序断言
+conn.execute("UPDATE stock SET reserved_qty_milli = 0 WHERE id = 11")
+conn.execute("DELETE FROM stock WHERE id = 33")
+conn.commit()
+
+D = one("SELECT diff_qty_milli FROM count_line WHERE id=1")[0]
+ok(f"§5.6 差异生成列 diff_qty_milli = {D}（预期 -2000）") if D == -2000 else bad(f"差异列 = {D}")
 
 print("=== 3. §4.4 FEFO 候选池排序（视图 + 排序键）===")
 rows = conn.execute(
     """
     SELECT lot_code FROM v_stock_available
-    WHERE sku_id=1 AND warehouse_id=1 AND available_qty > 0
+    WHERE sku_id=1 AND warehouse_id=1 AND available_qty_milli > 0
       AND date(expiry_date) >= date('2026-10-15','+10 day')
     ORDER BY expiry_date ASC, remaining_life_days ASC, pick_sequence ASC, stock_id ASC
     """
@@ -196,8 +291,8 @@ seq = [r[0] for r in rows]
 print(f"  → 出库顺序：{' '.join(seq)}")
 ok("FEFO 序列与 PG 侧完全一致") if seq == ["LOT-1008", "LOT-1008", "LOT-1012", "LOT-1014"] \
     else bad(f"FEFO 序列偏离：{seq}")
-AV = one("SELECT available_qty FROM v_stock_available WHERE stock_id=12")[0]
-ok(f"available = on_hand(30) − allocated(10) = {AV}") if AV == 20 else bad(f"可用量 = {AV}")
+AV = one("SELECT available_qty_milli FROM v_stock_available WHERE stock_id=12")[0]
+ok(f"available_qty_milli = 30000 − 10000 = {AV}") if AV == 20000 else bad(f"可用量 = {AV}")
 
 # ---------------------------------------------------------------------------
 # 3. 并发防超卖（多线程 + WAL）
@@ -208,7 +303,7 @@ conn.close()
 c1 = sqlite3.connect(dbf, timeout=30)
 c1.execute("PRAGMA journal_mode = WAL")
 c1.execute("PRAGMA busy_timeout = 30000")
-c1.execute("INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand) VALUES (999,1,1,1,1,'KG',100.000)")
+c1.execute("INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (999,1,1,1,1,'KG',100000)")
 c1.commit()
 mode = c1.execute("PRAGMA journal_mode").fetchone()[0]
 print(f"  → journal_mode = {mode}（§3.1 / RK1 要求）")
@@ -223,8 +318,8 @@ def worker() -> None:
     wc.execute("PRAGMA busy_timeout = 30000")
     try:
         cur = wc.execute(
-            "UPDATE stock SET on_hand = on_hand - 3.000, version = version + 1 "
-            "WHERE id = 999 AND on_hand >= 3.000"
+            "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 3000, ledger_seq = ledger_seq + 1, version = version + 1 "
+            "WHERE id = 999 AND on_hand_qty_milli >= 3000"
         )
         with lock:
             results.append(cur.rowcount)
@@ -246,13 +341,13 @@ succ = sum(1 for r in results if r == 1)
 rej = sum(1 for r in results if r == 0)
 err = sum(1 for r in results if r == -1)
 conn = sqlite3.connect(dbf)
-final = one("SELECT on_hand FROM stock WHERE id=999")[0]
+final = one("SELECT on_hand_qty_milli FROM stock WHERE id=999")[0]
 ver = one("SELECT version FROM stock WHERE id=999")[0]
 print(f"  → 成功 {succ} / 拒绝 {rej} / 异常 {err} / 剩余 {final} / version {ver}")
-if succ == 33 and rej == 17 and err == 0 and Decimal(str(final)) == Decimal("1"):
-    ok("SQLite 无 SELECT FOR UPDATE，条件更新同样做到不超卖、不丢更新（33×3 + 1 = 100）")
+if succ == 33 and rej == 17 and err == 0 and final == 1000 and ver == 33:
+    ok("SQLite 无 SELECT FOR UPDATE，条件更新同样做到不超卖、不丢更新（33×3000 + 1000 = 100000 milli）")
 else:
-    bad(f"并发结果偏离：succ={succ} rej={rej} err={err} final={final}")
+    bad(f"并发结果偏离：succ={succ} rej={rej} err={err} final={final} version={ver}")
 
 # ---------------------------------------------------------------------------
 # 4. R2 精度规则实测
