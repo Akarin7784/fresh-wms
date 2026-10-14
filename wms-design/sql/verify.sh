@@ -73,7 +73,7 @@ if [ "$ACT" = "$EXPECT_PRIVS" ]; then ok "S4 wms_app 权限矩阵与期望逐表
 else bad "S4 wms_app 权限矩阵不符：$(diff <(echo "$EXPECT_PRIVS" | tr ' ' '\n') <(echo "$ACT" | tr ' ' '\n') | grep '^[<>]' | tr '\n' ' ')"; fi
 echo "=== 2. 库层不变量断言（§4.1 I1–I5 + §2.2 SoD + §4.6 幂等）==="
 seed() { psql -q -c "$1" >/dev/null; }
-seed "INSERT INTO warehouse (id,code,name,cutoff_time,work_date_offset) VALUES (1,'WH-SH-01','上海青浦仓','20:00',-1);"
+seed "INSERT INTO warehouse (id,code,name,cutoff_time,work_date_offset) VALUES (1,'WHSH01','上海青浦仓','20:00',-1);"
 seed "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (1,1,'Z-C1','冷藏拣货区','CHILLED','PICK'),(2,1,'Z-C2','冷藏存储区','CHILLED','STORAGE');"
 seed "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (1,1,1,'A01-02-03','BIN',2,'A010'),(2,1,1,'A01-03-01','BIN',2,'A020'),(3,1,2,'B02-01-05','PALLET',8,'B010');"
 seed "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life) VALUES (1,'SKU-APPLE','山东红富士 80#','KG','CHILLED',30,10);"
@@ -471,6 +471,19 @@ OUT=$(psql -q -c "SET ROLE wms_app; UPDATE node_registry SET warehouse_id = 2 WH
 case "$OUT" in *"permission denied for table node_registry"*) ok "01 B4 wms_app 只能改 node_registry 退役列";; *) bad "01 B4 wms_app 改 node_registry.warehouse_id 未被拒：$OUT";; esac
 OUT=$(psql -q -c "SET ROLE wms_app; UPDATE md_disable_action_policy SET doc_ref='x';" 2>&1)
 case "$OUT" in *"permission denied"*) ok "01 B4 wms_app 白名单只读";; *) bad "01 B4 wms_app 改白名单未被拒：$OUT";; esac
+
+echo "=== 2e3. docs/01 仓库编码 ck_wh_code（[A-Z0-9]，2–16，不含 -）==="
+expect_block "01 仓库编码反向：含 '-' WH-01" "INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (60,'WH-01','x','20:00');" "ck_wh_code"
+expect_block "01 仓库编码反向：小写 wh01" "INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (61,'wh01','x','20:00');" "ck_wh_code"
+expect_block "01 仓库编码反向：长度 1 W" "INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (62,'W','x','20:00');" "ck_wh_code"
+expect_block "01 仓库编码反向：长度 17 AAAAAAAAAAAAAAAAA" "INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (63,'AAAAAAAAAAAAAAAAA','x','20:00');" "ck_wh_code"
+expect_block "01 仓库编码反向：含下划线 WH_01" "INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (64,'WH_01','x','20:00');" "ck_wh_code"
+expect_block "01 仓库编码反向：含空格 WH 01" "INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (65,'WH 01','x','20:00');" "ck_wh_code"
+expect_block "01 仓库编码反向：含中文 仓01" "INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (66,'仓01','x','20:00');" "ck_wh_code"
+expect_allow "01 仓库编码正向：长度 2 W2" "INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (70,'W2','x','20:00');"
+expect_allow "01 仓库编码正向：长度 16 AAAAAAAA12345678" "INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (71,'AAAAAAAA12345678','x','20:00');"
+expect_allow "01 仓库编码正向：字母数字混合 WHSH01" "UPDATE warehouse SET code='WHSH01' WHERE id=1;"
+expect_block "01 仓库编码反向：改成带 - 的编码" "UPDATE warehouse SET code='WH-SH-01' WHERE id=1;" "ck_wh_code"
 
 echo "=== 2d. Q7：PG 写入 bigint 的取整行为（QA 在 PG16.14 实测，已关闭）==="
 # 临时表只活在一个会话里：建表、插入、查询必须在同一次 psql 调用（小赵 C1）

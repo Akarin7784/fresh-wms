@@ -191,7 +191,7 @@ def expect_allow_tx(desc: str, stmts: list[str]) -> None:
 # ---------------------------------------------------------------------------
 print("=== 2. 库层不变量断言（与 verify.sh 同一套）===")
 seed = [
-    "INSERT INTO warehouse (id,code,name,cutoff_time,work_date_offset) VALUES (1,'WH-SH-01','上海青浦仓','20:00',-1)",
+    "INSERT INTO warehouse (id,code,name,cutoff_time,work_date_offset) VALUES (1,'WHSH01','上海青浦仓','20:00',-1)",
     "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (1,1,'Z-C1','冷藏拣货区','CHILLED','PICK'),(2,1,'Z-C2','冷藏存储区','CHILLED','STORAGE')",
     "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (1,1,1,'A01-02-03','BIN',2,'A010'),(2,1,1,'A01-03-01','BIN',2,'A020'),(3,1,2,'B02-01-05','PALLET',8,'B010')",
     "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life) VALUES (1,'SKU-APPLE','山东红富士 80#','KG','CHILLED',30,10)",
@@ -511,6 +511,19 @@ expect_block_tx("01 门店挂在不存在的客户下", ["INSERT INTO customer (
 expect_block_tx("01 门店挂在门店下", ["INSERT INTO customer (id,code,name,customer_type,parent_id) VALUES (905,'ST-905','x','STORE',2)"], "customer_parent_invalid")
 expect_block("01 entity_type 不在码表", "INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,payload_json,operator_id) VALUES (9,'BANANA',1,1,'UPSERT','{}',1)", "ck_mdlog_entity")
 expect_block("01 待停用 entity_type 不在码表", "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,requested_by) VALUES (9,'WHATEVER',1,1,1,1)", "ck_mdpd_entity")
+
+print("=== 2f3. docs/01 仓库编码 ck_wh_code（[A-Z0-9]，2–16，不含 -）===")
+expect_block("01 仓库编码反向：含 '-' WH-01", "INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (60,'WH-01','x','20:00')", "ck_wh_code")
+expect_block('01 仓库编码反向：小写 wh01', "INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (61,'wh01','x','20:00')", "ck_wh_code")
+expect_block('01 仓库编码反向：长度 1 W', "INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (62,'W','x','20:00')", "ck_wh_code")
+expect_block('01 仓库编码反向：长度 17 AAAAAAAAAAAAAAAAA', "INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (63,'AAAAAAAAAAAAAAAAA','x','20:00')", "ck_wh_code")
+expect_block('01 仓库编码反向：含下划线 WH_01', "INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (64,'WH_01','x','20:00')", "ck_wh_code")
+expect_block('01 仓库编码反向：含空格 WH 01', "INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (65,'WH 01','x','20:00')", "ck_wh_code")
+expect_block('01 仓库编码反向：含中文 仓01', "INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (66,'仓01','x','20:00')", "ck_wh_code")
+expect_allow('01 仓库编码正向：长度 2 W2', "INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (70,'W2','x','20:00')")
+expect_allow('01 仓库编码正向：长度 16 AAAAAAAA12345678', "INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (71,'AAAAAAAA12345678','x','20:00')")
+expect_allow('01 仓库编码正向：字母数字混合 WHSH01', "UPDATE warehouse SET code='WHSH01' WHERE id=1")
+expect_block("01 仓库编码反向：改成带 - 的编码", "UPDATE warehouse SET code='WH-SH-01' WHERE id=1", "ck_wh_code")
 
 print("=== 3. §4.4 FEFO 候选池排序（视图 + 排序键）===")
 rows = conn.execute(

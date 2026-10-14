@@ -31,6 +31,8 @@ CREATE TABLE warehouse (
     updated_at          TIMESTAMP    NOT NULL DEFAULT now(),
     deleted_at          TIMESTAMP,
     md_version          BIGINT       NOT NULL DEFAULT 1,  -- docs/01 §4
+    -- 仓库编码只允许 [A-Z0-9]、长度 2–16、不含 '-'（审批单号 APR-{warehouse_code}-… 以 '-' 分段）。两库通用：不用 ~ / GLOB，去掉 36 个合法字符后须为空串
+    CONSTRAINT ck_wh_code CHECK (length(code) BETWEEN 2 AND 16 AND replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(code,'A',''),'B',''),'C',''),'D',''),'E',''),'F',''),'G',''),'H',''),'I',''),'J',''),'K',''),'L',''),'M',''),'N',''),'O',''),'P',''),'Q',''),'R',''),'S',''),'T',''),'U',''),'V',''),'W',''),'X',''),'Y',''),'Z',''),'0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9','') = ''),
     CONSTRAINT uq_warehouse_code UNIQUE (code)
 );
 COMMENT ON COLUMN warehouse.work_date_offset IS '凌晨作业归属哪一天：-1 表示今日凌晨拣昨日截单的货';
