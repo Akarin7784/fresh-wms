@@ -1037,6 +1037,18 @@ BEGIN                                                                           
 END $$;                                                                                                       -- @pg-only
 CREATE TRIGGER trg_idem_expiry_fwd   BEFORE UPDATE ON idempotency_record FOR EACH ROW EXECUTE FUNCTION trg_expiry_forward();  -- @pg-only
 CREATE TRIGGER trg_outbox_expiry_fwd BEFORE UPDATE ON outbox_event       FOR EACH ROW EXECUTE FUNCTION trg_expiry_forward();  -- @pg-only
+-- 十六轮 R1 补洞：wms_app 只能以初始状态 PENDING（不带 sent_at）插入 outbox；SENT 只能经 UPDATE 写入（受 sent_at_not_now 约束）。
+-- 种子/迁移用超级用户或迁移角色写入，不受此限
+CREATE FUNCTION trg_outbox_insert_pending() RETURNS trigger LANGUAGE plpgsql AS $$                         -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    IF current_user = 'wms_app' AND (NEW.status IS DISTINCT FROM 'PENDING' OR NEW.sent_at IS NOT NULL) THEN   -- @pg-only
+        RAISE EXCEPTION 'outbox_insert_not_pending' USING ERRCODE = '42501'; END IF;                          -- @pg-only
+    RETURN NEW;                                                                                               -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_outbox_insert_pending BEFORE INSERT ON outbox_event FOR EACH ROW EXECUTE FUNCTION trg_outbox_insert_pending();  -- @pg-only
+-- SQLite 没有角色：应用只能插入 PENDING（不带 sent_at）；验证脚本造 SENT 种子时临时 DROP 本触发器、写完重建（单独的种子路径）
+-- @sqlite-only CREATE TRIGGER trg_outbox_insert_pending BEFORE INSERT ON outbox_event WHEN NEW.status IS NOT 'PENDING' OR NEW.sent_at IS NOT NULL
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'outbox_insert_not_pending'); END;
 -- @sqlite-only CREATE TRIGGER trg_idem_expiry_fwd BEFORE UPDATE ON idempotency_record WHEN NEW.created_at IS NOT OLD.created_at OR NEW.expires_at < OLD.expires_at
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'expiry_backdate: idempotency_record'); END;
 -- @sqlite-only CREATE TRIGGER trg_outbox_expiry_fwd BEFORE UPDATE ON outbox_event WHEN NEW.created_at IS NOT OLD.created_at OR (OLD.sent_at IS NOT NULL AND (NEW.sent_at IS NULL OR NEW.sent_at < OLD.sent_at)) OR (OLD.sent_at IS NULL AND NEW.sent_at < OLD.created_at) OR (OLD.status = 'SENT' AND NEW.status <> 'SENT')
