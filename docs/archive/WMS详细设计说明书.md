@@ -2,6 +2,8 @@
 
 版本 v1.0 ｜ 状态：设计定稿 ｜ 适用范围：单仓起步、多仓扩展
 
+> **已归档（2026-10-15）**：本文档已拆分为 [`docs/00-总体设计.md`](../00-总体设计.md) 与各模块详细设计，以拆分后的文档为准。建表与验证脚本仍在 [`wms-design/sql/`](../../wms-design/sql/)。正文中命令 `sql/verify.sh` 等路径相对 `wms-design/` 目录。
+
 ---
 
 ## 0. 文档说明
@@ -37,7 +39,7 @@
 - 只关心**业务流程能不能跑通**：读 §5（流程与状态机）。
 - 只关心**工程落地**：读 §6–§11。
 - 想确认**这些结论是跑出来的还是想出来的**：直接看 §16 附录 A，含可复现命令、实测数字、以及验证过程中抓出来的 3 个 bug。
-- 建表脚本单独放在 [`sql/schema_postgres.sql`](sql/schema_postgres.sql)。
+- 建表脚本单独放在 [`sql/schema_postgres.sql`](../../wms-design/sql/schema_postgres.sql)。
 
 ---
 
@@ -1972,7 +1974,7 @@ PDA 要显示批次号（`pick_task_line.lot_code` 的展示来源），但视�
 | 文件 | 说明 |
 |---|---|
 | [`WMS详细设计说明书.md`](WMS详细设计说明书.md) | 本文档 |
-| [`sql/schema_postgres.sql`](sql/schema_postgres.sql) | 核心表结构（38 表 / 99 索引 / 1 视图），PG 16.15 实测可执行 |
-| [`sql/schema_sqlite.sql`](sql/schema_sqlite.sql) | 由脚本从 PG 版机械生成，勿手改 |
-| [`sql/verify.sh`](sql/verify.sh) | PG 侧验证：建表 + 12 项断言 |
-| [`sql/verify_sqlite.py`](sql/verify_sqlite.py) | SQLite 侧验证：翻译 + 16 项断言 + 并发压测 |
+| [`sql/schema_postgres.sql`](../../wms-design/sql/schema_postgres.sql) | 核心表结构（38 表 / 99 索引 / 1 视图），PG 16.15 实测可执行 |
+| [`sql/schema_sqlite.sql`](../../wms-design/sql/schema_sqlite.sql) | 由脚本从 PG 版机械生成，勿手改 |
+| [`sql/verify.sh`](../../wms-design/sql/verify.sh) | PG 侧验证：建表 + 12 项断言 |
+| [`sql/verify_sqlite.py`](../../wms-design/sql/verify_sqlite.py) | SQLite 侧验证：翻译 + 16 项断言 + 并发压测 |
