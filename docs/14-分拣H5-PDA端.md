@@ -84,6 +84,8 @@ Hash 路由（WebView 兼容）。权限点为建议值，以第 12 篇为准。
 | 任务执行 | 撤销上一次确认（反向流水） | 待对齐：见第 5、2 篇 |
 | 任务汇总 | 提交任务完成 | 待对齐：见第 5 篇 |
 | 补交队列 | 批量/逐条补交、查询任务当前状态 | 待对齐：见第 5 篇 |
+| 补交队列 / 红条 | 查询待回库记录状态 | `GET /api/v1/return-records/{returnRecordId}`（§9.4.2） |
+| 回库 | 扫原库位确认回库 | `POST /api/v1/return-records/{returnRecordId}/confirm`（§9.4.2） |
 | 复核 | 应复核清单、逐件复核、复核通过/退回、装箱、箱码 | 待对齐：见第 6 篇 |
 
 ## 7. 权限点
@@ -143,15 +145,15 @@ flowchart TD
 ```
 
 ### 9.3 outbox 记录与幂等
-outbox 每条：`{ op_id(uuid), local_seq, format_version, idem_key, install_id, user_id, warehouse_id, task_id, line_no, op_seq, scan_event_ids, type, payload, task_version, created_at, status, attempts, last_error, server_record_id, linked_op_id }`。
+outbox 每条：`{ op_id(uuid), local_seq, format_version, idem_key, device_instance_id, user_id, warehouse_id, task_id, line_no, op_seq, scan_event_ids, type, payload, task_version, created_at, status, attempts, last_error, server_record_id, linked_op_id }`。
 
 **两层去重（B1）**
 1. **第一层：`Idempotency-Key`**。用户点确认时生成 uuid，与 payload 在同一个 IndexedDB 事务里写入；重试、重连、重启、退避都复用同一个 Key，不重新生成。服务端 Key 只保留 24h，**它只是第一层**。
-2. **第二层：服务端业务唯一键 `(task_id, line_no, op_seq)`**。这是兜底：Key 过期后再补交，服务端仍按三元组判重，不会重复扣减。
-   - 三元组相同、数量相同 → 重放首次结果，视为成功；
-   - 三元组相同、数量不同 → 409，条目转人工。
+2. **第二层：服务端业务唯一键（四元组）`(task_id, line_no, device_instance_id, op_seq)`**。这是兜底：Key 过期后再补交，服务端仍按四元组判重，不会重复扣减。
+   - 四元组相同、数量相同 → 重放首次结果，视为成功；
+   - 四元组相同、数量不同 → 409，条目转人工。
    - `op_seq`：PDA 按任务行单调递增生成，写入 outbox 后不再改变，重试原样发送。
-   - 为避免重装/清数据后 `op_seq` 从头计数与旧操作撞号（小赵的反例），PDA 同时上送 `install_id`（安装实例 id，重装或清数据时重新生成）。最终形态（`install_id` + `op_seq`，还是由服务端在领取任务时分配 `op_seq` 号段）由小李在第 5 篇定，见 Q10。
+   - `device_instance_id`：设备安装实例 id，重装或清数据时重新生成，与 `op_seq` 一起进入业务唯一键，避免重装后 `op_seq` 从头计数与旧操作撞号（小赵的反例）。已定，见 Q10。
 - 因此不再依赖「补交一定落在 Key 有效期内」；离线超过 24h 的条目仍自动补交，由业务键兜底。
 
 **写入与断电**：outbox 写成功后才给成功反馈；断电后要么整条存在、要么不存在。请求在途时 WebView 被杀，重启后同 Key、同 `op_seq` 重发。
@@ -175,44 +177,69 @@ outbox 每条：`{ op_id(uuid), local_seq, format_version, idem_key, install_id,
 
 **离线撤销（I5，默认口径）**
 - 撤销是一条新操作（新 Key、新 `op_seq`），进 outbox，**本地不合并抵消**，确认和撤销按顺序都发，由服务端裁决。
-- 若该行的确认被拒（40920/40921 等），其后同行的撤销条目在本地置 `superseded`，不上传。
+- 若该行的确认被拒（40920/40921/40922 等），其后同行的撤销条目在本地置 `superseded`，不上传。
 
 ### 9.4 补交冲突处理
 | 服务端返回 | 含义 | 前端处理 |
 |---|---|---|
-| 幂等命中 / 业务键重放（同三元组同数量） | 已处理过 | 视为成功 |
+| 幂等命中 / 业务键重放（同四元组同数量） | 已处理过 | 视为成功 |
 | `WMS-10002` 同 Key 不同 body | 本地数据异常或 bug | `failed`，不重试，上报日志 |
-| 409 同三元组不同数量 | `op_seq` 冲突 | `failed`，交主管 |
+| 409 同四元组不同数量 | `op_seq` 冲突 | `failed`，交主管 |
 | 409 `40920 TASK_REASSIGNED` | 离线超时回收或主管改派 | 见 §9.4.1 |
 | 409 `40921 TASK_CANCELLED` | 任务/出库单已取消 | 见 §9.4.1 |
-| 任务已关闭（业务码见第 5 篇） | 任务已完成关闭 | 同 §9.4.1 未上传行处理 |
+| 409 `40922 TASK_CLOSED` | 任务已关闭 | 见 §9.4.1 |
 | `WMS-40902` 库存不足 | 本地认为拣到但服务端扣不了 | 原条目 `failed`；选「重扫」生成**新操作、新 Key、新 `op_seq`**，新条目 `linked_op_id` 指向原条目，新条目成功后原条目置 `superseded`；或选「报缺」 |
 | `WMS-50002` 条码不匹配 / 批次效期不符 | 白名单过期 | 同上，重扫生成新条目并关联 |
 | 401 | token 失效 | 暂停该账号队列，同一账号重新登录后继续 |
 | 403 | 权限被收回 | 暂停该账号队列，交主管 |
 
-#### 9.4.1 任务改派 / 取消 / 已关闭（40920 / 40921）
+#### 9.4.1 任务改派 / 取消 / 已关闭（40920 / 40921 / 40922）
 
 响应体带 `confirmedLines`（服务端已确认的行）和 `returnRecordId`（待回库记录 id）。
 
 1. **已确认行有效**：`confirmedLines` 中的行保持完成，货物计在原分拣员的周转筐上。
 2. **改派（40920）**：服务端生成交接任务；原分拣员提示「请将周转筐交给接手人」，接手人扫筐接管。前端不把本地数据重放到新任务。
 3. **未上传的离线行一律拒绝**（不静默合并）。**服务端用被拒的 payload 落一条「待回库」记录**并生成回库任务（B3），响应返回记录 id；PDA 把红条与该 id 绑定（`server_record_id`），提示「放回原库位」并列出库位与数量。
-4. 待回库记录按三元组幂等：同一条目重复补交被拒，返回同一个记录 id，不重复生成。
-5. 待回库记录**在回库扫码确认前不动库存**。分拣员到原库位扫库位码，服务端确认后回执，PDA 删除 `failed` 条目、红条消失。
+4. 待回库记录按四元组幂等：同一条目重复补交被拒，返回同一个记录 id，不重复生成。
+5. 待回库记录**在回库扫码确认前不动库存**。分拣员到原库位扫库位码，调用 confirm（§9.4.2），成功回执后 PDA 删除 `failed` 条目、红条消失。
 6. 换设备、清缓存后记录仍在服务端；未闭环的待回库记录在管理后台主管看板展示（第 13 篇），主管可处理。
-7. 取消（40921）、任务已关闭同样适用 1、3–6。该任务后续 outbox 条目停止上传，同样按此处理。
+7. 取消（40921）、已关闭（40922 TASK_CLOSED）同样适用 1、3–6。该任务后续 outbox 条目停止上传，同样按此处理。
 
 ```mermaid
 flowchart LR
-  A[补交被拒 40920/40921/已关闭] --> B[服务端: 按 confirmedLines 保留已确认行]
-  A --> C[服务端: 落待回库记录 + 回库任务<br/>按三元组幂等 不动库存]
+  A[补交被拒 40920/40921/40922] --> B[服务端: 按 confirmedLines 保留已确认行]
+  A --> C[服务端: 落待回库记录 + 回库任务<br/>按四元组幂等 不动库存]
   C --> D[PDA: 红条绑定 returnRecordId<br/>提示放回原库位]
   D --> E[扫库位码]
   E --> F[服务端确认回执]
   F --> G[PDA 删除 failed 条目 闭环]
   A -->|40920| H[交接任务: 接手人扫筐接管]
   C --> I[后台主管看板: 未闭环记录]
+```
+
+#### 9.4.2 待回库记录接口与闭环
+
+| 动作 | 接口 | 调用方 | 要点 |
+|---|---|---|---|
+| 主管列表 | `GET /api/v1/return-records?status=OPEN&warehouseId=…`（分页） | 后台 `/picking/pending-returns` | 见第 13 篇 |
+| 红条状态 | `GET /api/v1/return-records/{returnRecordId}` | PDA | 重连后、打开 `/sync` 时刷新红条状态 |
+| 回库确认 | `POST /api/v1/return-records/{returnRecordId}/confirm` | PDA | 头带 `Idempotency-Key`，body 带扫到的 `locationCode`；**不写库存流水**，只把记录 `OPEN → CONFIRMED` |
+| 主管处理 | `POST /api/v1/return-records/{returnRecordId}/resolve` | 后台（主管权限） | 必填原因；可选「就近放回」并指定目标库位（记一笔移库） |
+
+PDA 规则：
+- confirm 扫错库位 → 422：红条保留，提示「请扫原库位 XX」重扫。**PDA 不提供就近放回**，就近放回只能主管在后台 resolve。
+- confirm 和 resolve 都是 `status=OPEN` 条件更新，只有一方成功。输的一方收到 409，响应带当前状态、处理人、处理时间；**PDA 把这个 409 视为已闭环**，删除本地 `failed` 条目并提示「已由 XX 于 HH:mm 处理」。
+- confirm 或 resolve 成功回执后（含通过 GET 查到已非 OPEN），PDA 删除对应 `failed` 条目。
+- confirm 网络失败按 outbox 规则同 Key 重试。
+
+```mermaid
+stateDiagram-v2
+  [*] --> OPEN: 补交被拒 40920/40921/40922
+  OPEN --> CONFIRMED: PDA confirm 扫原库位
+  OPEN --> RESOLVED: 主管 resolve（可就近放回=移库）
+  OPEN --> OPEN: 扫错库位 422 / 原库位冻结或温区不符 422
+  CONFIRMED --> [*]
+  RESOLVED --> [*]
 ```
 
 原则：**冲突绝不静默丢弃**；处理动作本身是新操作、新 Key。
@@ -228,7 +255,7 @@ flowchart LR
 |---|---|---|
 | 单元 | Vitest + fake-indexeddb | outbox 写入原子性；Key 与 `op_seq` 在失败/重启/退避后不变；`local_seq` 排序（时钟回拨后顺序不变）；串行与失败暂停只影响本账号同任务；`failed` 不被 24h 清理、只在服务端回执后删除；撤销在确认被拒后置 `superseded`；重扫生成新条目并关联；`format_version` 迁移（含迁移失败标红）；数量字符串计算 |
 | 组件 | Vitest + @vue/test-utils | 三步扫码不可跳步、缺货跳行、30 秒撤销、BigButton ≥56dp、离线确认即时反馈；计件模式 1 秒扫 5 件得 5（不被去抖）；非计件模式壳重复广播被丢弃；outbox 非空不能登出、可交主管；首页显示其他账号待补交数 |
-| 模拟弱网 | MSW | 超时后重试同 Key；响应丢失；**Key 过期（服务端无 Key 记录）后补交按三元组重放，不重复扣减**；同三元组不同数量 409；40920/40921 返回 `confirmedLines` + `returnRecordId`，重复被拒返回同一 id；401 中途失效 |
+| 模拟弱网 | MSW | 超时后重试同 Key；响应丢失；**Key 过期（服务端无 Key 记录）后补交按四元组重放，不重复扣减**；同四元组不同数量 409；40920/40921/40922 返回 `confirmedLines` + `returnRecordId`，重复被拒返回同一 id（按四元组）；confirm 扫错库位 422 红条保留并提示重扫原库位；confirm 成功后删除 failed 条目；confirm 与主管 resolve 并发，输方 409（带状态/处理人/时间）被 PDA 视为已闭环并删除条目；confirm 网络失败同 Key 重试；401 中途失效 |
 | 真机 | 手工清单 | 冷库断网 30 分钟及跨夜（>24h）后补交；拔电池/杀 WebView 后恢复；手动改系统时间后上传顺序；换班换账号；outbox 非空时强制更新 |
 
 覆盖率目标：`offline/`、`utils/`、`composables/` 行 ≥ 85%、分支 ≥ 75%；组件 ≥ 70%。
@@ -246,7 +273,7 @@ flowchart LR
 | Q7 | 离线期间 token 过期的宽限策略 | 第 12 篇 |
 | Q8 | 称重品复核允差参数由接口下发还是字典 | 第 6 篇 |
 | Q9 | 共享 `utils/format.ts` 的方式（monorepo 包 / 复制） | 总体设计工程结构 |
-| Q10 | `op_seq` 防撞号的最终形态：`install_id` + 本地 `op_seq`，还是服务端分配号段 | 第 5 篇（小李） |
-| Q11 | 「任务已关闭」的业务码；待回库记录与回执接口 | 第 5 篇 |
+| Q10 | ~~`op_seq` 防撞号形态~~ **已定**：业务唯一键 `(task_id, line_no, device_instance_id, op_seq)`，见 §9.3 | 已关闭 |
+| Q11 | ~~已关闭业务码与待回库接口~~ **已定**：`40922 TASK_CLOSED`；接口见 §9.4.2 | 已关闭 |
 | Q12 | 交给主管的流程（主管在 PDA 登录确认 / 后台接管）与审计字段 | 第 12 篇 |
 | Q13 | 键盘楔入去抖阈值的配置来源 | 第 1 篇字典 |
