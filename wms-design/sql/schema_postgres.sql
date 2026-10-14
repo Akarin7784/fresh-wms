@@ -333,7 +333,7 @@ INSERT INTO md_disable_action_policy (action_code, ref_effect, allowed_when_pend
     ('MOVE_OUT',            'REDUCE', true,  '02'),   -- 从该库位移出
     ('COUNT_ADJUST',        'REDUCE', true,  '08'),   -- 盘点差异调整（盘盈盘亏都放行：账实一致才能清零）
     ('RETURN_TO_SUPPLIER',  'REDUCE', true,  '10'),   -- 退供出库
-    ('CUSTOMER_RETURN_IN',  'REDUCE', true,  '10'),   -- 门店退货回仓：入库同事务写 RETURN_QC 系统冻结（来源 STORE_RETURN），第 10 篇质检 release_qc_hold 释放；不合格 convert_hold → SCRAP_PENDING；不能直接转可售
+    ('CUSTOMER_RETURN_IN',  'REDUCE', true,  '10'),   -- 门店退货回仓：先建质检单（来源 STORE_RETURN），冻结 RETURN_QC/source_type=QC，release_qc_hold 释放；不合格 convert_hold → SCRAP_PENDING
     ('RETURN_RECORD_CLOSE', 'REDUCE', true,  '04'),   -- 待回库 confirm / resolve（RETURNED_TO_ORIGINAL / SCRAP_HANDOVER）
     ('PICK_EXISTING_TASK',  'REDUCE', true,  '05'),   -- 停用前已生成任务的拣货、复核、发货
     ('RELEASE_HOLD',        'REDUCE', true,  '02'),   -- release_return_hold / release_scrap_hold / release_qc_hold 等 release_*_hold
@@ -603,11 +603,16 @@ CREATE TABLE stock_hold_release (
     qty_milli           BIGINT          NOT NULL,
     created_at          TIMESTAMP       NOT NULL DEFAULT now(),
     CONSTRAINT uq_hr_op UNIQUE (op_key),
+    CONSTRAINT fk_hr_hold FOREIGN KEY (hold_id) REFERENCES stock_hold(id),   -- 小赵 S6：释放记录必须挂在真实冻结上
     CONSTRAINT ck_hr_qty CHECK (qty_milli > 0 AND qty_milli = CAST(qty_milli AS BIGINT))
 );
 CREATE INDEX ix_hr_hold ON stock_hold_release(hold_id);
 -- @sqlite-only CREATE TRIGGER trg_hr_no_update BEFORE UPDATE ON stock_hold_release BEGIN SELECT RAISE(ABORT, 'hold_immutable'); END;
 -- @sqlite-only CREATE TRIGGER trg_hr_no_delete BEFORE DELETE ON stock_hold_release BEGIN SELECT RAISE(ABORT, 'hold_immutable'); END;
+-- 小赵 Q1：REPLACE 冲突删旧行不触发 DELETE 触发器，同 trg_hold_no_replace 用 BEFORE INSERT 先拦（重放撞这里，按 op_key 查回）
+-- @sqlite-only CREATE TRIGGER trg_hr_no_replace BEFORE INSERT ON stock_hold_release
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM stock_hold_release r WHERE r.id = NEW.id OR r.op_key = NEW.op_key)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'hold_duplicate'); END;
 -- ↑ 一条待回库记录最多一条 RETURN_PENDING 冻结（重复拒收复用已有记录，不会重复冻结）。
 --   只约束 RETURN_PENDING：convert_hold 转出的报损明细（SCRAP_PENDING/SCRAP）不受它约束（小赵 D1）
 -- 原文档 §4.2"冻结记 stock_freeze"在此落地为 stock_hold，使 quality_hold/frozen 与 allocated/reserved 一样可对账（I3）
@@ -778,7 +783,8 @@ BEGIN                                                                           
 END $$;                                                                                                       -- @pg-only
 CREATE TRIGGER trg_hold_no_delete   BEFORE DELETE   ON stock_hold FOR EACH ROW       EXECUTE FUNCTION trg_hold_no_delete();  -- @pg-only
 CREATE TRIGGER trg_hold_no_truncate BEFORE TRUNCATE ON stock_hold FOR EACH STATEMENT EXECUTE FUNCTION trg_hold_no_delete();  -- @pg-only
--- stock_hold_release 只追加（A3）
+-- stock_hold_release 只追加（A3）；TRUNCATE 也拦（小赵 S5）
+CREATE TRIGGER trg_hr_no_truncate BEFORE TRUNCATE ON stock_hold_release FOR EACH STATEMENT EXECUTE FUNCTION trg_hold_no_delete();  -- @pg-only
 CREATE TRIGGER trg_hr_append_only BEFORE UPDATE OR DELETE ON stock_hold_release FOR EACH ROW EXECUTE FUNCTION trg_hold_no_delete();  -- @pg-only
 -- @sqlite-only CREATE TRIGGER trg_hold_immutable BEFORE UPDATE ON stock_hold
 -- @sqlite-only WHEN NEW.id IS NOT OLD.id OR NEW.stock_id IS NOT OLD.stock_id OR NEW.hold_type IS NOT OLD.hold_type OR NEW.reason_code IS NOT OLD.reason_code
@@ -856,7 +862,7 @@ CREATE TABLE stock_recon_alert (
     detected_at             TIMESTAMP       NOT NULL DEFAULT now(),
     last_seen_at            TIMESTAMP       NOT NULL DEFAULT now(),
     CONSTRAINT ck_recon_status CHECK (status IN ('OPEN','ACKED','RESOLVED')),
-    CONSTRAINT ck_recon_code CHECK (check_code IN ('I3a','I3b','I3c','I3d','I4','I5','SNAP'))   -- 码表见 docs/02 §4.6；新增走迁移（小赵 C4）
+    CONSTRAINT ck_recon_code CHECK (check_code IN ('I3a','I3b','I3c','I3d','I3e','I4','I5','SNAP'))   -- 码表见 docs/02 §4.6；新增走迁移（小赵 C4）
 );
 CREATE INDEX ix_recon_open ON stock_recon_alert(warehouse_id, status, detected_at DESC);
 CREATE UNIQUE INDEX uq_recon_open ON stock_recon_alert(check_code, warehouse_id, stock_id) WHERE status <> 'RESOLVED';
@@ -1262,6 +1268,33 @@ CREATE TABLE outbox_event (
 CREATE INDEX ix_outbox_pending ON outbox_event(status, next_retry_at);
 CREATE INDEX ix_outbox_bizkey  ON outbox_event(biz_key, id);   -- 同键串行发送
 
+-- 小赵 Q2：去重记录与 outbox 只能清理"已过期 / 已投递且过保留期"的行（两库触发器，条件与 purge_expired() 一致）
+CREATE FUNCTION trg_purge_guard() RETURNS trigger LANGUAGE plpgsql AS $$                                   -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    IF TG_OP = 'TRUNCATE' THEN RAISE EXCEPTION 'purge_not_allowed: %', TG_TABLE_NAME USING ERRCODE = '42501'; END IF;  -- @pg-only
+    IF TG_TABLE_NAME = 'idempotency_record' THEN                                                              -- @pg-only
+        IF NOT (OLD.expires_at < now()) THEN                                                                  -- @pg-only
+            RAISE EXCEPTION 'purge_not_allowed: idempotency_record' USING ERRCODE = '42501';                 -- @pg-only
+        END IF;                                                                                               -- @pg-only
+    ELSIF NOT (OLD.status = 'SENT' AND OLD.sent_at < now() - interval '7 days') THEN   -- outbox_event      -- @pg-only
+        RAISE EXCEPTION 'purge_not_allowed: outbox_event' USING ERRCODE = '42501';                           -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    RETURN OLD;                                                                                               -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_idem_purge_guard    BEFORE DELETE   ON idempotency_record FOR EACH ROW       EXECUTE FUNCTION trg_purge_guard();  -- @pg-only
+CREATE TRIGGER trg_idem_no_truncate    BEFORE TRUNCATE ON idempotency_record FOR EACH STATEMENT EXECUTE FUNCTION trg_purge_guard();  -- @pg-only
+CREATE TRIGGER trg_outbox_purge_guard  BEFORE DELETE   ON outbox_event       FOR EACH ROW       EXECUTE FUNCTION trg_purge_guard();  -- @pg-only
+CREATE TRIGGER trg_outbox_no_truncate  BEFORE TRUNCATE ON outbox_event       FOR EACH STATEMENT EXECUTE FUNCTION trg_purge_guard();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_idem_purge_guard BEFORE DELETE ON idempotency_record WHEN NOT (OLD.expires_at < datetime('now'))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'purge_not_allowed: idempotency_record'); END;
+-- @sqlite-only CREATE TRIGGER trg_outbox_purge_guard BEFORE DELETE ON outbox_event WHEN NOT (OLD.status = 'SENT' AND OLD.sent_at < datetime('now', '-7 days'))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'purge_not_allowed: outbox_event'); END;
+-- SQLite REPLACE 冲突删旧行不触发 DELETE 触发器 → BEFORE INSERT 主键已存在就中止（应用把 idem_duplicate 当作"键已存在"处理，与 PG 23505 同分支）
+-- @sqlite-only CREATE TRIGGER trg_idem_no_replace BEFORE INSERT ON idempotency_record WHEN EXISTS (SELECT 1 FROM idempotency_record r WHERE r.idem_key = NEW.idem_key)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'idem_duplicate'); END;
+-- @sqlite-only CREATE TRIGGER trg_outbox_no_replace BEFORE INSERT ON outbox_event WHEN EXISTS (SELECT 1 FROM outbox_event o WHERE o.id = NEW.id)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'outbox_duplicate'); END;
+
 CREATE TABLE audit_log (
     id              BIGINT       PRIMARY KEY,
     actor_id        BIGINT,
@@ -1392,7 +1425,24 @@ GRANT SELECT, INSERT, UPDATE ON warehouse, zone, location, sku, sku_unit, sku_ba
     pack_box, pack_box_line, shipment, shipment_order, count_order, count_line, adjust_order, adjust_line,       -- @pg-only
     sys_user, sys_role, sys_permission, sys_role_perm, sys_user_role, sys_user_warehouse, api_credential,        -- @pg-only
     inbound_message TO wms_app;                                                                                   -- @pg-only
-GRANT SELECT, INSERT, UPDATE, DELETE ON idempotency_record, outbox_event TO wms_app;   -- 过期清理/已投递清理由应用定时任务做 -- @pg-only
+GRANT SELECT, INSERT, UPDATE ON idempotency_record, outbox_event TO wms_app;           -- 无 DELETE/TRUNCATE（小赵 Q2）-- @pg-only
+-- 清理只能经 purge_expired()：属主 wms_purge_owner（非超级用户、NOLOGIN，只有这两张表的 SELECT/DELETE），
+-- 调用方 wms_cleaner 只有 EXECUTE，对表没有任何权限；删除条件写死在函数里，不接受参数
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'wms_purge_owner') THEN CREATE ROLE wms_purge_owner NOLOGIN NOSUPERUSER NOINHERIT; END IF; END $$;  -- @pg-only
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'wms_cleaner') THEN CREATE ROLE wms_cleaner NOLOGIN NOSUPERUSER; END IF; END $$;  -- @pg-only
+GRANT USAGE ON SCHEMA public TO wms_purge_owner, wms_cleaner;                          -- @pg-only
+GRANT SELECT, DELETE ON idempotency_record, outbox_event TO wms_purge_owner;           -- @pg-only
+CREATE FUNCTION public.purge_expired(OUT idem_deleted BIGINT, OUT outbox_deleted BIGINT)  -- @pg-only
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$          -- @pg-only
+BEGIN                                                                                  -- @pg-only
+    DELETE FROM public.idempotency_record WHERE expires_at < now();                    -- @pg-only
+    GET DIAGNOSTICS idem_deleted = ROW_COUNT;                                          -- @pg-only
+    DELETE FROM public.outbox_event WHERE status = 'SENT' AND sent_at < now() - interval '7 days';  -- @pg-only
+    GET DIAGNOSTICS outbox_deleted = ROW_COUNT;                                        -- @pg-only
+END $$;                                                                                -- @pg-only
+ALTER FUNCTION public.purge_expired() OWNER TO wms_purge_owner;                        -- @pg-only
+REVOKE ALL ON FUNCTION public.purge_expired() FROM PUBLIC;                             -- @pg-only
+GRANT EXECUTE ON FUNCTION public.purge_expired() TO wms_cleaner;                       -- @pg-only
 GRANT SELECT, INSERT ON audit_log, stock_snapshot_daily TO wms_app;                    -- 只追加 -- @pg-only
 GRANT SELECT ON v_stock_available TO wms_app;                                          -- @pg-only
 -- docs/01 新表 wms_app 最小授权（小钱 B4）：md_change_log 只追加；node_registry 只能改退役相关列；不给 DELETE/TRUNCATE
