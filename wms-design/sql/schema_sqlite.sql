@@ -340,7 +340,7 @@ INSERT INTO md_disable_action_policy (action_code, ref_effect, allowed_when_pend
     ('MOVE_OUT',            'REDUCE', true,  '02'),   -- 从该库位移出
     ('COUNT_ADJUST',        'REDUCE', true,  '08'),   -- 盘点差异调整（盘盈盘亏都放行：账实一致才能清零）
     ('RETURN_TO_SUPPLIER',  'REDUCE', true,  '10'),   -- 退供出库
-    ('CUSTOMER_RETURN_IN',  'REDUCE', true,  '10'),   -- 门店退货回仓：入库同事务冻结为 RETURN_PENDING，只能走报损或退供，不能转可售
+    ('CUSTOMER_RETURN_IN',  'REDUCE', true,  '10'),   -- 门店退货回仓：入库同事务写 RETURN_QC 系统冻结（来源 STORE_RETURN），第 10 篇质检 release_qc_hold 释放；不合格 convert_hold → SCRAP_PENDING；不能直接转可售
     ('RETURN_RECORD_CLOSE', 'REDUCE', true,  '04'),   -- 待回库 confirm / resolve（RETURNED_TO_ORIGINAL / SCRAP_HANDOVER）
     ('PICK_EXISTING_TASK',  'REDUCE', true,  '05'),   -- 停用前已生成任务的拣货、复核、发货
     ('RELEASE_HOLD',        'REDUCE', true,  '02'),   -- release_return_hold / release_scrap_hold / release_qc_hold 等 release_*_hold
