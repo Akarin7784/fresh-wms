@@ -1,8 +1,8 @@
 -- 本文件由 sql/verify_sqlite.py 从 schema_postgres.sql 机械生成，请勿手改。
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
---   2. 43 处 DEFAULT now() → DEFAULT (datetime('now'))（表达式默认值需括号）
---   3. 方言专属行：删除 133 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 53 行 @sqlite-only（等价触发器）
+--   2. 40 处 DEFAULT now()、3 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
+--   3. 方言专属行：删除 152 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 57 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -958,8 +958,8 @@ CREATE TABLE idempotency_record (
     req_hash     VARCHAR(64)  NOT NULL,
     response     TEXT         NOT NULL,
     status_code  INT          NOT NULL,
-    created_at   TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
-    expires_at   TIMESTAMP    NOT NULL
+    created_at   TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- 一律存 UTC（P1）
+    expires_at   TIMESTAMP    NOT NULL                -- UTC；写入后只许往后改（trg_idem_expiry_fwd，P2）
 );
 CREATE INDEX ix_idem_exp ON idempotency_record(expires_at);
 
@@ -988,19 +988,25 @@ CREATE TABLE outbox_event (
     headers         TEXT,
     status          VARCHAR(16)  NOT NULL DEFAULT 'PENDING',
     retry_count     SMALLINT     NOT NULL DEFAULT 0,
-    next_retry_at   TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    next_retry_at   TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- UTC
     last_error      VARCHAR(512),
-    created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
-    sent_at         TIMESTAMP
+    created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- UTC
+    sent_at         TIMESTAMP,                          -- UTC；写入后只许往后改（P2）
+    CONSTRAINT ck_outbox_sent CHECK (status <> 'SENT' OR sent_at IS NOT NULL)   -- P3
 );
 CREATE INDEX ix_outbox_pending ON outbox_event(status, next_retry_at);
 CREATE INDEX ix_outbox_bizkey  ON outbox_event(biz_key, id);   -- 同键串行发送
 
 -- 小赵 Q2：去重记录与 outbox 只能清理"已过期 / 已投递且过保留期"的行（两库触发器，条件与 purge_expired() 一致）
-CREATE TRIGGER trg_idem_purge_guard BEFORE DELETE ON idempotency_record WHEN NOT (OLD.expires_at < datetime('now'))
+CREATE TRIGGER trg_idem_purge_guard BEFORE DELETE ON idempotency_record WHEN NOT COALESCE(OLD.expires_at < datetime('now'), 0)
 BEGIN SELECT RAISE(ABORT, 'purge_not_allowed: idempotency_record'); END;
-CREATE TRIGGER trg_outbox_purge_guard BEFORE DELETE ON outbox_event WHEN NOT (OLD.status = 'SENT' AND OLD.sent_at < datetime('now', '-7 days'))
+CREATE TRIGGER trg_outbox_purge_guard BEFORE DELETE ON outbox_event WHEN NOT COALESCE(OLD.status = 'SENT' AND OLD.sent_at < datetime('now', '-7 days'), 0)
 BEGIN SELECT RAISE(ABORT, 'purge_not_allowed: outbox_event'); END;
+-- 九轮 P2：过期/投递时间写入后只许往后改，不许改早；created_at 不可改；SENT 是终态；sent_at 首次写入不得早于 created_at
+CREATE TRIGGER trg_idem_expiry_fwd BEFORE UPDATE ON idempotency_record WHEN NEW.created_at IS NOT OLD.created_at OR NEW.expires_at < OLD.expires_at
+BEGIN SELECT RAISE(ABORT, 'expiry_backdate: idempotency_record'); END;
+CREATE TRIGGER trg_outbox_expiry_fwd BEFORE UPDATE ON outbox_event WHEN NEW.created_at IS NOT OLD.created_at OR (OLD.sent_at IS NOT NULL AND (NEW.sent_at IS NULL OR NEW.sent_at < OLD.sent_at)) OR (OLD.sent_at IS NULL AND NEW.sent_at < OLD.created_at) OR (OLD.status = 'SENT' AND NEW.status <> 'SENT')
+BEGIN SELECT RAISE(ABORT, 'expiry_backdate: outbox_event'); END;
 -- SQLite REPLACE 冲突删旧行不触发 DELETE 触发器 → BEFORE INSERT 主键已存在就中止（应用把 idem_duplicate 当作"键已存在"处理，与 PG 23505 同分支）
 CREATE TRIGGER trg_idem_no_replace BEFORE INSERT ON idempotency_record WHEN EXISTS (SELECT 1 FROM idempotency_record r WHERE r.idem_key = NEW.idem_key)
 BEGIN SELECT RAISE(ABORT, 'idem_duplicate'); END;

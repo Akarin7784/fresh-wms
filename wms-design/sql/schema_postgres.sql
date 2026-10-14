@@ -1046,8 +1046,8 @@ CREATE TABLE idempotency_record (
     req_hash     VARCHAR(64)  NOT NULL,
     response     TEXT         NOT NULL,
     status_code  INT          NOT NULL,
-    created_at   TIMESTAMP    NOT NULL DEFAULT now(),
-    expires_at   TIMESTAMP    NOT NULL
+    created_at   TIMESTAMP    NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),   -- 一律存 UTC（P1）
+    expires_at   TIMESTAMP    NOT NULL                -- UTC；写入后只许往后改（trg_idem_expiry_fwd，P2）
 );
 CREATE INDEX ix_idem_exp ON idempotency_record(expires_at);
 
@@ -1076,10 +1076,11 @@ CREATE TABLE outbox_event (
     headers         TEXT,
     status          VARCHAR(16)  NOT NULL DEFAULT 'PENDING',
     retry_count     SMALLINT     NOT NULL DEFAULT 0,
-    next_retry_at   TIMESTAMP    NOT NULL DEFAULT now(),
+    next_retry_at   TIMESTAMP    NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),   -- UTC
     last_error      VARCHAR(512),
-    created_at      TIMESTAMP    NOT NULL DEFAULT now(),
-    sent_at         TIMESTAMP
+    created_at      TIMESTAMP    NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),   -- UTC
+    sent_at         TIMESTAMP,                          -- UTC；写入后只许往后改（P2）
+    CONSTRAINT ck_outbox_sent CHECK (status <> 'SENT' OR sent_at IS NOT NULL)   -- P3
 );
 CREATE INDEX ix_outbox_pending ON outbox_event(status, next_retry_at);
 CREATE INDEX ix_outbox_bizkey  ON outbox_event(biz_key, id);   -- 同键串行发送
@@ -1089,10 +1090,10 @@ CREATE FUNCTION trg_purge_guard() RETURNS trigger LANGUAGE plpgsql AS $$        
 BEGIN                                                                                                         -- @pg-only
     IF TG_OP = 'TRUNCATE' THEN RAISE EXCEPTION 'purge_not_allowed: %', TG_TABLE_NAME USING ERRCODE = '42501'; END IF;  -- @pg-only
     IF TG_TABLE_NAME = 'idempotency_record' THEN                                                              -- @pg-only
-        IF NOT (OLD.expires_at < now()) THEN                                                                  -- @pg-only
+        IF NOT COALESCE(OLD.expires_at < (now() AT TIME ZONE 'UTC'), false) THEN                                                            -- @pg-only
             RAISE EXCEPTION 'purge_not_allowed: idempotency_record' USING ERRCODE = '42501';                 -- @pg-only
         END IF;                                                                                               -- @pg-only
-    ELSIF NOT (OLD.status = 'SENT' AND OLD.sent_at < now() - interval '7 days') THEN   -- outbox_event      -- @pg-only
+    ELSIF NOT COALESCE(OLD.status = 'SENT' AND OLD.sent_at < (now() AT TIME ZONE 'UTC') - interval '7 days', false) THEN   -- outbox_event  -- @pg-only
         RAISE EXCEPTION 'purge_not_allowed: outbox_event' USING ERRCODE = '42501';                           -- @pg-only
     END IF;                                                                                                   -- @pg-only
     RETURN OLD;                                                                                               -- @pg-only
@@ -1101,10 +1102,34 @@ CREATE TRIGGER trg_idem_purge_guard    BEFORE DELETE   ON idempotency_record FOR
 CREATE TRIGGER trg_idem_no_truncate    BEFORE TRUNCATE ON idempotency_record FOR EACH STATEMENT EXECUTE FUNCTION trg_purge_guard();  -- @pg-only
 CREATE TRIGGER trg_outbox_purge_guard  BEFORE DELETE   ON outbox_event       FOR EACH ROW       EXECUTE FUNCTION trg_purge_guard();  -- @pg-only
 CREATE TRIGGER trg_outbox_no_truncate  BEFORE TRUNCATE ON outbox_event       FOR EACH STATEMENT EXECUTE FUNCTION trg_purge_guard();  -- @pg-only
--- @sqlite-only CREATE TRIGGER trg_idem_purge_guard BEFORE DELETE ON idempotency_record WHEN NOT (OLD.expires_at < datetime('now'))
+-- @sqlite-only CREATE TRIGGER trg_idem_purge_guard BEFORE DELETE ON idempotency_record WHEN NOT COALESCE(OLD.expires_at < datetime('now'), 0)
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'purge_not_allowed: idempotency_record'); END;
--- @sqlite-only CREATE TRIGGER trg_outbox_purge_guard BEFORE DELETE ON outbox_event WHEN NOT (OLD.status = 'SENT' AND OLD.sent_at < datetime('now', '-7 days'))
+-- @sqlite-only CREATE TRIGGER trg_outbox_purge_guard BEFORE DELETE ON outbox_event WHEN NOT COALESCE(OLD.status = 'SENT' AND OLD.sent_at < datetime('now', '-7 days'), 0)
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'purge_not_allowed: outbox_event'); END;
+-- 九轮 P2：过期/投递时间写入后只许往后改，不许改早；created_at 不可改；SENT 是终态；sent_at 首次写入不得早于 created_at
+CREATE FUNCTION trg_expiry_forward() RETURNS trigger LANGUAGE plpgsql AS $$                                -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    IF NEW.created_at IS DISTINCT FROM OLD.created_at THEN                                                    -- @pg-only
+        RAISE EXCEPTION 'expiry_backdate: created_at' USING ERRCODE = '42501'; END IF;                        -- @pg-only
+    IF TG_TABLE_NAME = 'idempotency_record' THEN                                                              -- @pg-only
+        IF NEW.expires_at < OLD.expires_at THEN                                                               -- @pg-only
+            RAISE EXCEPTION 'expiry_backdate: expires_at' USING ERRCODE = '42501'; END IF;                    -- @pg-only
+    ELSE                                                                                                      -- @pg-only
+        IF OLD.sent_at IS NOT NULL AND (NEW.sent_at IS NULL OR NEW.sent_at < OLD.sent_at) THEN                -- @pg-only
+            RAISE EXCEPTION 'expiry_backdate: sent_at' USING ERRCODE = '42501'; END IF;                       -- @pg-only
+        IF OLD.sent_at IS NULL AND NEW.sent_at < OLD.created_at THEN                                          -- @pg-only
+            RAISE EXCEPTION 'expiry_backdate: sent_at' USING ERRCODE = '42501'; END IF;                       -- @pg-only
+        IF OLD.status = 'SENT' AND NEW.status <> 'SENT' THEN                                                  -- @pg-only
+            RAISE EXCEPTION 'expiry_backdate: status' USING ERRCODE = '42501'; END IF;                        -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    RETURN NEW;                                                                                               -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_idem_expiry_fwd   BEFORE UPDATE ON idempotency_record FOR EACH ROW EXECUTE FUNCTION trg_expiry_forward();  -- @pg-only
+CREATE TRIGGER trg_outbox_expiry_fwd BEFORE UPDATE ON outbox_event       FOR EACH ROW EXECUTE FUNCTION trg_expiry_forward();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_idem_expiry_fwd BEFORE UPDATE ON idempotency_record WHEN NEW.created_at IS NOT OLD.created_at OR NEW.expires_at < OLD.expires_at
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'expiry_backdate: idempotency_record'); END;
+-- @sqlite-only CREATE TRIGGER trg_outbox_expiry_fwd BEFORE UPDATE ON outbox_event WHEN NEW.created_at IS NOT OLD.created_at OR (OLD.sent_at IS NOT NULL AND (NEW.sent_at IS NULL OR NEW.sent_at < OLD.sent_at)) OR (OLD.sent_at IS NULL AND NEW.sent_at < OLD.created_at) OR (OLD.status = 'SENT' AND NEW.status <> 'SENT')
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'expiry_backdate: outbox_event'); END;
 -- SQLite REPLACE 冲突删旧行不触发 DELETE 触发器 → BEFORE INSERT 主键已存在就中止（应用把 idem_duplicate 当作"键已存在"处理，与 PG 23505 同分支）
 -- @sqlite-only CREATE TRIGGER trg_idem_no_replace BEFORE INSERT ON idempotency_record WHEN EXISTS (SELECT 1 FROM idempotency_record r WHERE r.idem_key = NEW.idem_key)
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'idem_duplicate'); END;
@@ -1251,9 +1276,9 @@ GRANT SELECT, DELETE ON idempotency_record, outbox_event TO wms_purge_owner;    
 CREATE FUNCTION public.purge_expired(OUT idem_deleted BIGINT, OUT outbox_deleted BIGINT)  -- @pg-only
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$          -- @pg-only
 BEGIN                                                                                  -- @pg-only
-    DELETE FROM public.idempotency_record WHERE expires_at < now();                    -- @pg-only
+    DELETE FROM public.idempotency_record WHERE expires_at < (now() AT TIME ZONE 'UTC');  -- @pg-only
     GET DIAGNOSTICS idem_deleted = ROW_COUNT;                                          -- @pg-only
-    DELETE FROM public.outbox_event WHERE status = 'SENT' AND sent_at < now() - interval '7 days';  -- @pg-only
+    DELETE FROM public.outbox_event WHERE status = 'SENT' AND sent_at < (now() AT TIME ZONE 'UTC') - interval '7 days';  -- @pg-only
     GET DIAGNOSTICS outbox_deleted = ROW_COUNT;                                        -- @pg-only
 END $$;                                                                                -- @pg-only
 ALTER FUNCTION public.purge_expired() OWNER TO wms_purge_owner;                        -- @pg-only
