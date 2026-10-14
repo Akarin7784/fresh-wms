@@ -33,3 +33,4 @@
 | `ck_inbl_int`、`ck_inbl_qc` | `inbound_line` | 第 10 篇 `10_returns.sql` | `ck_inbl_int`：上述 milli 列为整数。`ck_inbl_qc`：非负，且 `qc_passed_qty_milli + qc_failed_qty_milli ≤ received_qty_milli` | 待 #5 落库 |
 | `ck_inb_rtn_src` | `inbound_order` | 第 10 篇 `10_returns.sql`（对 03 入库单 ALTER） | 限制退货入库来源。PostgreSQL 用 CHECK；SQLite 用触发器 | 待 #5 落库 |
 | `upstream_push_log` 的 SELECT、DELETE 给 `wms_purge_owner`；`purge_push_log()` 的 EXECUTE 给 `wms_cleaner` | `upstream_push_log` | `99_grants.sql`（目录检查，表或函数不存在则跳过） | 第 11 篇清理角色。本分支还没有这张表和这个函数，两笔 GRANT 当前都跳过 | 待 #11 落库（当前跳过） |
+| `ALTER FUNCTION purge_push_log() OWNER TO wms_purge_owner` | `purge_push_log()` | `99_grants.sql`（`to_regprocedure` 查目录，函数不存在则跳过） | 第 11 篇 `trg_upl_append_only` 只放行 `current_user = wms_purge_owner` 删除已过 `retain_until` 的行。函数是 SECURITY DEFINER，属主才是触发器看到的当前用户。角色在本文件开头创建，表上的 SELECT、DELETE 已按目录检查授予。函数体和触发器归第 11 篇，本文件不建 | 待 #11 落库（当前跳过） |
