@@ -203,8 +203,13 @@ seed = [
     "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000)",
     "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (1,'OBT1',1,'SALE','MALL','M-2026-001','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'CREATED','2026-10-16')",
 ]
+# 大肥鱼：seed 任一步失败立即非零退出
 for s in seed:
-    conn.execute(s)
+    try:
+        conn.execute(s)
+    except sqlite3.Error as e:
+        print(f"  ✗ seed 失败，立即退出：{e}：{s}")
+        sys.exit(2)
 conn.commit()
 ok("种子数据写入（含 TIME/DATE/TIMESTAMP/BOOLEAN/NUMERIC 列，未做任何列型改写）")
 
@@ -592,15 +597,15 @@ ok('09 人工解冻路径对 SCRAP_PENDING（→ 40933）' + ' rowcount=' + str(
 expect_allow('09 A1 质检不合格报损单 DRAFT（RETURN_QC，source_id=退货行 8101）', "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (105,'SCR-6',1,'RETURN_QC',8101,'QC_REJECT','2026-10-15',9)")
 
 expect_block('09 Q8 交接单作废必须带 SCRAP_MISREPORT 审批单号', "UPDATE scrap_order SET status='VOIDED' WHERE id=102", 'ck_scr_void')
-expect_block('09 Q8 非交接单不能作废（手工单 104）', "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-SH01-20261015-000009' WHERE id=104", 'scrap_state_forward_only')
-expect_block_tx('09 Q8 误报回转缺审批（ck_hold_approval）', ["UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 80 AND status = 'HELD' AND released_qty_milli = 0", "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (82,80,'RETURN_QC','RETURN_QC','QC',8301,'CVT:80',2000,0,'HELD',0)", 'UPDATE stock SET hold_qty_milli = hold_qty_milli - 2000, quality_hold_qty_milli = quality_hold_qty_milli + 2000, version = version + 1 WHERE id = 80 AND hold_qty_milli >= 2000', "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-SH01-20261015-000001', version=version+1 WHERE id=102 AND status='PENDING_APPROVAL'"], 'ck_hold_approval')
+expect_block('09 Q8 非交接单不能作废（手工单 104）', "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-WHSH01-20261015-000009' WHERE id=104", 'scrap_state_forward_only')
+expect_block_tx('09 Q8 误报回转缺审批（ck_hold_approval）', ["UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 80 AND status = 'HELD' AND released_qty_milli = 0", "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (82,80,'RETURN_QC','RETURN_QC','QC',8301,'CVT:80',2000,0,'HELD',0)", 'UPDATE stock SET hold_qty_milli = hold_qty_milli - 2000, quality_hold_qty_milli = quality_hold_qty_milli + 2000, version = version + 1 WHERE id = 80 AND hold_qty_milli >= 2000', "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-WHSH01-20261015-000001', version=version+1 WHERE id=102 AND status='PENDING_APPROVAL'"], 'ck_hold_approval')
 expect_block('09 Q17 审批单号格式不对（APR-1）', "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-1' WHERE id=102", 'ck_scr_apr_fmt')
-expect_block('09 Q17 审批单号序号不足 6 位', "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-SH01-20261015-12345' WHERE id=102", 'ck_scr_apr_fmt')
-expect_block('09 Q17 审批单号仓库编码含小写', "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-sh01-20261015-000001' WHERE id=102", 'ck_scr_apr_fmt')
-expect_block('09 Q17 审批单号日期不足 8 位', "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-SH01-2026101-000001' WHERE id=102", 'ck_scr_apr_fmt')
+expect_block('09 Q17 审批单号序号不足 6 位', "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-WHSH01-20261015-12345' WHERE id=102", 'ck_scr_apr_fmt')
+expect_block('09 Q17 审批单号仓库编码含小写', "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-whsh01-20261015-000001' WHERE id=102", 'ck_scr_apr_fmt')
+expect_block('09 Q17 审批单号日期不足 8 位', "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-WHSH01-2026101-000001' WHERE id=102", 'ck_scr_apr_fmt')
 expect_block('09 Q17 审批单号仓库编码只有 1 位', "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-S-20261015-000001' WHERE id=102", 'ck_scr_apr_fmt')
 expect_block('09 Q17 审批单号仓库编码超过 16 位', "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-ABCDEFGHIJKLMNOPQ-20261015-000001' WHERE id=102", 'ck_scr_apr_fmt')
-expect_allow_tx('09 Q8 误报同一事务：convert_hold SCRAP_PENDING→RETURN_QC（CVT:80，审批 APR-1，新质检单 8301）+ 报损单 VOIDED', ["UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 80 AND status = 'HELD' AND released_qty_milli = 0", "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (82,80,'RETURN_QC','RETURN_QC','QC',8301,'CVT:80',2000,0,'HELD',0,'SCRAP_MISREPORT','APR-SH01-20261015-000001')", 'UPDATE stock SET hold_qty_milli = hold_qty_milli - 2000, quality_hold_qty_milli = quality_hold_qty_milli + 2000, version = version + 1 WHERE id = 80 AND hold_qty_milli >= 2000', "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-SH01-20261015-000001', version=version+1 WHERE id=102 AND status='PENDING_APPROVAL'"])
+expect_allow_tx('09 Q8 误报同一事务：convert_hold SCRAP_PENDING→RETURN_QC（CVT:80，审批 APR-1，新质检单 8301）+ 报损单 VOIDED', ["UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 80 AND status = 'HELD' AND released_qty_milli = 0", "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (82,80,'RETURN_QC','RETURN_QC','QC',8301,'CVT:80',2000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH01-20261015-000001')", 'UPDATE stock SET hold_qty_milli = hold_qty_milli - 2000, quality_hold_qty_milli = quality_hold_qty_milli + 2000, version = version + 1 WHERE id = 80 AND hold_qty_milli >= 2000', "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-WHSH01-20261015-000001', version=version+1 WHERE id=102 AND status='PENDING_APPROVAL'"])
 _v = str(one("SELECT hold_qty_milli||'/'||quality_hold_qty_milli FROM stock WHERE id=80")[0])
 ok('09 Q8 回转后 stock 80 hold/quality（跨列挪量，可用量不变）' + ' = ' + _v) if _v == '2000/2000' else bad('09 Q8 回转后 stock 80 hold/quality（跨列挪量，可用量不变）' + ' = ' + _v)
 expect_block('09 K1 质检不合格单不许取消（DRAFT → CANCELLED，→ 40930）', "UPDATE scrap_order SET status='CANCELLED' WHERE id=105", 'scrap_handover_no_revoke')
@@ -613,7 +618,7 @@ ok('09 K1 release_scrap_hold(REVOKED) 对质检单拒绝（→ 40930）' + ' row
 expect_allow('09 K1 质检单提交', "UPDATE scrap_order SET status='PENDING_APPROVAL' WHERE id=105 AND status='DRAFT'")
 expect_block('09 K1 质检单不许撤回（→ DRAFT）', "UPDATE scrap_order SET status='DRAFT' WHERE id=105", 'scrap_handover_no_revoke')
 expect_block('09 K1 质检单不许驳回（→ REJECTED）', "UPDATE scrap_order SET status='REJECTED' WHERE id=105", 'scrap_handover_no_revoke')
-expect_allow('09 K1 质检判错只走 SCRAP_MISREPORT 作废（VOIDED，合法审批号）', "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-SH01-20261015-000002' WHERE id=105 AND status='PENDING_APPROVAL'")
+expect_allow('09 K1 质检判错只走 SCRAP_MISREPORT 作废（VOIDED，合法审批号）', "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-WHSH01-20261015-000002' WHERE id=105 AND status='PENDING_APPROVAL'")
 expect_block('09 K3 POSTED 单的行改 hold_id / ledger_mode', "UPDATE scrap_line SET hold_id=0, ledger_mode='NONE' WHERE id=100", 'scrap_line_locked')
 expect_block('09 K3 POSTED 单的行改成本', 'UPDATE scrap_line SET cost_amount=1 WHERE id=100', 'scrap_line_locked')
 expect_block('09 K3 事后换申请人', 'UPDATE scrap_order SET applicant_id=12 WHERE id=100', 'scrap_immutable')
