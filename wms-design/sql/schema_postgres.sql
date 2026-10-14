@@ -783,6 +783,51 @@ CREATE TABLE adjust_line (
     CONSTRAINT ck_adj_delta CHECK (delta_qty <> 0)
 );
 
+-- 第 10 篇 退货与异常：异常码字典 + 异常单（EXC）。退货入库单复用 inbound_order(order_type='RETURN')。
+CREATE TABLE exception_code (
+    code            VARCHAR(32)     PRIMARY KEY,   -- SHORT_STOCK/DAMAGED/EXPIRED/WRONG_LOC/WRONG_SKU/CUSTOMER_REJECT/RETURN_COUNT_DIFF/TEMP_BREACH ...
+    name            VARCHAR(64)     NOT NULL,
+    action          VARCHAR(32)     NOT NULL,      -- NONE/ADJUST/SCRAP/REPLENISH/NOTIFY_PURCHASE
+    liability       VARCHAR(16)     NOT NULL,      -- WAREHOUSE/SUPPLIER/CARRIER/CUSTOMER/UNKNOWN
+    escalate_minutes INT            NOT NULL DEFAULT 240,
+    is_active       SMALLINT        NOT NULL DEFAULT 1,
+    CONSTRAINT ck_exc_liab CHECK (liability IN ('WAREHOUSE','SUPPLIER','CARRIER','CUSTOMER','UNKNOWN'))
+);
+
+CREATE TABLE exception_case (
+    id              BIGINT          PRIMARY KEY,
+    code            VARCHAR(64)     NOT NULL,      -- EXC-{仓}-{节点}-{作业日}-{序号}
+    warehouse_id    BIGINT          NOT NULL,
+    exception_code  VARCHAR(32)     NOT NULL,
+    source_type     VARCHAR(24)     NOT NULL,      -- DELIVERY_RETURN(16)/RETURN_INBOUND/RR_HOLD_FAILED/PICK/COUNT/MANUAL
+    source_key      VARCHAR(96)     NOT NULL,      -- 来源业务键，如 {waybill_no}:{stop_no}:{line_no}
+    source_hash     VARCHAR(64)     NOT NULL,      -- 规范化内容 SHA-256：同键不同内容 → 40910 SOURCE_ORDER
+    sku_id          BIGINT          NOT NULL DEFAULT 0,
+    lot_id          BIGINT          NOT NULL DEFAULT 0,
+    claimed_qty_milli  BIGINT       NOT NULL DEFAULT 0,   -- 对方声称（如司机拒收登记数）
+    counted_qty_milli  BIGINT       NOT NULL DEFAULT 0,   -- 仓库实点数（以此为准）
+    diff_qty_milli  BIGINT          NOT NULL DEFAULT 0,   -- counted − claimed，应用层写入
+    liability       VARCHAR(16)     NOT NULL DEFAULT 'UNKNOWN',
+    status          VARCHAR(16)     NOT NULL DEFAULT 'OPEN',
+    escalated       SMALLINT        NOT NULL DEFAULT 0,
+    due_at          TIMESTAMP       NOT NULL,
+    assignee_id     BIGINT,
+    resolution      VARCHAR(32),                   -- ACCEPT_COUNT/ADJUST/SCRAP/CLAIM_CARRIER/CLAIM_CUSTOMER/NO_ACTION
+    resolution_doc  VARCHAR(64),                   -- 生成的调整单/报损单号
+    reporter_id     BIGINT          NOT NULL,
+    closed_by       BIGINT,
+    closed_at       TIMESTAMP,
+    version         BIGINT          NOT NULL DEFAULT 0,
+    created_at      TIMESTAMP       NOT NULL DEFAULT now(),
+    CONSTRAINT uq_exc_code   UNIQUE (code),
+    CONSTRAINT uq_exc_src    UNIQUE (source_type, source_key),
+    CONSTRAINT ck_exc_status CHECK (status IN ('OPEN','PROCESSING','RESOLVED','CLOSED','CANCELLED')),
+    CONSTRAINT ck_exc_int    CHECK (claimed_qty_milli = CAST(claimed_qty_milli AS BIGINT) AND counted_qty_milli = CAST(counted_qty_milli AS BIGINT) AND diff_qty_milli = CAST(diff_qty_milli AS BIGINT)),
+    CONSTRAINT ck_exc_diff   CHECK (diff_qty_milli = counted_qty_milli - claimed_qty_milli),
+    CONSTRAINT ck_exc_close  CHECK (status NOT IN ('RESOLVED','CLOSED') OR (resolution IS NOT NULL AND closed_by IS NOT NULL))
+);
+CREATE INDEX ix_exc_wh_status ON exception_case(warehouse_id, status, due_at);
+
 -- -----------------------------------------------------------------------------
 -- 幂等 / 集成 / 审计
 -- -----------------------------------------------------------------------------

@@ -119,7 +119,7 @@ NI = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='index' AND sql
 NV = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='view'").fetchone()[0]
 print(f"  → 表 {NT} 张 / 手工建索引 {NI} 个 / 视图 {NV} 个")
 # 期望值：main 8ed5f0c 为 38 表；docs/02 新增 stock_hold、stock_recon_alert、stock_movement_key、stock_ledger_line → 42 表（PG 分区子表不计）。改表数必须同步改这里和 verify.sh
-EXPECT_TABLES, EXPECT_VIEWS = 42, 1
+EXPECT_TABLES, EXPECT_VIEWS = 44, 1
 ok(f"表数 = {NT}（期望 {EXPECT_TABLES}）") if NT == EXPECT_TABLES else bad(f"表数 = {NT}，期望 {EXPECT_TABLES}")
 ok(f"视图数 = {NV}") if NV == EXPECT_VIEWS else bad(f"视图数 = {NV}，期望 {EXPECT_VIEWS}")
 
@@ -333,6 +333,15 @@ expect_block(
 
 D = one("SELECT diff_qty_milli FROM count_line WHERE id=1")[0]
 ok(f"§5.6 差异生成列 diff_qty_milli = {D}（预期 -2000）") if D == -2000 else bad(f"差异列 = {D}")
+
+print("=== 2g. docs/10 退货与异常：异常单（拒收回仓清点差异） ===")
+expect_allow('10 拒收回仓清点差异异常单（司机报 5000，仓点 4000）', "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (100,'EXC-1',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','WB1:2:1','h1',1,1,5000,4000,-1000,'2026-10-15 12:00:00',7)")
+expect_block('10 同一来源业务键重复建异常单', "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (101,'EXC-2',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','WB1:2:1','h2',5000,3000,-2000,'2026-10-15 12:00:00',7)", 'exception_case.source_type, exception_case.source_key')
+expect_block('10 差异列必须 = 实点 − 声称', "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (102,'EXC-3',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','WB1:2:2','h3',5000,4000,1000,'2026-10-15 12:00:00',7)", 'ck_exc_diff')
+expect_block('10 关闭异常必须有处置结论和处理人', "UPDATE exception_case SET status='CLOSED' WHERE id=100", 'ck_exc_close')
+expect_block('10 异常单非法状态', "UPDATE exception_case SET status='DONE' WHERE id=100", 'ck_exc_status')
+expect_allow('10 按结论关闭（ACCEPT_COUNT，以仓库实点为准）', "UPDATE exception_case SET status='CLOSED', resolution='ACCEPT_COUNT', closed_by=8 WHERE id=100")
+expect_block('10 异常码字典责任方取值', "INSERT INTO exception_code (code,name,action,liability) VALUES ('X','x','NONE','NOBODY')", 'ck_exc_liab')
 
 print("=== 3. §4.4 FEFO 候选池排序（视图 + 排序键）===")
 rows = conn.execute(

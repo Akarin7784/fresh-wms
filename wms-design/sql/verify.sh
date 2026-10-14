@@ -16,8 +16,8 @@ SCHEMA=sql/schema_postgres.sql
 # 期望值：main 8ed5f0c 为 38 表 / 99 索引 / 1 视图。docs/02 新增 stock_hold、stock_recon_alert、
 # stock_movement_key、stock_ledger_line → 42 表 / 114 索引（含 PK、UNIQUE 自动索引和分区父表上的分区索引；
 # 分区子表及其继承来的索引不计）/ 1 视图。改 DDL 必须同步改这里。
-EXPECT_TABLES=42
-EXPECT_INDEXES=114
+EXPECT_TABLES=44
+EXPECT_INDEXES=119
 EXPECT_VIEWS=1
 
 CTR=wms-pg-verify
@@ -232,6 +232,27 @@ psql -q -c "CREATE TEMP TABLE q7 (v BIGINT); INSERT INTO q7 VALUES (3.5), (2.5),
 Q7=$(psql -t -A -c "SELECT string_agg(v::text, ',' ORDER BY ctid) FROM q7")
 [ "$Q7" = "4,3,2" ] && ok "numeric 3.5→4、2.5→3（四舍五入），float8 2.5→2（银行家舍入）→ 应用层只绑定整数" \
                   || bad "Q7 取整结果 = $Q7（期望 4,3,2）"
+
+echo "=== 2g. docs/10 退货与异常：异常单（拒收回仓清点差异） ==="
+expect_allow "10 拒收回仓清点差异异常单（司机报 5000，仓点 4000）" \
+  "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (100,'EXC-1',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','WB1:2:1','h1',1,1,5000,4000,-1000,'2026-10-15 12:00:00',7);"
+expect_block "10 同一来源业务键重复建异常单" \
+  "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (101,'EXC-2',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','WB1:2:1','h2',5000,3000,-2000,'2026-10-15 12:00:00',7);" \
+  "uq_exc_src"
+expect_block "10 差异列必须 = 实点 − 声称" \
+  "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (102,'EXC-3',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','WB1:2:2','h3',5000,4000,1000,'2026-10-15 12:00:00',7);" \
+  "ck_exc_diff"
+expect_block "10 关闭异常必须有处置结论和处理人" \
+  "UPDATE exception_case SET status='CLOSED' WHERE id=100;" \
+  "ck_exc_close"
+expect_block "10 异常单非法状态" \
+  "UPDATE exception_case SET status='DONE' WHERE id=100;" \
+  "ck_exc_status"
+expect_allow "10 按结论关闭（ACCEPT_COUNT，以仓库实点为准）" \
+  "UPDATE exception_case SET status='CLOSED', resolution='ACCEPT_COUNT', closed_by=8 WHERE id=100;"
+expect_block "10 异常码字典责任方取值" \
+  "INSERT INTO exception_code (code,name,action,liability) VALUES ('X','x','NONE','NOBODY');" \
+  "ck_exc_liab"
 
 echo "=== 3. §5.6 盘点差异生成列（实盘 − 基准账面 − 期间流水）==="
 seed "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000);"
