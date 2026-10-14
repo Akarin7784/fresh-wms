@@ -1,8 +1,8 @@
 -- 本文件由 sql/verify_sqlite.py 从 schema_postgres.sql 机械生成，请勿手改。
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
---   2. 41 处 DEFAULT now() → DEFAULT (datetime('now'))（表达式默认值需括号）
---   3. 方言专属行：删除 53 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 17 行 @sqlite-only（等价触发器）
+--   2. 56 处 DEFAULT now() → DEFAULT (datetime('now'))（表达式默认值需括号）
+--   3. 方言专属行：删除 66 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 23 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -76,15 +76,18 @@ CREATE TABLE location (
     abc_class           VARCHAR(2),
     status              VARCHAR(16)   NOT NULL DEFAULT 'AVAILABLE', -- AVAILABLE/LOCKED/DISABLED
     lock_reason         VARCHAR(64),
-    min_level           NUMERIC(14,3) NOT NULL DEFAULT 0,  -- 拣货位补货水位
-    max_level           NUMERIC(14,3) NOT NULL DEFAULT 0,
+    min_level_milli     BIGINT        NOT NULL DEFAULT 0,  -- 拣货位补货水位，milli（docs/01 §4.3，替代 NUMERIC min_level）
+    max_level_milli     BIGINT        NOT NULL DEFAULT 0,
     pick_sequence       VARCHAR(32),
     created_at          TIMESTAMP     NOT NULL DEFAULT (datetime('now')),
     updated_at          TIMESTAMP     NOT NULL DEFAULT (datetime('now')),
     deleted_at          TIMESTAMP,
-    CONSTRAINT uq_location_code UNIQUE (warehouse_id, code)
+    md_version          BIGINT        NOT NULL DEFAULT 1,  -- 主数据版本（docs/01 §6），中心每次修改 +1
+    CONSTRAINT uq_location_code UNIQUE (warehouse_id, code),
+    CONSTRAINT ck_loc_level CHECK (min_level_milli >= 0 AND max_level_milli >= min_level_milli),
+    CONSTRAINT ck_loc_status CHECK (status IN ('AVAILABLE','LOCKED','DISABLED'))
 );
--- 待补货扫描：available < min_level 且 pickable
+-- 待补货扫描：available < min_level_milli 且 pickable
 CREATE INDEX ix_loc_replen ON location(zone_id, pick_sequence) WHERE pickable = true AND status = 'AVAILABLE';
 -- [SQLite] 部分索引需 3.8+，语义一致；BOOLEAN 在 SQLite 存为 INTEGER 0/1
 
@@ -103,17 +106,22 @@ CREATE TABLE sku (
     is_weighing                 BOOLEAN      NOT NULL DEFAULT false,
     avg_weight_g                NUMERIC(10,2),
     weight_tolerance_pct        NUMERIC(5,2) NOT NULL DEFAULT 5,
-    natural_loss_pct            NUMERIC(5,2) NOT NULL DEFAULT 0, -- 自然损耗容差 RK7
+    natural_loss_tolerance_ppm  BIGINT       NOT NULL DEFAULT 0, -- 自然损耗容差，百万分比（docs/01 §4.4，第 9 篇引用）；替代 natural_loss_pct
     unit_gross_weight           NUMERIC(12,3) NOT NULL DEFAULT 0,
     unit_volume                 NUMERIC(14,6) NOT NULL DEFAULT 0,
     cross_dock                  BOOLEAN      NOT NULL DEFAULT false,
     need_quality_check          BOOLEAN      NOT NULL DEFAULT false,
     abc_class                   VARCHAR(2),
     status                      VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
+    md_version                  BIGINT       NOT NULL DEFAULT 1,
     created_at                  TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     updated_at                  TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     deleted_at                  TIMESTAMP,
-    CONSTRAINT uq_sku_code UNIQUE (code)
+    CONSTRAINT uq_sku_code UNIQUE (code),
+    CONSTRAINT ck_sku_loss_ppm CHECK (natural_loss_tolerance_ppm BETWEEN 0 AND 1000000),
+    CONSTRAINT ck_sku_shelf_life CHECK (shelf_life_days >= 0 AND receive_min_shelf_life >= 0 AND ship_min_shelf_life >= 0
+        AND (shelf_life_days = 0 OR (receive_min_shelf_life <= shelf_life_days AND ship_min_shelf_life <= shelf_life_days))),
+    CONSTRAINT ck_sku_status CHECK (status IN ('ACTIVE','PENDING_DISABLE','DISABLED'))
 );
 CREATE INDEX ix_sku_category ON sku(category_id, status);
 
@@ -131,11 +139,12 @@ CREATE TABLE sku_unit (
     id              BIGINT        PRIMARY KEY,
     sku_id          BIGINT        NOT NULL,
     uom             VARCHAR(16)   NOT NULL,
-    ratio_to_base   NUMERIC(14,6) NOT NULL,
+    base_qty_milli  BIGINT        NOT NULL,   -- 1 个该单位 = 多少 milli 基本单位（docs/01 §4.4，替代 NUMERIC ratio_to_base）
     is_pick_uom     BOOLEAN       NOT NULL DEFAULT false,
     is_receive_uom  BOOLEAN       NOT NULL DEFAULT false,
     barcode_level   SMALLINT      NOT NULL DEFAULT 1,
-    CONSTRAINT uq_sku_uom UNIQUE (sku_id, uom)
+    CONSTRAINT uq_sku_uom UNIQUE (sku_id, uom),
+    CONSTRAINT ck_unit_ratio CHECK (base_qty_milli > 0)
 );
 
 CREATE TABLE lot (
@@ -155,6 +164,160 @@ CREATE TABLE lot (
     CONSTRAINT uq_lot UNIQUE (sku_id, lot_code, expiry_date)
 );
 CREATE INDEX ix_lot_expiry ON lot(sku_id, expiry_date) WHERE quality_status = 'QUALIFIED';
+
+-- -----------------------------------------------------------------------------
+-- docs/01 主数据：往来方、车辆司机、设备、节点、下发日志
+-- -----------------------------------------------------------------------------
+
+CREATE TABLE supplier (
+    id              BIGINT       PRIMARY KEY,
+    code            VARCHAR(32)  NOT NULL,
+    name            VARCHAR(128) NOT NULL,
+    contact_name    VARCHAR(64),
+    contact_phone   VARCHAR(32),
+    status          VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
+    md_version      BIGINT       NOT NULL DEFAULT 1,
+    created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    updated_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT uq_supplier_code UNIQUE (code),
+    CONSTRAINT ck_supplier_status CHECK (status IN ('ACTIVE','PENDING_DISABLE','DISABLED'))
+);
+
+-- 客户与门店同表：STORE 必须挂在一个 CUSTOMER 下；签收、配送线路按门店
+CREATE TABLE customer (
+    id              BIGINT       PRIMARY KEY,
+    code            VARCHAR(32)  NOT NULL,
+    name            VARCHAR(128) NOT NULL,
+    customer_type   VARCHAR(16)  NOT NULL,              -- CUSTOMER / STORE
+    parent_id       BIGINT,                             -- STORE 所属客户
+    address         VARCHAR(256),
+    geohash         VARCHAR(12),
+    receive_window  VARCHAR(32),                        -- 收货时间窗，如 05:00-07:00
+    status          VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
+    md_version      BIGINT       NOT NULL DEFAULT 1,
+    created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    updated_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT uq_customer_code UNIQUE (code),
+    CONSTRAINT ck_customer_type CHECK ((customer_type = 'CUSTOMER' AND parent_id IS NULL) OR (customer_type = 'STORE' AND parent_id IS NOT NULL)),
+    CONSTRAINT ck_customer_status CHECK (status IN ('ACTIVE','PENDING_DISABLE','DISABLED'))
+);
+CREATE INDEX ix_customer_parent ON customer(parent_id) WHERE parent_id IS NOT NULL;
+
+CREATE TABLE vehicle (
+    id              BIGINT       PRIMARY KEY,
+    warehouse_id    BIGINT       NOT NULL,              -- 归属仓（发车仓）
+    plate_no        VARCHAR(16)  NOT NULL,
+    temp_zone       VARCHAR(16)  NOT NULL,              -- AMBIENT/CHILLED/FROZEN/MULTI
+    capacity_weight_milli BIGINT NOT NULL DEFAULT 0,    -- kg 的 milli
+    status          VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
+    md_version      BIGINT       NOT NULL DEFAULT 1,
+    created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    updated_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT uq_vehicle_plate UNIQUE (plate_no),
+    CONSTRAINT ck_vehicle_cap CHECK (capacity_weight_milli >= 0),
+    CONSTRAINT ck_vehicle_status CHECK (status IN ('ACTIVE','PENDING_DISABLE','DISABLED'))
+);
+CREATE INDEX ix_vehicle_wh ON vehicle(warehouse_id, status);
+
+-- 司机是业务主数据；登录账号在 sys_user（user_id），一人一条
+CREATE TABLE driver (
+    id              BIGINT       PRIMARY KEY,
+    warehouse_id    BIGINT       NOT NULL,
+    user_id         BIGINT       NOT NULL,
+    name            VARCHAR(64)  NOT NULL,
+    phone           VARCHAR(32)  NOT NULL,
+    license_no      VARCHAR(32),
+    health_cert_expiry DATE,                            -- 健康证到期（食品配送）
+    status          VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
+    md_version      BIGINT       NOT NULL DEFAULT 1,
+    created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    updated_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT uq_driver_user UNIQUE (user_id),
+    CONSTRAINT ck_driver_status CHECK (status IN ('ACTIVE','PENDING_DISABLE','DISABLED'))
+);
+CREATE INDEX ix_driver_wh ON driver(warehouse_id, status);
+
+-- 物理设备台账（PDA、司机手机、打印机、电子秤）。设备实例（device_instance_id）与账号绑定见第 12 篇
+CREATE TABLE device (
+    id              BIGINT       PRIMARY KEY,
+    warehouse_id    BIGINT       NOT NULL,
+    device_code     VARCHAR(32)  NOT NULL,              -- 资产编号，贴在机身
+    device_type     VARCHAR(16)  NOT NULL,              -- PDA/DRIVER_APP/PRINTER/SCALE
+    serial_no       VARCHAR(64),
+    status          VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
+    md_version      BIGINT       NOT NULL DEFAULT 1,
+    created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    updated_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT uq_device_code UNIQUE (device_code),
+    CONSTRAINT ck_device_type CHECK (device_type IN ('PDA','DRIVER_APP','PRINTER','SCALE')),
+    CONSTRAINT ck_device_status CHECK (status IN ('ACTIVE','LOST','RETIRED'))
+);
+
+-- 节点号登记（00 §9.1 ④）：node_id 即主键，全局唯一、永不复用；退役不删行
+CREATE TABLE node_registry (
+    node_id         INT          PRIMARY KEY,
+    warehouse_id    BIGINT,                             -- 中心节点为 NULL
+    form            VARCHAR(1)   NOT NULL,              -- A 中心 / B 边缘
+    role            VARCHAR(16)  NOT NULL,              -- API/WORKER/EDGE
+    host_label      VARCHAR(64)  NOT NULL,
+    status          VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
+    assigned_at     TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    retired_at      TIMESTAMP,
+    retire_reason   VARCHAR(64),
+    CONSTRAINT ck_node_id_range CHECK (node_id BETWEEN 0 AND 1023),
+    CONSTRAINT ck_node_form CHECK (form IN ('A','B') AND (form = 'A' OR warehouse_id IS NOT NULL)),
+    CONSTRAINT ck_node_status CHECK ((status = 'ACTIVE' AND retired_at IS NULL) OR (status = 'RETIRED' AND retired_at IS NOT NULL))
+);
+CREATE INDEX ix_node_wh ON node_registry(warehouse_id, status);
+
+-- 主数据变更日志（中心写，按 seq 顺序下发到边缘节点）。同一实体同一版本只能有一条
+CREATE TABLE md_change_log (
+    seq             BIGINT       PRIMARY KEY,           -- 中心单调递增（雪花 ID 即可，单写者）
+    entity_type     VARCHAR(24)  NOT NULL,              -- WAREHOUSE/ZONE/LOCATION/SKU/SKU_UNIT/SKU_BARCODE/SUPPLIER/CUSTOMER/VEHICLE/DRIVER/DEVICE/USER_PERM
+    entity_id       BIGINT       NOT NULL,
+    md_version      BIGINT       NOT NULL,
+    op              VARCHAR(16)  NOT NULL,              -- UPSERT / DISABLE
+    scope_warehouse_id BIGINT,                          -- NULL = 全部仓（SKU、供应商等全局主数据）
+    payload_json    TEXT         NOT NULL,              -- 全量快照，不发差量
+    operator_id     BIGINT       NOT NULL,
+    created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT uq_mdlog_ver UNIQUE (entity_type, entity_id, md_version),
+    CONSTRAINT ck_mdlog_op CHECK (op IN ('UPSERT','DISABLE')),
+    CONSTRAINT ck_mdlog_ver CHECK (md_version > 0)
+);
+CREATE INDEX ix_mdlog_scope ON md_change_log(scope_warehouse_id, seq);
+
+-- 边缘节点的应用水位：每个节点一行，只前进
+CREATE TABLE md_sync_state (
+    node_id         INT          PRIMARY KEY,
+    applied_seq     BIGINT       NOT NULL DEFAULT 0,
+    applied_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 延迟停用：被未完结单据/在库库存引用的停用命令先登记在这里，引用清零后由 worker 生效（00 §9.1 ③）
+CREATE TABLE md_pending_disable (
+    id              BIGINT       PRIMARY KEY,
+    entity_type     VARCHAR(24)  NOT NULL,
+    entity_id       BIGINT       NOT NULL,
+    warehouse_id    BIGINT       NOT NULL,              -- 在哪个仓的权威库里判定引用
+    requested_version BIGINT     NOT NULL,
+    status          VARCHAR(16)  NOT NULL DEFAULT 'WAITING',  -- WAITING/APPLIED/CANCELLED
+    blocker_json    TEXT,                               -- 最近一次检查到的引用摘要
+    requested_by    BIGINT       NOT NULL,
+    created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    updated_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT ck_mdpd_status CHECK (status IN ('WAITING','APPLIED','CANCELLED'))
+);
+CREATE UNIQUE INDEX uq_mdpd_waiting ON md_pending_disable(entity_type, entity_id, warehouse_id) WHERE status = 'WAITING';
+
+-- md_change_log 只追加
+CREATE TRIGGER trg_mdlog_no_update BEFORE UPDATE ON md_change_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: md_change_log'); END;
+CREATE TRIGGER trg_mdlog_no_delete BEFORE DELETE ON md_change_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: md_change_log'); END;
+-- 节点号永不复用：node_registry 禁止 DELETE，node_id 不可改
+CREATE TRIGGER trg_node_no_delete BEFORE DELETE ON node_registry BEGIN SELECT RAISE(ABORT, 'node_id_never_reused'); END;
+CREATE TRIGGER trg_node_no_revive BEFORE UPDATE ON node_registry
+WHEN NEW.node_id IS NOT OLD.node_id OR (OLD.status = 'RETIRED' AND NEW.status <> 'RETIRED')
+BEGIN SELECT RAISE(ABORT, 'node_id_never_reused'); END;
 CREATE INDEX ix_lot_aging  ON lot(remaining_life_days, sku_id);
 -- [SQLite] 两个部分索引均支持；ix_lot_aging 支撑效期预警列表
 

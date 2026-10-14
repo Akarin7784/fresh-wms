@@ -17,8 +17,8 @@ SCHEMA=sql/schema_postgres.sql
 # stock_movement_key、stock_ledger_line → 42 表 / 114 索引（含 PK、UNIQUE 自动索引和分区父表上的分区索引；
 # 分区子表及其继承来的索引不计）/ 1 视图。二轮 C2 加 uq_mvk_mv（外键被引用键）→ 115。改 DDL 必须同步改这里。
 # 必须用新建的空库跑（DROP SCHEMA public 重建会丢 wms_app 的 USAGE；schema 里已 GRANT USAGE 兜底，小赵 C6）。
-EXPECT_TABLES=42
-EXPECT_INDEXES=115
+EXPECT_TABLES=51
+EXPECT_INDEXES=136   # docs/01 +21：9 张表主键 + 6 个唯一约束 + 6 个显式索引
 EXPECT_VIEWS=1
 
 CTR=wms-pg-verify
@@ -328,6 +328,45 @@ R=$(psql -t -A -c "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli + 1000
 R=$(psql -t -A -c "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli + 1000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 13 AND ('MOVE' = 'REVERSE_PICK' OR EXISTS (SELECT 1 FROM location l WHERE l.id = stock.location_id AND l.status <> 'LOCKED'))")
 [ "$R" = "UPDATE 0" ] && ok "库位 LOCKED：MOVE 目标腿 rowcount=0" || bad "MOVE 未被锁拦：$R"
 psql -q -c "UPDATE location SET status='AVAILABLE' WHERE id=3; UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq - 1 WHERE id = 13;" >/dev/null
+
+echo "=== 2e. docs/01 主数据：milli 换算、损耗 ppm、往来方、节点号、下发日志 ==="
+expect_block "01 损耗容差超过 100%（ppm>1000000）" \
+  "UPDATE sku SET natural_loss_tolerance_ppm = 1000001 WHERE id = 1;" "ck_sku_loss_ppm"
+expect_block "01 出库禁发期大于保质期" \
+  "UPDATE sku SET ship_min_shelf_life = 31 WHERE id = 1;" "ck_sku_shelf_life"
+expect_block "01 单位换算为 0" \
+  "INSERT INTO sku_unit (id,sku_id,uom,base_qty_milli) VALUES (901,1,'BOX',0);" "ck_unit_ratio"
+expect_allow "01 单位换算 1 箱 = 12.5 KG（12500 milli）" \
+  "INSERT INTO sku_unit (id,sku_id,uom,base_qty_milli) VALUES (902,1,'BOX',12500);"
+expect_block "01 库位补货水位 max < min" \
+  "UPDATE location SET min_level_milli = 5000, max_level_milli = 1000 WHERE id = 1;" "ck_loc_level"
+expect_block "01 门店没挂客户" \
+  "INSERT INTO customer (id,code,name,customer_type) VALUES (901,'ST-001','静安店','STORE');" "ck_customer_type"
+seed "INSERT INTO customer (id,code,name,customer_type) VALUES (1,'C-001','华东连锁','CUSTOMER');"
+expect_allow "01 门店挂在客户下" \
+  "INSERT INTO customer (id,code,name,customer_type,parent_id) VALUES (2,'ST-002','徐汇店','STORE',1);"
+expect_block "01 客户编码重复" \
+  "INSERT INTO customer (id,code,name,customer_type) VALUES (903,'C-001','重复','CUSTOMER');" "uq_customer_code"
+expect_block "01 节点号超出 0–1023" \
+  "INSERT INTO node_registry (node_id,warehouse_id,form,role,host_label) VALUES (1024,1,'B','EDGE','edge-x');" "ck_node_id_range"
+expect_block "01 边缘节点不挂仓" \
+  "INSERT INTO node_registry (node_id,form,role,host_label) VALUES (5,'B','EDGE','edge-x');" "ck_node_form"
+seed "INSERT INTO node_registry (node_id,warehouse_id,form,role,host_label) VALUES (7,1,'B','EDGE','qp-edge-01');"
+seed "UPDATE node_registry SET status='RETIRED', retired_at=now(), retire_reason='HW_REPLACE' WHERE node_id = 7;"
+expect_block "01 退役节点号重新分配（同号 INSERT）" \
+  "INSERT INTO node_registry (node_id,warehouse_id,form,role,host_label) VALUES (7,1,'B','EDGE','qp-edge-02');" "node_registry_pkey"
+expect_block "01 退役节点号复活" \
+  "UPDATE node_registry SET status='ACTIVE', retired_at=NULL WHERE node_id = 7;" "node_id_never_reused"
+expect_block "01 删除节点登记" \
+  "DELETE FROM node_registry WHERE node_id = 7;" "node_id_never_reused"
+seed "INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,payload_json,operator_id) VALUES (1,'SKU',1,2,'UPSERT','{}',100);"
+expect_block "01 同一实体同一版本两条下发日志" \
+  "INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,payload_json,operator_id) VALUES (2,'SKU',1,2,'UPSERT','{\"x\":1}',100);" "uq_mdlog_ver"
+expect_block "01 下发日志只追加（UPDATE）" \
+  "UPDATE md_change_log SET payload_json='{}' WHERE seq = 1;" "append_only_violation: md_change_log"
+seed "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,requested_by) VALUES (1,'SKU',1,1,3,100);"
+expect_block "01 同一实体同仓两条等待中的延迟停用" \
+  "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,requested_by) VALUES (2,'SKU',1,1,4,100);" "uq_mdpd_waiting"
 
 echo "=== 2d. Q7：PG 写入 bigint 的取整行为（QA 在 PG16.14 实测，已关闭）==="
 # 临时表只活在一个会话里：建表、插入、查询必须在同一次 psql 调用（小赵 C1）

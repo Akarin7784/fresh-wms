@@ -119,7 +119,7 @@ NI = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='index' AND sql
 NV = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='view'").fetchone()[0]
 print(f"  → 表 {NT} 张 / 手工建索引 {NI} 个 / 视图 {NV} 个")
 # 期望值：main 8ed5f0c 为 38 表；docs/02 新增 stock_hold、stock_recon_alert、stock_movement_key、stock_ledger_line → 42 表（PG 分区子表不计）。改表数必须同步改这里和 verify.sh
-EXPECT_TABLES, EXPECT_VIEWS = 42, 1
+EXPECT_TABLES, EXPECT_VIEWS = 51, 1  # docs/01 +9：supplier customer vehicle driver device node_registry md_change_log md_sync_state md_pending_disable
 ok(f"表数 = {NT}（期望 {EXPECT_TABLES}）") if NT == EXPECT_TABLES else bad(f"表数 = {NT}，期望 {EXPECT_TABLES}")
 ok(f"视图数 = {NV}") if NV == EXPECT_VIEWS else bad(f"视图数 = {NV}，期望 {EXPECT_VIEWS}")
 
@@ -407,6 +407,29 @@ expect_block(
 
 D = one("SELECT diff_qty_milli FROM count_line WHERE id=1")[0]
 ok(f"§5.6 差异生成列 diff_qty_milli = {D}（预期 -2000）") if D == -2000 else bad(f"差异列 = {D}")
+
+print("=== 2f. docs/01 主数据：milli 换算、损耗 ppm、往来方、节点号、下发日志 ===")
+expect_block("01 损耗容差超过 100%", "UPDATE sku SET natural_loss_tolerance_ppm = 1000001 WHERE id = 1", "ck_sku_loss_ppm")
+expect_block("01 出库禁发期大于保质期", "UPDATE sku SET ship_min_shelf_life = 31 WHERE id = 1", "ck_sku_shelf_life")
+expect_block("01 单位换算为 0", "INSERT INTO sku_unit (id,sku_id,uom,base_qty_milli) VALUES (901,1,'BOX',0)", "ck_unit_ratio")
+expect_allow("01 单位换算 1 箱 = 12500 milli", "INSERT INTO sku_unit (id,sku_id,uom,base_qty_milli) VALUES (902,1,'BOX',12500)")
+expect_block("01 库位补货水位 max < min", "UPDATE location SET min_level_milli = 5000, max_level_milli = 1000 WHERE id = 1", "ck_loc_level")
+expect_block("01 门店没挂客户", "INSERT INTO customer (id,code,name,customer_type) VALUES (901,'ST-001','静安店','STORE')", "ck_customer_type")
+conn.execute("INSERT INTO customer (id,code,name,customer_type) VALUES (1,'C-001','华东连锁','CUSTOMER')")
+expect_allow("01 门店挂在客户下", "INSERT INTO customer (id,code,name,customer_type,parent_id) VALUES (2,'ST-002','徐汇店','STORE',1)")
+expect_block("01 客户编码重复", "INSERT INTO customer (id,code,name,customer_type) VALUES (903,'C-001','重复','CUSTOMER')", "customer.code")
+expect_block("01 节点号超出 0–1023", "INSERT INTO node_registry (node_id,warehouse_id,form,role,host_label) VALUES (1024,1,'B','EDGE','edge-x')", "ck_node_id_range")
+expect_block("01 边缘节点不挂仓", "INSERT INTO node_registry (node_id,form,role,host_label) VALUES (5,'B','EDGE','edge-x')", "ck_node_form")
+conn.execute("INSERT INTO node_registry (node_id,warehouse_id,form,role,host_label) VALUES (7,1,'B','EDGE','qp-edge-01')")
+conn.execute("UPDATE node_registry SET status='RETIRED', retired_at=datetime('now'), retire_reason='HW_REPLACE' WHERE node_id = 7")
+expect_block("01 退役节点号重新分配", "INSERT INTO node_registry (node_id,warehouse_id,form,role,host_label) VALUES (7,1,'B','EDGE','qp-edge-02')", "node_registry.node_id")
+expect_block_tx("01 退役节点号复活", ["UPDATE node_registry SET status='ACTIVE', retired_at=NULL WHERE node_id = 7"], "node_id_never_reused")
+expect_block_tx("01 删除节点登记", ["DELETE FROM node_registry WHERE node_id = 7"], "node_id_never_reused")
+conn.execute("INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,payload_json,operator_id) VALUES (1,'SKU',1,2,'UPSERT','{}',100)")
+expect_block("01 同一实体同一版本两条下发日志", "INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,payload_json,operator_id) VALUES (2,'SKU',1,2,'UPSERT','{}',100)", "md_change_log.entity_type, md_change_log.entity_id, md_change_log.md_version")
+expect_block_tx("01 下发日志只追加（UPDATE）", ["UPDATE md_change_log SET payload_json='{}' WHERE seq = 1"], "append_only_violation: md_change_log")
+conn.execute("INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,requested_by) VALUES (1,'SKU',1,1,3,100)")
+expect_block("01 同一实体同仓两条等待中的延迟停用", "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,requested_by) VALUES (2,'SKU',1,1,4,100)", "md_pending_disable.entity_type, md_pending_disable.entity_id, md_pending_disable.warehouse_id")
 
 print("=== 3. §4.4 FEFO 候选池排序（视图 + 排序键）===")
 rows = conn.execute(
