@@ -172,7 +172,7 @@ CREATE TABLE stock (
     on_hand_qty_milli       BIGINT          NOT NULL DEFAULT 0,   -- 在库总量
     allocated_qty_milli     BIGINT          NOT NULL DEFAULT 0,   -- 已分配未拣（= ALLOCATE 占用汇总）
     reserved_qty_milli      BIGINT          NOT NULL DEFAULT 0,   -- 已预占（= RESERVE 占用汇总）
-    quality_hold_qty_milli  BIGINT          NOT NULL DEFAULT 0,   -- 质检/盘点冻结（= QUALITY 冻结汇总）
+    quality_hold_qty_milli  BIGINT          NOT NULL DEFAULT 0,   -- 质检/盘点冻结（= QUALITY + RETURN_QC 冻结汇总）
     hold_qty_milli        BIGINT          NOT NULL DEFAULT 0,   -- 冻结（= MANUAL + RETURN_PENDING + SCRAP_PENDING 冻结汇总），从 available 扣除，FEFO 分不到
 
     ledger_seq              BIGINT          NOT NULL DEFAULT 0,   -- 本行 on_hand 变更计数，与流水 stock_seq 一一对应（快照水位线）；期初/迁移行的第 1 条流水是 OPENING
@@ -248,9 +248,9 @@ CREATE INDEX ix_res_exp    ON stock_reservation(expires_at) WHERE status = 'RESE
 CREATE TABLE stock_hold (
     id                  BIGINT          PRIMARY KEY,
     stock_id            BIGINT          NOT NULL,
-    hold_type           VARCHAR(16)     NOT NULL,   -- QUALITY → stock.quality_hold_qty_milli；MANUAL、RETURN_PENDING、SCRAP_PENDING → stock.hold_qty_milli
+    hold_type           VARCHAR(16)     NOT NULL,   -- QUALITY、RETURN_QC → stock.quality_hold_qty_milli；MANUAL、RETURN_PENDING、SCRAP_PENDING → stock.hold_qty_milli
     reason_code         VARCHAR(24)     NOT NULL,   -- 见 ck_hold_reason；新增原因走迁移
-    source_type         VARCHAR(24)     NOT NULL,   -- INBOUND_QC/COUNT/RETURN/EXCEPTION/MANUAL/RETURN_RECORD/SCRAP
+    source_type         VARCHAR(24)     NOT NULL,   -- INBOUND_QC/QC/COUNT/RETURN/EXCEPTION/MANUAL/RETURN_RECORD/SCRAP
     source_id           BIGINT          NOT NULL DEFAULT 0,
     op_key              VARCHAR(80)     NOT NULL,   -- RETURN_PENDING 固定为 RRH:{return_record_id}；convert_hold 新建的明细固定为 CVT:{原 hold_id}
     hold_qty_milli      BIGINT          NOT NULL,
@@ -261,11 +261,12 @@ CREATE TABLE stock_hold (
     created_at          TIMESTAMP       NOT NULL DEFAULT now(),
     updated_at          TIMESTAMP       NOT NULL DEFAULT now(),
     CONSTRAINT uq_hold_op UNIQUE (op_key),
-    CONSTRAINT ck_hold_type CHECK (hold_type IN ('QUALITY','MANUAL','RETURN_PENDING','SCRAP_PENDING')),
+    CONSTRAINT ck_hold_type CHECK (hold_type IN ('QUALITY','RETURN_QC','MANUAL','RETURN_PENDING','SCRAP_PENDING')),
     -- 一套方案：hold_type 是大类（决定计入哪一列），reason_code 是细分原因，二者成对约束
     CONSTRAINT ck_hold_reason CHECK (
-        hold_type NOT IN ('QUALITY','MANUAL','RETURN_PENDING','SCRAP_PENDING')      -- 类型非法交给 ck_hold_type 报，避免两条约束同时报
-        OR (hold_type = 'QUALITY'        AND reason_code IN ('QC_PENDING','RETURN_QC','COUNT_LOCK'))
+        hold_type NOT IN ('QUALITY','RETURN_QC','MANUAL','RETURN_PENDING','SCRAP_PENDING')      -- 类型非法交给 ck_hold_type 报，避免两条约束同时报
+        OR (hold_type = 'QUALITY'        AND reason_code IN ('QC_PENDING','COUNT_LOCK'))
+        OR (hold_type = 'RETURN_QC'      AND reason_code = 'RETURN_QC')     -- 退货待检（A3：系统冻结，只能由质检 release_qc_hold 释放）
         OR (hold_type = 'MANUAL'      AND reason_code IN ('DAMAGE','EXCEPTION','OTHER'))
         OR (hold_type = 'RETURN_PENDING' AND reason_code = 'RETURN_PENDING')
         OR (hold_type = 'SCRAP_PENDING'  AND reason_code = 'SCRAP')        -- 报损待处置（convert_hold 自 RETURN_PENDING 转入，docs/02 §7.1.1）
@@ -276,6 +277,11 @@ CREATE TABLE stock_hold (
         OR (source_type = 'RETURN_RECORD' AND source_id > 0 AND operator_id = 0)
     ),
     -- SCRAP_PENDING 也是系统冻结：挂报损单（source_type=SCRAP）、operator_id=0；人工解冻拒绝（40933，应用层），只能由第 9 篇报损完成/撤销释放
+    -- RETURN_QC 系统冻结（A3）：挂质检单（source_type=QC，source_id=质检单 id）、operator_id=0；人工解冻拒绝（40933），只能由 release_qc_hold 释放
+    CONSTRAINT ck_hold_retqc CHECK (
+        hold_type <> 'RETURN_QC'
+        OR (source_type = 'QC' AND source_id > 0 AND operator_id = 0)
+    ),
     CONSTRAINT ck_hold_scrap CHECK (
         hold_type <> 'SCRAP_PENDING'
         OR (source_type = 'SCRAP' AND source_id > 0 AND operator_id = 0)
@@ -292,6 +298,26 @@ CREATE TABLE stock_hold (
 );
 CREATE INDEX ix_hold_stock ON stock_hold(stock_id, hold_type, status);
 CREATE UNIQUE INDEX uq_hold_return ON stock_hold(source_id) WHERE hold_type = 'RETURN_PENDING';
+
+-- 冻结部分释放的操作去重（A3，release_qc_hold）：一次释放一行，op_key 由质检行操作生成（如 QCR:{qc_line_id}:{op_no}），
+-- 与质检行 qc_passed 累加、stock_hold 释放、stock.quality_hold 扣减同一事务；重放撞 uq_hr_op → 整个事务回滚，不重复解冻。只追加。
+CREATE TABLE stock_hold_release (
+    id                  BIGINT          PRIMARY KEY,
+    hold_id             BIGINT          NOT NULL,
+    op_key              VARCHAR(80)     NOT NULL,
+    qty_milli           BIGINT          NOT NULL,
+    created_at          TIMESTAMP       NOT NULL DEFAULT now(),
+    CONSTRAINT uq_hr_op UNIQUE (op_key),
+    CONSTRAINT fk_hr_hold FOREIGN KEY (hold_id) REFERENCES stock_hold(id),   -- 小赵 S6：释放记录必须挂在真实冻结上
+    CONSTRAINT ck_hr_qty CHECK (qty_milli > 0 AND qty_milli = CAST(qty_milli AS BIGINT))
+);
+CREATE INDEX ix_hr_hold ON stock_hold_release(hold_id);
+-- @sqlite-only CREATE TRIGGER trg_hr_no_update BEFORE UPDATE ON stock_hold_release BEGIN SELECT RAISE(ABORT, 'hold_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_hr_no_delete BEFORE DELETE ON stock_hold_release BEGIN SELECT RAISE(ABORT, 'hold_immutable'); END;
+-- 小赵 Q1：REPLACE 冲突删旧行不触发 DELETE 触发器，同 trg_hold_no_replace 用 BEFORE INSERT 先拦（重放撞这里，按 op_key 查回）
+-- @sqlite-only CREATE TRIGGER trg_hr_no_replace BEFORE INSERT ON stock_hold_release
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM stock_hold_release r WHERE r.id = NEW.id OR r.op_key = NEW.op_key)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'hold_duplicate'); END;
 -- ↑ 一条待回库记录最多一条 RETURN_PENDING 冻结（重复拒收复用已有记录，不会重复冻结）。
 --   只约束 RETURN_PENDING：convert_hold 转出的报损明细（SCRAP_PENDING/SCRAP）不受它约束（小赵 D1）
 -- 原文档 §4.2"冻结记 stock_freeze"在此落地为 stock_hold，使 quality_hold/frozen 与 allocated/reserved 一样可对账（I3）
@@ -462,6 +488,9 @@ BEGIN                                                                           
 END $$;                                                                                                       -- @pg-only
 CREATE TRIGGER trg_hold_no_delete   BEFORE DELETE   ON stock_hold FOR EACH ROW       EXECUTE FUNCTION trg_hold_no_delete();  -- @pg-only
 CREATE TRIGGER trg_hold_no_truncate BEFORE TRUNCATE ON stock_hold FOR EACH STATEMENT EXECUTE FUNCTION trg_hold_no_delete();  -- @pg-only
+-- stock_hold_release 只追加（A3）；TRUNCATE 也拦（小赵 S5）
+CREATE TRIGGER trg_hr_no_truncate BEFORE TRUNCATE ON stock_hold_release FOR EACH STATEMENT EXECUTE FUNCTION trg_hold_no_delete();  -- @pg-only
+CREATE TRIGGER trg_hr_append_only BEFORE UPDATE OR DELETE ON stock_hold_release FOR EACH ROW EXECUTE FUNCTION trg_hold_no_delete();  -- @pg-only
 -- @sqlite-only CREATE TRIGGER trg_hold_immutable BEFORE UPDATE ON stock_hold
 -- @sqlite-only WHEN NEW.id IS NOT OLD.id OR NEW.stock_id IS NOT OLD.stock_id OR NEW.hold_type IS NOT OLD.hold_type OR NEW.reason_code IS NOT OLD.reason_code
 -- @sqlite-only   OR NEW.source_type IS NOT OLD.source_type OR NEW.source_id IS NOT OLD.source_id OR NEW.op_key IS NOT OLD.op_key
@@ -493,7 +522,7 @@ CREATE TRIGGER trg_mvk_no_truncate BEFORE TRUNCATE ON stock_movement_key FOR EAC
 GRANT USAGE ON SCHEMA public TO wms_app;                                                                      -- @pg-only
 GRANT SELECT, INSERT, UPDATE ON stock, stock_reservation TO wms_app;                                         -- @pg-only
 -- stock_hold 只授释放相关列（小赵 N1）；其余列由 trg_hold_immutable 再拦一道（防超级用户/迁移脚本）
-GRANT SELECT, INSERT ON stock_hold TO wms_app;                                                                -- @pg-only
+GRANT SELECT, INSERT ON stock_hold, stock_hold_release TO wms_app;                                                                -- @pg-only
 GRANT UPDATE (released_qty_milli, status, version, updated_at) ON stock_hold TO wms_app;                     -- @pg-only
 GRANT SELECT, INSERT ON stock_ledger_line TO wms_app;                                                         -- @pg-only
 GRANT UPDATE (owner_device_instance_id, post_count, updated_at) ON stock_ledger_line TO wms_app;             -- @pg-only
@@ -538,7 +567,7 @@ CREATE TABLE stock_recon_alert (
     detected_at             TIMESTAMP       NOT NULL DEFAULT now(),
     last_seen_at            TIMESTAMP       NOT NULL DEFAULT now(),
     CONSTRAINT ck_recon_status CHECK (status IN ('OPEN','ACKED','RESOLVED')),
-    CONSTRAINT ck_recon_code CHECK (check_code IN ('I3a','I3b','I3c','I3d','I4','I5','SNAP'))   -- 码表见 docs/02 §4.6；新增走迁移（小赵 C4）
+    CONSTRAINT ck_recon_code CHECK (check_code IN ('I3a','I3b','I3c','I3d','I3e','I4','I5','SNAP'))   -- 码表见 docs/02 §4.6；新增走迁移（小赵 C4）
 );
 CREATE INDEX ix_recon_open ON stock_recon_alert(warehouse_id, status, detected_at DESC);
 CREATE UNIQUE INDEX uq_recon_open ON stock_recon_alert(check_code, warehouse_id, stock_id) WHERE status <> 'RESOLVED';
@@ -924,21 +953,18 @@ CREATE TABLE upstream_push_log (
 CREATE INDEX ix_upl_time ON upstream_push_log(warehouse_id, received_at);
 CREATE INDEX ix_upl_src  ON upstream_push_log(source_system, source_order_no, received_at);
 -- 小赵 B1：只追加在库层落地（写法同 stock_movement）。wms_app 只有 SELECT/INSERT；
--- 唯一能删的是专用归档角色 wms_archiver，且只能删 retain_until 已过（按 UTC）的行；UPDATE、TRUNCATE 对任何角色都拦。
+-- 唯一能删的是清理函数 purge_push_log()（属主 wms_purge_owner，与 02 purge_expired 同一套），且只能删 retain_until 已过（按 UTC）的行；UPDATE、TRUNCATE 对任何角色都拦。
 CREATE FUNCTION trg_upl_append_only() RETURNS trigger LANGUAGE plpgsql AS $$                               -- @pg-only
 BEGIN                                                                                                         -- @pg-only
-    IF TG_OP = 'DELETE' AND current_user = 'wms_archiver' AND OLD.retain_until < (now() AT TIME ZONE 'UTC') THEN  -- @pg-only
+    IF TG_OP = 'DELETE' AND current_user = 'wms_purge_owner' AND OLD.retain_until < (now() AT TIME ZONE 'UTC') THEN  -- @pg-only
         RETURN OLD;                                                                                           -- @pg-only
     END IF;                                                                                                   -- @pg-only
     RAISE EXCEPTION 'append_only_violation: %', TG_TABLE_NAME USING ERRCODE = '42501';                       -- @pg-only
 END $$;                                                                                                       -- @pg-only
 CREATE TRIGGER trg_upl_append_only BEFORE UPDATE OR DELETE ON upstream_push_log FOR EACH ROW EXECUTE FUNCTION trg_upl_append_only();  -- @pg-only
 CREATE TRIGGER trg_upl_no_truncate BEFORE TRUNCATE ON upstream_push_log FOR EACH STATEMENT EXECUTE FUNCTION trg_append_only();  -- @pg-only
-DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'wms_archiver') THEN CREATE ROLE wms_archiver NOLOGIN; END IF; END $$;  -- @pg-only
 GRANT SELECT, INSERT ON upstream_push_log TO wms_app;                                                         -- @pg-only
 REVOKE UPDATE, DELETE, TRUNCATE ON upstream_push_log FROM wms_app;                                            -- @pg-only
-GRANT USAGE ON SCHEMA public TO wms_archiver;                                                                 -- @pg-only
-GRANT SELECT, DELETE ON upstream_push_log TO wms_archiver;                                                    -- @pg-only
 -- SQLite（边缘节点）没有角色：UPDATE/DELETE 一律拦；到期清理同流水表，由维护脚本导出后 DROP 触发器→删 retain_until 已过的行→重建，全程审计
 -- @sqlite-only CREATE TRIGGER trg_upl_no_update BEFORE UPDATE ON upstream_push_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: upstream_push_log'); END;
 -- @sqlite-only CREATE TRIGGER trg_upl_no_delete BEFORE DELETE ON upstream_push_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: upstream_push_log'); END;
@@ -993,12 +1019,79 @@ CREATE TABLE outbox_event (
     node_id         INT          NOT NULL DEFAULT 0,
     seq             BIGINT       NOT NULL DEFAULT 0,
     replay_count    SMALLINT     NOT NULL DEFAULT 0,   -- 死信人工重放次数（重放沿用原 id，下游按事件 id 幂等）
-    CONSTRAINT ck_outbox_status CHECK (status IN ('PENDING','SENDING','SENT','FAILED','DEAD')),
-    CONSTRAINT ck_outbox_seq    CHECK (seq >= 0)
+    -- 小吴 C2：SENT 必须注明依据：2XX = 下游 2xx；DUP_409 = 下游 409 且被识别为"同一请求重复"（docs/11 §6.3）
+    ack_kind        VARCHAR(8),
+    -- 小吴 C1：DEAD 人工跳过的审计（谁、何时、原因），同事务另写 audit_log
+    skipped_by      BIGINT,
+    skipped_at      TIMESTAMP,
+    skip_reason     VARCHAR(256),
+    CONSTRAINT ck_outbox_status CHECK (status IN ('PENDING','SENDING','SENT','FAILED','DEAD','SKIPPED')),
+    CONSTRAINT ck_outbox_seq    CHECK (seq >= 0),
+    CONSTRAINT ck_outbox_ack    CHECK ((status = 'SENT' AND ack_kind IS NOT NULL AND ack_kind IN ('2XX','DUP_409')) OR (status <> 'SENT' AND ack_kind IS NULL)),
+    CONSTRAINT ck_outbox_skip   CHECK ((status = 'SKIPPED' AND skipped_by IS NOT NULL AND skipped_at IS NOT NULL AND skip_reason IS NOT NULL AND length(trim(skip_reason)) >= 4)
+                                    OR (status <> 'SKIPPED' AND skipped_by IS NULL AND skipped_at IS NULL AND skip_reason IS NULL))
 );
 CREATE UNIQUE INDEX uq_outbox_seq ON outbox_event(node_id, seq) WHERE seq > 0;
 CREATE INDEX ix_outbox_pending ON outbox_event(status, next_retry_at);
 CREATE INDEX ix_outbox_bizkey  ON outbox_event(biz_key, id);   -- 同键串行发送
+-- 小吴 C1：同一 biz_key 同时最多一条 DEAD（它之后的事件都被阻塞在 PENDING/FAILED，不可能再进死信）
+CREATE UNIQUE INDEX uq_outbox_dead_bizkey ON outbox_event(biz_key) WHERE status = 'DEAD';
+-- 形态 A：relay 扫待补 seq 的事件（seq=0），按 id 顺序补号（小吴 C3）
+CREATE INDEX ix_outbox_noseq ON outbox_event(node_id, id) WHERE seq = 0;
+-- 小吴 C1/C3：投递顺序与 seq 的库层守卫（两库同义）
+--   ① 进 SENDING 时，同 biz_key 更早（id 更小）的事件必须都已 SENT 或 SKIPPED，否则 outbox_bizkey_blocked
+--   ② SKIPPED 只能从 DEAD 来，且 SKIPPED / SENT 是终态
+--   ③ seq 只能从 0 补成正数一次，之后不可改（relay 补号、边缘事务内取号都满足）
+CREATE FUNCTION trg_outbox_order_guard() RETURNS trigger LANGUAGE plpgsql AS $$                          -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    IF NEW.status = 'SENDING' AND OLD.status <> 'SENDING' AND EXISTS (SELECT 1 FROM outbox_event e WHERE e.biz_key = NEW.biz_key AND e.id < NEW.id AND e.status NOT IN ('SENT','SKIPPED')) THEN  -- @pg-only
+        RAISE EXCEPTION 'outbox_bizkey_blocked' USING ERRCODE = '23514';                                      -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    IF (NEW.status = 'SKIPPED' AND OLD.status NOT IN ('DEAD','SKIPPED')) OR (OLD.status IN ('SENT','SKIPPED') AND NEW.status <> OLD.status) THEN  -- @pg-only
+        RAISE EXCEPTION 'outbox_illegal_transition' USING ERRCODE = '23514';                                  -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    IF NEW.seq <> OLD.seq AND OLD.seq <> 0 THEN                                                               -- @pg-only
+        RAISE EXCEPTION 'outbox_seq_immutable' USING ERRCODE = '23514';                                       -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    RETURN NEW;                                                                                               -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_outbox_order_guard BEFORE UPDATE ON outbox_event FOR EACH ROW EXECUTE FUNCTION trg_outbox_order_guard();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_outbox_bizkey_blocked BEFORE UPDATE OF status ON outbox_event
+-- @sqlite-only WHEN NEW.status = 'SENDING' AND OLD.status <> 'SENDING' AND EXISTS (SELECT 1 FROM outbox_event e WHERE e.biz_key = NEW.biz_key AND e.id < NEW.id AND e.status NOT IN ('SENT','SKIPPED'))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'outbox_bizkey_blocked'); END;
+-- @sqlite-only CREATE TRIGGER trg_outbox_illegal_transition BEFORE UPDATE OF status ON outbox_event
+-- @sqlite-only WHEN (NEW.status = 'SKIPPED' AND OLD.status NOT IN ('DEAD','SKIPPED')) OR (OLD.status IN ('SENT','SKIPPED') AND NEW.status <> OLD.status)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'outbox_illegal_transition'); END;
+-- @sqlite-only CREATE TRIGGER trg_outbox_seq_immutable BEFORE UPDATE OF seq ON outbox_event
+-- @sqlite-only WHEN NEW.seq <> OLD.seq AND OLD.seq <> 0
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'outbox_seq_immutable'); END;
+
+-- 小赵 Q2：去重记录与 outbox 只能清理"已过期 / 已投递且过保留期"的行（两库触发器，条件与 purge_expired() 一致）
+CREATE FUNCTION trg_purge_guard() RETURNS trigger LANGUAGE plpgsql AS $$                                   -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    IF TG_OP = 'TRUNCATE' THEN RAISE EXCEPTION 'purge_not_allowed: %', TG_TABLE_NAME USING ERRCODE = '42501'; END IF;  -- @pg-only
+    IF TG_TABLE_NAME = 'idempotency_record' THEN                                                              -- @pg-only
+        IF NOT (OLD.expires_at < now()) THEN                                                                  -- @pg-only
+            RAISE EXCEPTION 'purge_not_allowed: idempotency_record' USING ERRCODE = '42501';                 -- @pg-only
+        END IF;                                                                                               -- @pg-only
+    ELSIF NOT (OLD.status = 'SENT' AND OLD.sent_at < now() - interval '7 days') THEN   -- outbox_event      -- @pg-only
+        RAISE EXCEPTION 'purge_not_allowed: outbox_event' USING ERRCODE = '42501';                           -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    RETURN OLD;                                                                                               -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_idem_purge_guard    BEFORE DELETE   ON idempotency_record FOR EACH ROW       EXECUTE FUNCTION trg_purge_guard();  -- @pg-only
+CREATE TRIGGER trg_idem_no_truncate    BEFORE TRUNCATE ON idempotency_record FOR EACH STATEMENT EXECUTE FUNCTION trg_purge_guard();  -- @pg-only
+CREATE TRIGGER trg_outbox_purge_guard  BEFORE DELETE   ON outbox_event       FOR EACH ROW       EXECUTE FUNCTION trg_purge_guard();  -- @pg-only
+CREATE TRIGGER trg_outbox_no_truncate  BEFORE TRUNCATE ON outbox_event       FOR EACH STATEMENT EXECUTE FUNCTION trg_purge_guard();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_idem_purge_guard BEFORE DELETE ON idempotency_record WHEN NOT (OLD.expires_at < datetime('now'))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'purge_not_allowed: idempotency_record'); END;
+-- @sqlite-only CREATE TRIGGER trg_outbox_purge_guard BEFORE DELETE ON outbox_event WHEN NOT (OLD.status = 'SENT' AND OLD.sent_at < datetime('now', '-7 days'))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'purge_not_allowed: outbox_event'); END;
+-- SQLite REPLACE 冲突删旧行不触发 DELETE 触发器 → BEFORE INSERT 主键已存在就中止（应用把 idem_duplicate 当作"键已存在"处理，与 PG 23505 同分支）
+-- @sqlite-only CREATE TRIGGER trg_idem_no_replace BEFORE INSERT ON idempotency_record WHEN EXISTS (SELECT 1 FROM idempotency_record r WHERE r.idem_key = NEW.idem_key)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'idem_duplicate'); END;
+-- @sqlite-only CREATE TRIGGER trg_outbox_no_replace BEFORE INSERT ON outbox_event WHEN EXISTS (SELECT 1 FROM outbox_event o WHERE o.id = NEW.id)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'outbox_duplicate'); END;
 
 CREATE TABLE audit_log (
     id              BIGINT       PRIMARY KEY,
@@ -1120,3 +1213,44 @@ WHERE s.on_hand_qty_milli > 0 AND l.status = 'AVAILABLE' AND l.deleted_at IS NUL
 -- [SQLite] 视图支持一致；now() 在 SQLite 侧用 datetime('now')，故未在本文件使用
 
 COMMIT;
+
+-- ============================================================
+-- wms_app 授权清单（其余表，docs/02 §4.4.4）：public 下每张表/视图都必须对 wms_app 有显式授权，
+-- verify.sh 按 pg_class 逐表检查，缺一张就失败。新增表必须在这里（或表旁）写 GRANT，按需最小授权；不给 TRUNCATE。
+-- ============================================================
+GRANT SELECT, INSERT, UPDATE ON warehouse, zone, location, sku, sku_unit, sku_barcode, lot, numbering_segment,  -- @pg-only
+    inbound_order, inbound_line, outbound_order, outbound_line, wave, pick_task, pick_task_line,                  -- @pg-only
+    pack_box, pack_box_line, shipment, shipment_order, count_order, count_line, adjust_order, adjust_line,       -- @pg-only
+    sys_user, sys_role, sys_permission, sys_role_perm, sys_user_role, sys_user_warehouse, api_credential,        -- @pg-only
+    inbound_message TO wms_app;                                                                                   -- @pg-only
+GRANT SELECT, INSERT, UPDATE ON idempotency_record, outbox_event TO wms_app;           -- 无 DELETE/TRUNCATE（小赵 Q2）-- @pg-only
+-- 清理只能经 purge_expired()：属主 wms_purge_owner（非超级用户、NOLOGIN，只有这两张表的 SELECT/DELETE），
+-- 调用方 wms_cleaner 只有 EXECUTE，对表没有任何权限；删除条件写死在函数里，不接受参数
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'wms_purge_owner') THEN CREATE ROLE wms_purge_owner NOLOGIN NOSUPERUSER NOINHERIT; END IF; END $$;  -- @pg-only
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'wms_cleaner') THEN CREATE ROLE wms_cleaner NOLOGIN NOSUPERUSER; END IF; END $$;  -- @pg-only
+GRANT USAGE ON SCHEMA public TO wms_purge_owner, wms_cleaner;                          -- @pg-only
+GRANT SELECT, DELETE ON idempotency_record, outbox_event TO wms_purge_owner;           -- @pg-only
+CREATE FUNCTION public.purge_expired(OUT idem_deleted BIGINT, OUT outbox_deleted BIGINT)  -- @pg-only
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$          -- @pg-only
+BEGIN                                                                                  -- @pg-only
+    DELETE FROM public.idempotency_record WHERE expires_at < now();                    -- @pg-only
+    GET DIAGNOSTICS idem_deleted = ROW_COUNT;                                          -- @pg-only
+    DELETE FROM public.outbox_event WHERE status = 'SENT' AND sent_at < now() - interval '7 days';  -- @pg-only
+    GET DIAGNOSTICS outbox_deleted = ROW_COUNT;                                        -- @pg-only
+END $$;                                                                                -- @pg-only
+ALTER FUNCTION public.purge_expired() OWNER TO wms_purge_owner;                        -- @pg-only
+REVOKE ALL ON FUNCTION public.purge_expired() FROM PUBLIC;                             -- @pg-only
+GRANT EXECUTE ON FUNCTION public.purge_expired() TO wms_cleaner;                       -- @pg-only
+-- 第 11 篇：推送日志到期清理同样只经函数（替代原 wms_archiver 直删），触发器只放行 wms_purge_owner 删 retain_until 已过的行
+GRANT SELECT, DELETE ON upstream_push_log TO wms_purge_owner;                          -- @pg-only
+CREATE FUNCTION public.purge_push_log(OUT push_log_deleted BIGINT)                     -- @pg-only
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$          -- @pg-only
+BEGIN                                                                                  -- @pg-only
+    DELETE FROM public.upstream_push_log WHERE retain_until < (now() AT TIME ZONE 'UTC');  -- @pg-only
+    GET DIAGNOSTICS push_log_deleted = ROW_COUNT;                                      -- @pg-only
+END $$;                                                                                -- @pg-only
+ALTER FUNCTION public.purge_push_log() OWNER TO wms_purge_owner;                       -- @pg-only
+REVOKE ALL ON FUNCTION public.purge_push_log() FROM PUBLIC;                            -- @pg-only
+GRANT EXECUTE ON FUNCTION public.purge_push_log() TO wms_cleaner;                      -- @pg-only
+GRANT SELECT, INSERT ON audit_log, stock_snapshot_daily TO wms_app;                    -- 只追加 -- @pg-only
+GRANT SELECT ON v_stock_available TO wms_app;                                          -- @pg-only
