@@ -794,7 +794,9 @@ CREATE TABLE inbound_message (
     error           VARCHAR(512),
     received_at     TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     processed_at    TIMESTAMP,
-    CONSTRAINT uq_in_msg UNIQUE (source, biz_type, external_no)
+    biz_ref         VARCHAR(64),                 -- 第 11 篇：处理成功后生成的 WMS 单号
+    CONSTRAINT uq_in_msg UNIQUE (source, biz_type, external_no),
+    CONSTRAINT ck_in_msg_status CHECK (status IN ('RECEIVED','PROCESSING','DONE','FAILED','DEAD','REJECTED'))
 );
 CREATE INDEX ix_in_msg_retry ON inbound_message(status, next_retry_at);
 
@@ -809,8 +811,16 @@ CREATE TABLE outbox_event (
     next_retry_at   TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     last_error      VARCHAR(512),
     created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
-    sent_at         TIMESTAMP
+    sent_at         TIMESTAMP,
+    -- 第 11 篇：节点内单调序号（00 §9.1 边缘回传按 (node_id, seq) 严格顺序，缺口暂停）
+    warehouse_id    BIGINT       NOT NULL DEFAULT 0,
+    node_id         INT          NOT NULL DEFAULT 0,
+    seq             BIGINT       NOT NULL DEFAULT 0,
+    replay_count    SMALLINT     NOT NULL DEFAULT 0,   -- 死信人工重放次数（重放沿用原 id，下游按事件 id 幂等）
+    CONSTRAINT ck_outbox_status CHECK (status IN ('PENDING','SENDING','SENT','FAILED','DEAD')),
+    CONSTRAINT ck_outbox_seq    CHECK (seq >= 0)
 );
+CREATE UNIQUE INDEX uq_outbox_seq ON outbox_event(node_id, seq) WHERE seq > 0;
 CREATE INDEX ix_outbox_pending ON outbox_event(status, next_retry_at);
 CREATE INDEX ix_outbox_bizkey  ON outbox_event(biz_key, id);   -- 同键串行发送
 

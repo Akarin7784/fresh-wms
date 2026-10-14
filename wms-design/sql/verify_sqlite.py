@@ -334,6 +334,15 @@ expect_block(
 D = one("SELECT diff_qty_milli FROM count_line WHERE id=1")[0]
 ok(f"§5.6 差异生成列 diff_qty_milli = {D}（预期 -2000）") if D == -2000 else bad(f"差异列 = {D}")
 
+print("=== 2h. docs/11 集成：outbox 节点序号、入站报文 ===")
+expect_allow('11 outbox 事件（node 3, seq 1）', "INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (100,'wms.shipment.completed','SHP1','{}',1,3,1)")
+expect_block('11 同节点 seq 重复（回传顺序被破坏）', "INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (101,'wms.shipment.completed','SHP2','{}',1,3,1)", 'outbox_event.node_id, outbox_event.seq')
+expect_allow('11 不同节点同 seq 合法', "INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (102,'wms.shipment.completed','SHP3','{}',1,4,1)")
+expect_block('11 outbox 非法状态', "UPDATE outbox_event SET status='LOST' WHERE id=100", 'ck_outbox_status')
+expect_allow('11 入站报文落库', "INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha) VALUES (100,'ERP','SALES_ORDER','SO-1','{}','h1')")
+expect_block('11 同源同单号重复落库', "INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha) VALUES (101,'ERP','SALES_ORDER','SO-1','{}','h2')", 'inbound_message.source, inbound_message.biz_type, inbound_message.external_no')
+expect_block('11 入站报文非法状态', "UPDATE inbound_message SET status='OK' WHERE id=100", 'ck_in_msg_status')
+
 print("=== 3. §4.4 FEFO 候选池排序（视图 + 排序键）===")
 rows = conn.execute(
     """

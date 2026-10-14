@@ -17,7 +17,7 @@ SCHEMA=sql/schema_postgres.sql
 # stock_movement_key、stock_ledger_line → 42 表 / 114 索引（含 PK、UNIQUE 自动索引和分区父表上的分区索引；
 # 分区子表及其继承来的索引不计）/ 1 视图。改 DDL 必须同步改这里。
 EXPECT_TABLES=42
-EXPECT_INDEXES=114
+EXPECT_INDEXES=115
 EXPECT_VIEWS=1
 
 CTR=wms-pg-verify
@@ -232,6 +232,26 @@ psql -q -c "CREATE TEMP TABLE q7 (v BIGINT); INSERT INTO q7 VALUES (3.5), (2.5),
 Q7=$(psql -t -A -c "SELECT string_agg(v::text, ',' ORDER BY ctid) FROM q7")
 [ "$Q7" = "4,3,2" ] && ok "numeric 3.5→4、2.5→3（四舍五入），float8 2.5→2（银行家舍入）→ 应用层只绑定整数" \
                   || bad "Q7 取整结果 = $Q7（期望 4,3,2）"
+
+echo "=== 2h. docs/11 集成：outbox 节点序号、入站报文 ==="
+expect_allow "11 outbox 事件（node 3, seq 1）" \
+  "INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (100,'wms.shipment.completed','SHP1','{}',1,3,1);"
+expect_block "11 同节点 seq 重复（回传顺序被破坏）" \
+  "INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (101,'wms.shipment.completed','SHP2','{}',1,3,1);" \
+  "uq_outbox_seq"
+expect_allow "11 不同节点同 seq 合法" \
+  "INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (102,'wms.shipment.completed','SHP3','{}',1,4,1);"
+expect_block "11 outbox 非法状态" \
+  "UPDATE outbox_event SET status='LOST' WHERE id=100;" \
+  "ck_outbox_status"
+expect_allow "11 入站报文落库" \
+  "INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha) VALUES (100,'ERP','SALES_ORDER','SO-1','{}','h1');"
+expect_block "11 同源同单号重复落库" \
+  "INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha) VALUES (101,'ERP','SALES_ORDER','SO-1','{}','h2');" \
+  "uq_in_msg"
+expect_block "11 入站报文非法状态" \
+  "UPDATE inbound_message SET status='OK' WHERE id=100;" \
+  "ck_in_msg_status"
 
 echo "=== 3. §5.6 盘点差异生成列（实盘 − 基准账面 − 期间流水）==="
 seed "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000);"
