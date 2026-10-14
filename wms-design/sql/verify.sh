@@ -96,16 +96,35 @@ expect_allow() {  # $1 描述  $2 SQL —— 参数顺序与 expect_block 保持
 expect_block "I2 超占（allocated>on_hand）" \
   "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,allocated_qty_milli) VALUES (900,1,1,1,1,'KG',10000,99000);" \
   "ck_stock_nonneg"
-seed "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,customer_id,status,work_date) VALUES (1,'OBT1',1,'SALE','MALL','M-2026-001',1,'CREATED','2026-10-16');"
+seed "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (1,'OBT1',1,'SALE','MALL','M-2026-001','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'CREATED','2026-10-16');"
 expect_block "§4.6② 业务层幂等（source_system+source_order_no 重复）" \
-  "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,customer_id,status,work_date) VALUES (2,'OBT2',1,'SALE','MALL','M-2026-001',1,'CREATED','2026-10-16');" \
+  "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (2,'OBT2',1,'SALE','MALL','M-2026-001','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'CREATED','2026-10-16');" \
   "uq_obo_src"
 expect_block "§2.2 职责分离（拣货人=复核人）" \
-  "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,customer_id,status,work_date,picker_id,checker_id) VALUES (3,'OBT3',1,'SALE','MALL','M-2026-003',1,'CREATED','2026-10-16',77,77);" \
+  "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date,picker_id,checker_id) VALUES (3,'OBT3',1,'SALE','MALL','M-2026-003','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'CREATED','2026-10-16',77,77);" \
   "ck_obo_sod"
 expect_block "I6 同维度重复库存行（container_id 用 0 哨兵后应被拦）" \
   "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,container_id,uom,on_hand_qty_milli) VALUES (21,1,3,1,1,0,'KG',5000);" \
   "uq_stock_dim"
+
+echo "=== 2a'. docs/04 出库数量 milli、source_hash、回冲上限 ==="
+expect_block "04 D6 source_hash 不是 64 位（空串）" \
+  "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (4,'OBT4',1,'SALE','MALL','M-2026-004','',1,'CREATED','2026-10-16');" \
+  "ck_obo_hash"
+expect_block "04 I4 非法出库单状态" \
+  "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (5,'OBT5',1,'SALE','MALL','M-2026-005','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'ALLOCATING','2026-10-16');" \
+  "ck_obo_status"
+seed "INSERT INTO outbound_line (id,outbound_id,line_no,sku_id,order_qty_milli,picked_qty_milli,uom) VALUES (1,1,1,1,10000,5000,'KG');"
+expect_block "04 D4 回冲超过拣出（reversed > picked）" \
+  "UPDATE outbound_line SET reversed_qty_milli = 6000 WHERE id = 1;" \
+  "ck_obl_reversed"
+expect_block "04 出库行数量为负" \
+  "UPDATE outbound_line SET short_qty_milli = -1 WHERE id = 1;" \
+  "ck_obl_nonneg"
+R1=$(psql -t -A -c "UPDATE outbound_line SET reversed_qty_milli = reversed_qty_milli + 3000 WHERE id = 1 AND reversed_qty_milli + 3000 <= picked_qty_milli RETURNING 1" | grep -c '^1$')
+R2=$(psql -t -A -c "UPDATE outbound_line SET reversed_qty_milli = reversed_qty_milli + 3000 WHERE id = 1 AND reversed_qty_milli + 3000 <= picked_qty_milli RETURNING 1" | grep -c '^1$')
+[ "$R1" = "1" ] && [ "$R2" = "0" ] && ok "04 回冲条件更新：第 1 次 3000 → 1 行；再冲 3000 超过 picked 5000 → 0 行（走 42214，不靠 CHECK）" \
+  || bad "04 回冲条件更新 rowcount = $R1/$R2（期望 1/0）"
 
 
 echo "=== 2b. docs/02 库存核心：BIGINT *_qty_milli 与记账链断言 ==="
