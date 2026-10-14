@@ -1,0 +1,46 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# ---- 数据库本地文件（SQLite 是开发/边缘库，绝不入库）----
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+pgdata/
+
+# ---- 环境与密钥（§10.5：.env 不入库，仓库只留 .env.example）----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---- 前端 ----
+node_modules/
+web/dist/
+h5-picker/dist/
+unpackage/
+.mini-ide/
+
+# ---- 验证脚本产物 ----
+/tmp/wms_ct_*.out
+*.log
+coverage.xml
+.coverage
+htmlcov/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

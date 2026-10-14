@@ -1,0 +1,20 @@
+# 规范化行尾：仓库内一律 LF。
+# 宿主是 Windows，git 默认 core.autocrlf 会把 .sh 转成 CRLF，
+# 那样 sql/verify.sh 在 Linux CI / WSL 下会因 \r 报
+# "bash\r: No such file or directory" 而整条流水线红掉。
+* text=auto eol=lf
+
+# 明确强制：脚本与代码必须是 LF
+*.sh   text eol=lf
+*.py   text eol=lf
+*.sql  text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+
+# 二进制不转换
+*.png binary
+*.jpg binary
+*.pdf binary
+*.woff2 binary
