@@ -19,7 +19,7 @@ SCHEMA=sql/schema_postgres.sql
 # 分区子表及其继承来的索引不计）/ 1 视图。二轮 C2 加 uq_mvk_mv（外键被引用键）→ 115；A3 加 stock_hold_release（PK、uq_hr_op、ix_hr_hold）→ 43 表 / 118。改 DDL 必须同步改这里。
 # 必须用新建的空库跑（DROP SCHEMA public 重建会丢 wms_app 的 USAGE；schema 里已 GRANT USAGE 兜底，小赵 C6）。
 EXPECT_TABLES=45
-EXPECT_INDEXES=125
+EXPECT_INDEXES=126
 EXPECT_VIEWS=1
 
 CTR=wms-pg-verify
@@ -541,10 +541,12 @@ expect_block "09 K2 DELETE 报损单" "DELETE FROM scrap_order WHERE id=102;" "s
 expect_block "09 K2 DELETE POSTED 单的行" "DELETE FROM scrap_line WHERE id=100;" "scrap_no_delete"
 expect_block "09 K2 PG TRUNCATE 报损行（超级用户 / 迁移脚本）" "TRUNCATE scrap_line;" "scrap_no_delete"
 expect_block "09 K2 PG TRUNCATE 报损单" "TRUNCATE scrap_order CASCADE;" "scrap_no_delete"
-expect_allow "09 sell_days 到期自动报损单（SELL_DAYS_EXPIRED，扫描批次 601，系统建单）" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (130,'SCR-30',1,'SELL_DAYS_EXPIRED',601,'SELL_DAYS_EXPIRED','2026-10-15',0);"
-expect_block "09 sell_days 同一扫描批次重复建单" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (131,'SCR-31',1,'SELL_DAYS_EXPIRED',601,'SELL_DAYS_EXPIRED','2026-10-15',0);" "uq_scr_source"
-expect_block "09 sell_days 来源拼错" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (131,'SCR-31',1,'SELL_DAY_EXPIRED',602,'SELL_DAYS_EXPIRED','2026-10-15',0);" "ck_scr_src_type"
-expect_block "09 sell_days 原因码拼错" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (131,'SCR-31',1,'SELL_DAYS_EXPIRED',602,'SELL_DAYS','2026-10-15',0);" "ck_scr_reason"
+expect_allow "09 sell_days 到期自动报损单（SELL_EXPIRED，批次 lot_id=601，系统建草稿）" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (130,'SCR-30',1,'SELL_EXPIRED',601,'SELL_EXPIRED','2026-10-15',0);"
+expect_block "09 sell_days 同一批次同一天重复建单" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (131,'SCR-31',1,'SELL_EXPIRED',601,'SELL_EXPIRED','2026-10-15',0);" "uq_scr_sell"
+expect_allow "09 sell_days 同一批次次日余量（退货回仓后）再建一张" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (132,'SCR-32',1,'SELL_EXPIRED',601,'SELL_EXPIRED','2026-10-16',0);"
+expect_allow "09 sell_days 来源与 EXPIRY_SCAN 同 source_id 互不干扰" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (133,'SCR-33',1,'EXPIRY_SCAN',601,'EXPIRED','2026-10-15',0);"
+expect_block "09 sell_days 来源拼错" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (131,'SCR-31',1,'SELL_DAY_EXPIRED',602,'SELL_EXPIRED','2026-10-15',0);" "ck_scr_src_type"
+expect_block "09 sell_days 原因码拼错" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (131,'SCR-31',1,'SELL_EXPIRED',602,'SELL_DAYS','2026-10-15',0);" "ck_scr_reason"
 expect_allow "09 sell_days 系统提交（DRAFT → PENDING_APPROVAL，S1 同事务冻结 SCRAP_PENDING 即下架）" "UPDATE scrap_order SET status='PENDING_APPROVAL' WHERE id=130 AND status='DRAFT';"
 expect_block "09 sell_days 系统单也要人审（审批人 = 申请人 0）" "UPDATE scrap_order SET approver_id=0, approved_at='2026-10-15 10:00:00', status='APPROVED' WHERE id=130;" "ck_scr_sod"
 expect_block "09 Q8 VOIDED 是终态（→ POSTED）" "UPDATE scrap_order SET status='POSTED' WHERE id=102;" "scrap_state_forward_only"
