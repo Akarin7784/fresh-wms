@@ -66,8 +66,11 @@ echo "  → 表 $T 张 / 索引 $I 个 / 视图 $V 个"
 [ "$I" = "$EXPECT_INDEXES" ] && ok "索引数 = $I" || bad "索引数 = $I，期望 $EXPECT_INDEXES"
 [ "$V" = "$EXPECT_VIEWS" ]   && ok "视图数 = $V" || bad "视图数 = $V，期望 $EXPECT_VIEWS"
 
-R=$(psql -t -A -c "SELECT COALESCE(string_agg(c.relname, ',' ORDER BY c.relname), '') FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v') AND NOT c.relispartition AND NOT has_table_privilege('wms_app', c.oid, 'SELECT')")
-[ -z "$R" ] && ok "授权完整：public 下每张表/视图 wms_app 都有显式授权（pg_class 逐表检查）" || bad "以下表没有给 wms_app 授权：$R"
+# 小赵 S4：按期望权限矩阵逐表核对 wms_app（表、分区父表、视图、物化视图；序列查 USAGE），多给、少给、漏表都失败
+EXPECT_PRIVS="adjust_line:SELECT,INSERT,UPDATE adjust_order:SELECT,INSERT,UPDATE api_credential:SELECT,INSERT,UPDATE audit_log:SELECT,INSERT count_line:SELECT,INSERT,UPDATE count_order:SELECT,INSERT,UPDATE idempotency_record:SELECT,INSERT,UPDATE inbound_line:SELECT,INSERT,UPDATE inbound_message:SELECT,INSERT,UPDATE inbound_order:SELECT,INSERT,UPDATE location:SELECT,INSERT,UPDATE lot:SELECT,INSERT,UPDATE numbering_segment:SELECT,INSERT,UPDATE outbound_line:SELECT,INSERT,UPDATE outbound_order:SELECT,INSERT,UPDATE outbox_event:SELECT,INSERT,UPDATE pack_box:SELECT,INSERT,UPDATE pack_box_line:SELECT,INSERT,UPDATE pick_op:SELECT,INSERT pick_task:SELECT,INSERT,UPDATE pick_task_line:SELECT,INSERT,UPDATE return_record:SELECT,INSERT shipment:SELECT,INSERT,UPDATE shipment_order:SELECT,INSERT,UPDATE sku:SELECT,INSERT,UPDATE sku_barcode:SELECT,INSERT,UPDATE sku_unit:SELECT,INSERT,UPDATE stock:SELECT,INSERT,UPDATE stock_hold:SELECT,INSERT stock_hold_release:SELECT,INSERT stock_ledger_line:SELECT,INSERT stock_movement:SELECT,INSERT stock_movement_key:SELECT,INSERT stock_recon_alert:SELECT,INSERT,UPDATE stock_reservation:SELECT,INSERT,UPDATE stock_snapshot_daily:SELECT,INSERT sys_permission:SELECT,INSERT,UPDATE sys_role:SELECT,INSERT,UPDATE sys_role_perm:SELECT,INSERT,UPDATE sys_user:SELECT,INSERT,UPDATE sys_user_role:SELECT,INSERT,UPDATE sys_user_warehouse:SELECT,INSERT,UPDATE v_stock_available:SELECT warehouse:SELECT,INSERT,UPDATE wave:SELECT,INSERT,UPDATE wave_capacity_config:SELECT,INSERT,UPDATE zone:SELECT,INSERT,UPDATE"
+ACT=$(psql -t -A -c "SELECT string_agg(x, ' ' ORDER BY x) FROM (SELECT c.relname || ':' || COALESCE(NULLIF(concat_ws(',', CASE WHEN c.relkind='S' THEN (CASE WHEN has_sequence_privilege('wms_app', c.oid, 'USAGE') THEN 'USAGE' END) ELSE (CASE WHEN has_table_privilege('wms_app', c.oid, 'SELECT') THEN 'SELECT' END) END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'INSERT') THEN 'INSERT' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'UPDATE') THEN 'UPDATE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'DELETE') THEN 'DELETE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'TRUNCATE') THEN 'TRUNCATE' END), ''), 'NONE') AS x FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','S') AND NOT c.relispartition) t")
+if [ "$ACT" = "$EXPECT_PRIVS" ]; then ok "S4 wms_app 权限矩阵与期望逐表一致（$(echo "$ACT" | wc -w) 个对象；列级 UPDATE 另测）"
+else bad "S4 wms_app 权限矩阵不符：$(diff <(echo "$EXPECT_PRIVS" | tr ' ' '\n') <(echo "$ACT" | tr ' ' '\n') | grep '^[<>]' | tr '\n' ' ')"; fi
 echo "=== 2. 库层不变量断言（§4.1 I1–I5 + §2.2 SoD + §4.6 幂等）==="
 seed() { psql -q -c "$1" >/dev/null; }
 seed "INSERT INTO warehouse (id,code,name,cutoff_time,work_date_offset) VALUES (1,'WH-SH-01','上海青浦仓','20:00',-1);"
@@ -299,7 +302,7 @@ case "$OUT" in *"hold_immutable"*) ok "R1 wms_app 改回 HELD 被触发器拦（
 expect_block "R2 超级用户 DELETE 冻结明细" "BEGIN; DELETE FROM stock_hold WHERE id = 31; COMMIT;" "hold_immutable"
 OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM stock_hold WHERE id = 31;")
 case "$OUT" in *"permission denied for table stock_hold"*) ok "R2 wms_app DELETE stock_hold → permission denied";; *) bad "wms_app DELETE 未被拒：$OUT";; esac
-OUT=$(psql -q -c "TRUNCATE stock_hold;")
+OUT=$(psql -q -c "TRUNCATE stock_hold CASCADE;")   # 有 fk_hr_hold 后不带 CASCADE 会先报外键；CASCADE 时两表触发器都拦
 case "$OUT" in *"hold_immutable"*) ok "R2 超级用户 TRUNCATE stock_hold 被语句级触发器拦";; *) bad "TRUNCATE 未被拦：$OUT";; esac
 R=$(psql -t -A -c "SELECT hold_type||'/'||status||'/'||released_qty_milli FROM stock_hold WHERE id=31")
 [ "$R" = "SCRAP_PENDING/HELD/0" ] && ok "R2 绕过尝试后 id=31 仍为 $R" || bad "id=31 被改成 $R"
@@ -343,9 +346,9 @@ expect_block "05 Q5 交接来源不能指向自己" \
   'ck_pt_handover'
 expect_allow "05 Q3 任务行合法（outbound_line_id 有值）" \
   "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,outbound_line_id,planned_qty_milli,uom,status) VALUES (1,3,1,1,1,2,11,1,5000,'KG','PENDING');"
-expect_block "05 Q3 任务行 outbound_line_id 为空" \
+expect_block "05 Q3 拣货任务行 outbound_line_id 为空（ck_ptl_obl）" \
   "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,outbound_line_id,planned_qty_milli,uom) VALUES (2,3,2,1,1,2,11,NULL,5000,'KG');" \
-  'column "outbound_line_id"'
+  'ck_ptl_obl'
 expect_block "05 Q4 任务行非法状态 PICKED" \
   "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,outbound_line_id,planned_qty_milli,uom,status) VALUES (3,3,3,1,1,2,11,1,5000,'KG','PICKED');" \
   'ck_ptl_status'
@@ -362,7 +365,7 @@ expect_block "05 Q2 计件模式同一 scan_event_id 重复" \
   "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli,scan_event_id) VALUES (5,3,1,'DEV-B',3,'CONFIRM',1000,'SE-1');" \
   'uq_pick_op_scan'
 expect_allow "05 Q2 pick_op 报缺 qty=0 合法（只写 pick_op，不写流水）" \
-  "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli,result_code) VALUES (6,3,1,'DEV-B',4,'SHORT',0,'0');"
+  "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli,result_code) VALUES (6,3,1,'DEV-B',4,'SHORT',0,NULL);"
 expect_block "05 Q2 pick_op CONFIRM qty=0" \
   "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli) VALUES (7,3,1,'DEV-B',5,'CONFIRM',0);" \
   'ck_pick_op_qty'
@@ -398,30 +401,30 @@ expect_block "05 Q1 冻结失败却挂了 hold_id" \
   "INSERT INTO return_record (id,code,warehouse_id,source_type,outbound_line_id,ref_movement_id,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli,hold_id,hold_failed) VALUES (509,'RR-9',1,'CANCEL_AFTER_PICK',1,14,7,12,2,1,1,1000,10,1);" \
   'ck_rr_hold'
 expect_block "05 Q1 非法状态 CLOSED" \
-  "UPDATE return_record SET status='CLOSED' WHERE id=505;" \
+  "UPDATE return_record SET status='CLOSED', closed_by=9, closed_at='2026-10-15 10:00:00' WHERE id=505;" \
   'ck_rr_status'
 expect_block "05 Q1 OPEN 却带 resolution" \
   "UPDATE return_record SET resolution='CONFIRMED' WHERE id=505;" \
   'ck_rr_resolution'
 expect_block "05 Q1 CONFIRMED 状态 resolution 必须为 CONFIRMED" \
-  "UPDATE return_record SET status='CONFIRMED', resolution='SCRAP_HANDOVER' WHERE id=505;" \
+  "UPDATE return_record SET status='CONFIRMED', resolution='SCRAP_HANDOVER', closed_by=9, closed_at='2026-10-15 10:00:00' WHERE id=505;" \
   'ck_rr_resolution'
 expect_block "05 Q1 NEARBY_PUTBACK 缺目标库位" \
-  "UPDATE return_record SET status='RESOLVED', resolution='NEARBY_PUTBACK' WHERE id=505;" \
+  "UPDATE return_record SET status='RESOLVED', resolution='NEARBY_PUTBACK', closed_by=9, closed_at='2026-10-15 10:00:00' WHERE id=505;" \
   'ck_rr_target'
 expect_block "05 Q1 非 NEARBY_PUTBACK 带目标库位" \
-  "UPDATE return_record SET status='RESOLVED', resolution='RETURNED_TO_ORIGINAL', target_location_id=2 WHERE id=505;" \
+  "UPDATE return_record SET status='RESOLVED', resolution='RETURNED_TO_ORIGINAL', target_location_id=2, closed_by=9, closed_at='2026-10-15 10:00:00' WHERE id=505;" \
   'ck_rr_target'
 expect_allow "05 Q1 resolve NEARBY_PUTBACK（带目标库位）" \
-  "UPDATE return_record SET status='RESOLVED', resolution='NEARBY_PUTBACK', target_location_id=2, closed_by=9, version=version+1 WHERE id=505 AND status='OPEN';"
+  "UPDATE return_record SET status='RESOLVED', resolution='NEARBY_PUTBACK', target_location_id=2, closed_by=9, closed_at='2026-10-15 10:00:00', version=version+1 WHERE id=505 AND status='OPEN';"
 expect_allow "05 Q1 confirm（CONFIRMED/CONFIRMED）" \
-  "UPDATE return_record SET status='CONFIRMED', resolution='CONFIRMED', closed_by=7, version=version+1 WHERE id=501 AND status='OPEN';"
+  "UPDATE return_record SET status='CONFIRMED', resolution='CONFIRMED', closed_by=7, closed_at='2026-10-15 10:00:00', version=version+1 WHERE id=501 AND status='OPEN';"
 R=$(psql -t -A -c "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli) VALUES (20,3,1,'DEV-B',1,'CONFIRM',3000) ON CONFLICT (task_id,line_no,device_instance_id,op_seq) DO NOTHING")
 F=$(psql -t -A -c "SELECT op_type||'/'||qty_milli FROM pick_op WHERE task_id=3 AND line_no=1 AND device_instance_id='DEV-B' AND op_seq=1")
 [ "$R" = "INSERT 0 0" ] && [ "$F" = "CONFIRM/2000" ] && ok "05 Q2 40910 判定基准：ON CONFLICT DO NOTHING 0 行，读回首次 CONFIRM/2000 ≠ 3000 → 40910 PDA_OP" || bad "pick_op 比对基准 = $R / $F"
 OUT=$(psql -q -c "SET ROLE wms_app; UPDATE pick_op SET qty_milli=3000 WHERE id=1;")
 case "$OUT" in *"permission denied for table pick_op"*) ok "05 Q2 wms_app 不能改 pick_op.qty_milli（比对基准不可篡改）";; *) bad "wms_app 改 qty_milli 未被拒：$OUT";; esac
-OUT=$(psql -q -c "SET ROLE wms_app; UPDATE pick_op SET result_code='0', movement_id=11 WHERE id=1;")
+OUT=$(psql -q -c "SET ROLE wms_app; UPDATE pick_op SET movement_id=11, finished_at=now() WHERE id=1;")
 case "$OUT" in *ERROR*) bad "wms_app 回写首次结果被拒：$OUT";; *) ok "05 Q2 wms_app 可回写 pick_op 首次结果列";; esac
 OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM pick_op WHERE id=1;")
 case "$OUT" in *"permission denied for table pick_op"*) ok "05 Q2 wms_app 不能删 pick_op";; *) bad "wms_app 删 pick_op 未被拒：$OUT";; esac
@@ -455,6 +458,123 @@ OUT=$(psql -q -c "SET ROLE wms_app; UPDATE wave_capacity_config SET max_order_co
 case "$OUT" in *ERROR*) bad "wms_app 改容量配置被拒：$OUT";; *) ok "05 Q7 wms_app 可按 version 改容量配置";; esac
 OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM wave_capacity_config WHERE id=2;")
 case "$OUT" in *"permission denied for table wave_capacity_config"*) ok "05 Q7 wms_app 不能删容量配置";; *) bad "wms_app 删配置未被拒：$OUT";; esac
+echo "=== 2e2. docs/05 #7 复评：REPLENISH 可空、CLOSED 终态、pick_op/return_record 不可改（B1–B3）==="
+expect_allow "05 PM 补货任务可不挂波次（REPLENISH, wave_id NULL）" \
+  "INSERT INTO pick_task (id,code,wave_id,warehouse_id,task_type,status) VALUES (10,'RP10',NULL,1,'REPLENISH','PENDING');"
+expect_block "05 PM 拣货任务必须挂波次" \
+  "INSERT INTO pick_task (id,code,wave_id,warehouse_id,task_type,status) VALUES (11,'PT11',NULL,1,'PICK','PENDING');" \
+  "ck_pt_wave"
+expect_block "05 PM 非法 task_type" \
+  "INSERT INTO pick_task (id,code,wave_id,warehouse_id,task_type,status) VALUES (13,'PT13',1,1,'MOVE','PENDING');" \
+  "ck_pt_type"
+expect_block "05 PM EXECUTING 缺持有设备" \
+  "INSERT INTO pick_task (id,code,wave_id,warehouse_id,status,assigned_to,device_instance_id) VALUES (12,'PT12',1,1,'EXECUTING',7,NULL);" \
+  "ck_pt_exec"
+expect_block "05 PM EXECUTING 缺 assigned_to" \
+  "INSERT INTO pick_task (id,code,wave_id,warehouse_id,status,assigned_to,device_instance_id) VALUES (14,'PT14',1,1,'EXECUTING',NULL,'DEV-X');" \
+  "ck_pt_exec"
+expect_allow "05 PM 补货行可无 outbound_line_id" \
+  "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,task_type,outbound_line_id,planned_qty_milli,uom) VALUES (10,10,1,3,1,1,14,'REPLENISH',NULL,1000,'KG');"
+expect_block "05 PM 拣货行缺 outbound_line_id" \
+  "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,task_type,outbound_line_id,planned_qty_milli,uom) VALUES (11,3,8,1,1,2,11,'PICK',NULL,1000,'KG');" \
+  "ck_ptl_obl"
+expect_block "05 PM 行冒充 REPLENISH（父任务是 PICK）逃避 outbound_line_id" \
+  "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,task_type,outbound_line_id,planned_qty_milli,uom) VALUES (12,3,9,1,1,2,11,'REPLENISH',NULL,1000,'KG');" \
+  "ptl_task_type_mismatch"
+expect_block "05 PM 行改 task_type 与父任务不一致" \
+  "UPDATE pick_task_line SET task_type='PICK' WHERE id=10;" \
+  "ptl_task_type_mismatch"
+expect_block "05 PM 任务 task_type 不可改" \
+  "UPDATE pick_task SET task_type='PICK', wave_id=1 WHERE id=10;" \
+  "pick_task_type_immutable"
+expect_block "05 PM CLOSED 是终态（CLOSED→EXECUTING）" \
+  "UPDATE pick_task SET status='EXECUTING' WHERE id=1;" \
+  "pick_task_closed_terminal"
+expect_allow "05 PM CLOSED 任务改其他列仍可（version）" \
+  "UPDATE pick_task SET version=version+1 WHERE id=1;"
+expect_allow "05 B2 pick_op 新操作（3/2/DEV-B/1）" \
+  "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli) VALUES (30,3,2,'DEV-B',1,'CONFIRM',1000);"
+expect_block "05 S result_code 不是 5 位码（'0'）" \
+  "UPDATE pick_op SET result_code='0', finished_at='2026-10-15 10:00:00' WHERE id=30;" \
+  "ck_pick_op_result"
+expect_block "05 B2 未写 finished_at 就写结果" \
+  "UPDATE pick_op SET result_code='40920' WHERE id=30;" \
+  "ck_pick_op_finish"
+expect_allow "05 B2 首次结果：成功（result_code NULL + movement_id + finished_at）" \
+  "UPDATE pick_op SET movement_id=11, finished_at='2026-10-15 10:00:00' WHERE id=30;"
+expect_block "05 B2 首次结果不可改写（成功→40920）" \
+  "UPDATE pick_op SET result_code='40920', movement_id=777 WHERE id=30;" \
+  "pick_op_immutable"
+expect_block "05 B1 pick_op 改数量" \
+  "UPDATE pick_op SET qty_milli=7 WHERE id=3;" \
+  "pick_op_immutable"
+expect_block "05 B1 pick_op 改操作类型" \
+  "UPDATE pick_op SET op_type='UNDO' WHERE id=3;" \
+  "pick_op_immutable"
+expect_block "05 B1 pick_op 删除" \
+  "DELETE FROM pick_op WHERE id=3;" \
+  "pick_op_immutable"
+expect_block "05 B1 覆盖已有 pick_op（PG upsert / SQLite REPLACE）" \
+  "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli) VALUES (30,3,2,'DEV-B',1,'UNDO',2000) ON CONFLICT (id) DO UPDATE SET op_type='UNDO', qty_milli=2000;" \
+  "pick_op_immutable"
+R=$(psql -t -A -c "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli) VALUES (32,3,2,'DEV-B',1,'CONFIRM',5000) ON CONFLICT DO NOTHING")
+[ "$R" = "INSERT 0 0" ] && ok "05 B1 SQLite REPLACE 换 id 撞四元组 → PG 走 ON CONFLICT DO NOTHING 0 行，原行不动" || bad "05 B1 SQLite REPLACE 换 id 撞四元组：$R"
+expect_allow "05 B2 失败操作准备（3/2/DEV-B/2）" \
+  "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli) VALUES (31,3,2,'DEV-B',2,'CONFIRM',1000);"
+expect_allow "05 B2 首次结果：拒收 40920 + returnRecordId" \
+  "UPDATE pick_op SET result_code='40920', return_record_id=501, finished_at='2026-10-15 10:00:00' WHERE id=31;"
+expect_block "05 PM CANCEL_AFTER_PICK 带了 PDA 四元组" \
+  "INSERT INTO return_record (id,code,warehouse_id,source_type,task_id,line_no,device_instance_id,op_seq,outbound_line_id,ref_movement_id,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli) VALUES (510,'RR-10',1,'CANCEL_AFTER_PICK',1,1,'DEV-A',3,1,21,7,12,2,1,1,1000);" \
+  "ck_rr_source"
+expect_allow "05 B3 准备：CANCEL_AFTER_PICK RR-11（OPEN）" \
+  "INSERT INTO return_record (id,code,warehouse_id,source_type,outbound_line_id,ref_movement_id,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli) VALUES (511,'RR-11',1,'CANCEL_AFTER_PICK',1,22,7,12,2,1,1,1000);"
+expect_block "05 B3 关闭不写 closed_by/closed_at" \
+  "UPDATE return_record SET status='RESOLVED', resolution='RETURNED_TO_ORIGINAL' WHERE id=511;" \
+  "ck_rr_closed"
+expect_block "05 B3 CONFIRMED 也必须写 closed_by/closed_at" \
+  "UPDATE return_record SET status='CONFIRMED', resolution='CONFIRMED', closed_by=7 WHERE id=511;" \
+  "ck_rr_closed"
+expect_block "05 B3 SCRAP_HANDOVER 缺报损单" \
+  "UPDATE return_record SET status='RESOLVED', resolution='SCRAP_HANDOVER', closed_by=9, closed_at='2026-10-15 10:00:00' WHERE id=511;" \
+  "ck_rr_scrap"
+expect_allow "05 B3 hold_id NULL→值（建冻结后回填一次）" \
+  "UPDATE return_record SET hold_id=12 WHERE id=511;"
+expect_block "05 B3 hold_id 换绑另一条冻结" \
+  "UPDATE return_record SET hold_id=99999 WHERE id=511;" \
+  "rr_immutable"
+expect_block "05 B3 改数量" \
+  "UPDATE return_record SET qty_milli=5 WHERE id=511;" \
+  "rr_immutable"
+expect_allow "05 B3 SCRAP_HANDOVER 带报损单 + 关闭人/时间" \
+  "UPDATE return_record SET status='RESOLVED', resolution='SCRAP_HANDOVER', scrap_doc_id=9001, closed_by=9, closed_at='2026-10-15 10:00:00', version=version+1 WHERE id=511 AND status='OPEN';"
+expect_block "05 B3 已关闭记录重开（RESOLVED→OPEN）" \
+  "UPDATE return_record SET status='OPEN', resolution=NULL, scrap_doc_id=NULL, closed_by=NULL, closed_at=NULL WHERE id=511;" \
+  "rr_closed"
+expect_block "05 B3 关闭后改处置结果" \
+  "UPDATE return_record SET resolution='RETURNED_TO_ORIGINAL', target_location_id=NULL WHERE id=505;" \
+  "rr_closed"
+expect_allow "05 B3 关闭后补写交接确认（一次）" \
+  "UPDATE return_record SET handover_confirmed_at='2026-10-15 10:00:00', handover_confirmed_by=8, version=version+1 WHERE id=511;"
+expect_block "05 B3 交接确认不可改写" \
+  "UPDATE return_record SET handover_confirmed_by=9 WHERE id=511;" \
+  "rr_immutable"
+expect_allow "05 B3 关闭后补写就近放回到位（一次）" \
+  "UPDATE return_record SET putback_acked_at='2026-10-15 10:00:00', putback_acked_by=7 WHERE id=505;"
+expect_block "05 B3 到位确认不可改写" \
+  "UPDATE return_record SET putback_acked_by=8 WHERE id=505;" \
+  "rr_immutable"
+expect_block "05 B1 return_record 删除" \
+  "DELETE FROM return_record WHERE id=511;" \
+  "rr_immutable"
+expect_block "05 B1 覆盖已有 RR（PG upsert / SQLite REPLACE）" \
+  "INSERT INTO return_record (id,code,warehouse_id,source_type,outbound_line_id,ref_movement_id,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli) VALUES (520,'RR-11',1,'CANCEL_AFTER_PICK',1,23,7,12,2,1,1,1) ON CONFLICT (code) DO UPDATE SET qty_milli=1;" \
+  "rr_immutable"
+expect_allow "05 S 巡检告警 RR_HOLD_MISMATCH 可写入" \
+  "INSERT INTO stock_recon_alert (id,check_code,warehouse_id,stock_id,expected_qty_milli,actual_qty_milli) VALUES (20,'RR_HOLD_MISMATCH',1,14,5000,0);"
+expect_allow "05 S 巡检告警 RR_HOLD_FAILED 可写入" \
+  "INSERT INTO stock_recon_alert (id,check_code,warehouse_id,stock_id,expected_qty_milli,actual_qty_milli) VALUES (21,'RR_HOLD_FAILED',1,12,1000,0);"
+R=$(psql -t -A -c "SELECT op_type||'/'||qty_milli||'/'||COALESCE(result_code,'ok')||'/'||movement_id FROM pick_op WHERE id=30")
+[ "$R" = "CONFIRM/1000/ok/11" ] && ok "05 B1/B2 覆盖尝试后 pick_op 30 仍为 $R" || bad "pick_op 30 = $R"
 ND=$(psql -t -A -c "SELECT coalesce(string_agg(c.relname, ',' ORDER BY c.relname),'') FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p') AND c.relname IN ('pick_op','return_record','wave','pick_task','pick_task_line','wave_capacity_config') AND (has_table_privilege('wms_app', c.oid, 'DELETE') OR has_table_privilege('wms_app', c.oid, 'TRUNCATE'))")
 [ -z "$ND" ] && ok "05 wms_app 对 pick_op/return_record/wave/pick_task/pick_task_line 无 DELETE/TRUNCATE" || bad "wms_app 可删的表：$ND"
 OUT=$(psql -q -c "SET ROLE wms_app; UPDATE return_record SET qty_milli=1 WHERE id=501;")
@@ -477,6 +597,36 @@ expect_allow "A3 convert_hold RETURN_QC 剩余 5000 → SCRAP_PENDING" "BEGIN; U
 R=$(psql -t -A -c "SELECT quality_hold_qty_milli||'/'||hold_qty_milli||'/'||(on_hand_qty_milli-allocated_qty_milli-reserved_qty_milli-quality_hold_qty_milli-hold_qty_milli) FROM stock WHERE id=41")
 [ "$R" = "0/8000/1000" ] && ok "A3 RETURN_QC 转后 quality/hold/available = $R（冻结总量 8000 与可用量不变）" || bad "A3 RETURN_QC 转后 = $R（期望 0/8000/1000）"
 expect_block "A3 stock_hold_release 只追加（UPDATE）" "BEGIN; UPDATE stock_hold_release SET qty_milli = 2000 WHERE op_key = 'QCR:7001:1'; COMMIT;" "hold_immutable"
+echo "=== 2f2. 小赵五轮 Q1/S5/S6 stock_hold_release；Q2 去重记录与 outbox 清理 ==="
+expect_block "S6 释放记录挂不存在的冻结（外键）" "BEGIN; INSERT INTO stock_hold_release (id,hold_id,op_key,qty_milli) VALUES (4,999999,'QCR:x:1',1); COMMIT;" "fk_hr_hold"
+OUT=$(psql -q -c "TRUNCATE stock_hold_release;")
+case "$OUT" in *"hold_immutable"*) ok "S5 超级用户 TRUNCATE stock_hold_release 被语句级触发器拦";; *) bad "TRUNCATE stock_hold_release 未被拦：$OUT";; esac
+R=$(psql -t -A -c "SELECT count(*) FROM (SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.released_qty_milli <> COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id = h.id), 0) + COALESCE((SELECT c.hold_qty_milli FROM stock_hold c WHERE c.op_key = 'CVT:' || h.id), 0)) t")
+[ "$R" = "0" ] && ok "S6 I3e 对账：RETURN_QC 已释放 = Σ释放记录 + 转报损量（无差异行）" || bad "I3e 差异行 $R"
+R=$(psql -t -A -c "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (55,41,'RETURN_QC','RETURN_QC','QC',7003,'RQC:7003',2000,0,'HELD',0); UPDATE stock_hold SET released_qty_milli = 500, version = version + 1 WHERE id = 55; SELECT 'ids=' || string_agg(id::text, ',') FROM (SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.released_qty_milli <> COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id = h.id), 0) + COALESCE((SELECT c.hold_qty_milli FROM stock_hold c WHERE c.op_key = 'CVT:' || h.id), 0)) t; ROLLBACK;" | grep '^ids=')
+[ "$R" = "ids=55" ] && ok "S6 I3e 反向：绕过释放记录直接 UPDATE 释放 → 对账查出 hold 55" || bad "I3e 未查出：$R"
+expect_allow "Q2 准备：去重记录（未过期/已过期）+ outbox（PENDING / 8 天前 SENT / 刚 SENT）" "BEGIN; INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,expires_at) VALUES ('live','h','{}',200,now()+interval '1 day'),('dead','h','{}',200,now()-interval '1 hour'); INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at) VALUES (8801,'t','k','{}','PENDING',NULL),(8802,'t','k','{}','SENT',now()-interval '8 days'),(8803,'t','k','{}','SENT',now()); COMMIT;"
+OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM idempotency_record WHERE idem_key='dead';")
+case "$OUT" in *"permission denied for table idempotency_record"*) ok "Q2 wms_app DELETE idempotency_record → permission denied";; *) bad "wms_app DELETE idem 未被拒：$OUT";; esac
+OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM outbox_event WHERE id=8802;")
+case "$OUT" in *"permission denied for table outbox_event"*) ok "Q2 wms_app DELETE outbox_event → permission denied";; *) bad "wms_app DELETE outbox 未被拒：$OUT";; esac
+OUT=$(psql -q -c "SET ROLE wms_app; TRUNCATE outbox_event;")
+case "$OUT" in *"permission denied"*) ok "Q2 wms_app TRUNCATE outbox_event → permission denied";; *) bad "wms_app TRUNCATE 未被拒：$OUT";; esac
+OUT=$(psql -q -c "SET ROLE wms_cleaner; DELETE FROM idempotency_record WHERE idem_key='dead';")
+case "$OUT" in *"permission denied for table idempotency_record"*) ok "Q2 wms_cleaner 直接 DELETE → permission denied（只能 EXECUTE 函数）";; *) bad "wms_cleaner 直接 DELETE 未被拒：$OUT";; esac
+OUT=$(psql -q -c "SET ROLE wms_app; SELECT * FROM purge_expired();")
+case "$OUT" in *"permission denied for function purge_expired"*) ok "Q2 wms_app 调 purge_expired() → permission denied";; *) bad "wms_app 调函数未被拒：$OUT";; esac
+expect_block "Q2 超级用户删未过期去重记录（触发器兜底）" "BEGIN; DELETE FROM idempotency_record WHERE idem_key='live'; COMMIT;" "purge_not_allowed: idempotency_record"
+expect_block "Q2 超级用户删 PENDING 事件" "BEGIN; DELETE FROM outbox_event WHERE id=8801; COMMIT;" "purge_not_allowed: outbox_event"
+expect_block "Q2 超级用户删刚投递（未过保留期）事件" "BEGIN; DELETE FROM outbox_event WHERE id=8803; COMMIT;" "purge_not_allowed: outbox_event"
+OUT=$(psql -q -c "TRUNCATE idempotency_record;")
+case "$OUT" in *"purge_not_allowed"*) ok "Q2 超级用户 TRUNCATE idempotency_record 被拦";; *) bad "TRUNCATE idem 未被拦：$OUT";; esac
+R=$(psql -t -A -c "SELECT p.prosecdef::text || '/' || array_to_string(p.proconfig, ',') || '/' || r.rolsuper::text || '/' || r.rolname || '/' || has_function_privilege('public', p.oid, 'EXECUTE')::text FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner WHERE p.proname = 'purge_expired'")
+[ "$R" = "true/search_path=pg_catalog, public/false/wms_purge_owner/false" ] && ok "Q2 purge_expired：SECURITY DEFINER、固定 search_path、属主非超级用户、PUBLIC 无 EXECUTE（$R）" || bad "purge_expired 属性：$R"
+R=$(psql -t -A -c "SET ROLE wms_cleaner; SELECT idem_deleted || '/' || outbox_deleted FROM purge_expired();" | grep '/')
+[ "$R" = "1/1" ] && ok "Q2 wms_cleaner 调 purge_expired() 删掉 1 条过期去重 + 1 条过保留期 SENT" || bad "purge_expired 结果：$R"
+R=$(psql -t -A -c "SELECT (SELECT string_agg(idem_key, ',') FROM idempotency_record) || '|' || (SELECT string_agg(id::text, ',' ORDER BY id) FROM outbox_event)")
+[ "$R" = "live|8801,8803" ] && ok "Q2 清理后剩余 $R（未过期、PENDING、未过保留期的都在）" || bad "Q2 清理后：$R"
 echo "=== 2c. docs/02 40906：库位锁定写进扣减原语的 WHERE ==="
 psql -q -c "UPDATE location SET status='LOCKED' WHERE id=3;" >/dev/null
 DEDUCT="UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 13 AND on_hand_qty_milli - allocated_qty_milli - reserved_qty_milli - quality_hold_qty_milli - hold_qty_milli >= 1000 AND EXISTS (SELECT 1 FROM location l WHERE l.id = stock.location_id AND l.status <> 'LOCKED');"

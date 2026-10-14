@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 45 处 DEFAULT now() → DEFAULT (datetime('now'))（表达式默认值需括号）
---   3. 方言专属行：删除 74 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 24 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 156 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 80 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -315,11 +315,16 @@ CREATE TABLE stock_hold_release (
     qty_milli           BIGINT          NOT NULL,
     created_at          TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT uq_hr_op UNIQUE (op_key),
+    CONSTRAINT fk_hr_hold FOREIGN KEY (hold_id) REFERENCES stock_hold(id),   -- 小赵 S6：释放记录必须挂在真实冻结上
     CONSTRAINT ck_hr_qty CHECK (qty_milli > 0 AND qty_milli = CAST(qty_milli AS BIGINT))
 );
 CREATE INDEX ix_hr_hold ON stock_hold_release(hold_id);
 CREATE TRIGGER trg_hr_no_update BEFORE UPDATE ON stock_hold_release BEGIN SELECT RAISE(ABORT, 'hold_immutable'); END;
 CREATE TRIGGER trg_hr_no_delete BEFORE DELETE ON stock_hold_release BEGIN SELECT RAISE(ABORT, 'hold_immutable'); END;
+-- 小赵 Q1：REPLACE 冲突删旧行不触发 DELETE 触发器，同 trg_hold_no_replace 用 BEFORE INSERT 先拦（重放撞这里，按 op_key 查回）
+CREATE TRIGGER trg_hr_no_replace BEFORE INSERT ON stock_hold_release
+WHEN EXISTS (SELECT 1 FROM stock_hold_release r WHERE r.id = NEW.id OR r.op_key = NEW.op_key)
+BEGIN SELECT RAISE(ABORT, 'hold_duplicate'); END;
 -- ↑ 一条待回库记录最多一条 RETURN_PENDING 冻结（重复拒收复用已有记录，不会重复冻结）。
 --   只约束 RETURN_PENDING：convert_hold 转出的报损明细（SCRAP_PENDING/SCRAP）不受它约束（小赵 D1）
 -- 原文档 §4.2"冻结记 stock_freeze"在此落地为 stock_hold，使 quality_hold/frozen 与 allocated/reserved 一样可对账（I3）
@@ -447,7 +452,7 @@ BEGIN SELECT RAISE(ABORT, 'ledger_line_immutable'); END;
 -- 冻结明细写入后不可改（小赵 N1）：只放行释放路径要写的 released_qty_milli / status / version / updated_at。
 -- 类型转换只走 convert_hold（关旧建新），任何路径都不需要改 hold_type；否则先把 SCRAP_PENDING 改成 MANUAL 就能绕过 40933
 -- R2：冻结明细不可删除（wms_app 本就没有 DELETE/TRUNCATE 权限；这里兜底超级用户/迁移脚本，与流水表写法一致）
--- stock_hold_release 只追加（A3）
+-- stock_hold_release 只追加（A3）；TRUNCATE 也拦（小赵 S5）
 CREATE TRIGGER trg_hold_immutable BEFORE UPDATE ON stock_hold
 WHEN NEW.id IS NOT OLD.id OR NEW.stock_id IS NOT OLD.stock_id OR NEW.hold_type IS NOT OLD.hold_type OR NEW.reason_code IS NOT OLD.reason_code
   OR NEW.source_type IS NOT OLD.source_type OR NEW.source_id IS NOT OLD.source_id OR NEW.op_key IS NOT OLD.op_key
@@ -507,7 +512,7 @@ CREATE TABLE stock_recon_alert (
     detected_at             TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     last_seen_at            TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT ck_recon_status CHECK (status IN ('OPEN','ACKED','RESOLVED')),
-    CONSTRAINT ck_recon_code CHECK (check_code IN ('I3a','I3b','I3c','I3d','I4','I5','SNAP'))   -- 码表见 docs/02 §4.6；新增走迁移（小赵 C4）
+    CONSTRAINT ck_recon_code CHECK (check_code IN ('I3a','I3b','I3c','I3d','I3e','I4','I5','SNAP','RR_HOLD_FAILED','RR_HOLD_MISMATCH'))   -- 码表见 docs/02 §4.6；新增走迁移（小赵 C4）
 );
 CREATE INDEX ix_recon_open ON stock_recon_alert(warehouse_id, status, detected_at DESC);
 CREATE UNIQUE INDEX uq_recon_open ON stock_recon_alert(check_code, warehouse_id, stock_id) WHERE status <> 'RESOLVED';
@@ -713,9 +718,9 @@ CREATE TABLE wave_capacity_config (
 CREATE TABLE pick_task (
     id              BIGINT       PRIMARY KEY,
     code            VARCHAR(64)  NOT NULL,
-    wave_id         BIGINT       NOT NULL,
+    wave_id         BIGINT,                              -- PICK 必填；REPLENISH 可空（ck_pt_wave，docs/05 PM 阻塞项）
     warehouse_id    BIGINT       NOT NULL,
-    task_type       VARCHAR(24)  NOT NULL DEFAULT 'PICK',   -- PICK/REPLENISH（补货复用本表）
+    task_type       VARCHAR(24)  NOT NULL DEFAULT 'PICK',   -- PICK/REPLENISH（补货复用本表）；写入后不可改（trg_pt_guard）
     zone_id         BIGINT,
     status          VARCHAR(16)  NOT NULL DEFAULT 'PENDING',-- PENDING/EXECUTING/DONE/ABNORMAL/CANCELLED/CLOSED（docs/05 Q4）
     assigned_to     BIGINT,
@@ -731,8 +736,16 @@ CREATE TABLE pick_task (
     updated_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT uq_pt_code UNIQUE (code),
     CONSTRAINT ck_pt_status CHECK (status IN ('PENDING','EXECUTING','DONE','ABNORMAL','CANCELLED','CLOSED')),
-    CONSTRAINT ck_pt_handover CHECK (handover_from_task_id IS NULL OR handover_from_task_id <> id)
+    CONSTRAINT ck_pt_handover CHECK (handover_from_task_id IS NULL OR handover_from_task_id <> id),
+    CONSTRAINT ck_pt_type CHECK (task_type IN ('PICK','REPLENISH')),
+    CONSTRAINT ck_pt_wave CHECK (task_type = 'REPLENISH' OR wave_id IS NOT NULL),
+    CONSTRAINT ck_pt_exec CHECK (status <> 'EXECUTING' OR (assigned_to IS NOT NULL AND device_instance_id IS NOT NULL))
 );
+-- docs/05：CLOSED 是终态；task_type 不可改（行上的冗余 task_type 依赖它）
+CREATE TRIGGER trg_pt_closed BEFORE UPDATE OF status ON pick_task WHEN OLD.status = 'CLOSED' AND NEW.status <> 'CLOSED'
+BEGIN SELECT RAISE(ABORT, 'pick_task_closed_terminal'); END;
+CREATE TRIGGER trg_pt_type BEFORE UPDATE OF task_type ON pick_task WHEN NEW.task_type <> OLD.task_type
+BEGIN SELECT RAISE(ABORT, 'pick_task_type_immutable'); END;
 -- 领取队列：待领取 + 按动线优先级
 CREATE INDEX ix_pt_claim ON pick_task(wave_id, status, zone_id) WHERE status = 'PENDING';
 CREATE INDEX ix_pt_mine  ON pick_task(assigned_to, status);
@@ -745,7 +758,8 @@ CREATE TABLE pick_task_line (
     sku_id              BIGINT          NOT NULL,
     lot_id              BIGINT          NOT NULL,
     stock_id            BIGINT          NOT NULL,
-    outbound_line_id    BIGINT          NOT NULL,   -- docs/05 Q3：任务行按占用粒度生成，恒有值；BATCH 合并只在展示层
+    task_type           VARCHAR(24)     NOT NULL DEFAULT 'PICK',  -- 冗余父任务 task_type，供 ck_ptl_obl 判断；trg_ptl_type 保证与父任务一致
+    outbound_line_id    BIGINT,                     -- docs/05 Q3：PICK 行恒有值（按占用粒度生成，合并只在展示层）；REPLENISH 行为空
     planned_qty_milli   BIGINT          NOT NULL,   -- 应拣量，基本单位 milli（原 plan_qty_base）
     confirmed_qty_milli BIGINT          NOT NULL DEFAULT 0,  -- 已确认量；条件更新 confirmed + qty <= planned，否则 42214（00 §6.5）
     uom                 VARCHAR(16)     NOT NULL,   -- 作业单位，仅展示
@@ -760,9 +774,16 @@ CREATE TABLE pick_task_line (
         AND planned_qty_milli = CAST(planned_qty_milli AS BIGINT) AND confirmed_qty_milli = CAST(confirmed_qty_milli AS BIGINT)
     ),
     CONSTRAINT uq_ptl UNIQUE (pick_task_id, seq),
-    CONSTRAINT ck_ptl_status CHECK (status IN ('PENDING','DONE','SHORT','SKIP','ABNORMAL'))
+    CONSTRAINT ck_ptl_status CHECK (status IN ('PENDING','DONE','SHORT','SKIP','ABNORMAL')),
+    CONSTRAINT ck_ptl_obl CHECK (task_type = 'REPLENISH' OR outbound_line_id IS NOT NULL)
 );
 CREATE INDEX ix_ptl_loc ON pick_task_line(location_id, status);
+CREATE TRIGGER trg_ptl_type_ins BEFORE INSERT ON pick_task_line
+WHEN NOT EXISTS (SELECT 1 FROM pick_task t WHERE t.id = NEW.pick_task_id AND t.task_type = NEW.task_type)
+BEGIN SELECT RAISE(ABORT, 'ptl_task_type_mismatch'); END;
+CREATE TRIGGER trg_ptl_type_upd BEFORE UPDATE OF pick_task_id, task_type ON pick_task_line
+WHEN NOT EXISTS (SELECT 1 FROM pick_task t WHERE t.id = NEW.pick_task_id AND t.task_type = NEW.task_type)
+BEGIN SELECT RAISE(ABORT, 'ptl_task_type_mismatch'); END;
 
 -- docs/05 §4.5：PDA 拣货操作去重（第二层，四元组业务键）。拒收/报缺不写流水，只写本表。
 -- 同四元组同 op_type 同 qty_milli → 回放 result_code；否则 40910 detail.key_type=PDA_OP（应用层比对本行）。
@@ -775,16 +796,33 @@ CREATE TABLE pick_op (
     op_type             VARCHAR(16)     NOT NULL,   -- CONFIRM/UNDO/SHORT
     qty_milli           BIGINT          NOT NULL,
     scan_event_id       VARCHAR(64),                -- 计件模式必填
-    result_code         VARCHAR(5),                 -- 首次结果：'0' 成功；40920/40921/40922 拒收；处理中为空
+    result_code         VARCHAR(5),                 -- 首次结果：成功为 NULL；失败为 5 位错误码（40920/40921/40922…）
+    finished_at         TIMESTAMP,                  -- 首次结果写入时刻；非空后整行冻结（B2）
     movement_id         BIGINT,
     return_record_id    BIGINT,
     created_at          TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT uq_pick_op UNIQUE (task_id, line_no, device_instance_id, op_seq),
     CONSTRAINT ck_pick_op_type CHECK (op_type IN ('CONFIRM','UNDO','SHORT')),
     CONSTRAINT ck_pick_op_qty CHECK (qty_milli >= 0 AND qty_milli = CAST(qty_milli AS BIGINT) AND op_seq > 0
-        AND (op_type = 'SHORT' OR qty_milli > 0))
+        AND (op_type = 'SHORT' OR qty_milli > 0)),
+    CONSTRAINT ck_pick_op_result CHECK (result_code IS NULL OR (length(result_code) = 5 AND replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(result_code,'0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9','') = '')),
+    CONSTRAINT ck_pick_op_finish CHECK (finished_at IS NOT NULL OR (result_code IS NULL AND movement_id IS NULL AND return_record_id IS NULL))
 );
 CREATE UNIQUE INDEX uq_pick_op_scan ON pick_op(task_id, line_no, scan_event_id) WHERE scan_event_id IS NOT NULL;
+-- B1/B2：业务键、类型、数量写入后不可改；首次结果只能写一次（finished_at 非空后整行冻结）；不可删
+CREATE TRIGGER trg_pick_op_upd BEFORE UPDATE ON pick_op
+WHEN NEW.id IS NOT OLD.id OR NEW.task_id IS NOT OLD.task_id OR NEW.line_no IS NOT OLD.line_no
+  OR NEW.device_instance_id IS NOT OLD.device_instance_id OR NEW.op_seq IS NOT OLD.op_seq OR NEW.op_type IS NOT OLD.op_type
+  OR NEW.qty_milli IS NOT OLD.qty_milli OR NEW.scan_event_id IS NOT OLD.scan_event_id
+  OR NEW.created_at IS NOT OLD.created_at OR OLD.finished_at IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'pick_op_immutable'); END;
+CREATE TRIGGER trg_pick_op_del BEFORE DELETE ON pick_op BEGIN SELECT RAISE(ABORT, 'pick_op_immutable'); END;
+-- SQLite：REPLACE 会先删冲突行（任一唯一键），BEFORE INSERT 先拦；应用层在 SQLite 用普通 INSERT 并捕获 pick_op_duplicate（docs/05 §6.2）
+CREATE TRIGGER trg_pick_op_dup BEFORE INSERT ON pick_op
+WHEN EXISTS (SELECT 1 FROM pick_op o WHERE o.id = NEW.id
+  OR (o.task_id = NEW.task_id AND o.line_no = NEW.line_no AND o.device_instance_id = NEW.device_instance_id AND o.op_seq = NEW.op_seq)
+  OR (NEW.scan_event_id IS NOT NULL AND o.task_id = NEW.task_id AND o.line_no = NEW.line_no AND o.scan_event_id = NEW.scan_event_id))
+BEGIN SELECT RAISE(ABORT, 'pick_op_duplicate'); END;
 
 -- docs/05 §4.5 / 04 §4.4：待回库记录。接口口径见 04 §7.3（returnRecordId = id）。
 -- 所有类型统一预建 stock_ledger_line DOC 行（biz_no = code）。
@@ -825,7 +863,8 @@ CREATE TABLE return_record (
     CONSTRAINT ck_rr_source CHECK (
         (source_type = 'OFFLINE_REJECT' AND task_id IS NOT NULL AND line_no IS NOT NULL AND device_instance_id IS NOT NULL
             AND op_seq IS NOT NULL AND reject_code IN ('40920','40921','40922'))
-        OR (source_type = 'CANCEL_AFTER_PICK' AND outbound_line_id IS NOT NULL AND ref_movement_id IS NOT NULL AND reject_code IS NULL)),
+        OR (source_type = 'CANCEL_AFTER_PICK' AND outbound_line_id IS NOT NULL AND ref_movement_id IS NOT NULL AND reject_code IS NULL
+            AND task_id IS NULL AND line_no IS NULL AND device_instance_id IS NULL AND op_seq IS NULL)),
     CONSTRAINT ck_rr_qty CHECK (qty_milli > 0 AND qty_milli = CAST(qty_milli AS BIGINT)),
     CONSTRAINT ck_rr_hold CHECK (hold_failed IN (0,1) AND NOT (hold_failed = 1 AND hold_id IS NOT NULL)),
     CONSTRAINT ck_rr_status CHECK (status IN ('OPEN','CONFIRMED','RESOLVED')),
@@ -833,6 +872,8 @@ CREATE TABLE return_record (
         (status <> 'OPEN' OR resolution IS NULL)
         AND (status <> 'CONFIRMED' OR resolution = 'CONFIRMED')
         AND (status <> 'RESOLVED' OR resolution IN ('RETURNED_TO_ORIGINAL','NEARBY_PUTBACK','SCRAP_HANDOVER'))),
+    CONSTRAINT ck_rr_closed CHECK (status = 'OPEN' OR (closed_by IS NOT NULL AND closed_at IS NOT NULL)),
+    CONSTRAINT ck_rr_scrap CHECK (COALESCE(resolution, '') <> 'SCRAP_HANDOVER' OR scrap_doc_id IS NOT NULL),
     CONSTRAINT ck_rr_target CHECK ((resolution = 'NEARBY_PUTBACK' AND target_location_id IS NOT NULL)
         OR (COALESCE(resolution, '') <> 'NEARBY_PUTBACK' AND target_location_id IS NULL))
 );
@@ -840,6 +881,30 @@ CREATE UNIQUE INDEX uq_rr_pda ON return_record(task_id, line_no, device_instance
 CREATE UNIQUE INDEX uq_rr_cap ON return_record(outbound_line_id, ref_movement_id) WHERE source_type = 'CANCEL_AFTER_PICK';
 CREATE INDEX ix_rr_open   ON return_record(warehouse_id, status, created_at);
 CREATE INDEX ix_rr_picker ON return_record(picker_id, status);
+-- B3：来源/数量等列不可改；hold_id 只能 NULL→值一次；只允许 OPEN→CONFIRMED/RESOLVED 单向；关闭后只允许补写到位/交接确认（各一次）与 version；不可删
+CREATE TRIGGER trg_rr_upd BEFORE UPDATE ON return_record
+WHEN NEW.id IS NOT OLD.id OR NEW.code IS NOT OLD.code OR NEW.warehouse_id IS NOT OLD.warehouse_id OR NEW.source_type IS NOT OLD.source_type
+  OR NEW.task_id IS NOT OLD.task_id OR NEW.line_no IS NOT OLD.line_no OR NEW.device_instance_id IS NOT OLD.device_instance_id OR NEW.op_seq IS NOT OLD.op_seq
+  OR NEW.outbound_line_id IS NOT OLD.outbound_line_id OR NEW.ref_movement_id IS NOT OLD.ref_movement_id OR NEW.reject_code IS NOT OLD.reject_code
+  OR NEW.picker_id IS NOT OLD.picker_id OR NEW.stock_id IS NOT OLD.stock_id OR NEW.location_id IS NOT OLD.location_id OR NEW.sku_id IS NOT OLD.sku_id
+  OR NEW.lot_id IS NOT OLD.lot_id OR NEW.qty_milli IS NOT OLD.qty_milli OR NEW.payload IS NOT OLD.payload OR NEW.created_at IS NOT OLD.created_at
+  OR (OLD.hold_id IS NOT NULL AND NEW.hold_id IS NOT OLD.hold_id)
+  OR (OLD.putback_acked_at IS NOT NULL AND (NEW.putback_acked_at IS NOT OLD.putback_acked_at OR NEW.putback_acked_by IS NOT OLD.putback_acked_by))
+  OR (OLD.handover_confirmed_at IS NOT NULL AND (NEW.handover_confirmed_at IS NOT OLD.handover_confirmed_at OR NEW.handover_confirmed_by IS NOT OLD.handover_confirmed_by))
+BEGIN SELECT RAISE(ABORT, 'rr_immutable'); END;
+CREATE TRIGGER trg_rr_closed BEFORE UPDATE ON return_record
+WHEN OLD.status <> 'OPEN' AND (NEW.status IS NOT OLD.status OR NEW.resolution IS NOT OLD.resolution OR NEW.target_location_id IS NOT OLD.target_location_id
+  OR NEW.scrap_doc_id IS NOT OLD.scrap_doc_id OR NEW.hold_id IS NOT OLD.hold_id OR NEW.hold_failed IS NOT OLD.hold_failed
+  OR NEW.closed_by IS NOT OLD.closed_by OR NEW.closed_at IS NOT OLD.closed_at)
+BEGIN SELECT RAISE(ABORT, 'rr_closed'); END;
+CREATE TRIGGER trg_rr_del BEFORE DELETE ON return_record BEGIN SELECT RAISE(ABORT, 'rr_immutable'); END;
+CREATE TRIGGER trg_rr_dup BEFORE INSERT ON return_record
+WHEN EXISTS (SELECT 1 FROM return_record r WHERE r.id = NEW.id OR r.code = NEW.code
+  OR (NEW.source_type = 'OFFLINE_REJECT' AND r.source_type = 'OFFLINE_REJECT' AND r.task_id = NEW.task_id AND r.line_no = NEW.line_no
+      AND r.device_instance_id = NEW.device_instance_id AND r.op_seq = NEW.op_seq)
+  OR (NEW.source_type = 'CANCEL_AFTER_PICK' AND r.source_type = 'CANCEL_AFTER_PICK' AND r.outbound_line_id = NEW.outbound_line_id
+      AND r.ref_movement_id = NEW.ref_movement_id))
+BEGIN SELECT RAISE(ABORT, 'rr_duplicate'); END;
 -- pick_op 的四元组、op_type、qty_milli 是 40910 PDA_OP 比对基准，应用角色只能补写首次结果列
 CREATE TABLE pack_box (
     id              BIGINT       PRIMARY KEY,
@@ -1013,6 +1078,17 @@ CREATE TABLE outbox_event (
 CREATE INDEX ix_outbox_pending ON outbox_event(status, next_retry_at);
 CREATE INDEX ix_outbox_bizkey  ON outbox_event(biz_key, id);   -- 同键串行发送
 
+-- 小赵 Q2：去重记录与 outbox 只能清理"已过期 / 已投递且过保留期"的行（两库触发器，条件与 purge_expired() 一致）
+CREATE TRIGGER trg_idem_purge_guard BEFORE DELETE ON idempotency_record WHEN NOT (OLD.expires_at < datetime('now'))
+BEGIN SELECT RAISE(ABORT, 'purge_not_allowed: idempotency_record'); END;
+CREATE TRIGGER trg_outbox_purge_guard BEFORE DELETE ON outbox_event WHEN NOT (OLD.status = 'SENT' AND OLD.sent_at < datetime('now', '-7 days'))
+BEGIN SELECT RAISE(ABORT, 'purge_not_allowed: outbox_event'); END;
+-- SQLite REPLACE 冲突删旧行不触发 DELETE 触发器 → BEFORE INSERT 主键已存在就中止（应用把 idem_duplicate 当作"键已存在"处理，与 PG 23505 同分支）
+CREATE TRIGGER trg_idem_no_replace BEFORE INSERT ON idempotency_record WHEN EXISTS (SELECT 1 FROM idempotency_record r WHERE r.idem_key = NEW.idem_key)
+BEGIN SELECT RAISE(ABORT, 'idem_duplicate'); END;
+CREATE TRIGGER trg_outbox_no_replace BEFORE INSERT ON outbox_event WHEN EXISTS (SELECT 1 FROM outbox_event o WHERE o.id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'outbox_duplicate'); END;
+
 CREATE TABLE audit_log (
     id              BIGINT       PRIMARY KEY,
     actor_id        BIGINT,
@@ -1138,3 +1214,5 @@ WHERE s.on_hand_qty_milli > 0 AND l.status = 'AVAILABLE' AND l.deleted_at IS NUL
 -- wms_app 授权清单（其余表，docs/02 §4.4.4）：public 下每张表/视图都必须对 wms_app 有显式授权，
 -- verify.sh 按 pg_class 逐表检查，缺一张就失败。新增表必须在这里（或表旁）写 GRANT，按需最小授权；不给 TRUNCATE。
 -- ============================================================
+-- 清理只能经 purge_expired()：属主 wms_purge_owner（非超级用户、NOLOGIN，只有这两张表的 SELECT/DELETE），
+-- 调用方 wms_cleaner 只有 EXECUTE，对表没有任何权限；删除条件写死在函数里，不接受参数

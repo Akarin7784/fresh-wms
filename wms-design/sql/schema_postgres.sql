@@ -308,11 +308,16 @@ CREATE TABLE stock_hold_release (
     qty_milli           BIGINT          NOT NULL,
     created_at          TIMESTAMP       NOT NULL DEFAULT now(),
     CONSTRAINT uq_hr_op UNIQUE (op_key),
+    CONSTRAINT fk_hr_hold FOREIGN KEY (hold_id) REFERENCES stock_hold(id),   -- 小赵 S6：释放记录必须挂在真实冻结上
     CONSTRAINT ck_hr_qty CHECK (qty_milli > 0 AND qty_milli = CAST(qty_milli AS BIGINT))
 );
 CREATE INDEX ix_hr_hold ON stock_hold_release(hold_id);
 -- @sqlite-only CREATE TRIGGER trg_hr_no_update BEFORE UPDATE ON stock_hold_release BEGIN SELECT RAISE(ABORT, 'hold_immutable'); END;
 -- @sqlite-only CREATE TRIGGER trg_hr_no_delete BEFORE DELETE ON stock_hold_release BEGIN SELECT RAISE(ABORT, 'hold_immutable'); END;
+-- 小赵 Q1：REPLACE 冲突删旧行不触发 DELETE 触发器，同 trg_hold_no_replace 用 BEFORE INSERT 先拦（重放撞这里，按 op_key 查回）
+-- @sqlite-only CREATE TRIGGER trg_hr_no_replace BEFORE INSERT ON stock_hold_release
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM stock_hold_release r WHERE r.id = NEW.id OR r.op_key = NEW.op_key)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'hold_duplicate'); END;
 -- ↑ 一条待回库记录最多一条 RETURN_PENDING 冻结（重复拒收复用已有记录，不会重复冻结）。
 --   只约束 RETURN_PENDING：convert_hold 转出的报损明细（SCRAP_PENDING/SCRAP）不受它约束（小赵 D1）
 -- 原文档 §4.2"冻结记 stock_freeze"在此落地为 stock_hold，使 quality_hold/frozen 与 allocated/reserved 一样可对账（I3）
@@ -483,7 +488,8 @@ BEGIN                                                                           
 END $$;                                                                                                       -- @pg-only
 CREATE TRIGGER trg_hold_no_delete   BEFORE DELETE   ON stock_hold FOR EACH ROW       EXECUTE FUNCTION trg_hold_no_delete();  -- @pg-only
 CREATE TRIGGER trg_hold_no_truncate BEFORE TRUNCATE ON stock_hold FOR EACH STATEMENT EXECUTE FUNCTION trg_hold_no_delete();  -- @pg-only
--- stock_hold_release 只追加（A3）
+-- stock_hold_release 只追加（A3）；TRUNCATE 也拦（小赵 S5）
+CREATE TRIGGER trg_hr_no_truncate BEFORE TRUNCATE ON stock_hold_release FOR EACH STATEMENT EXECUTE FUNCTION trg_hold_no_delete();  -- @pg-only
 CREATE TRIGGER trg_hr_append_only BEFORE UPDATE OR DELETE ON stock_hold_release FOR EACH ROW EXECUTE FUNCTION trg_hold_no_delete();  -- @pg-only
 -- @sqlite-only CREATE TRIGGER trg_hold_immutable BEFORE UPDATE ON stock_hold
 -- @sqlite-only WHEN NEW.id IS NOT OLD.id OR NEW.stock_id IS NOT OLD.stock_id OR NEW.hold_type IS NOT OLD.hold_type OR NEW.reason_code IS NOT OLD.reason_code
@@ -561,7 +567,7 @@ CREATE TABLE stock_recon_alert (
     detected_at             TIMESTAMP       NOT NULL DEFAULT now(),
     last_seen_at            TIMESTAMP       NOT NULL DEFAULT now(),
     CONSTRAINT ck_recon_status CHECK (status IN ('OPEN','ACKED','RESOLVED')),
-    CONSTRAINT ck_recon_code CHECK (check_code IN ('I3a','I3b','I3c','I3d','I4','I5','SNAP'))   -- 码表见 docs/02 §4.6；新增走迁移（小赵 C4）
+    CONSTRAINT ck_recon_code CHECK (check_code IN ('I3a','I3b','I3c','I3d','I3e','I4','I5','SNAP','RR_HOLD_FAILED','RR_HOLD_MISMATCH'))   -- 码表见 docs/02 §4.6；新增走迁移（小赵 C4）
 );
 CREATE INDEX ix_recon_open ON stock_recon_alert(warehouse_id, status, detected_at DESC);
 CREATE UNIQUE INDEX uq_recon_open ON stock_recon_alert(check_code, warehouse_id, stock_id) WHERE status <> 'RESOLVED';
@@ -768,9 +774,9 @@ CREATE TABLE wave_capacity_config (
 CREATE TABLE pick_task (
     id              BIGINT       PRIMARY KEY,
     code            VARCHAR(64)  NOT NULL,
-    wave_id         BIGINT       NOT NULL,
+    wave_id         BIGINT,                              -- PICK 必填；REPLENISH 可空（ck_pt_wave，docs/05 PM 阻塞项）
     warehouse_id    BIGINT       NOT NULL,
-    task_type       VARCHAR(24)  NOT NULL DEFAULT 'PICK',   -- PICK/REPLENISH（补货复用本表）
+    task_type       VARCHAR(24)  NOT NULL DEFAULT 'PICK',   -- PICK/REPLENISH（补货复用本表）；写入后不可改（trg_pt_guard）
     zone_id         BIGINT,
     status          VARCHAR(16)  NOT NULL DEFAULT 'PENDING',-- PENDING/EXECUTING/DONE/ABNORMAL/CANCELLED/CLOSED（docs/05 Q4）
     assigned_to     BIGINT,
@@ -786,8 +792,23 @@ CREATE TABLE pick_task (
     updated_at      TIMESTAMP    NOT NULL DEFAULT now(),
     CONSTRAINT uq_pt_code UNIQUE (code),
     CONSTRAINT ck_pt_status CHECK (status IN ('PENDING','EXECUTING','DONE','ABNORMAL','CANCELLED','CLOSED')),
-    CONSTRAINT ck_pt_handover CHECK (handover_from_task_id IS NULL OR handover_from_task_id <> id)
+    CONSTRAINT ck_pt_handover CHECK (handover_from_task_id IS NULL OR handover_from_task_id <> id),
+    CONSTRAINT ck_pt_type CHECK (task_type IN ('PICK','REPLENISH')),
+    CONSTRAINT ck_pt_wave CHECK (task_type = 'REPLENISH' OR wave_id IS NOT NULL),
+    CONSTRAINT ck_pt_exec CHECK (status <> 'EXECUTING' OR (assigned_to IS NOT NULL AND device_instance_id IS NOT NULL))
 );
+-- docs/05：CLOSED 是终态；task_type 不可改（行上的冗余 task_type 依赖它）
+CREATE FUNCTION trg_pt_guard() RETURNS trigger LANGUAGE plpgsql AS $$                                       -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    IF OLD.status = 'CLOSED' AND NEW.status <> 'CLOSED' THEN RAISE EXCEPTION 'pick_task_closed_terminal' USING ERRCODE = '23514'; END IF;  -- @pg-only
+    IF NEW.task_type <> OLD.task_type THEN RAISE EXCEPTION 'pick_task_type_immutable' USING ERRCODE = '23514'; END IF;  -- @pg-only
+    RETURN NEW;                                                                                               -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_pt_guard BEFORE UPDATE ON pick_task FOR EACH ROW EXECUTE FUNCTION trg_pt_guard();       -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_pt_closed BEFORE UPDATE OF status ON pick_task WHEN OLD.status = 'CLOSED' AND NEW.status <> 'CLOSED'
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'pick_task_closed_terminal'); END;
+-- @sqlite-only CREATE TRIGGER trg_pt_type BEFORE UPDATE OF task_type ON pick_task WHEN NEW.task_type <> OLD.task_type
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'pick_task_type_immutable'); END;
 -- 领取队列：待领取 + 按动线优先级
 CREATE INDEX ix_pt_claim ON pick_task(wave_id, status, zone_id) WHERE status = 'PENDING';
 CREATE INDEX ix_pt_mine  ON pick_task(assigned_to, status);
@@ -800,7 +821,8 @@ CREATE TABLE pick_task_line (
     sku_id              BIGINT          NOT NULL,
     lot_id              BIGINT          NOT NULL,
     stock_id            BIGINT          NOT NULL,
-    outbound_line_id    BIGINT          NOT NULL,   -- docs/05 Q3：任务行按占用粒度生成，恒有值；BATCH 合并只在展示层
+    task_type           VARCHAR(24)     NOT NULL DEFAULT 'PICK',  -- 冗余父任务 task_type，供 ck_ptl_obl 判断；trg_ptl_type 保证与父任务一致
+    outbound_line_id    BIGINT,                     -- docs/05 Q3：PICK 行恒有值（按占用粒度生成，合并只在展示层）；REPLENISH 行为空
     planned_qty_milli   BIGINT          NOT NULL,   -- 应拣量，基本单位 milli（原 plan_qty_base）
     confirmed_qty_milli BIGINT          NOT NULL DEFAULT 0,  -- 已确认量；条件更新 confirmed + qty <= planned，否则 42214（00 §6.5）
     uom                 VARCHAR(16)     NOT NULL,   -- 作业单位，仅展示
@@ -815,9 +837,24 @@ CREATE TABLE pick_task_line (
         AND planned_qty_milli = CAST(planned_qty_milli AS BIGINT) AND confirmed_qty_milli = CAST(confirmed_qty_milli AS BIGINT)
     ),
     CONSTRAINT uq_ptl UNIQUE (pick_task_id, seq),
-    CONSTRAINT ck_ptl_status CHECK (status IN ('PENDING','DONE','SHORT','SKIP','ABNORMAL'))
+    CONSTRAINT ck_ptl_status CHECK (status IN ('PENDING','DONE','SHORT','SKIP','ABNORMAL')),
+    CONSTRAINT ck_ptl_obl CHECK (task_type = 'REPLENISH' OR outbound_line_id IS NOT NULL)
 );
 CREATE INDEX ix_ptl_loc ON pick_task_line(location_id, status);
+CREATE FUNCTION trg_ptl_type() RETURNS trigger LANGUAGE plpgsql AS $$                                       -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    IF NOT EXISTS (SELECT 1 FROM pick_task t WHERE t.id = NEW.pick_task_id AND t.task_type = NEW.task_type) THEN  -- @pg-only
+        RAISE EXCEPTION 'ptl_task_type_mismatch' USING ERRCODE = '23514';                                    -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    RETURN NEW;                                                                                               -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_ptl_type BEFORE INSERT OR UPDATE OF pick_task_id, task_type ON pick_task_line FOR EACH ROW EXECUTE FUNCTION trg_ptl_type();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_ptl_type_ins BEFORE INSERT ON pick_task_line
+-- @sqlite-only WHEN NOT EXISTS (SELECT 1 FROM pick_task t WHERE t.id = NEW.pick_task_id AND t.task_type = NEW.task_type)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'ptl_task_type_mismatch'); END;
+-- @sqlite-only CREATE TRIGGER trg_ptl_type_upd BEFORE UPDATE OF pick_task_id, task_type ON pick_task_line
+-- @sqlite-only WHEN NOT EXISTS (SELECT 1 FROM pick_task t WHERE t.id = NEW.pick_task_id AND t.task_type = NEW.task_type)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'ptl_task_type_mismatch'); END;
 
 -- docs/05 §4.5：PDA 拣货操作去重（第二层，四元组业务键）。拒收/报缺不写流水，只写本表。
 -- 同四元组同 op_type 同 qty_milli → 回放 result_code；否则 40910 detail.key_type=PDA_OP（应用层比对本行）。
@@ -830,16 +867,46 @@ CREATE TABLE pick_op (
     op_type             VARCHAR(16)     NOT NULL,   -- CONFIRM/UNDO/SHORT
     qty_milli           BIGINT          NOT NULL,
     scan_event_id       VARCHAR(64),                -- 计件模式必填
-    result_code         VARCHAR(5),                 -- 首次结果：'0' 成功；40920/40921/40922 拒收；处理中为空
+    result_code         VARCHAR(5),                 -- 首次结果：成功为 NULL；失败为 5 位错误码（40920/40921/40922…）
+    finished_at         TIMESTAMP,                  -- 首次结果写入时刻；非空后整行冻结（B2）
     movement_id         BIGINT,
     return_record_id    BIGINT,
     created_at          TIMESTAMP       NOT NULL DEFAULT now(),
     CONSTRAINT uq_pick_op UNIQUE (task_id, line_no, device_instance_id, op_seq),
     CONSTRAINT ck_pick_op_type CHECK (op_type IN ('CONFIRM','UNDO','SHORT')),
     CONSTRAINT ck_pick_op_qty CHECK (qty_milli >= 0 AND qty_milli = CAST(qty_milli AS BIGINT) AND op_seq > 0
-        AND (op_type = 'SHORT' OR qty_milli > 0))
+        AND (op_type = 'SHORT' OR qty_milli > 0)),
+    CONSTRAINT ck_pick_op_result CHECK (result_code IS NULL OR (length(result_code) = 5 AND replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(result_code,'0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9','') = '')),
+    CONSTRAINT ck_pick_op_finish CHECK (finished_at IS NOT NULL OR (result_code IS NULL AND movement_id IS NULL AND return_record_id IS NULL))
 );
 CREATE UNIQUE INDEX uq_pick_op_scan ON pick_op(task_id, line_no, scan_event_id) WHERE scan_event_id IS NOT NULL;
+-- B1/B2：业务键、类型、数量写入后不可改；首次结果只能写一次（finished_at 非空后整行冻结）；不可删
+CREATE FUNCTION trg_pick_op_guard() RETURNS trigger LANGUAGE plpgsql AS $$                                  -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    IF TG_OP <> 'UPDATE' THEN RAISE EXCEPTION 'pick_op_immutable' USING ERRCODE = '23514'; END IF;           -- @pg-only
+    IF NEW.id <> OLD.id OR NEW.task_id <> OLD.task_id OR NEW.line_no <> OLD.line_no                         -- @pg-only
+       OR NEW.device_instance_id <> OLD.device_instance_id OR NEW.op_seq <> OLD.op_seq OR NEW.op_type <> OLD.op_type  -- @pg-only
+       OR NEW.qty_milli <> OLD.qty_milli OR NEW.scan_event_id IS DISTINCT FROM OLD.scan_event_id           -- @pg-only
+       OR NEW.created_at <> OLD.created_at OR OLD.finished_at IS NOT NULL THEN                               -- @pg-only
+        RAISE EXCEPTION 'pick_op_immutable' USING ERRCODE = '23514';                                         -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    RETURN NEW;                                                                                               -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_pick_op_guard BEFORE UPDATE OR DELETE ON pick_op FOR EACH ROW EXECUTE FUNCTION trg_pick_op_guard();  -- @pg-only
+CREATE TRIGGER trg_pick_op_no_truncate BEFORE TRUNCATE ON pick_op FOR EACH STATEMENT EXECUTE FUNCTION trg_pick_op_guard();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_pick_op_upd BEFORE UPDATE ON pick_op
+-- @sqlite-only WHEN NEW.id IS NOT OLD.id OR NEW.task_id IS NOT OLD.task_id OR NEW.line_no IS NOT OLD.line_no
+-- @sqlite-only   OR NEW.device_instance_id IS NOT OLD.device_instance_id OR NEW.op_seq IS NOT OLD.op_seq OR NEW.op_type IS NOT OLD.op_type
+-- @sqlite-only   OR NEW.qty_milli IS NOT OLD.qty_milli OR NEW.scan_event_id IS NOT OLD.scan_event_id
+-- @sqlite-only   OR NEW.created_at IS NOT OLD.created_at OR OLD.finished_at IS NOT NULL
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'pick_op_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_pick_op_del BEFORE DELETE ON pick_op BEGIN SELECT RAISE(ABORT, 'pick_op_immutable'); END;
+-- SQLite：REPLACE 会先删冲突行（任一唯一键），BEFORE INSERT 先拦；应用层在 SQLite 用普通 INSERT 并捕获 pick_op_duplicate（docs/05 §6.2）
+-- @sqlite-only CREATE TRIGGER trg_pick_op_dup BEFORE INSERT ON pick_op
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM pick_op o WHERE o.id = NEW.id
+-- @sqlite-only   OR (o.task_id = NEW.task_id AND o.line_no = NEW.line_no AND o.device_instance_id = NEW.device_instance_id AND o.op_seq = NEW.op_seq)
+-- @sqlite-only   OR (NEW.scan_event_id IS NOT NULL AND o.task_id = NEW.task_id AND o.line_no = NEW.line_no AND o.scan_event_id = NEW.scan_event_id))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'pick_op_duplicate'); END;
 
 -- docs/05 §4.5 / 04 §4.4：待回库记录。接口口径见 04 §7.3（returnRecordId = id）。
 -- 所有类型统一预建 stock_ledger_line DOC 行（biz_no = code）。
@@ -880,7 +947,8 @@ CREATE TABLE return_record (
     CONSTRAINT ck_rr_source CHECK (
         (source_type = 'OFFLINE_REJECT' AND task_id IS NOT NULL AND line_no IS NOT NULL AND device_instance_id IS NOT NULL
             AND op_seq IS NOT NULL AND reject_code IN ('40920','40921','40922'))
-        OR (source_type = 'CANCEL_AFTER_PICK' AND outbound_line_id IS NOT NULL AND ref_movement_id IS NOT NULL AND reject_code IS NULL)),
+        OR (source_type = 'CANCEL_AFTER_PICK' AND outbound_line_id IS NOT NULL AND ref_movement_id IS NOT NULL AND reject_code IS NULL
+            AND task_id IS NULL AND line_no IS NULL AND device_instance_id IS NULL AND op_seq IS NULL)),
     CONSTRAINT ck_rr_qty CHECK (qty_milli > 0 AND qty_milli = CAST(qty_milli AS BIGINT)),
     CONSTRAINT ck_rr_hold CHECK (hold_failed IN (0,1) AND NOT (hold_failed = 1 AND hold_id IS NOT NULL)),
     CONSTRAINT ck_rr_status CHECK (status IN ('OPEN','CONFIRMED','RESOLVED')),
@@ -888,6 +956,8 @@ CREATE TABLE return_record (
         (status <> 'OPEN' OR resolution IS NULL)
         AND (status <> 'CONFIRMED' OR resolution = 'CONFIRMED')
         AND (status <> 'RESOLVED' OR resolution IN ('RETURNED_TO_ORIGINAL','NEARBY_PUTBACK','SCRAP_HANDOVER'))),
+    CONSTRAINT ck_rr_closed CHECK (status = 'OPEN' OR (closed_by IS NOT NULL AND closed_at IS NOT NULL)),
+    CONSTRAINT ck_rr_scrap CHECK (COALESCE(resolution, '') <> 'SCRAP_HANDOVER' OR scrap_doc_id IS NOT NULL),
     CONSTRAINT ck_rr_target CHECK ((resolution = 'NEARBY_PUTBACK' AND target_location_id IS NOT NULL)
         OR (COALESCE(resolution, '') <> 'NEARBY_PUTBACK' AND target_location_id IS NULL))
 );
@@ -895,11 +965,57 @@ CREATE UNIQUE INDEX uq_rr_pda ON return_record(task_id, line_no, device_instance
 CREATE UNIQUE INDEX uq_rr_cap ON return_record(outbound_line_id, ref_movement_id) WHERE source_type = 'CANCEL_AFTER_PICK';
 CREATE INDEX ix_rr_open   ON return_record(warehouse_id, status, created_at);
 CREATE INDEX ix_rr_picker ON return_record(picker_id, status);
+-- B3：来源/数量等列不可改；hold_id 只能 NULL→值一次；只允许 OPEN→CONFIRMED/RESOLVED 单向；关闭后只允许补写到位/交接确认（各一次）与 version；不可删
+CREATE FUNCTION trg_rr_guard() RETURNS trigger LANGUAGE plpgsql AS $$                                       -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    IF TG_OP <> 'UPDATE' THEN RAISE EXCEPTION 'rr_immutable' USING ERRCODE = '23514'; END IF;                -- @pg-only
+    IF ROW(NEW.id, NEW.code, NEW.warehouse_id, NEW.source_type, NEW.task_id, NEW.line_no, NEW.device_instance_id, NEW.op_seq,  -- @pg-only
+           NEW.outbound_line_id, NEW.ref_movement_id, NEW.reject_code, NEW.picker_id, NEW.stock_id, NEW.location_id,  -- @pg-only
+           NEW.sku_id, NEW.lot_id, NEW.qty_milli, NEW.payload, NEW.created_at)                                  -- @pg-only
+       IS DISTINCT FROM ROW(OLD.id, OLD.code, OLD.warehouse_id, OLD.source_type, OLD.task_id, OLD.line_no, OLD.device_instance_id, OLD.op_seq,  -- @pg-only
+           OLD.outbound_line_id, OLD.ref_movement_id, OLD.reject_code, OLD.picker_id, OLD.stock_id, OLD.location_id,  -- @pg-only
+           OLD.sku_id, OLD.lot_id, OLD.qty_milli, OLD.payload, OLD.created_at)                                  -- @pg-only
+       OR (OLD.hold_id IS NOT NULL AND NEW.hold_id IS DISTINCT FROM OLD.hold_id)                              -- @pg-only
+       OR (OLD.putback_acked_at IS NOT NULL AND ROW(NEW.putback_acked_at, NEW.putback_acked_by) IS DISTINCT FROM ROW(OLD.putback_acked_at, OLD.putback_acked_by))  -- @pg-only
+       OR (OLD.handover_confirmed_at IS NOT NULL AND ROW(NEW.handover_confirmed_at, NEW.handover_confirmed_by) IS DISTINCT FROM ROW(OLD.handover_confirmed_at, OLD.handover_confirmed_by)) THEN  -- @pg-only
+        RAISE EXCEPTION 'rr_immutable' USING ERRCODE = '23514';                                              -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    IF OLD.status <> 'OPEN' AND ROW(NEW.status, NEW.resolution, NEW.target_location_id, NEW.scrap_doc_id, NEW.hold_id, NEW.hold_failed, NEW.closed_by, NEW.closed_at)  -- @pg-only
+       IS DISTINCT FROM ROW(OLD.status, OLD.resolution, OLD.target_location_id, OLD.scrap_doc_id, OLD.hold_id, OLD.hold_failed, OLD.closed_by, OLD.closed_at) THEN  -- @pg-only
+        RAISE EXCEPTION 'rr_closed' USING ERRCODE = '23514';                                                 -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    RETURN NEW;                                                                                               -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_rr_guard BEFORE UPDATE OR DELETE ON return_record FOR EACH ROW EXECUTE FUNCTION trg_rr_guard();  -- @pg-only
+CREATE TRIGGER trg_rr_no_truncate BEFORE TRUNCATE ON return_record FOR EACH STATEMENT EXECUTE FUNCTION trg_rr_guard();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_rr_upd BEFORE UPDATE ON return_record
+-- @sqlite-only WHEN NEW.id IS NOT OLD.id OR NEW.code IS NOT OLD.code OR NEW.warehouse_id IS NOT OLD.warehouse_id OR NEW.source_type IS NOT OLD.source_type
+-- @sqlite-only   OR NEW.task_id IS NOT OLD.task_id OR NEW.line_no IS NOT OLD.line_no OR NEW.device_instance_id IS NOT OLD.device_instance_id OR NEW.op_seq IS NOT OLD.op_seq
+-- @sqlite-only   OR NEW.outbound_line_id IS NOT OLD.outbound_line_id OR NEW.ref_movement_id IS NOT OLD.ref_movement_id OR NEW.reject_code IS NOT OLD.reject_code
+-- @sqlite-only   OR NEW.picker_id IS NOT OLD.picker_id OR NEW.stock_id IS NOT OLD.stock_id OR NEW.location_id IS NOT OLD.location_id OR NEW.sku_id IS NOT OLD.sku_id
+-- @sqlite-only   OR NEW.lot_id IS NOT OLD.lot_id OR NEW.qty_milli IS NOT OLD.qty_milli OR NEW.payload IS NOT OLD.payload OR NEW.created_at IS NOT OLD.created_at
+-- @sqlite-only   OR (OLD.hold_id IS NOT NULL AND NEW.hold_id IS NOT OLD.hold_id)
+-- @sqlite-only   OR (OLD.putback_acked_at IS NOT NULL AND (NEW.putback_acked_at IS NOT OLD.putback_acked_at OR NEW.putback_acked_by IS NOT OLD.putback_acked_by))
+-- @sqlite-only   OR (OLD.handover_confirmed_at IS NOT NULL AND (NEW.handover_confirmed_at IS NOT OLD.handover_confirmed_at OR NEW.handover_confirmed_by IS NOT OLD.handover_confirmed_by))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'rr_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_rr_closed BEFORE UPDATE ON return_record
+-- @sqlite-only WHEN OLD.status <> 'OPEN' AND (NEW.status IS NOT OLD.status OR NEW.resolution IS NOT OLD.resolution OR NEW.target_location_id IS NOT OLD.target_location_id
+-- @sqlite-only   OR NEW.scrap_doc_id IS NOT OLD.scrap_doc_id OR NEW.hold_id IS NOT OLD.hold_id OR NEW.hold_failed IS NOT OLD.hold_failed
+-- @sqlite-only   OR NEW.closed_by IS NOT OLD.closed_by OR NEW.closed_at IS NOT OLD.closed_at)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'rr_closed'); END;
+-- @sqlite-only CREATE TRIGGER trg_rr_del BEFORE DELETE ON return_record BEGIN SELECT RAISE(ABORT, 'rr_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_rr_dup BEFORE INSERT ON return_record
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM return_record r WHERE r.id = NEW.id OR r.code = NEW.code
+-- @sqlite-only   OR (NEW.source_type = 'OFFLINE_REJECT' AND r.source_type = 'OFFLINE_REJECT' AND r.task_id = NEW.task_id AND r.line_no = NEW.line_no
+-- @sqlite-only       AND r.device_instance_id = NEW.device_instance_id AND r.op_seq = NEW.op_seq)
+-- @sqlite-only   OR (NEW.source_type = 'CANCEL_AFTER_PICK' AND r.source_type = 'CANCEL_AFTER_PICK' AND r.outbound_line_id = NEW.outbound_line_id
+-- @sqlite-only       AND r.ref_movement_id = NEW.ref_movement_id))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'rr_duplicate'); END;
 -- pick_op 的四元组、op_type、qty_milli 是 40910 PDA_OP 比对基准，应用角色只能补写首次结果列
 GRANT SELECT, INSERT, UPDATE ON wave_capacity_config TO wms_app;                                             -- @pg-only
 GRANT SELECT, INSERT ON pick_op, return_record TO wms_app;                                                     -- @pg-only
 GRANT UPDATE (status, resolution, target_location_id, putback_acked_at, putback_acked_by, scrap_doc_id, handover_confirmed_at, handover_confirmed_by, hold_id, hold_failed, closed_by, closed_at, version) ON return_record TO wms_app;  -- @pg-only
-GRANT UPDATE (result_code, movement_id, return_record_id) ON pick_op TO wms_app;                             -- @pg-only
+GRANT UPDATE (result_code, movement_id, return_record_id, finished_at) ON pick_op TO wms_app;                             -- @pg-only
 
 CREATE TABLE pack_box (
     id              BIGINT       PRIMARY KEY,
@@ -1073,6 +1189,33 @@ CREATE TABLE outbox_event (
 CREATE INDEX ix_outbox_pending ON outbox_event(status, next_retry_at);
 CREATE INDEX ix_outbox_bizkey  ON outbox_event(biz_key, id);   -- 同键串行发送
 
+-- 小赵 Q2：去重记录与 outbox 只能清理"已过期 / 已投递且过保留期"的行（两库触发器，条件与 purge_expired() 一致）
+CREATE FUNCTION trg_purge_guard() RETURNS trigger LANGUAGE plpgsql AS $$                                   -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    IF TG_OP = 'TRUNCATE' THEN RAISE EXCEPTION 'purge_not_allowed: %', TG_TABLE_NAME USING ERRCODE = '42501'; END IF;  -- @pg-only
+    IF TG_TABLE_NAME = 'idempotency_record' THEN                                                              -- @pg-only
+        IF NOT (OLD.expires_at < now()) THEN                                                                  -- @pg-only
+            RAISE EXCEPTION 'purge_not_allowed: idempotency_record' USING ERRCODE = '42501';                 -- @pg-only
+        END IF;                                                                                               -- @pg-only
+    ELSIF NOT (OLD.status = 'SENT' AND OLD.sent_at < now() - interval '7 days') THEN   -- outbox_event      -- @pg-only
+        RAISE EXCEPTION 'purge_not_allowed: outbox_event' USING ERRCODE = '42501';                           -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    RETURN OLD;                                                                                               -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_idem_purge_guard    BEFORE DELETE   ON idempotency_record FOR EACH ROW       EXECUTE FUNCTION trg_purge_guard();  -- @pg-only
+CREATE TRIGGER trg_idem_no_truncate    BEFORE TRUNCATE ON idempotency_record FOR EACH STATEMENT EXECUTE FUNCTION trg_purge_guard();  -- @pg-only
+CREATE TRIGGER trg_outbox_purge_guard  BEFORE DELETE   ON outbox_event       FOR EACH ROW       EXECUTE FUNCTION trg_purge_guard();  -- @pg-only
+CREATE TRIGGER trg_outbox_no_truncate  BEFORE TRUNCATE ON outbox_event       FOR EACH STATEMENT EXECUTE FUNCTION trg_purge_guard();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_idem_purge_guard BEFORE DELETE ON idempotency_record WHEN NOT (OLD.expires_at < datetime('now'))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'purge_not_allowed: idempotency_record'); END;
+-- @sqlite-only CREATE TRIGGER trg_outbox_purge_guard BEFORE DELETE ON outbox_event WHEN NOT (OLD.status = 'SENT' AND OLD.sent_at < datetime('now', '-7 days'))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'purge_not_allowed: outbox_event'); END;
+-- SQLite REPLACE 冲突删旧行不触发 DELETE 触发器 → BEFORE INSERT 主键已存在就中止（应用把 idem_duplicate 当作"键已存在"处理，与 PG 23505 同分支）
+-- @sqlite-only CREATE TRIGGER trg_idem_no_replace BEFORE INSERT ON idempotency_record WHEN EXISTS (SELECT 1 FROM idempotency_record r WHERE r.idem_key = NEW.idem_key)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'idem_duplicate'); END;
+-- @sqlite-only CREATE TRIGGER trg_outbox_no_replace BEFORE INSERT ON outbox_event WHEN EXISTS (SELECT 1 FROM outbox_event o WHERE o.id = NEW.id)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'outbox_duplicate'); END;
+
 CREATE TABLE audit_log (
     id              BIGINT       PRIMARY KEY,
     actor_id        BIGINT,
@@ -1203,6 +1346,23 @@ GRANT SELECT, INSERT, UPDATE ON warehouse, zone, location, sku, sku_unit, sku_ba
     pack_box, pack_box_line, shipment, shipment_order, count_order, count_line, adjust_order, adjust_line,       -- @pg-only
     sys_user, sys_role, sys_permission, sys_role_perm, sys_user_role, sys_user_warehouse, api_credential,        -- @pg-only
     inbound_message TO wms_app;                                                                                   -- @pg-only
-GRANT SELECT, INSERT, UPDATE, DELETE ON idempotency_record, outbox_event TO wms_app;   -- 过期清理/已投递清理由应用定时任务做 -- @pg-only
+GRANT SELECT, INSERT, UPDATE ON idempotency_record, outbox_event TO wms_app;           -- 无 DELETE/TRUNCATE（小赵 Q2）-- @pg-only
+-- 清理只能经 purge_expired()：属主 wms_purge_owner（非超级用户、NOLOGIN，只有这两张表的 SELECT/DELETE），
+-- 调用方 wms_cleaner 只有 EXECUTE，对表没有任何权限；删除条件写死在函数里，不接受参数
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'wms_purge_owner') THEN CREATE ROLE wms_purge_owner NOLOGIN NOSUPERUSER NOINHERIT; END IF; END $$;  -- @pg-only
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'wms_cleaner') THEN CREATE ROLE wms_cleaner NOLOGIN NOSUPERUSER; END IF; END $$;  -- @pg-only
+GRANT USAGE ON SCHEMA public TO wms_purge_owner, wms_cleaner;                          -- @pg-only
+GRANT SELECT, DELETE ON idempotency_record, outbox_event TO wms_purge_owner;           -- @pg-only
+CREATE FUNCTION public.purge_expired(OUT idem_deleted BIGINT, OUT outbox_deleted BIGINT)  -- @pg-only
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$          -- @pg-only
+BEGIN                                                                                  -- @pg-only
+    DELETE FROM public.idempotency_record WHERE expires_at < now();                    -- @pg-only
+    GET DIAGNOSTICS idem_deleted = ROW_COUNT;                                          -- @pg-only
+    DELETE FROM public.outbox_event WHERE status = 'SENT' AND sent_at < now() - interval '7 days';  -- @pg-only
+    GET DIAGNOSTICS outbox_deleted = ROW_COUNT;                                        -- @pg-only
+END $$;                                                                                -- @pg-only
+ALTER FUNCTION public.purge_expired() OWNER TO wms_purge_owner;                        -- @pg-only
+REVOKE ALL ON FUNCTION public.purge_expired() FROM PUBLIC;                             -- @pg-only
+GRANT EXECUTE ON FUNCTION public.purge_expired() TO wms_cleaner;                       -- @pg-only
 GRANT SELECT, INSERT ON audit_log, stock_snapshot_daily TO wms_app;                    -- 只追加 -- @pg-only
 GRANT SELECT ON v_stock_available TO wms_app;                                          -- @pg-only
