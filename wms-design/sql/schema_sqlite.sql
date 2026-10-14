@@ -180,7 +180,7 @@ CREATE TABLE stock (
     allocated_qty_milli     BIGINT          NOT NULL DEFAULT 0,   -- 已分配未拣（= ALLOCATE 占用汇总）
     reserved_qty_milli      BIGINT          NOT NULL DEFAULT 0,   -- 已预占（= RESERVE 占用汇总）
     quality_hold_qty_milli  BIGINT          NOT NULL DEFAULT 0,   -- 质检/盘点冻结（= QUALITY 冻结汇总）
-    frozen_qty_milli        BIGINT          NOT NULL DEFAULT 0,   -- 人工冻结（= MANUAL 冻结汇总）
+    hold_qty_milli        BIGINT          NOT NULL DEFAULT 0,   -- 冻结（= MANUAL + RETURN_PENDING 冻结汇总），从 available 扣除，FEFO 分不到
 
     ledger_seq              BIGINT          NOT NULL DEFAULT 0,   -- 本行 on_hand 变更计数，与流水 stock_seq 一一对应（快照水位线）；期初/迁移行的第 1 条流水是 OPENING
     version                 BIGINT          NOT NULL DEFAULT 0,
@@ -198,13 +198,13 @@ CREATE TABLE stock (
         AND allocated_qty_milli = CAST(allocated_qty_milli AS BIGINT)
         AND reserved_qty_milli = CAST(reserved_qty_milli AS BIGINT)
         AND quality_hold_qty_milli = CAST(quality_hold_qty_milli AS BIGINT)
-        AND frozen_qty_milli = CAST(frozen_qty_milli AS BIGINT)
+        AND hold_qty_milli = CAST(hold_qty_milli AS BIGINT)
     ),
     -- 数据库层兜底不变量 I1/I2：即使 Service 写错，也不会出现负数或超占
     CONSTRAINT ck_stock_nonneg CHECK (
         on_hand_qty_milli >= 0 AND allocated_qty_milli >= 0 AND reserved_qty_milli >= 0
-        AND quality_hold_qty_milli >= 0 AND frozen_qty_milli >= 0
-        AND (allocated_qty_milli + reserved_qty_milli + quality_hold_qty_milli + frozen_qty_milli) <= on_hand_qty_milli
+        AND quality_hold_qty_milli >= 0 AND hold_qty_milli >= 0
+        AND (allocated_qty_milli + reserved_qty_milli + quality_hold_qty_milli + hold_qty_milli) <= on_hand_qty_milli
     )
 );
 CREATE INDEX ix_stock_sku_avail ON stock(sku_id, warehouse_id, lot_id) WHERE on_hand_qty_milli > 0;
@@ -220,7 +220,7 @@ CREATE TABLE stock_reservation (
     source_type         VARCHAR(24)     NOT NULL,   -- OUTBOUND_LINE/WAVE/COUNT/MANUAL
     source_id           BIGINT          NOT NULL,
     source_line_id      BIGINT          NOT NULL DEFAULT 0,   -- R11：0 哨兵
-    op_key              VARCHAR(80)     NOT NULL,   -- 占用操作幂等键，调用方给定
+    op_key              VARCHAR(80)     NOT NULL,   -- RES:{doc_no}:{line_no}:{alloc_round}:{stock_id}；alloc_round 在出库行上，每次重新分配 +1
     reserve_qty_milli   BIGINT          NOT NULL,
     consumed_qty_milli  BIGINT          NOT NULL DEFAULT 0,
     released_qty_milli  BIGINT          NOT NULL DEFAULT 0,
@@ -255,7 +255,7 @@ CREATE INDEX ix_res_exp    ON stock_reservation(expires_at) WHERE status = 'RESE
 CREATE TABLE stock_hold (
     id                  BIGINT          PRIMARY KEY,
     stock_id            BIGINT          NOT NULL,
-    hold_type           VARCHAR(16)     NOT NULL,   -- QUALITY → quality_hold；MANUAL、RETURN_PENDING → frozen
+    hold_type           VARCHAR(16)     NOT NULL,   -- QUALITY → stock.quality_hold_qty_milli；MANUAL、RETURN_PENDING → stock.hold_qty_milli
     reason_code         VARCHAR(24)     NOT NULL,   -- 见 ck_hold_reason；新增原因走迁移
     source_type         VARCHAR(24)     NOT NULL,   -- INBOUND_QC/COUNT/RETURN/EXCEPTION/MANUAL/RETURN_RECORD
     source_id           BIGINT          NOT NULL DEFAULT 0,
@@ -421,7 +421,7 @@ CREATE TABLE stock_snapshot_daily (
     allocated_qty_milli     BIGINT          NOT NULL,
     reserved_qty_milli      BIGINT          NOT NULL,
     quality_hold_qty_milli  BIGINT          NOT NULL,
-    frozen_qty_milli        BIGINT          NOT NULL,
+    hold_qty_milli        BIGINT          NOT NULL,
     ledger_seq              BIGINT          NOT NULL,   -- 快照水位线：回放该行 stock_seq <= ledger_seq 的流水应等于 on_hand
     cost_amount             BIGINT          NOT NULL DEFAULT 0,
     created_at              TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
@@ -918,9 +918,9 @@ SELECT
     s.allocated_qty_milli,
     s.reserved_qty_milli,
     s.quality_hold_qty_milli,
-    s.frozen_qty_milli,
-    (s.on_hand_qty_milli - s.allocated_qty_milli - s.reserved_qty_milli - s.quality_hold_qty_milli - s.frozen_qty_milli) AS available_qty_milli,
-    (s.on_hand_qty_milli - s.quality_hold_qty_milli - s.frozen_qty_milli - s.allocated_qty_milli)                        AS pickable_qty_milli
+    s.hold_qty_milli,
+    (s.on_hand_qty_milli - s.allocated_qty_milli - s.reserved_qty_milli - s.quality_hold_qty_milli - s.hold_qty_milli) AS available_qty_milli,
+    (s.on_hand_qty_milli - s.quality_hold_qty_milli - s.hold_qty_milli - s.allocated_qty_milli)                        AS pickable_qty_milli
 FROM stock s
 JOIN location l ON l.id = s.location_id
 JOIN zone z     ON z.id = l.zone_id

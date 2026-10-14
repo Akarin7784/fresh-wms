@@ -167,9 +167,9 @@ expect_block "跨分区去重：同一键 11-01 再记（PG 落在另一个分�
   "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('XP1',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (18,'XP1',1,1,1,'DOC','SHIP',0,13,0,1,3,1,3,NULL,NULL,NULL,NULL,1000,200000,200000,'2026-11-01','X:xp'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (18,'X:xp','XP1',1,1,1,'DOC',NULL,NULL,NULL,NULL,13,0,0,'2026-11-01'); COMMIT;" \
   "uq_mvk_biz_line"
 expect_allow "占用写入（RESERVE 10000）" \
-  "BEGIN; INSERT INTO stock_reservation (id,stock_id,stage,source_type,source_id,source_line_id,op_key,reserve_qty_milli,consumed_qty_milli,released_qty_milli,status) VALUES (1,11,'RESERVE','OUTBOUND_LINE',1,1,'RES:OBT1:1:1',10000,0,0,'RESERVED'); COMMIT;"
+  "BEGIN; INSERT INTO stock_reservation (id,stock_id,stage,source_type,source_id,source_line_id,op_key,reserve_qty_milli,consumed_qty_milli,released_qty_milli,status) VALUES (1,11,'RESERVE','OUTBOUND_LINE',1,1,'RES:OBT1:1:1:11',10000,0,0,'RESERVED'); COMMIT;"
 expect_block "占用幂等（同 op_key）" \
-  "BEGIN; INSERT INTO stock_reservation (id,stock_id,stage,source_type,source_id,source_line_id,op_key,reserve_qty_milli,consumed_qty_milli,released_qty_milli,status) VALUES (2,11,'RESERVE','OUTBOUND_LINE',1,1,'RES:OBT1:1:1',10000,0,0,'RESERVED'); COMMIT;" \
+  "BEGIN; INSERT INTO stock_reservation (id,stock_id,stage,source_type,source_id,source_line_id,op_key,reserve_qty_milli,consumed_qty_milli,released_qty_milli,status) VALUES (2,11,'RESERVE','OUTBOUND_LINE',1,1,'RES:OBT1:1:1:11',10000,0,0,'RESERVED'); COMMIT;" \
   "uq_res_op"
 expect_block "超消耗（consumed+released > reserve）" \
   "BEGIN; UPDATE stock_reservation SET consumed_qty_milli=6000, released_qty_milli=5000, status='CONSUMED' WHERE id=1; COMMIT;" \
@@ -219,7 +219,7 @@ case "$OUT" in *"permission denied for table stock_movement_key"*) ok "只追加
 
 echo "=== 2c. docs/02 40906：库位锁定写进扣减原语的 WHERE ==="
 psql -q -c "UPDATE location SET status='LOCKED' WHERE id=3;" >/dev/null
-DEDUCT="UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 13 AND on_hand_qty_milli - allocated_qty_milli - reserved_qty_milli - quality_hold_qty_milli - frozen_qty_milli >= 1000 AND EXISTS (SELECT 1 FROM location l WHERE l.id = stock.location_id AND l.status <> 'LOCKED');"
+DEDUCT="UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 13 AND on_hand_qty_milli - allocated_qty_milli - reserved_qty_milli - quality_hold_qty_milli - hold_qty_milli >= 1000 AND EXISTS (SELECT 1 FROM location l WHERE l.id = stock.location_id AND l.status <> 'LOCKED');"
 R=$(psql -t -A -c "$DEDUCT")
 [ "$R" = "UPDATE 0" ] && ok "库位 LOCKED：扣减 rowcount=0" || bad "锁定库位仍扣减：$R"
 psql -q -c "UPDATE location SET status='AVAILABLE' WHERE id=3;" >/dev/null
@@ -252,6 +252,12 @@ LOT-1014"
 echo "  → 出库顺序：$(echo "$ORDER" | tr '\n' ' ')"
 [ "$ORDER" = "$EXPECT" ] && ok "FEFO 全序列匹配（同批次内先拣货位 A01-03-01 后存储位 B02-01-05）" \
                          || bad "FEFO 排序偏离预期"
+RP=$(psql -t -A -q -c "BEGIN;
+INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (20,12,'RETURN_PENDING','RETURN_PENDING','RETURN_RECORD',20,'RRH:20',20000,0,'HELD',0);
+UPDATE stock SET hold_qty_milli = hold_qty_milli + 20000 WHERE id = 12 AND on_hand_qty_milli - allocated_qty_milli - reserved_qty_milli - quality_hold_qty_milli - hold_qty_milli >= 20000;
+SELECT (SELECT available_qty_milli FROM v_stock_available WHERE stock_id=12) || ',' || (SELECT count(*) FROM v_stock_available WHERE sku_id=1 AND warehouse_id=1 AND available_qty_milli > 0 AND expiry_date >= '2026-10-15'::date + 10) || ',' || (SELECT count(*) FROM v_stock_available WHERE stock_id=12 AND available_qty_milli > 0);
+ROLLBACK;" | tr -d '\r' | grep -E '^[0-9]+,[0-9]+,[0-9]+$')
+[ "$RP" = "0,3,0" ] && ok "RETURN_PENDING 冻满 stock 12：available→0，FEFO 候选 4→3 行且不含 12" || bad "RETURN_PENDING/FEFO = $RP（期望 0,3,0）"
 AV=$(psql -t -A -c "SELECT available_qty_milli FROM v_stock_available WHERE stock_id=12")
 [ "$AV" = "20000" ] && ok "available_qty_milli = 30000 − 10000 = $AV" || bad "可用量计算错误：$AV"
 
