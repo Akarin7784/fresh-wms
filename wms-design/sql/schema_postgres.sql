@@ -951,14 +951,32 @@ CREATE TABLE pod_op (
     signer_type         VARCHAR(16),                -- CUSTOMER_SCAN / DRIVER_PROXY（仅签收类）
     media_json          TEXT,                       -- [{object_key, sha256}]
     client_created_at   TIMESTAMP,                  -- 只展示，不参与排序与记账
+    -- 冷链签收温度（GB/T 40956-2021）：单位 0.1℃ 的整数，POD_SIGN / POD_REJECT 必填，其他操作必须为空
+    temperature_x10     INTEGER,
+    delivered_at        TIMESTAMP,                  -- UTC，服务端受理成功签收的时间（2xx 签收必填）
+    correct_deadline_at TIMESTAMP,                  -- UTC，= delivered_at + 24h（Q-J），服务端写入，不可修改（trg_pod_op_immutable）
     created_at          TIMESTAMP    NOT NULL DEFAULT now(),
     CONSTRAINT uq_pod_op_key  UNIQUE (waybill_no, stop_no, device_instance_id, op_seq),
     CONSTRAINT ck_pod_op_type CHECK (op_type IN ('LOAD','ARRIVE','POD_SIGN','POD_REJECT','DEPART','CONTAINER','RETURN_COUNT')),
     CONSTRAINT ck_pod_op_seq  CHECK (op_seq > 0 AND stop_no >= 0),
     CONSTRAINT ck_pod_op_cache CHECK ((http_status BETWEEN 200 AND 299 AND biz_code = '0')
                                    OR (http_status = 400 AND biz_code LIKE '400__')
-                                   OR (http_status = 409 AND biz_code LIKE '409__'))
+                                   OR (http_status = 409 AND biz_code LIKE '409__')),
+    CONSTRAINT ck_pod_op_temp CHECK ((op_type IN ('POD_SIGN','POD_REJECT')) = (temperature_x10 IS NOT NULL)
+                                  AND (temperature_x10 IS NULL OR temperature_x10 BETWEEN -400 AND 600)
+                                  AND temperature_x10 = CAST(temperature_x10 AS INTEGER)),   -- CAST 只在 SQLite 起作用
+    CONSTRAINT ck_pod_op_cdl  CHECK ((op_type IN ('POD_SIGN','POD_REJECT') AND http_status BETWEEN 200 AND 299)
+                                     = (delivered_at IS NOT NULL AND correct_deadline_at IS NOT NULL)
+                                  AND (delivered_at IS NOT NULL OR correct_deadline_at IS NULL)),
+    CONSTRAINT ck_pod_op_cdl24 CHECK (correct_deadline_at IS NULL OR correct_deadline_at = delivered_at + INTERVAL '24 hours')  -- @pg-only
+-- @sqlite-only     CONSTRAINT ck_pod_op_cdl24 CHECK (correct_deadline_at IS NULL OR correct_deadline_at = datetime(delivered_at, '+24 hours'))
 );
+-- pod_op 只追加：签收记录（含温度、delivered_at、correct_deadline_at）写入后任何列都不能改（wms_app 本就无 UPDATE，触发器兜超级用户与 SQLite）
+CREATE FUNCTION trg_pod_op_immutable() RETURNS trigger LANGUAGE plpgsql AS $$   -- @pg-only
+BEGIN RAISE EXCEPTION 'pod_op_immutable' USING ERRCODE = '23514'; END $$;   -- @pg-only
+CREATE TRIGGER trg_pod_op_immutable BEFORE UPDATE OR DELETE ON pod_op FOR EACH ROW EXECUTE FUNCTION trg_pod_op_immutable();   -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_pod_op_no_upd BEFORE UPDATE ON pod_op BEGIN SELECT RAISE(ABORT, 'pod_op_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_pod_op_no_del BEFORE DELETE ON pod_op BEGIN SELECT RAISE(ABORT, 'pod_op_immutable'); END;
 CREATE INDEX ix_pod_op_dev ON pod_op(device_instance_id, waybill_no, stop_no, op_seq);   -- GET /devices/{id}/op-seq-hwm（Q13）
 CREATE INDEX ix_pod_op_stop ON pod_op(waybill_no, stop_no, created_at);
 
@@ -976,7 +994,9 @@ CREATE TABLE pod_line (
     CONSTRAINT uq_podl      UNIQUE (pod_id, outbound_line_id, lot_id),
     CONSTRAINT ck_podl_int  CHECK (shipped_qty_milli = CAST(shipped_qty_milli AS BIGINT) AND rejected_qty_milli = CAST(rejected_qty_milli AS BIGINT)),
     CONSTRAINT ck_podl_qty  CHECK (shipped_qty_milli > 0 AND rejected_qty_milli >= 0 AND rejected_qty_milli <= shipped_qty_milli),
-    CONSTRAINT ck_podl_rsn  CHECK (rejected_qty_milli = 0 OR reject_reason IS NOT NULL)
+    CONSTRAINT ck_podl_rsn  CHECK (rejected_qty_milli = 0 OR reject_reason IS NOT NULL),
+    -- 拒收原因；TEMPERATURE_ABNORMAL = 到货温度超出冷链要求（GB/T 40956-2021），只能随带温度的签收使用
+    CONSTRAINT ck_podl_rsn_v CHECK (reject_reason IS NULL OR reject_reason IN ('DAMAGED','QUALITY','EXPIRED','SHORT','WRONG_ITEM','TEMPERATURE_ABNORMAL','CUSTOMER_REFUSED','OTHER'))
 );
 
 -- 签收更正：只能在线提交 POST /api/v1/approvals（type=POD_CORRECT，第 12 篇 approval_request），按审批单号关联；
@@ -984,7 +1004,9 @@ CREATE TABLE pod_line (
 -- 状态镜像审批单：PENDING / APPLIED / REJECTED / WITHDRAWN / EXPIRED / VOID（执行时原签收已变 → 40951，审批显示作废）
 CREATE TABLE pod_correction (
     id                BIGINT       PRIMARY KEY,     -- 也是更正后的签收 id（valid_pod_id、pod_line.pod_id 指向它）
-    approval_id       BIGINT       NOT NULL,        -- 第 12 篇 approval_request.id
+    approval_id       BIGINT,                       -- 第 12 篇 approval_request.id；容差内自动更正为 NULL（不走审批）
+    auto_tolerance    SMALLINT     NOT NULL DEFAULT 0,   -- 1 = 差异在 pod_tolerance_config 容差内，免审批直接执行
+    tolerance_version BIGINT,                       -- 自动更正时命中的容差配置 version（审计）
     corrected_pod_id  BIGINT       NOT NULL,
     outbound_id       BIGINT       NOT NULL,
     status            VARCHAR(16)  NOT NULL DEFAULT 'PENDING',
@@ -997,14 +1019,34 @@ CREATE TABLE pod_correction (
     CONSTRAINT uq_podc_approval UNIQUE (approval_id),
     CONSTRAINT ck_podc_status CHECK (status IN ('PENDING','APPLIED','REJECTED','WITHDRAWN','EXPIRED','VOID')),
     CONSTRAINT ck_podc_sod    CHECK (approver_id IS NULL OR approver_id <> requested_by),
+    CONSTRAINT ck_podc_auto   CHECK (auto_tolerance IN (0,1)
+                                  AND (auto_tolerance = 1) = (approval_id IS NULL)
+                                  AND (auto_tolerance = 0 OR (tolerance_version IS NOT NULL AND status IN ('APPLIED','VOID') AND approver_id IS NULL))),
     CONSTRAINT ck_podc_decide CHECK (status NOT IN ('PENDING','APPLIED','REJECTED','VOID','WITHDRAWN','EXPIRED')   -- 非法取值交给 ck_podc_status 报
                                   OR status = 'PENDING'
-                                  OR (status IN ('APPLIED','REJECTED','VOID') AND approver_id IS NOT NULL AND decided_at IS NOT NULL)
+                                  OR (status IN ('APPLIED','REJECTED','VOID') AND (approver_id IS NOT NULL OR auto_tolerance = 1) AND decided_at IS NOT NULL)
                                   OR (status IN ('WITHDRAWN','EXPIRED') AND decided_at IS NOT NULL)),
     CONSTRAINT ck_podc_seq    CHECK ((status = 'APPLIED') = (correct_seq IS NOT NULL) AND (correct_seq IS NULL OR correct_seq > 0))
 );
 CREATE UNIQUE INDEX uq_podc_pending ON pod_correction(corrected_pod_id, outbound_id) WHERE status = 'PENDING';
 CREATE UNIQUE INDEX uq_podc_seq     ON pod_correction(outbound_id, correct_seq) WHERE status = 'APPLIED';
+
+-- 签收更正容差（Q-J）：差异两项都不超才算容差内（免审批）。sku_category 为 NULL = 全品类兜底；同仓同品类（含 NULL）只能一条
+CREATE TABLE pod_tolerance_config (
+    id            BIGINT       PRIMARY KEY,
+    warehouse_id  BIGINT       NOT NULL,
+    sku_category  VARCHAR(32),                     -- NULL = 全品类
+    max_abs_qty   BIGINT       NOT NULL,           -- 按最小单位计的整数
+    max_pct_bp    INTEGER      NOT NULL,           -- 万分比（100 = 1%）
+    version       BIGINT       NOT NULL DEFAULT 1, -- PUT 带 version，不一致 40930
+    updated_by    BIGINT       NOT NULL,
+    updated_at    TIMESTAMP    NOT NULL DEFAULT now(),
+    CONSTRAINT ck_podt_cat CHECK (sku_category IS NULL OR length(sku_category) > 0),
+    CONSTRAINT ck_podt_val CHECK (max_abs_qty >= 0 AND max_abs_qty = CAST(max_abs_qty AS BIGINT)
+                              AND max_pct_bp BETWEEN 0 AND 10000 AND max_pct_bp = CAST(max_pct_bp AS INTEGER) AND version > 0)
+);
+CREATE UNIQUE INDEX uq_podt_scope ON pod_tolerance_config(warehouse_id, COALESCE(sku_category, ''));   -- NULL 也只能一条
+GRANT SELECT, INSERT, UPDATE ON pod_tolerance_config TO wms_app;   -- @pg-only
 
 -- 拒收回仓交接：司机登记数（暂记） vs 交接员实点数（为准）；生成第 10 篇 RTN，差异推第 10 篇异常单
 CREATE TABLE delivery_return (
