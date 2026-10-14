@@ -16,9 +16,10 @@ SCHEMA=sql/schema_postgres.sql
 # 期望值：main 8ed5f0c 为 38 表 / 99 索引 / 1 视图。docs/02 新增 stock_hold、stock_recon_alert、
 # stock_movement_key、stock_ledger_line → 42 表 / 114 索引（含 PK、UNIQUE 自动索引和分区父表上的分区索引；
 # 分区子表及其继承来的索引不计）/ 1 视图。二轮 C2 加 uq_mvk_mv（外键被引用键）→ 115。改 DDL 必须同步改这里。
+# docs/05 Q1/Q2 新增 pick_op（PK、uq_pick_op、uq_pick_op_scan）、return_record（PK、uq_rr_code、uq_rr_pda、uq_rr_cap、ix_rr_open、ix_rr_picker）→ 44 表 / 124 索引。
 # 必须用新建的空库跑（DROP SCHEMA public 重建会丢 wms_app 的 USAGE；schema 里已 GRANT USAGE 兜底，小赵 C6）。
-EXPECT_TABLES=42
-EXPECT_INDEXES=115
+EXPECT_TABLES=44
+EXPECT_INDEXES=124
 EXPECT_VIEWS=1
 
 CTR=wms-pg-verify
@@ -309,6 +310,111 @@ OUT=$(psql -q -c "SET ROLE wms_app; UPDATE stock_movement SET remark='x' WHERE i
 case "$OUT" in *"permission denied for table stock_movement"*) ok "只追加：应用角色 wms_app 无 UPDATE 权限";; *) bad "wms_app UPDATE 未被拒：$OUT";; esac
 OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM stock_movement_key WHERE movement_id=4;")
 case "$OUT" in *"permission denied for table stock_movement_key"*) ok "只追加：应用角色 wms_app 无 DELETE 权限";; *) bad "wms_app DELETE 未被拒：$OUT";; esac
+
+echo "=== 2e. docs/05 §12 Q1–Q5：wave / pick_task / pick_task_line / pick_op / return_record ==="
+expect_allow "05 Q4 wave 合法状态 PLANNED" \
+  "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status) VALUES (1,'WV1',1,'2026-10-16','CHILLED','R1','PLANNED');"
+expect_block "05 Q4 wave 非法状态 RELEASING" \
+  "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status) VALUES (2,'WV2',1,'2026-10-16','CHILLED','R1','RELEASING');" \
+  'ck_wave_status'
+expect_allow "05 Q4 wave version 乐观锁：带旧 version 迁移" \
+  "UPDATE wave SET status='RELEASED', version=version+1 WHERE id=1 AND status='PLANNED' AND version=0;"
+expect_allow "05 Q4 pick_task CLOSED 合法（主管强制关闭）" \
+  "INSERT INTO pick_task (id,code,wave_id,warehouse_id,status,assigned_to,device_instance_id) VALUES (1,'PT1',1,1,'CLOSED',7,'DEV-A');"
+expect_block "05 Q4 pick_task 非法状态 REASSIGNED" \
+  "INSERT INTO pick_task (id,code,wave_id,warehouse_id,status) VALUES (2,'PT2',1,1,'REASSIGNED');" \
+  'ck_pt_status'
+expect_allow "05 Q5 交接任务记录来源 handover_from_task_id" \
+  "INSERT INTO pick_task (id,code,wave_id,warehouse_id,status,assigned_to,device_instance_id,handover_from_task_id) VALUES (3,'PT3',1,1,'EXECUTING',8,'DEV-B',1);"
+expect_block "05 Q5 交接来源不能指向自己" \
+  "INSERT INTO pick_task (id,code,wave_id,warehouse_id,status,handover_from_task_id) VALUES (4,'PT4',1,1,'PENDING',4);" \
+  'ck_pt_handover'
+expect_allow "05 Q3 任务行合法（outbound_line_id 有值）" \
+  "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,outbound_line_id,planned_qty_milli,uom,status) VALUES (1,3,1,1,1,2,11,1,5000,'KG','PENDING');"
+expect_block "05 Q3 任务行 outbound_line_id 为空" \
+  "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,outbound_line_id,planned_qty_milli,uom) VALUES (2,3,2,1,1,2,11,NULL,5000,'KG');" \
+  'column "outbound_line_id"'
+expect_block "05 Q4 任务行非法状态 PICKED" \
+  "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,outbound_line_id,planned_qty_milli,uom,status) VALUES (3,3,3,1,1,2,11,1,5000,'KG','PICKED');" \
+  'ck_ptl_status'
+expect_allow "05 Q2 pick_op 首次确认（四元组 3/1/DEV-B/1，2000）" \
+  "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli) VALUES (1,3,1,'DEV-B',1,'CONFIRM',2000);"
+expect_block "05 Q2 pick_op 同四元组不同数量（→ 应用层 40910 PDA_OP）" \
+  "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli) VALUES (2,3,1,'DEV-B',1,'CONFIRM',3000);" \
+  'uq_pick_op'
+expect_allow "05 Q2 pick_op 同行下一 op_seq 不被吞" \
+  "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli,scan_event_id) VALUES (3,3,1,'DEV-B',2,'CONFIRM',1000,'SE-1');"
+expect_allow "05 Q2 pick_op 换设备实例同 op_seq 是不同四元组" \
+  "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli) VALUES (4,3,1,'DEV-C',1,'CONFIRM',2000);"
+expect_block "05 Q2 计件模式同一 scan_event_id 重复" \
+  "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli,scan_event_id) VALUES (5,3,1,'DEV-B',3,'CONFIRM',1000,'SE-1');" \
+  'uq_pick_op_scan'
+expect_allow "05 Q2 pick_op 报缺 qty=0 合法（只写 pick_op，不写流水）" \
+  "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli,result_code) VALUES (6,3,1,'DEV-B',4,'SHORT',0,'0');"
+expect_block "05 Q2 pick_op CONFIRM qty=0" \
+  "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli) VALUES (7,3,1,'DEV-B',5,'CONFIRM',0);" \
+  'ck_pick_op_qty'
+expect_block "05 Q2 pick_op 非法 op_type" \
+  "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli) VALUES (8,3,1,'DEV-B',6,'MERGE',1000);" \
+  'ck_pick_op_type'
+expect_block "05 Q2 pick_op 缺 device_instance_id" \
+  "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli) VALUES (9,3,1,NULL,7,'CONFIRM',1000);" \
+  'column "device_instance_id"'
+expect_allow "05 Q1 OFFLINE_REJECT 待回库记录（RR-1，40920）" \
+  "INSERT INTO return_record (id,code,warehouse_id,source_type,task_id,line_no,device_instance_id,op_seq,reject_code,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli,hold_id) VALUES (501,'RR-1',1,'OFFLINE_REJECT',1,1,'DEV-A',9,'40920',7,14,3,1,1,5000,10);"
+expect_block "05 Q1 同四元组重复被拒（uq_rr_pda → 读回同一 returnRecordId）" \
+  "INSERT INTO return_record (id,code,warehouse_id,source_type,task_id,line_no,device_instance_id,op_seq,reject_code,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli) VALUES (502,'RR-2',1,'OFFLINE_REJECT',1,1,'DEV-A',9,'40920',7,14,3,1,1,5000);" \
+  'uq_rr_pda'
+expect_block "05 Q1 OFFLINE_REJECT 缺四元组" \
+  "INSERT INTO return_record (id,code,warehouse_id,source_type,task_id,line_no,device_instance_id,op_seq,reject_code,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli) VALUES (503,'RR-3',1,'OFFLINE_REJECT',1,1,NULL,9,'40920',7,14,3,1,1,5000);" \
+  'ck_rr_source'
+expect_block "05 Q1 OFFLINE_REJECT reject_code 不在 4092x" \
+  "INSERT INTO return_record (id,code,warehouse_id,source_type,task_id,line_no,device_instance_id,op_seq,reject_code,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli) VALUES (504,'RR-4',1,'OFFLINE_REJECT',1,1,'DEV-A',10,'40930',7,14,3,1,1,5000);" \
+  'ck_rr_source'
+expect_allow "05 Q1 CANCEL_AFTER_PICK 记录（RR-5）" \
+  "INSERT INTO return_record (id,code,warehouse_id,source_type,outbound_line_id,ref_movement_id,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli) VALUES (505,'RR-5',1,'CANCEL_AFTER_PICK',1,11,7,12,2,1,1,1000);"
+expect_block "05 Q1 CANCEL_AFTER_PICK 同出库行同原流水重复（uq_rr_cap）" \
+  "INSERT INTO return_record (id,code,warehouse_id,source_type,outbound_line_id,ref_movement_id,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli) VALUES (506,'RR-6',1,'CANCEL_AFTER_PICK',1,11,7,12,2,1,1,1000);" \
+  'uq_rr_cap'
+expect_block "05 Q1 待回库编码重复" \
+  "INSERT INTO return_record (id,code,warehouse_id,source_type,outbound_line_id,ref_movement_id,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli) VALUES (507,'RR-5',1,'CANCEL_AFTER_PICK',1,12,7,12,2,1,1,1000);" \
+  'uq_rr_code'
+expect_block "05 Q1 待回库数量 0" \
+  "INSERT INTO return_record (id,code,warehouse_id,source_type,outbound_line_id,ref_movement_id,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli) VALUES (508,'RR-8',1,'CANCEL_AFTER_PICK',1,13,7,12,2,1,1,0);" \
+  'ck_rr_qty'
+expect_block "05 Q1 冻结失败却挂了 hold_id" \
+  "INSERT INTO return_record (id,code,warehouse_id,source_type,outbound_line_id,ref_movement_id,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli,hold_id,hold_failed) VALUES (509,'RR-9',1,'CANCEL_AFTER_PICK',1,14,7,12,2,1,1,1000,10,1);" \
+  'ck_rr_hold'
+expect_block "05 Q1 非法状态 CLOSED" \
+  "UPDATE return_record SET status='CLOSED' WHERE id=505;" \
+  'ck_rr_status'
+expect_block "05 Q1 OPEN 却带 resolution" \
+  "UPDATE return_record SET resolution='CONFIRMED' WHERE id=505;" \
+  'ck_rr_resolution'
+expect_block "05 Q1 CONFIRMED 状态 resolution 必须为 CONFIRMED" \
+  "UPDATE return_record SET status='CONFIRMED', resolution='SCRAP_HANDOVER' WHERE id=505;" \
+  'ck_rr_resolution'
+expect_block "05 Q1 NEARBY_PUTBACK 缺目标库位" \
+  "UPDATE return_record SET status='RESOLVED', resolution='NEARBY_PUTBACK' WHERE id=505;" \
+  'ck_rr_target'
+expect_block "05 Q1 非 NEARBY_PUTBACK 带目标库位" \
+  "UPDATE return_record SET status='RESOLVED', resolution='RETURNED_TO_ORIGINAL', target_location_id=2 WHERE id=505;" \
+  'ck_rr_target'
+expect_allow "05 Q1 resolve NEARBY_PUTBACK（带目标库位）" \
+  "UPDATE return_record SET status='RESOLVED', resolution='NEARBY_PUTBACK', target_location_id=2, closed_by=9, version=version+1 WHERE id=505 AND status='OPEN';"
+expect_allow "05 Q1 confirm（CONFIRMED/CONFIRMED）" \
+  "UPDATE return_record SET status='CONFIRMED', resolution='CONFIRMED', closed_by=7, version=version+1 WHERE id=501 AND status='OPEN';"
+R=$(psql -t -A -c "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli) VALUES (20,3,1,'DEV-B',1,'CONFIRM',3000) ON CONFLICT (task_id,line_no,device_instance_id,op_seq) DO NOTHING")
+F=$(psql -t -A -c "SELECT op_type||'/'||qty_milli FROM pick_op WHERE task_id=3 AND line_no=1 AND device_instance_id='DEV-B' AND op_seq=1")
+[ "$R" = "INSERT 0 0" ] && [ "$F" = "CONFIRM/2000" ] && ok "05 Q2 40910 判定基准：ON CONFLICT DO NOTHING 0 行，读回首次 CONFIRM/2000 ≠ 3000 → 40910 PDA_OP" || bad "pick_op 比对基准 = $R / $F"
+OUT=$(psql -q -c "SET ROLE wms_app; UPDATE pick_op SET qty_milli=3000 WHERE id=1;")
+case "$OUT" in *"permission denied for table pick_op"*) ok "05 Q2 wms_app 不能改 pick_op.qty_milli（比对基准不可篡改）";; *) bad "wms_app 改 qty_milli 未被拒：$OUT";; esac
+OUT=$(psql -q -c "SET ROLE wms_app; UPDATE pick_op SET result_code='0', movement_id=11 WHERE id=1;")
+case "$OUT" in *ERROR*) bad "wms_app 回写首次结果被拒：$OUT";; *) ok "05 Q2 wms_app 可回写 pick_op 首次结果列";; esac
+OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM pick_op WHERE id=1;")
+case "$OUT" in *"permission denied for table pick_op"*) ok "05 Q2 wms_app 不能删 pick_op";; *) bad "wms_app 删 pick_op 未被拒：$OUT";; esac
+M=$(psql -t -A -c "SELECT count(*) FROM stock_movement WHERE biz_no='PT3'")
+[ "$M" = "0" ] && ok "05 Q2 报缺/拒收只写 pick_op，不产生流水（PT3 流水 0 条）" || bad "PT3 流水 $M 条"
 
 echo "=== 2c. docs/02 40906：库位锁定写进扣减原语的 WHERE ==="
 psql -q -c "UPDATE location SET status='LOCKED' WHERE id=3;" >/dev/null

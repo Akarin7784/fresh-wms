@@ -119,7 +119,7 @@ NI = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='index' AND sql
 NV = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='view'").fetchone()[0]
 print(f"  → 表 {NT} 张 / 手工建索引 {NI} 个 / 视图 {NV} 个")
 # 期望值：main 8ed5f0c 为 38 表；docs/02 新增 stock_hold、stock_recon_alert、stock_movement_key、stock_ledger_line → 42 表（PG 分区子表不计）。改表数必须同步改这里和 verify.sh
-EXPECT_TABLES, EXPECT_VIEWS = 42, 1
+EXPECT_TABLES, EXPECT_VIEWS = 44, 1  # docs/05 +pick_op +return_record
 ok(f"表数 = {NT}（期望 {EXPECT_TABLES}）") if NT == EXPECT_TABLES else bad(f"表数 = {NT}，期望 {EXPECT_TABLES}")
 ok(f"视图数 = {NV}") if NV == EXPECT_VIEWS else bad(f"视图数 = {NV}，期望 {EXPECT_VIEWS}")
 
@@ -373,6 +373,49 @@ mv1 = one("SELECT count(*) FROM stock_movement")[0]
 ok("确认回库：同事务释放冻结，available 回到 80000，无新增流水") if AV14 == 80000 and mv1 == mv0 else bad(f"确认后 available={AV14} 流水 {mv0}→{mv1}")
 c = conn.execute("UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED' WHERE id = 10 AND status = 'HELD'").rowcount
 ok("冻结只释放一次：再次释放 rowcount=0") if c == 0 else bad(f"重复释放 rowcount={c}")
+
+print("=== 2f. docs/05 §12 Q1–Q5：wave / pick_task / pick_task_line / pick_op / return_record ===")
+expect_allow('05 Q4 wave 合法状态 PLANNED', "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status) VALUES (1,'WV1',1,'2026-10-16','CHILLED','R1','PLANNED')")
+expect_block('05 Q4 wave 非法状态 RELEASING', "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status) VALUES (2,'WV2',1,'2026-10-16','CHILLED','R1','RELEASING')", 'ck_wave_status')
+expect_allow('05 Q4 wave version 乐观锁：带旧 version 迁移', "UPDATE wave SET status='RELEASED', version=version+1 WHERE id=1 AND status='PLANNED' AND version=0")
+expect_allow('05 Q4 pick_task CLOSED 合法（主管强制关闭）', "INSERT INTO pick_task (id,code,wave_id,warehouse_id,status,assigned_to,device_instance_id) VALUES (1,'PT1',1,1,'CLOSED',7,'DEV-A')")
+expect_block('05 Q4 pick_task 非法状态 REASSIGNED', "INSERT INTO pick_task (id,code,wave_id,warehouse_id,status) VALUES (2,'PT2',1,1,'REASSIGNED')", 'ck_pt_status')
+expect_allow('05 Q5 交接任务记录来源 handover_from_task_id', "INSERT INTO pick_task (id,code,wave_id,warehouse_id,status,assigned_to,device_instance_id,handover_from_task_id) VALUES (3,'PT3',1,1,'EXECUTING',8,'DEV-B',1)")
+expect_block('05 Q5 交接来源不能指向自己', "INSERT INTO pick_task (id,code,wave_id,warehouse_id,status,handover_from_task_id) VALUES (4,'PT4',1,1,'PENDING',4)", 'ck_pt_handover')
+expect_allow('05 Q3 任务行合法（outbound_line_id 有值）', "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,outbound_line_id,planned_qty_milli,uom,status) VALUES (1,3,1,1,1,2,11,1,5000,'KG','PENDING')")
+expect_block('05 Q3 任务行 outbound_line_id 为空', "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,outbound_line_id,planned_qty_milli,uom) VALUES (2,3,2,1,1,2,11,NULL,5000,'KG')", 'pick_task_line.outbound_line_id')
+expect_block('05 Q4 任务行非法状态 PICKED', "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,outbound_line_id,planned_qty_milli,uom,status) VALUES (3,3,3,1,1,2,11,1,5000,'KG','PICKED')", 'ck_ptl_status')
+expect_allow('05 Q2 pick_op 首次确认（四元组 3/1/DEV-B/1，2000）', "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli) VALUES (1,3,1,'DEV-B',1,'CONFIRM',2000)")
+expect_block('05 Q2 pick_op 同四元组不同数量（→ 应用层 40910 PDA_OP）', "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli) VALUES (2,3,1,'DEV-B',1,'CONFIRM',3000)", 'pick_op.task_id, pick_op.line_no, pick_op.device_instance_id, pick_op.op_seq')
+expect_allow('05 Q2 pick_op 同行下一 op_seq 不被吞', "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli,scan_event_id) VALUES (3,3,1,'DEV-B',2,'CONFIRM',1000,'SE-1')")
+expect_allow('05 Q2 pick_op 换设备实例同 op_seq 是不同四元组', "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli) VALUES (4,3,1,'DEV-C',1,'CONFIRM',2000)")
+expect_block('05 Q2 计件模式同一 scan_event_id 重复', "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli,scan_event_id) VALUES (5,3,1,'DEV-B',3,'CONFIRM',1000,'SE-1')", 'pick_op.task_id, pick_op.line_no, pick_op.scan_event_id')
+expect_allow('05 Q2 pick_op 报缺 qty=0 合法（只写 pick_op，不写流水）', "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli,result_code) VALUES (6,3,1,'DEV-B',4,'SHORT',0,'0')")
+expect_block('05 Q2 pick_op CONFIRM qty=0', "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli) VALUES (7,3,1,'DEV-B',5,'CONFIRM',0)", 'ck_pick_op_qty')
+expect_block('05 Q2 pick_op 非法 op_type', "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli) VALUES (8,3,1,'DEV-B',6,'MERGE',1000)", 'ck_pick_op_type')
+expect_block('05 Q2 pick_op 缺 device_instance_id', "INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli) VALUES (9,3,1,NULL,7,'CONFIRM',1000)", 'pick_op.device_instance_id')
+expect_allow('05 Q1 OFFLINE_REJECT 待回库记录（RR-1，40920）', "INSERT INTO return_record (id,code,warehouse_id,source_type,task_id,line_no,device_instance_id,op_seq,reject_code,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli,hold_id) VALUES (501,'RR-1',1,'OFFLINE_REJECT',1,1,'DEV-A',9,'40920',7,14,3,1,1,5000,10)")
+expect_block('05 Q1 同四元组重复被拒（uq_rr_pda → 读回同一 returnRecordId）', "INSERT INTO return_record (id,code,warehouse_id,source_type,task_id,line_no,device_instance_id,op_seq,reject_code,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli) VALUES (502,'RR-2',1,'OFFLINE_REJECT',1,1,'DEV-A',9,'40920',7,14,3,1,1,5000)", 'return_record.task_id, return_record.line_no, return_record.device_instance_id, return_record.op_seq')
+expect_block('05 Q1 OFFLINE_REJECT 缺四元组', "INSERT INTO return_record (id,code,warehouse_id,source_type,task_id,line_no,device_instance_id,op_seq,reject_code,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli) VALUES (503,'RR-3',1,'OFFLINE_REJECT',1,1,NULL,9,'40920',7,14,3,1,1,5000)", 'ck_rr_source')
+expect_block('05 Q1 OFFLINE_REJECT reject_code 不在 4092x', "INSERT INTO return_record (id,code,warehouse_id,source_type,task_id,line_no,device_instance_id,op_seq,reject_code,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli) VALUES (504,'RR-4',1,'OFFLINE_REJECT',1,1,'DEV-A',10,'40930',7,14,3,1,1,5000)", 'ck_rr_source')
+expect_allow('05 Q1 CANCEL_AFTER_PICK 记录（RR-5）', "INSERT INTO return_record (id,code,warehouse_id,source_type,outbound_line_id,ref_movement_id,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli) VALUES (505,'RR-5',1,'CANCEL_AFTER_PICK',1,11,7,12,2,1,1,1000)")
+expect_block('05 Q1 CANCEL_AFTER_PICK 同出库行同原流水重复（uq_rr_cap）', "INSERT INTO return_record (id,code,warehouse_id,source_type,outbound_line_id,ref_movement_id,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli) VALUES (506,'RR-6',1,'CANCEL_AFTER_PICK',1,11,7,12,2,1,1,1000)", 'return_record.outbound_line_id, return_record.ref_movement_id')
+expect_block('05 Q1 待回库编码重复', "INSERT INTO return_record (id,code,warehouse_id,source_type,outbound_line_id,ref_movement_id,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli) VALUES (507,'RR-5',1,'CANCEL_AFTER_PICK',1,12,7,12,2,1,1,1000)", 'return_record.code')
+expect_block('05 Q1 待回库数量 0', "INSERT INTO return_record (id,code,warehouse_id,source_type,outbound_line_id,ref_movement_id,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli) VALUES (508,'RR-8',1,'CANCEL_AFTER_PICK',1,13,7,12,2,1,1,0)", 'ck_rr_qty')
+expect_block('05 Q1 冻结失败却挂了 hold_id', "INSERT INTO return_record (id,code,warehouse_id,source_type,outbound_line_id,ref_movement_id,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli,hold_id,hold_failed) VALUES (509,'RR-9',1,'CANCEL_AFTER_PICK',1,14,7,12,2,1,1,1000,10,1)", 'ck_rr_hold')
+expect_block('05 Q1 非法状态 CLOSED', "UPDATE return_record SET status='CLOSED' WHERE id=505", 'ck_rr_status')
+expect_block('05 Q1 OPEN 却带 resolution', "UPDATE return_record SET resolution='CONFIRMED' WHERE id=505", 'ck_rr_resolution')
+expect_block('05 Q1 CONFIRMED 状态 resolution 必须为 CONFIRMED', "UPDATE return_record SET status='CONFIRMED', resolution='SCRAP_HANDOVER' WHERE id=505", 'ck_rr_resolution')
+expect_block('05 Q1 NEARBY_PUTBACK 缺目标库位', "UPDATE return_record SET status='RESOLVED', resolution='NEARBY_PUTBACK' WHERE id=505", 'ck_rr_target')
+expect_block('05 Q1 非 NEARBY_PUTBACK 带目标库位', "UPDATE return_record SET status='RESOLVED', resolution='RETURNED_TO_ORIGINAL', target_location_id=2 WHERE id=505", 'ck_rr_target')
+expect_allow('05 Q1 resolve NEARBY_PUTBACK（带目标库位）', "UPDATE return_record SET status='RESOLVED', resolution='NEARBY_PUTBACK', target_location_id=2, closed_by=9, version=version+1 WHERE id=505 AND status='OPEN'")
+expect_allow('05 Q1 confirm（CONFIRMED/CONFIRMED）', "UPDATE return_record SET status='CONFIRMED', resolution='CONFIRMED', closed_by=7, version=version+1 WHERE id=501 AND status='OPEN'")
+n = conn.execute("INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli) VALUES (20,3,1,'DEV-B',1,'CONFIRM',3000) ON CONFLICT (task_id,line_no,device_instance_id,op_seq) DO NOTHING").rowcount
+conn.commit()
+f = one("SELECT op_type||'/'||qty_milli FROM pick_op WHERE task_id=3 AND line_no=1 AND device_instance_id='DEV-B' AND op_seq=1")[0]
+ok(f"05 Q2 40910 判定基准：ON CONFLICT DO NOTHING 0 行，读回首次 {f} ≠ 3000 → 40910 PDA_OP") if (n, f) == (0, "CONFIRM/2000") else bad(f"pick_op 比对基准 = {n} / {f}")
+m = one("SELECT count(*) FROM stock_movement WHERE biz_no='PT3'")[0]
+ok("05 Q2 报缺/拒收只写 pick_op，不产生流水（PT3 流水 0 条）") if m == 0 else bad(f"PT3 流水 {m} 条")
 
 print("=== 2d. docs/02 40906：库位锁定写进扣减原语的 WHERE ===")
 conn.execute("UPDATE location SET status = 'LOCKED' WHERE id = 3")

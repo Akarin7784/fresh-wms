@@ -1,8 +1,8 @@
 -- 本文件由 sql/verify_sqlite.py 从 schema_postgres.sql 机械生成，请勿手改。
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
---   2. 41 处 DEFAULT now() → DEFAULT (datetime('now'))（表达式默认值需括号）
---   3. 方言专属行：删除 53 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 17 行 @sqlite-only（等价触发器）
+--   2. 43 处 DEFAULT now() → DEFAULT (datetime('now'))（表达式默认值需括号）
+--   3. 方言专属行：删除 55 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 17 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -655,9 +655,11 @@ CREATE TABLE wave (
     released_at         TIMESTAMP,
     completed_at        TIMESTAMP,
     created_by          BIGINT,
+    version             BIGINT       NOT NULL DEFAULT 0,      -- docs/05 Q4：波次迁移乐观锁
     created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     updated_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
-    CONSTRAINT uq_wave_code UNIQUE (code)
+    CONSTRAINT uq_wave_code UNIQUE (code),
+    CONSTRAINT ck_wave_status CHECK (status IN ('PLANNED','RELEASED','PICKING','COMPLETED','HOLD','CANCELLED'))
 );
 CREATE INDEX ix_wave_wh ON wave(warehouse_id, status, work_date DESC);
 
@@ -668,8 +670,10 @@ CREATE TABLE pick_task (
     warehouse_id    BIGINT       NOT NULL,
     task_type       VARCHAR(24)  NOT NULL DEFAULT 'PICK',   -- PICK/REPLENISH（补货复用本表）
     zone_id         BIGINT,
-    status          VARCHAR(16)  NOT NULL DEFAULT 'PENDING',-- PENDING/EXECUTING/DONE/ABNORMAL/CANCELLED
+    status          VARCHAR(16)  NOT NULL DEFAULT 'PENDING',-- PENDING/EXECUTING/DONE/ABNORMAL/CANCELLED/CLOSED（docs/05 Q4）
     assigned_to     BIGINT,
+    device_instance_id    VARCHAR(64),                  -- docs/05 Q5：当前持有设备（判定 40920 用；权威仍是 stock_ledger_line.owner_device_instance_id）
+    handover_from_task_id BIGINT,                       -- docs/05 Q5：交接任务来源
     claimed_at      TIMESTAMP,
     started_at      TIMESTAMP,
     finished_at     TIMESTAMP,
@@ -678,7 +682,9 @@ CREATE TABLE pick_task (
     version         BIGINT       NOT NULL DEFAULT 0,
     created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     updated_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
-    CONSTRAINT uq_pt_code UNIQUE (code)
+    CONSTRAINT uq_pt_code UNIQUE (code),
+    CONSTRAINT ck_pt_status CHECK (status IN ('PENDING','EXECUTING','DONE','ABNORMAL','CANCELLED','CLOSED')),
+    CONSTRAINT ck_pt_handover CHECK (handover_from_task_id IS NULL OR handover_from_task_id <> id)
 );
 -- 领取队列：待领取 + 按动线优先级
 CREATE INDEX ix_pt_claim ON pick_task(wave_id, status, zone_id) WHERE status = 'PENDING';
@@ -692,7 +698,7 @@ CREATE TABLE pick_task_line (
     sku_id              BIGINT          NOT NULL,
     lot_id              BIGINT          NOT NULL,
     stock_id            BIGINT          NOT NULL,
-    outbound_line_id    BIGINT,                     -- 分播墙按单分发时用
+    outbound_line_id    BIGINT          NOT NULL,   -- docs/05 Q3：任务行按占用粒度生成，恒有值；BATCH 合并只在展示层
     planned_qty_milli   BIGINT          NOT NULL,   -- 应拣量，基本单位 milli（原 plan_qty_base）
     confirmed_qty_milli BIGINT          NOT NULL DEFAULT 0,  -- 已确认量；条件更新 confirmed + qty <= planned，否则 42214（00 §6.5）
     uom                 VARCHAR(16)     NOT NULL,   -- 作业单位，仅展示
@@ -706,10 +712,88 @@ CREATE TABLE pick_task_line (
         planned_qty_milli > 0 AND confirmed_qty_milli >= 0 AND confirmed_qty_milli <= planned_qty_milli
         AND planned_qty_milli = CAST(planned_qty_milli AS BIGINT) AND confirmed_qty_milli = CAST(confirmed_qty_milli AS BIGINT)
     ),
-    CONSTRAINT uq_ptl UNIQUE (pick_task_id, seq)
+    CONSTRAINT uq_ptl UNIQUE (pick_task_id, seq),
+    CONSTRAINT ck_ptl_status CHECK (status IN ('PENDING','DONE','SHORT','SKIP','ABNORMAL'))
 );
 CREATE INDEX ix_ptl_loc ON pick_task_line(location_id, status);
 
+-- docs/05 §4.5：PDA 拣货操作去重（第二层，四元组业务键）。拒收/报缺不写流水，只写本表。
+-- 同四元组同 op_type 同 qty_milli → 回放 result_code；否则 40910 detail.key_type=PDA_OP（应用层比对本行）。
+CREATE TABLE pick_op (
+    id                  BIGINT          PRIMARY KEY,
+    task_id             BIGINT          NOT NULL,
+    line_no             SMALLINT        NOT NULL,
+    device_instance_id  VARCHAR(64)     NOT NULL,
+    op_seq              BIGINT          NOT NULL,
+    op_type             VARCHAR(16)     NOT NULL,   -- CONFIRM/UNDO/SHORT
+    qty_milli           BIGINT          NOT NULL,
+    scan_event_id       VARCHAR(64),                -- 计件模式必填
+    result_code         VARCHAR(5),                 -- 首次结果：'0' 成功；40920/40921/40922 拒收；处理中为空
+    movement_id         BIGINT,
+    return_record_id    BIGINT,
+    created_at          TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT uq_pick_op UNIQUE (task_id, line_no, device_instance_id, op_seq),
+    CONSTRAINT ck_pick_op_type CHECK (op_type IN ('CONFIRM','UNDO','SHORT')),
+    CONSTRAINT ck_pick_op_qty CHECK (qty_milli >= 0 AND qty_milli = CAST(qty_milli AS BIGINT) AND op_seq > 0
+        AND (op_type = 'SHORT' OR qty_milli > 0))
+);
+CREATE UNIQUE INDEX uq_pick_op_scan ON pick_op(task_id, line_no, scan_event_id) WHERE scan_event_id IS NOT NULL;
+
+-- docs/05 §4.5 / 04 §4.4：待回库记录。接口口径见 04 §7.3（returnRecordId = id）。
+-- 所有类型统一预建 stock_ledger_line DOC 行（biz_no = code）。
+CREATE TABLE return_record (
+    id                  BIGINT          PRIMARY KEY,
+    code                VARCHAR(64)     NOT NULL,
+    warehouse_id        BIGINT          NOT NULL,
+    source_type         VARCHAR(24)     NOT NULL,   -- OFFLINE_REJECT/CANCEL_AFTER_PICK
+    task_id             BIGINT,
+    line_no             SMALLINT,
+    device_instance_id  VARCHAR(64),
+    op_seq              BIGINT,
+    outbound_line_id    BIGINT,
+    ref_movement_id     BIGINT,
+    reject_code         CHAR(5),
+    picker_id           BIGINT          NOT NULL,
+    stock_id            BIGINT          NOT NULL,
+    location_id         BIGINT          NOT NULL,
+    sku_id              BIGINT          NOT NULL,
+    lot_id              BIGINT          NOT NULL,
+    qty_milli           BIGINT          NOT NULL,
+    hold_id             BIGINT,
+    hold_failed         SMALLINT        NOT NULL DEFAULT 0,
+    status              VARCHAR(16)     NOT NULL DEFAULT 'OPEN',
+    resolution          VARCHAR(24),
+    target_location_id  BIGINT,
+    putback_acked_at    TIMESTAMP,
+    putback_acked_by    BIGINT,
+    scrap_doc_id        BIGINT,
+    handover_confirmed_at TIMESTAMP,
+    handover_confirmed_by BIGINT,
+    closed_by           BIGINT,
+    closed_at           TIMESTAMP,
+    version             BIGINT          NOT NULL DEFAULT 0,
+    payload             TEXT,
+    created_at          TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT uq_rr_code UNIQUE (code),
+    CONSTRAINT ck_rr_source CHECK (
+        (source_type = 'OFFLINE_REJECT' AND task_id IS NOT NULL AND line_no IS NOT NULL AND device_instance_id IS NOT NULL
+            AND op_seq IS NOT NULL AND reject_code IN ('40920','40921','40922'))
+        OR (source_type = 'CANCEL_AFTER_PICK' AND outbound_line_id IS NOT NULL AND ref_movement_id IS NOT NULL AND reject_code IS NULL)),
+    CONSTRAINT ck_rr_qty CHECK (qty_milli > 0 AND qty_milli = CAST(qty_milli AS BIGINT)),
+    CONSTRAINT ck_rr_hold CHECK (hold_failed IN (0,1) AND NOT (hold_failed = 1 AND hold_id IS NOT NULL)),
+    CONSTRAINT ck_rr_status CHECK (status IN ('OPEN','CONFIRMED','RESOLVED')),
+    CONSTRAINT ck_rr_resolution CHECK (
+        (status <> 'OPEN' OR resolution IS NULL)
+        AND (status <> 'CONFIRMED' OR resolution = 'CONFIRMED')
+        AND (status <> 'RESOLVED' OR resolution IN ('RETURNED_TO_ORIGINAL','NEARBY_PUTBACK','SCRAP_HANDOVER'))),
+    CONSTRAINT ck_rr_target CHECK ((resolution = 'NEARBY_PUTBACK' AND target_location_id IS NOT NULL)
+        OR (COALESCE(resolution, '') <> 'NEARBY_PUTBACK' AND target_location_id IS NULL))
+);
+CREATE UNIQUE INDEX uq_rr_pda ON return_record(task_id, line_no, device_instance_id, op_seq) WHERE source_type = 'OFFLINE_REJECT';
+CREATE UNIQUE INDEX uq_rr_cap ON return_record(outbound_line_id, ref_movement_id) WHERE source_type = 'CANCEL_AFTER_PICK';
+CREATE INDEX ix_rr_open   ON return_record(warehouse_id, status, created_at);
+CREATE INDEX ix_rr_picker ON return_record(picker_id, status);
+-- pick_op 的四元组、op_type、qty_milli 是 40910 PDA_OP 比对基准，应用角色只能补写首次结果列
 CREATE TABLE pack_box (
     id              BIGINT       PRIMARY KEY,
     code            VARCHAR(64)  NOT NULL,          -- 箱码，司机端逐箱扫
