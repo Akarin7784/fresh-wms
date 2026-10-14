@@ -376,8 +376,8 @@ stateDiagram-v2
 - 重连后按 §9.8 对账补交；补交冲突进入服务端异常队列，PDA 对应条目显示红条与异常单号（若响应提供）。
 
 ### 9.11 盲收登记与退货预约收货
-- **盲收**（无预约到货，`inbound.return.blind`）：`POST /api/v1/inbound/returns/blind`，body `{sku_id, qty, reason_code, container_code, store_code?, photo_ids[]}`（`qty` 为 3 位小数字符串；**`reason_code`、`container_code` 必填**，`store_code` 可选），带 `Idempotency-Key`。前端必填校验：未选退货原因、未扫箱码（`container_code`）时提交置灰并在字段下提示；服务端缺字段返回 `400`，按 `detail` 中的字段名在对应输入框下显示提示，不重试。响应返回**收货记录号**与**自动生成的异常单号**，PDA 结果页同时显示二者，并提示「须在 48 小时内关联订单，超时升级主管」。离线时入 outbox（入队前同样做必填校验），联网补交后再显示两个单号。
-- **退货预约收货**（`return.reservation.receive`）：扫/选预约单 → 核对行（`sku_id`、`qty`、`reason_code`）→ `POST /api/v1/returns/reservations/{id}/receive`；收货后进入 `RETURN_QC` 冻结，PDA 只显示「待质检」，不提供解冻。
+- **盲收**（无预约到货，`inbound.return.blind`）：`POST /api/v1/inbound/returns/blind`，body `{sku_id, qty, reason_code, container_code, store_code?, photo_ids[]}`（`qty` 为 3 位小数字符串；**`reason_code`、`container_code` 必填**，`store_code` 可选），带 `Idempotency-Key`。前端必填校验：未选退货原因、未扫箱码（`container_code`）时提交置灰并在字段下提示；服务端缺字段返回 `400` `40001`，按 `detail` 中的字段名在对应输入框下显示提示，不重试。响应返回**收货记录号**与**自动生成的异常单号**，PDA 结果页同时显示二者，并提示「须在 48 小时内关联订单，超时升级主管」。离线时入 outbox（入队前同样做必填校验），联网补交后再显示两个单号。
+- **退货预约收货**（`return.reservation.receive`）：扫/选预约单 → 核对行（`sku_id`、`qty`、`reason_code`、`container_code`）→ `POST /api/v1/returns/reservations/{id}/receive` `{lines[{line_no, received_qty, location_code}]}`（第 10 篇 #5 @1844390；预约非 CREATED 返回 `40930`，刷新不重试）；收货后进入 `RETURN_QC` 冻结，PDA 只显示「待质检」，不提供解冻。
 - **纸单兜底补录**（00 §6.6.1，审批类型 `PAPER_BACKFILL`）：设备不可用时现场用纸质单据记录；恢复联网后由操作人（`offline.paper.backfill`）在「纸单补录」入口提交 `POST /api/v1/offline/paper-records` `{action_type, occurred_at, operator_id, payload, photo_ids[]}`（`occurred_at` 为纸单记录的发生时间，按仓库时区录入、以 UTC 提交；纸单照片必传），带 `Idempotency-Key`，生成待主管审批（`offline.paper.approve`）的审批单，申请人不能自批。
   - **24 小时时限**：必须在恢复联网后 24 小时内提交，超时由服务端转异常单（第 10 篇）。补录入口显示「补录剩余 HH:MM」倒计时，只读服务端下发的 `backfill_deadline_at`（`GET /api/v1/me` 与心跳返回，UTC，= 恢复联网 + 24h；前端**不用设备时间推算**），每次断网→恢复联网后都会下发（不论是否有待补纸单，服务端无从得知），**窗口期内一直显示「纸单补录」入口与倒计时**；为 `null`（窗口已过或设备从未断网）时隐藏补录入口、倒计时与提醒，已提交的补录记录仍可查看（00 §6.6.2 @6906310），<1 小时标红。
   - 补录本身必须在线，不进 outbox。
