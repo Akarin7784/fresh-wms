@@ -257,6 +257,8 @@ CREATE TABLE stock_hold (
     released_qty_milli  BIGINT          NOT NULL DEFAULT 0,
     status              VARCHAR(16)     NOT NULL DEFAULT 'HELD',      -- HELD/RELEASED，由余量决定
     operator_id         BIGINT          NOT NULL,   -- 系统冻结填 0
+    approval_type       VARCHAR(24),                -- 需要审批的转换才填：SCRAP_MISREPORT（SCRAP_PENDING → RETURN_QC 误报回转）
+    approval_no         VARCHAR(64),                -- 审批单号
     version             BIGINT          NOT NULL DEFAULT 0,
     created_at          TIMESTAMP       NOT NULL DEFAULT now(),
     updated_at          TIMESTAMP       NOT NULL DEFAULT now(),
@@ -281,6 +283,12 @@ CREATE TABLE stock_hold (
     CONSTRAINT ck_hold_retqc CHECK (
         hold_type <> 'RETURN_QC'
         OR (source_type = 'QC' AND source_id > 0 AND operator_id = 0)
+    ),
+    -- 误报回转（SCRAP_PENDING → RETURN_QC，convert_hold 生成 op_key=CVT:{原 hold_id}）必须带 SCRAP_MISREPORT 审批单号；其余明细不带审批
+    CONSTRAINT ck_hold_approval CHECK (
+        (NOT (hold_type = 'RETURN_QC' AND op_key LIKE 'CVT:%') AND approval_type IS NULL AND approval_no IS NULL)
+        OR (hold_type = 'RETURN_QC' AND op_key LIKE 'CVT:%'
+            AND approval_type = 'SCRAP_MISREPORT' AND approval_no IS NOT NULL AND length(approval_no) > 0)
     ),
     CONSTRAINT ck_hold_scrap CHECK (
         hold_type <> 'SCRAP_PENDING'
@@ -474,6 +482,7 @@ BEGIN                                                                           
        OR NEW.source_type IS DISTINCT FROM OLD.source_type OR NEW.source_id IS DISTINCT FROM OLD.source_id    -- @pg-only
        OR NEW.op_key IS DISTINCT FROM OLD.op_key OR NEW.hold_qty_milli IS DISTINCT FROM OLD.hold_qty_milli   -- @pg-only
        OR NEW.operator_id IS DISTINCT FROM OLD.operator_id OR NEW.created_at IS DISTINCT FROM OLD.created_at  -- @pg-only
+       OR NEW.approval_type IS DISTINCT FROM OLD.approval_type OR NEW.approval_no IS DISTINCT FROM OLD.approval_no  -- @pg-only
        OR NEW.released_qty_milli < OLD.released_qty_milli  -- R1 释放量只增不减 -- @pg-only
        OR (OLD.status = 'RELEASED' AND NEW.status <> 'RELEASED') THEN  -- R1 RELEASED 不能回 HELD -- @pg-only
         RAISE EXCEPTION 'hold_immutable' USING ERRCODE = '23514';                                            -- @pg-only
@@ -495,6 +504,7 @@ CREATE TRIGGER trg_hr_append_only BEFORE UPDATE OR DELETE ON stock_hold_release 
 -- @sqlite-only WHEN NEW.id IS NOT OLD.id OR NEW.stock_id IS NOT OLD.stock_id OR NEW.hold_type IS NOT OLD.hold_type OR NEW.reason_code IS NOT OLD.reason_code
 -- @sqlite-only   OR NEW.source_type IS NOT OLD.source_type OR NEW.source_id IS NOT OLD.source_id OR NEW.op_key IS NOT OLD.op_key
 -- @sqlite-only   OR NEW.hold_qty_milli IS NOT OLD.hold_qty_milli OR NEW.operator_id IS NOT OLD.operator_id OR NEW.created_at IS NOT OLD.created_at
+-- @sqlite-only   OR NEW.approval_type IS NOT OLD.approval_type OR NEW.approval_no IS NOT OLD.approval_no
 -- @sqlite-only   OR NEW.released_qty_milli < OLD.released_qty_milli OR (OLD.status = 'RELEASED' AND NEW.status <> 'RELEASED')
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'hold_immutable'); END;
 -- R2（SQLite）：拒删除；REPLACE 冲突时删旧行在 recursive_triggers=OFF（默认，且是连接级开关）下不触发 DELETE 触发器，
@@ -607,8 +617,8 @@ CREATE TABLE inbound_order (
     created_by      BIGINT,
     CONSTRAINT uq_inb_code  UNIQUE (code),
     CONSTRAINT uq_inb_src   UNIQUE (source_system, source_order_no),  -- 业务层幂等
-    -- docs/10：退货入库单（RTN）来源。WMS_DELIVERY=第 16 篇拒收回仓；STORE_RETURN=门店退货回仓；MALL/ERP=客户退货经第 11 篇
-    CONSTRAINT ck_inb_rtn_src CHECK (order_type <> 'RETURN' OR source_system IN ('WMS_DELIVERY','STORE_RETURN','MALL','ERP'))
+    -- docs/10：退货入库单（RTN）来源。WMS_DELIVERY=第 16 篇拒收回仓；STORE_RETURN=门店退货回仓；SCRAP_MISREPORT=第 9 篇交接误报回转的质检单（不 post_in）；MALL/ERP=客户退货经第 11 篇
+    CONSTRAINT ck_inb_rtn_src CHECK (order_type <> 'RETURN' OR source_system IN ('WMS_DELIVERY','STORE_RETURN','SCRAP_MISREPORT','MALL','ERP'))
 );
 CREATE INDEX ix_inb_wh_status ON inbound_order(warehouse_id, status, work_date DESC);
 
@@ -981,33 +991,80 @@ CREATE TABLE exception_case (
     CONSTRAINT ck_exc_int    CHECK (claimed_qty_milli = CAST(claimed_qty_milli AS BIGINT) AND counted_qty_milli = CAST(counted_qty_milli AS BIGINT) AND diff_qty_milli = CAST(diff_qty_milli AS BIGINT)),
     CONSTRAINT ck_exc_diff   CHECK (diff_qty_milli = counted_qty_milli - claimed_qty_milli),
     CONSTRAINT ck_exc_close  CHECK (status NOT IN ('RESOLVED','CLOSED') OR (resolution IS NOT NULL AND closed_by IS NOT NULL)),
-    CONSTRAINT ck_exc_src_type CHECK (source_type IN ('DELIVERY_RETURN','STORE_RETURN','RETURN_INBOUND','RR_HOLD_FAILED','FAILOVER_GAP','PICK','COUNT','MANUAL')),
+    -- 小赵复评建议 1：处置结论取值；调整 / 报损必须带生成的单号
+    CONSTRAINT ck_exc_resol  CHECK (resolution IS NULL OR resolution IN ('ACCEPT_COUNT','ADJUST','SCRAP','CLAIM_CARRIER','CLAIM_CUSTOMER','NO_ACTION')),
+    CONSTRAINT ck_exc_resdoc CHECK (resolution IS NULL OR resolution NOT IN ('ADJUST','SCRAP') OR (resolution_doc IS NOT NULL AND length(resolution_doc) > 0)),
+    CONSTRAINT ck_exc_src_type CHECK (source_type IN ('DELIVERY_RETURN','STORE_RETURN','SCRAP_MISREPORT','RETURN_INBOUND','RR_HOLD_FAILED','FAILOVER_GAP','PICK','COUNT','MANUAL')),
     CONSTRAINT ck_exc_hash   CHECK (length(source_hash) = 64 AND lower(source_hash) = source_hash AND replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(source_hash,'0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9',''),'a',''),'b',''),'c',''),'d',''),'e',''),'f','') = '')
 );
 CREATE INDEX ix_exc_wh_status ON exception_case(warehouse_id, status, due_at);
--- I2：状态只能前进；进入 RESOLVED 后声称/实点/差异/来源不可改；CLOSED、CANCELLED 是终态，不能离开
---   允许：OPEN→PROCESSING/RESOLVED/CANCELLED，PROCESSING→RESOLVED/CANCELLED，RESOLVED→CLOSED、RESOLVED→PROCESSING（X4 下游单据被驳回），同状态内改其他列（认领、升级）
-CREATE FUNCTION trg_exc_forward() RETURNS trigger LANGUAGE plpgsql AS $$                                    -- @pg-only
-BEGIN                                                                                                         -- @pg-only
-    IF (OLD.status IN ('CLOSED','CANCELLED') AND NEW.status <> OLD.status)                                    -- @pg-only
-       OR (OLD.status = 'RESOLVED' AND NEW.status NOT IN ('RESOLVED','CLOSED','PROCESSING'))                  -- @pg-only
-       OR (OLD.status = 'PROCESSING' AND NEW.status = 'OPEN')                                                 -- @pg-only
-       OR (OLD.status IN ('RESOLVED','CLOSED','CANCELLED') AND (NEW.claimed_qty_milli <> OLD.claimed_qty_milli -- @pg-only
-           OR NEW.counted_qty_milli <> OLD.counted_qty_milli OR NEW.diff_qty_milli <> OLD.diff_qty_milli      -- @pg-only
-           OR NEW.source_key <> OLD.source_key OR NEW.source_hash <> OLD.source_hash)) THEN                   -- @pg-only
-        RAISE EXCEPTION 'exc_state_forward_only' USING ERRCODE = '23514';                                    -- @pg-only
-    END IF;                                                                                                   -- @pg-only
-    RETURN NEW;                                                                                               -- @pg-only
-END $$;                                                                                                       -- @pg-only
-CREATE TRIGGER trg_exc_forward BEFORE UPDATE ON exception_case FOR EACH ROW EXECUTE FUNCTION trg_exc_forward();  -- @pg-only
+-- 异常单库层守卫（小赵 I2 / 复评 L1–L3，大肥鱼定案）
+-- L1 状态白名单：OPEN→PROCESSING/RESOLVED/CANCELLED，PROCESSING→RESOLVED/CANCELLED，RESOLVED→CLOSED；其余一律拒（含 RESOLVED→PROCESSING、
+--    OPEN/PROCESSING→CLOSED）。下游单据被驳回（原 X4）不再退回处理中，而是新开一张异常单（source_type=MANUAL，payload 引用原单号）。
+-- L2 建单后 code / warehouse_id / exception_code / source_type / source_key / source_hash / reporter_id 不可改；
+--    进入 RESOLVED 后声称、实点、差异、处置结论、处置单号、责任方、关闭人不可改，closed_at 只能从 NULL 写一次；CLOSED / CANCELLED 整行只读（含 version）。
+-- L3 不许 DELETE / TRUNCATE；SQLite 另拦 REPLACE（id 或 (source_type, source_key) 已存在即拒），去重键永不释放。
+-- 建议 2：SQLite 外键依赖 PRAGMA foreign_keys=ON，边缘连接漏开也要拦：exception_code 存在性用触发器再校验一次。
+CREATE FUNCTION trg_exc_forward() RETURNS trigger LANGUAGE plpgsql AS $$   -- @pg-only
+BEGIN   -- @pg-only
+    IF NEW.status <> OLD.status AND NEW.status IN ('OPEN','PROCESSING','RESOLVED','CLOSED','CANCELLED') AND NOT (   -- @pg-only
+          (OLD.status = 'OPEN' AND NEW.status IN ('PROCESSING','RESOLVED','CANCELLED'))   -- @pg-only
+       OR (OLD.status = 'PROCESSING' AND NEW.status IN ('RESOLVED','CANCELLED'))   -- @pg-only
+       OR (OLD.status = 'RESOLVED' AND NEW.status = 'CLOSED')) THEN   -- @pg-only
+        RAISE EXCEPTION 'exc_state_forward_only' USING ERRCODE = '23514';   -- @pg-only
+    END IF;   -- @pg-only
+    IF NEW.code IS DISTINCT FROM OLD.code OR NEW.warehouse_id IS DISTINCT FROM OLD.warehouse_id   -- @pg-only
+       OR NEW.exception_code IS DISTINCT FROM OLD.exception_code OR NEW.source_type IS DISTINCT FROM OLD.source_type   -- @pg-only
+       OR NEW.source_key IS DISTINCT FROM OLD.source_key OR NEW.source_hash IS DISTINCT FROM OLD.source_hash   -- @pg-only
+       OR NEW.reporter_id IS DISTINCT FROM OLD.reporter_id   -- @pg-only
+       OR (OLD.status IN ('CLOSED','CANCELLED') AND NEW.status = OLD.status AND ROW(NEW.*) IS DISTINCT FROM ROW(OLD.*))   -- @pg-only
+       OR (OLD.status = 'RESOLVED' AND (NEW.claimed_qty_milli IS DISTINCT FROM OLD.claimed_qty_milli   -- @pg-only
+           OR NEW.counted_qty_milli IS DISTINCT FROM OLD.counted_qty_milli OR NEW.diff_qty_milli IS DISTINCT FROM OLD.diff_qty_milli   -- @pg-only
+           OR NEW.resolution IS DISTINCT FROM OLD.resolution OR NEW.resolution_doc IS DISTINCT FROM OLD.resolution_doc   -- @pg-only
+           OR NEW.liability IS DISTINCT FROM OLD.liability OR NEW.closed_by IS DISTINCT FROM OLD.closed_by   -- @pg-only
+           OR (OLD.closed_at IS NOT NULL AND NEW.closed_at IS DISTINCT FROM OLD.closed_at))) THEN   -- @pg-only
+        RAISE EXCEPTION 'exc_immutable' USING ERRCODE = '23514';   -- @pg-only
+    END IF;   -- @pg-only
+    RETURN NEW;   -- @pg-only
+END $$;   -- @pg-only
+CREATE TRIGGER trg_exc_forward BEFORE UPDATE ON exception_case FOR EACH ROW EXECUTE FUNCTION trg_exc_forward();   -- @pg-only
+CREATE FUNCTION trg_exc_no_delete() RETURNS trigger LANGUAGE plpgsql AS $$   -- @pg-only
+BEGIN   -- @pg-only
+    RAISE EXCEPTION 'exc_no_delete' USING ERRCODE = '23514';   -- @pg-only
+END $$;   -- @pg-only
+CREATE TRIGGER trg_exc_no_delete BEFORE DELETE ON exception_case FOR EACH ROW EXECUTE FUNCTION trg_exc_no_delete();   -- @pg-only
+CREATE TRIGGER trg_exc_no_trunc  BEFORE TRUNCATE ON exception_case FOR EACH STATEMENT EXECUTE FUNCTION trg_exc_no_delete();   -- @pg-only
 -- @sqlite-only CREATE TRIGGER trg_exc_forward BEFORE UPDATE ON exception_case
--- @sqlite-only WHEN (OLD.status IN ('CLOSED','CANCELLED') AND NEW.status <> OLD.status)
--- @sqlite-only   OR (OLD.status = 'RESOLVED' AND NEW.status NOT IN ('RESOLVED','CLOSED','PROCESSING'))
--- @sqlite-only   OR (OLD.status = 'PROCESSING' AND NEW.status = 'OPEN')
--- @sqlite-only   OR (OLD.status IN ('RESOLVED','CLOSED','CANCELLED') AND (NEW.claimed_qty_milli <> OLD.claimed_qty_milli
--- @sqlite-only       OR NEW.counted_qty_milli <> OLD.counted_qty_milli OR NEW.diff_qty_milli <> OLD.diff_qty_milli
--- @sqlite-only       OR NEW.source_key <> OLD.source_key OR NEW.source_hash <> OLD.source_hash))
+-- @sqlite-only WHEN NEW.status <> OLD.status AND NEW.status IN ('OPEN','PROCESSING','RESOLVED','CLOSED','CANCELLED') AND NOT ((OLD.status = 'OPEN' AND NEW.status IN ('PROCESSING','RESOLVED','CANCELLED'))
+-- @sqlite-only   OR (OLD.status = 'PROCESSING' AND NEW.status IN ('RESOLVED','CANCELLED'))
+-- @sqlite-only   OR (OLD.status = 'RESOLVED' AND NEW.status = 'CLOSED'))
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'exc_state_forward_only'); END;
+-- @sqlite-only CREATE TRIGGER trg_exc_immutable BEFORE UPDATE ON exception_case
+-- @sqlite-only WHEN NEW.code IS NOT OLD.code OR NEW.warehouse_id IS NOT OLD.warehouse_id OR NEW.exception_code IS NOT OLD.exception_code
+-- @sqlite-only   OR NEW.source_type IS NOT OLD.source_type OR NEW.source_key IS NOT OLD.source_key OR NEW.source_hash IS NOT OLD.source_hash
+-- @sqlite-only   OR NEW.reporter_id IS NOT OLD.reporter_id
+-- @sqlite-only   OR (OLD.status IN ('CLOSED','CANCELLED') AND (NEW.code IS NOT OLD.code OR NEW.warehouse_id IS NOT OLD.warehouse_id
+-- @sqlite-only   OR NEW.exception_code IS NOT OLD.exception_code OR NEW.source_type IS NOT OLD.source_type
+-- @sqlite-only   OR NEW.source_key IS NOT OLD.source_key OR NEW.source_hash IS NOT OLD.source_hash OR NEW.sku_id IS NOT OLD.sku_id
+-- @sqlite-only   OR NEW.lot_id IS NOT OLD.lot_id OR NEW.claimed_qty_milli IS NOT OLD.claimed_qty_milli
+-- @sqlite-only   OR NEW.counted_qty_milli IS NOT OLD.counted_qty_milli OR NEW.diff_qty_milli IS NOT OLD.diff_qty_milli
+-- @sqlite-only   OR NEW.liability IS NOT OLD.liability OR NEW.escalated IS NOT OLD.escalated
+-- @sqlite-only   OR NEW.due_at IS NOT OLD.due_at OR NEW.assignee_id IS NOT OLD.assignee_id OR NEW.resolution IS NOT OLD.resolution
+-- @sqlite-only   OR NEW.resolution_doc IS NOT OLD.resolution_doc OR NEW.reporter_id IS NOT OLD.reporter_id
+-- @sqlite-only   OR NEW.closed_by IS NOT OLD.closed_by OR NEW.closed_at IS NOT OLD.closed_at OR NEW.version IS NOT OLD.version
+-- @sqlite-only   OR NEW.created_at IS NOT OLD.created_at))
+-- @sqlite-only   OR (OLD.status = 'RESOLVED' AND (NEW.claimed_qty_milli IS NOT OLD.claimed_qty_milli OR NEW.counted_qty_milli IS NOT OLD.counted_qty_milli
+-- @sqlite-only       OR NEW.diff_qty_milli IS NOT OLD.diff_qty_milli OR NEW.resolution IS NOT OLD.resolution OR NEW.resolution_doc IS NOT OLD.resolution_doc
+-- @sqlite-only       OR NEW.liability IS NOT OLD.liability OR NEW.closed_by IS NOT OLD.closed_by
+-- @sqlite-only       OR (OLD.closed_at IS NOT NULL AND NEW.closed_at IS NOT OLD.closed_at)))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'exc_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_exc_no_delete BEFORE DELETE ON exception_case BEGIN SELECT RAISE(ABORT, 'exc_no_delete'); END;
+-- @sqlite-only CREATE TRIGGER trg_exc_no_replace BEFORE INSERT ON exception_case
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM exception_case e WHERE e.id = NEW.id OR (e.source_type = NEW.source_type AND e.source_key = NEW.source_key))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'exc_duplicate'); END;
+-- @sqlite-only CREATE TRIGGER trg_exc_code_ins BEFORE INSERT ON exception_case
+-- @sqlite-only WHEN NOT EXISTS (SELECT 1 FROM exception_code c WHERE c.code = NEW.exception_code)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'exc_code_unknown'); END;
 -- I4：授权。字典只读写不删；异常单不删（取消走状态）
 GRANT SELECT, INSERT, UPDATE ON exception_code, exception_case TO wms_app;                                   -- @pg-only
 
@@ -1020,8 +1077,8 @@ CREATE TABLE idempotency_record (
     req_hash     VARCHAR(64)  NOT NULL,
     response     TEXT         NOT NULL,
     status_code  INT          NOT NULL,
-    created_at   TIMESTAMP    NOT NULL DEFAULT now(),
-    expires_at   TIMESTAMP    NOT NULL
+    created_at   TIMESTAMP    NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),   -- 一律存 UTC（P1）
+    expires_at   TIMESTAMP    NOT NULL                -- UTC；写入后只许往后改（trg_idem_expiry_fwd，P2）
 );
 CREATE INDEX ix_idem_exp ON idempotency_record(expires_at);
 
@@ -1050,10 +1107,11 @@ CREATE TABLE outbox_event (
     headers         TEXT,
     status          VARCHAR(16)  NOT NULL DEFAULT 'PENDING',
     retry_count     SMALLINT     NOT NULL DEFAULT 0,
-    next_retry_at   TIMESTAMP    NOT NULL DEFAULT now(),
+    next_retry_at   TIMESTAMP    NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),   -- UTC
     last_error      VARCHAR(512),
-    created_at      TIMESTAMP    NOT NULL DEFAULT now(),
-    sent_at         TIMESTAMP
+    created_at      TIMESTAMP    NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),   -- UTC
+    sent_at         TIMESTAMP,                          -- UTC；写入后只许往后改（P2）
+    CONSTRAINT ck_outbox_sent CHECK (status <> 'SENT' OR sent_at IS NOT NULL)   -- P3
 );
 CREATE INDEX ix_outbox_pending ON outbox_event(status, next_retry_at);
 CREATE INDEX ix_outbox_bizkey  ON outbox_event(biz_key, id);   -- 同键串行发送
@@ -1063,10 +1121,10 @@ CREATE FUNCTION trg_purge_guard() RETURNS trigger LANGUAGE plpgsql AS $$        
 BEGIN                                                                                                         -- @pg-only
     IF TG_OP = 'TRUNCATE' THEN RAISE EXCEPTION 'purge_not_allowed: %', TG_TABLE_NAME USING ERRCODE = '42501'; END IF;  -- @pg-only
     IF TG_TABLE_NAME = 'idempotency_record' THEN                                                              -- @pg-only
-        IF NOT (OLD.expires_at < now()) THEN                                                                  -- @pg-only
+        IF NOT COALESCE(OLD.expires_at < (now() AT TIME ZONE 'UTC'), false) THEN                                                            -- @pg-only
             RAISE EXCEPTION 'purge_not_allowed: idempotency_record' USING ERRCODE = '42501';                 -- @pg-only
         END IF;                                                                                               -- @pg-only
-    ELSIF NOT (OLD.status = 'SENT' AND OLD.sent_at < now() - interval '7 days') THEN   -- outbox_event      -- @pg-only
+    ELSIF NOT COALESCE(OLD.status = 'SENT' AND OLD.sent_at < (now() AT TIME ZONE 'UTC') - interval '7 days', false) THEN   -- outbox_event  -- @pg-only
         RAISE EXCEPTION 'purge_not_allowed: outbox_event' USING ERRCODE = '42501';                           -- @pg-only
     END IF;                                                                                                   -- @pg-only
     RETURN OLD;                                                                                               -- @pg-only
@@ -1075,10 +1133,34 @@ CREATE TRIGGER trg_idem_purge_guard    BEFORE DELETE   ON idempotency_record FOR
 CREATE TRIGGER trg_idem_no_truncate    BEFORE TRUNCATE ON idempotency_record FOR EACH STATEMENT EXECUTE FUNCTION trg_purge_guard();  -- @pg-only
 CREATE TRIGGER trg_outbox_purge_guard  BEFORE DELETE   ON outbox_event       FOR EACH ROW       EXECUTE FUNCTION trg_purge_guard();  -- @pg-only
 CREATE TRIGGER trg_outbox_no_truncate  BEFORE TRUNCATE ON outbox_event       FOR EACH STATEMENT EXECUTE FUNCTION trg_purge_guard();  -- @pg-only
--- @sqlite-only CREATE TRIGGER trg_idem_purge_guard BEFORE DELETE ON idempotency_record WHEN NOT (OLD.expires_at < datetime('now'))
+-- @sqlite-only CREATE TRIGGER trg_idem_purge_guard BEFORE DELETE ON idempotency_record WHEN NOT COALESCE(OLD.expires_at < datetime('now'), 0)
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'purge_not_allowed: idempotency_record'); END;
--- @sqlite-only CREATE TRIGGER trg_outbox_purge_guard BEFORE DELETE ON outbox_event WHEN NOT (OLD.status = 'SENT' AND OLD.sent_at < datetime('now', '-7 days'))
+-- @sqlite-only CREATE TRIGGER trg_outbox_purge_guard BEFORE DELETE ON outbox_event WHEN NOT COALESCE(OLD.status = 'SENT' AND OLD.sent_at < datetime('now', '-7 days'), 0)
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'purge_not_allowed: outbox_event'); END;
+-- 九轮 P2：过期/投递时间写入后只许往后改，不许改早；created_at 不可改；SENT 是终态；sent_at 首次写入不得早于 created_at
+CREATE FUNCTION trg_expiry_forward() RETURNS trigger LANGUAGE plpgsql AS $$                                -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    IF NEW.created_at IS DISTINCT FROM OLD.created_at THEN                                                    -- @pg-only
+        RAISE EXCEPTION 'expiry_backdate: created_at' USING ERRCODE = '42501'; END IF;                        -- @pg-only
+    IF TG_TABLE_NAME = 'idempotency_record' THEN                                                              -- @pg-only
+        IF NEW.expires_at < OLD.expires_at THEN                                                               -- @pg-only
+            RAISE EXCEPTION 'expiry_backdate: expires_at' USING ERRCODE = '42501'; END IF;                    -- @pg-only
+    ELSE                                                                                                      -- @pg-only
+        IF OLD.sent_at IS NOT NULL AND (NEW.sent_at IS NULL OR NEW.sent_at < OLD.sent_at) THEN                -- @pg-only
+            RAISE EXCEPTION 'expiry_backdate: sent_at' USING ERRCODE = '42501'; END IF;                       -- @pg-only
+        IF OLD.sent_at IS NULL AND NEW.sent_at < OLD.created_at THEN                                          -- @pg-only
+            RAISE EXCEPTION 'expiry_backdate: sent_at' USING ERRCODE = '42501'; END IF;                       -- @pg-only
+        IF OLD.status = 'SENT' AND NEW.status <> 'SENT' THEN                                                  -- @pg-only
+            RAISE EXCEPTION 'expiry_backdate: status' USING ERRCODE = '42501'; END IF;                        -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    RETURN NEW;                                                                                               -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_idem_expiry_fwd   BEFORE UPDATE ON idempotency_record FOR EACH ROW EXECUTE FUNCTION trg_expiry_forward();  -- @pg-only
+CREATE TRIGGER trg_outbox_expiry_fwd BEFORE UPDATE ON outbox_event       FOR EACH ROW EXECUTE FUNCTION trg_expiry_forward();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_idem_expiry_fwd BEFORE UPDATE ON idempotency_record WHEN NEW.created_at IS NOT OLD.created_at OR NEW.expires_at < OLD.expires_at
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'expiry_backdate: idempotency_record'); END;
+-- @sqlite-only CREATE TRIGGER trg_outbox_expiry_fwd BEFORE UPDATE ON outbox_event WHEN NEW.created_at IS NOT OLD.created_at OR (OLD.sent_at IS NOT NULL AND (NEW.sent_at IS NULL OR NEW.sent_at < OLD.sent_at)) OR (OLD.sent_at IS NULL AND NEW.sent_at < OLD.created_at) OR (OLD.status = 'SENT' AND NEW.status <> 'SENT')
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'expiry_backdate: outbox_event'); END;
 -- SQLite REPLACE 冲突删旧行不触发 DELETE 触发器 → BEFORE INSERT 主键已存在就中止（应用把 idem_duplicate 当作"键已存在"处理，与 PG 23505 同分支）
 -- @sqlite-only CREATE TRIGGER trg_idem_no_replace BEFORE INSERT ON idempotency_record WHEN EXISTS (SELECT 1 FROM idempotency_record r WHERE r.idem_key = NEW.idem_key)
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'idem_duplicate'); END;
@@ -1225,9 +1307,9 @@ GRANT SELECT, DELETE ON idempotency_record, outbox_event TO wms_purge_owner;    
 CREATE FUNCTION public.purge_expired(OUT idem_deleted BIGINT, OUT outbox_deleted BIGINT)  -- @pg-only
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$          -- @pg-only
 BEGIN                                                                                  -- @pg-only
-    DELETE FROM public.idempotency_record WHERE expires_at < now();                    -- @pg-only
+    DELETE FROM public.idempotency_record WHERE expires_at < (now() AT TIME ZONE 'UTC');  -- @pg-only
     GET DIAGNOSTICS idem_deleted = ROW_COUNT;                                          -- @pg-only
-    DELETE FROM public.outbox_event WHERE status = 'SENT' AND sent_at < now() - interval '7 days';  -- @pg-only
+    DELETE FROM public.outbox_event WHERE status = 'SENT' AND sent_at < (now() AT TIME ZONE 'UTC') - interval '7 days';  -- @pg-only
     GET DIAGNOSTICS outbox_deleted = ROW_COUNT;                                        -- @pg-only
 END $$;                                                                                -- @pg-only
 ALTER FUNCTION public.purge_expired() OWNER TO wms_purge_owner;                        -- @pg-only

@@ -10,6 +10,7 @@
 #  退出码非 0 即表示设计文档中的某条主张不成立
 # =============================================================================
 set -uo pipefail
+export PGTZ=UTC   # 九轮 P1：时间列一律按 UTC 存，写入端会话固定 UTC（清理/守卫本身不依赖会话时区）
 cd "$(dirname "$0")/.."
 
 SCHEMA=sql/schema_postgres.sql
@@ -372,6 +373,43 @@ R=$(psql -t -A -c "SET ROLE wms_cleaner; SELECT idem_deleted || '/' || outbox_de
 [ "$R" = "1/1" ] && ok "Q2 wms_cleaner 调 purge_expired() 删掉 1 条过期去重 + 1 条过保留期 SENT" || bad "purge_expired 结果：$R"
 R=$(psql -t -A -c "SELECT (SELECT string_agg(idem_key, ',') FROM idempotency_record) || '|' || (SELECT string_agg(id::text, ',' ORDER BY id) FROM outbox_event)")
 [ "$R" = "live|8801,8803" ] && ok "Q2 清理后剩余 $R（未过期、PENDING、未过保留期的都在）" || bad "Q2 清理后：$R"
+echo "=== 2f2b. 九轮 P1–P3：UTC 清理、过期列只许往后改、SENT 必带 sent_at ==="
+expect_block "P3 status=SENT 但 sent_at 为空" "INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at) VALUES (8804,'t','k','{}','SENT',NULL);" "ck_outbox_sent"
+expect_allow "P3 正向：PENDING 不带 sent_at、SENT 带 sent_at" "BEGIN; INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at) VALUES (8805,'t','k','{}','PENDING',NULL),(8806,'t','k','{}','SENT',now() AT TIME ZONE 'UTC'); ROLLBACK;"
+expect_block "P2 wms_app 把 idem expires_at 改早" "SET ROLE wms_app; UPDATE idempotency_record SET expires_at='2000-01-01' WHERE idem_key='live';" "expiry_backdate: expires_at"
+expect_block "P2 idem created_at 被改" "UPDATE idempotency_record SET created_at='2000-01-01' WHERE idem_key='live';" "expiry_backdate: created_at"
+expect_block "P2 wms_app 把 outbox sent_at 改早" "SET ROLE wms_app; UPDATE outbox_event SET sent_at=(now() AT TIME ZONE 'UTC') - interval '30 days' WHERE id=8803;" "expiry_backdate: sent_at"
+expect_block "P2 outbox sent_at 清空（SENT 仍在）" "UPDATE outbox_event SET sent_at=NULL WHERE id=8803;" "expiry_backdate: sent_at"
+expect_block "P2 wms_app PENDING → SENT 时 sent_at 倒填 2000-01-01" "SET ROLE wms_app; UPDATE outbox_event SET status='SENT', sent_at='2000-01-01' WHERE id=8801;" "expiry_backdate: sent_at"
+expect_block "P2 SENT 退回 PENDING" "UPDATE outbox_event SET status='PENDING' WHERE id=8803;" "expiry_backdate: status"
+expect_allow "P2 正向：idem expires_at 往后延" "BEGIN; SET LOCAL ROLE wms_app; UPDATE idempotency_record SET expires_at=(now() AT TIME ZONE 'UTC') + interval '2 days' WHERE idem_key='live'; ROLLBACK;"
+expect_allow "P2 正向：sent_at 往后改、PENDING → SENT 写当前 UTC" "BEGIN; SET LOCAL ROLE wms_app; UPDATE outbox_event SET sent_at=sent_at + interval '1 minute' WHERE id=8803; UPDATE outbox_event SET status='SENT', sent_at=now() AT TIME ZONE 'UTC' WHERE id=8801; ROLLBACK;"
+psql -q -c "INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,created_at,expires_at) VALUES ('tz_live12h','h','{}',200,now() AT TIME ZONE 'UTC',(now() AT TIME ZONE 'UTC') + interval '12 hours'),('tz_dead','h','{}',200,now() AT TIME ZONE 'UTC',(now() AT TIME ZONE 'UTC') - interval '1 hour');" >/dev/null
+# POSIX 记号相反：Etc/GMT-8 = UTC+8，Etc/GMT+10 = UTC-10，Etc/GMT-14 = UTC+14（小赵 P1 的复现时区）
+TZR=""
+for Z in Etc/GMT-8 Etc/GMT+10 Etc/GMT-14; do
+  N=$(psql -t -A -c "BEGIN; SET LOCAL TimeZone='$Z'; SET LOCAL ROLE wms_cleaner; SELECT 'n=' || idem_deleted FROM purge_expired(); ROLLBACK;" | grep '^n=')
+  TZR="$TZR$Z:$N "
+done
+[ "$TZR" = "Etc/GMT-8:n=1 Etc/GMT+10:n=1 Etc/GMT-14:n=1 " ] && ok "P1 会话时区 +8 / -10 / +14 下 purge_expired 删的行数相同（$TZR，只删 tz_dead）" || bad "P1 时区清理行数：$TZR"
+expect_block "P1 会话时区 +14 下超级用户删还剩 12 小时的记录（守卫按 UTC）" "SET TimeZone='Etc/GMT-14'; DELETE FROM idempotency_record WHERE idem_key='tz_live12h';" "purge_not_allowed: idempotency_record"
+R=$(psql -t -A -c "SET TimeZone='Etc/GMT-14'; SET ROLE wms_cleaner; SELECT 'n=' || idem_deleted FROM purge_expired();" | grep '^n=')
+R2=$(psql -t -A -c "SELECT string_agg(idem_key, ',' ORDER BY idem_key) FROM idempotency_record WHERE idem_key LIKE 'tz_%'")
+[ "$R/$R2" = "n=1/tz_live12h" ] && ok "P1 +14 时区实删后 tz_live12h 仍在（$R/$R2）" || bad "P1 +14 实删：$R/$R2"
+echo "=== 2f3. 误报回转 SCRAP_PENDING → RETURN_QC（SCRAP_MISREPORT 审批）==="
+R=$(psql -t -A -c "SELECT quality_hold_qty_milli||'/'||hold_qty_milli||'/'||(on_hand_qty_milli-allocated_qty_milli-reserved_qty_milli-quality_hold_qty_milli-hold_qty_milli) FROM stock WHERE id=41")
+[ "$R" = "0/8000/1000" ] && ok "误报回转前 quality/hold/available = $R" || bad "误报回转前 = $R（期望 0/8000/1000）"
+expect_block "误报回转缺审批单号（→ 应用层 40930，库层 ck_hold_approval 兜底）" "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (57,41,'RETURN_QC','RETURN_QC','QC',7011,'CVT:53',5000,0,'HELD',0,NULL,NULL); COMMIT;" "ck_hold_approval"
+expect_block "误报回转审批类型不是 SCRAP_MISREPORT" "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (59,41,'RETURN_QC','RETURN_QC','QC',7011,'CVT:53',5000,0,'HELD',0,'OTHER','X-1'); COMMIT;" "ck_hold_approval"
+expect_block "非误报回转的明细不能挂审批（MANUAL + SCRAP_MISREPORT）" "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (60,41,'MANUAL','DAMAGE','MANUAL',0,'H60',1000,0,'HELD',7,'SCRAP_MISREPORT','SM-9'); COMMIT;" "ck_hold_approval"
+expect_allow "误报回转：SCRAP_PENDING 52（3000）→ RETURN_QC 56，挂新质检单 7010 + 审批 SM-2026-001；hold −q、quality +q" "BEGIN; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 52 AND hold_type = 'SCRAP_PENDING' AND status = 'HELD' AND released_qty_milli = 0; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (56,41,'RETURN_QC','RETURN_QC','QC',7010,'CVT:52',3000,0,'HELD',0,'SCRAP_MISREPORT','SM-2026-001'); UPDATE stock SET hold_qty_milli = hold_qty_milli - 3000, quality_hold_qty_milli = quality_hold_qty_milli + 3000, version = version + 1 WHERE id = 41 AND hold_qty_milli >= 3000; COMMIT;"
+R=$(psql -t -A -c "SELECT quality_hold_qty_milli||'/'||hold_qty_milli||'/'||(on_hand_qty_milli-allocated_qty_milli-reserved_qty_milli-quality_hold_qty_milli-hold_qty_milli) FROM stock WHERE id=41")
+[ "$R" = "3000/5000/1000" ] && ok "误报回转后 quality/hold/available = $R（冻结总量 8000、可用量 1000 不变）" || bad "误报回转后 = $R（期望 3000/5000/1000）"
+expect_block "误报回转后审批单号不可改" "BEGIN; UPDATE stock_hold SET approval_no = 'SM-FAKE' WHERE id = 56; COMMIT;" "hold_immutable"
+R=$(psql -t -A -c "SELECT count(*) FROM (SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.op_key LIKE 'CVT:%' AND NOT EXISTS (SELECT 1 FROM stock_hold o WHERE 'CVT:' || o.id = h.op_key AND o.hold_type = 'SCRAP_PENDING' AND o.status = 'RELEASED' AND o.stock_id = h.stock_id) UNION ALL SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.released_qty_milli <> COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id = h.id), 0) + COALESCE((SELECT c.hold_qty_milli FROM stock_hold c WHERE c.op_key = 'CVT:' || h.id), 0)) t")
+[ "$R" = "0" ] && ok "I3e（含误报回转口径）无差异行" || bad "I3e 差异 $R"
+R=$(psql -t -A -c "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (58,41,'RETURN_QC','RETURN_QC','QC',7012,'CVT:999',1000,0,'HELD',0,'SCRAP_MISREPORT','SM-BAD'); SELECT 'ids=' || string_agg(id::text, ',') FROM (SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.op_key LIKE 'CVT:%' AND NOT EXISTS (SELECT 1 FROM stock_hold o WHERE 'CVT:' || o.id = h.op_key AND o.hold_type = 'SCRAP_PENDING' AND o.status = 'RELEASED' AND o.stock_id = h.stock_id) UNION ALL SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.released_qty_milli <> COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id = h.id), 0) + COALESCE((SELECT c.hold_qty_milli FROM stock_hold c WHERE c.op_key = 'CVT:' || h.id), 0)) t; ROLLBACK;" | grep '^ids=')
+[ "$R" = "ids=58" ] && ok "I3e 反向：RETURN_QC 声称回转自不存在的 SCRAP_PENDING 999→ 查出 58" || bad "I3e 未查出：$R"
 echo "=== 2c. docs/02 40906：库位锁定写进扣减原语的 WHERE ==="
 psql -q -c "UPDATE location SET status='LOCKED' WHERE id=3;" >/dev/null
 DEDUCT="UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 13 AND on_hand_qty_milli - allocated_qty_milli - reserved_qty_milli - quality_hold_qty_milli - hold_qty_milli >= 1000 AND EXISTS (SELECT 1 FROM location l WHERE l.id = stock.location_id AND l.status <> 'LOCKED');"
@@ -406,14 +444,14 @@ expect_block "10 I1 异常码不在字典（外键）" "INSERT INTO exception_ca
 expect_block "10 I1 来源类型非法" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (104,'EXC-104',1,'RETURN_COUNT_DIFF','BOGUS','X:1','0000000000000000000000000000000000000000000000000000000000000005',1,1,5000,4000,-1000,'2026-10-15 12:00:00',7);" "ck_exc_src_type"
 expect_block "10 source_hash 不是 64 位小写 hex" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (105,'EXC-105',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','POD:1614:0','h1',1,1,5000,4000,-1000,'2026-10-15 12:00:00',7);" "ck_exc_hash"
 expect_block "10 source_hash 大写" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (106,'EXC-106',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','POD:1615:0','AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',1,1,5000,4000,-1000,'2026-10-15 12:00:00',7);" "ck_exc_hash"
-expect_block "10 关闭异常必须有处置结论和处理人" "UPDATE exception_case SET status='CLOSED' WHERE id=100;" "ck_exc_close"
+expect_block "10 关闭异常必须有处置结论和处理人" "UPDATE exception_case SET status='RESOLVED' WHERE id=100;" "ck_exc_close"
 expect_block "10 异常单非法状态" "UPDATE exception_case SET status='DONE' WHERE id=100;" "ck_exc_status"
 expect_allow "10 OPEN → RESOLVED（ACCEPT_COUNT）" "UPDATE exception_case SET status='RESOLVED', resolution='ACCEPT_COUNT', closed_by=8 WHERE id=100;"
-expect_block "10 I2 RESOLVED 后改实点（同时改差异，ck_exc_diff 仍成立）" "UPDATE exception_case SET counted_qty_milli=5000, diff_qty_milli=0 WHERE id=100;" "exc_state_forward_only"
+expect_block "10 I2 RESOLVED 后改实点（同时改差异，ck_exc_diff 仍成立）" "UPDATE exception_case SET counted_qty_milli=5000, diff_qty_milli=0 WHERE id=100;" "exc_immutable"
 expect_block "10 I2 RESOLVED → OPEN" "UPDATE exception_case SET status='OPEN' WHERE id=100;" "exc_state_forward_only"
-expect_allow "10 RESOLVED → CLOSED" "UPDATE exception_case SET status='CLOSED' WHERE id=100;"
+expect_allow "10 RESOLVED → CLOSED" "UPDATE exception_case SET status='CLOSED', closed_at='2026-10-15 12:00:00' WHERE id=100;"
 expect_block "10 I2 CLOSED → OPEN" "UPDATE exception_case SET status='OPEN' WHERE id=100;" "exc_state_forward_only"
-expect_block "10 I2 CLOSED 后改声称数" "UPDATE exception_case SET claimed_qty_milli=4000, diff_qty_milli=0 WHERE id=100;" "exc_state_forward_only"
+expect_block "10 I2 CLOSED 后改声称数" "UPDATE exception_case SET claimed_qty_milli=4000, diff_qty_milli=0 WHERE id=100;" "exc_immutable"
 expect_allow "10 A2 首签差异单 POD:1611:0" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (110,'EXC-110',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','POD:1611:0','000000000000000000000000000000000000000000000000000000000000000a',1,1,5000,4000,-1000,'2026-10-15 12:00:00',7);"
 expect_allow "10 A2 更正后先取消旧单（X5）" "UPDATE exception_case SET status='CANCELLED' WHERE id=110;"
 expect_block "10 A2 已取消的旧键仍占位（uq_exc_src 不变，不能复用旧键）" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (111,'EXC-111',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','POD:1611:0','000000000000000000000000000000000000000000000000000000000000000b',1,1,5000,3000,-2000,'2026-10-15 12:00:00',7);" "uq_exc_src"
@@ -441,6 +479,34 @@ R=$(psql -t -A -c "SELECT quality_hold_qty_milli||'/'||hold_qty_milli||'/'||(on_
 R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 63 AND status = 'HELD' AND hold_type IN ('QUALITY','MANUAL')")
 [ "$R" = "UPDATE 0" ] && ok "10 A1 人工解冻路径对转入的 SCRAP_PENDING → 40933 rowcount=0" || bad "10 A1 人工解冻路径对转入的 SCRAP_PENDING → 40933：$R（期望 UPDATE 0）"
 
+expect_allow "10 L1 准备：异常单 140 / 141（OPEN）" "BEGIN; INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (140,'EXC-140',1,'RETURN_COUNT_DIFF','MANUAL','M:140','0000000000000000000000000000000000000000000000000000000000000082',1,1,5000,4000,-1000,'2026-10-15 12:00:00',7); INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (141,'EXC-141',1,'RETURN_COUNT_DIFF','MANUAL','M:141','0000000000000000000000000000000000000000000000000000000000000083',1,1,5000,4000,-1000,'2026-10-15 12:00:00',7); COMMIT;"
+expect_block "10 L1 OPEN → CLOSED（跳过 RESOLVED）" "UPDATE exception_case SET status='CLOSED', resolution='ACCEPT_COUNT', closed_by=8 WHERE id=141;" "exc_state_forward_only"
+expect_allow "10 L1 OPEN → PROCESSING" "UPDATE exception_case SET status='PROCESSING', assignee_id=8 WHERE id=140;"
+expect_block "10 L1 PROCESSING → CLOSED（跳过 RESOLVED）" "UPDATE exception_case SET status='CLOSED', resolution='ACCEPT_COUNT', closed_by=8 WHERE id=140;" "exc_state_forward_only"
+expect_block "10 建议 1 处置结论取值非法" "UPDATE exception_case SET resolution='WHATEVER' WHERE id=141;" "ck_exc_resol"
+expect_block "10 建议 1 报损处置缺报损单号" "UPDATE exception_case SET status='RESOLVED', resolution='SCRAP', closed_by=8 WHERE id=140;" "ck_exc_resdoc"
+expect_allow "10 L1 PROCESSING → RESOLVED（SCRAP，带单号）" "UPDATE exception_case SET status='RESOLVED', resolution='SCRAP', resolution_doc='SCR-1', closed_by=8 WHERE id=140;"
+expect_block "10 L1 RESOLVED → PROCESSING（已解决不能退回）" "UPDATE exception_case SET status='PROCESSING' WHERE id=140;" "exc_state_forward_only"
+expect_block "10 L1 RESOLVED 后改实点（借道重开改数被堵）" "UPDATE exception_case SET counted_qty_milli=5000, diff_qty_milli=0 WHERE id=140;" "exc_immutable"
+expect_block "10 L2 RESOLVED 后改处置结论" "UPDATE exception_case SET resolution='NO_ACTION', resolution_doc=NULL WHERE id=140;" "exc_immutable"
+expect_block "10 L2 RESOLVED 后改责任方" "UPDATE exception_case SET liability='CARRIER' WHERE id=140;" "exc_immutable"
+expect_allow "10 L2 RESOLVED 下首次写 closed_at" "UPDATE exception_case SET closed_at='2026-10-15 13:00:00' WHERE id=140;"
+expect_block "10 L2 closed_at 只能写一次" "UPDATE exception_case SET closed_at='2026-10-16 13:00:00' WHERE id=140;" "exc_immutable"
+expect_block "10 L2 CLOSED 后改处置结论 / 清单号" "UPDATE exception_case SET resolution='NO_ACTION', resolution_doc=NULL WHERE id=100;" "exc_immutable"
+expect_block "10 L2 CLOSED 后改责任方" "UPDATE exception_case SET liability='CARRIER' WHERE id=100;" "exc_immutable"
+expect_block "10 L2 CLOSED 后改关闭人" "UPDATE exception_case SET closed_by=99 WHERE id=100;" "exc_immutable"
+expect_block "10 L2 CLOSED 后改仓库" "UPDATE exception_case SET warehouse_id=2 WHERE id=100;" "exc_immutable"
+expect_block "10 L2 CLOSED 后只改 version 也不行" "UPDATE exception_case SET version=version+1 WHERE id=100;" "exc_immutable"
+expect_block "10 L2 建单后改仓库（OPEN）" "UPDATE exception_case SET warehouse_id=2 WHERE id=141;" "exc_immutable"
+expect_block "10 L2 建单后改异常码" "UPDATE exception_case SET exception_code='FAILOVER_GAP' WHERE id=141;" "exc_immutable"
+expect_block "10 L2 建单后改上报人" "UPDATE exception_case SET reporter_id=99 WHERE id=141;" "exc_immutable"
+expect_block "10 L2 建单后改单号" "UPDATE exception_case SET code='EXC-X' WHERE id=141;" "exc_immutable"
+expect_block "10 L3 DELETE 已关闭异常单（去重键不能被释放）" "DELETE FROM exception_case WHERE id=100;" "exc_no_delete"
+expect_block "10 L3 DELETE 已取消异常单" "DELETE FROM exception_case WHERE id=110;" "exc_no_delete"
+expect_allow "10 质检单来源 SCRAP_MISREPORT（第 9 篇交接 / 质检误报回转）" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8010,'RTN-10',1,'RETURN','SCRAP_MISREPORT','APR-SH01-20261015-000001','CREATED','2026-10-15');"
+expect_block "10 质检单来源拼错（SCRAP_MISREPORTX）" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8011,'RTN-11',1,'RETURN','SCRAP_MISREPORTX','APR-SH01-20261015-000002','CREATED','2026-10-15');" "ck_inb_rtn_src"
+expect_allow "10 异常单来源 SCRAP_MISREPORT" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (142,'EXC-142',1,'RETURN_COUNT_DIFF','SCRAP_MISREPORT','APR-SH01-20261015-000001','0000000000000000000000000000000000000000000000000000000000000084',1,1,0,0,0,'2026-10-15 12:00:00',7);"
+expect_block "10 L3 PG TRUNCATE 异常单（超级用户 / 迁移脚本）" "TRUNCATE exception_case;" "exc_no_delete"
 expect_allow "10 STORE_RETURN 门店退货回仓 RTN" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8002,'RTN-2',1,'RETURN','STORE_RETURN','ST01:R-001','CREATED','2026-10-15');"
 expect_block "10 STORE_RETURN 之外的未登记退货来源" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8003,'RTN-3',1,'RETURN','WHATEVER','X-1','CREATED','2026-10-15');" "ck_inb_rtn_src"
 expect_allow "10 非退货入库单不受退货来源 CHECK 约束" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8004,'PO-1',1,'PURCHASE','ERP_X','PO-001','CREATED','2026-10-15');"
