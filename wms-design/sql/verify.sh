@@ -56,14 +56,16 @@ if [ -n "${PGHOST:-}" ]; then
   MODE=env
   command -v psql >/dev/null 2>&1 || { echo "  ✗ 设置了 PGHOST 但本机没有 psql 客户端"; exit 1; }
   export PGPORT="${PGPORT:-5432}" PGUSER="${PGUSER:-postgres}" PGDATABASE="${PGDATABASE:-postgres}"
-  psql() { command psql -X "$@" 2>&1; }
+  # stderr 保持独立。需要按错误文本断言的调用点自己合并（psql_capture）。
+  # -v ON_ERROR_STOP=1 放在包装里，等价于每次会话 \set ON_ERROR_STOP on。
+  psql() { command psql -X -v ON_ERROR_STOP=1 "$@"; }
   cleanup() { :; }
   echo "=== 0. 直连 PG：$PGUSER@$PGHOST:$PGPORT/$PGDATABASE ==="
   for _ in $(seq 1 30); do command psql -X -t -A -c "SELECT 1" >/dev/null 2>&1 && break; sleep 1; done
 else
   MODE=docker
   command -v docker >/dev/null 2>&1 || { echo "  ✗ 未设置 PGHOST，且本机没有 docker，无法验证 PG 侧"; exit 1; }
-  psql() { docker exec -i "$CTR" psql -X -U postgres -d postgres "$@" 2>&1; }
+  psql() { docker exec -i "$CTR" psql -X -v ON_ERROR_STOP=1 -U postgres -d postgres "$@"; }
   cleanup() { docker rm -f "$CTR" >/dev/null 2>&1; }
   echo "=== 0. 启动一次性 PG16 容器（回退模式）==="
   docker rm -f "$CTR" >/dev/null 2>&1
@@ -72,11 +74,26 @@ else
 fi
 
 echo "=== 1. 建表（ON_ERROR_STOP，任何语法/方言错误直接失败）==="
-SCHEMA_OUT=$(psql -v ON_ERROR_STOP=1 -q < "$SCHEMA")
-if [ -n "$SCHEMA_OUT" ]; then
-  bad "schema 执行报错"; echo "$SCHEMA_OUT" | head -20; cleanup; exit 1
+SCHEMA_ERR=$(mktemp)
+SCHEMA_OUT=$(psql -q < "$SCHEMA" 2>"$SCHEMA_ERR")
+SCHEMA_RC=$?
+if [ "$SCHEMA_RC" != 0 ] || [ -s "$SCHEMA_ERR" ] || [ -n "$SCHEMA_OUT" ]; then
+  bad "schema 执行报错（退出 $SCHEMA_RC）"
+  echo "--- stdout ---"; printf '%s\n' "$SCHEMA_OUT" | head -20
+  echo "--- stderr ---"; head -20 "$SCHEMA_ERR"
+  rm -f "$SCHEMA_ERR"; cleanup; exit 1
 fi
-ok "sql/schema/*.sql 在 PG16 按序全量执行通过（无任何告警输出）"
+rm -f "$SCHEMA_ERR"
+ok "sql/schema/*.sql 在 PG16 按序全量执行通过（退出码 0，stdout/stderr 都空）"
+
+# 把 stdout 和 stderr 拼在一起，只给“这条语句应该报错/不该报错”的断言用。
+psql_capture() {
+  local errf out
+  errf=$(mktemp)
+  out=$(psql -q -c "$1" 2>"$errf") || true
+  printf '%s\n%s' "$out" "$(cat "$errf")"
+  rm -f "$errf"
+}
 
 T=$(psql -t -A -c "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p') AND NOT c.relispartition")
 I=$(psql -t -A -c "SELECT count(*) FROM pg_indexes i JOIN pg_class c ON c.relname=i.tablename JOIN pg_namespace n ON n.oid=c.relnamespace AND n.nspname=i.schemaname WHERE i.schemaname='public' AND NOT c.relispartition")
@@ -92,19 +109,32 @@ ACT=$(psql -t -A -c "SELECT string_agg(x, ' ' ORDER BY x) FROM (SELECT c.relname
 if [ "$ACT" = "$EXPECT_PRIVS" ]; then ok "S4 wms_app 权限矩阵与期望逐表一致（$(echo "$ACT" | wc -w) 个对象，含 TRIGGER/REFERENCES；列级 UPDATE 另测）"
 else bad "S4 wms_app 权限矩阵不符：$(diff <(echo "$EXPECT_PRIVS" | tr ' ' '\n') <(echo "$ACT" | tr ' ' '\n') | grep '^[<>]' | tr '\n' ' ')"; fi
 echo "=== 2. 库层不变量断言（§4.1 I1–I5 + §2.2 SoD + §4.6 幂等）==="
-seed() { psql -v ON_ERROR_STOP=1 -q -c "$1" >/dev/null || { echo "  ✗ seed 失败，立即退出：$1"; exit 2; }; }   # 种子任何一步失败都立即非零退出
+seed() { psql -q -c "$1" >/dev/null || { echo "  ✗ seed 失败，立即退出：$1"; exit 2; }; }   # 种子任何一步失败都立即非零退出；错误留在 stderr
+assert_n() {  # $1 描述  $2 SQL  $3 期望行数。计数语句本身失败也立即退出，不当成 0 行。
+  local n
+  n=$(psql -t -A -q -c "$2") || { echo "  ✗ 计数失败：$1"; exit 2; }
+  n=$(printf '%s' "$n" | tr -d '[:space:]')
+  [ "$n" = "$3" ] && ok "$1 = $n" || bad "$1 = $n，期望 $3"
+}
 seed "INSERT INTO warehouse (id,code,name,cutoff_time,work_date_offset) VALUES (1,'WHSH01','上海青浦仓','20:00',-1);"
 seed "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (1,1,'Z-C1','冷藏拣货区','CHILLED','PICK'),(2,1,'Z-C2','冷藏存储区','CHILLED','STORAGE');"
 seed "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (1,1,1,'A01-02-03','BIN',2,'A010'),(2,1,1,'A01-03-01','BIN',2,'A020'),(3,1,2,'B02-01-05','PALLET',8,'B010');"
 seed "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life) VALUES (1,'SKU-APPLE','山东红富士 80#','KG','CHILLED',30,10);"
 seed "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date,quality_status,remaining_life_days) VALUES (1,1,'LOT-1008','2026-10-25','2026-10-08','QUALIFIED',10),(2,1,'LOT-1012','2026-10-29','2026-10-12','QUALIFIED',14),(3,1,'LOT-1014','2026-10-31','2026-10-14','QUALIFIED',16);"
 seed "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,allocated_qty_milli) VALUES (11,1,1,1,2,'KG',50000,0),(12,1,2,1,1,'KG',30000,10000),(13,1,3,1,3,'KG',200000,0),(14,1,3,1,1,'KG',80000,0);"
+assert_n "主数据种子 warehouse" "SELECT count(*) FROM warehouse" 1
+assert_n "主数据种子 zone" "SELECT count(*) FROM zone" 2
+assert_n "主数据种子 location" "SELECT count(*) FROM location" 3
+assert_n "主数据种子 sku" "SELECT count(*) FROM sku" 1
+assert_n "主数据种子 lot" "SELECT count(*) FROM lot" 3
+assert_n "主数据种子 stock" "SELECT count(*) FROM stock" 4
 
 expect_block() {  # $1 描述  $2 SQL  $3 期望命中的约束名（或错误片段）
   # 注意：不要用 `psql | grep -q`。grep -q 命中即退出会触发 SIGPIPE，
   # 在 set -o pipefail 下会把"确实拦截了"误判成"未拦截"。先捕获再匹配。
   # 只认"指定约束"拦下：被别的约束/语法错误拦下 = 这条断言没测到它声称测的东西。
-  local out; out=$(psql -q -c "$2")
+  # 错误在 stderr，必须用 psql_capture，不能只看 stdout。
+  local out; out=$(psql_capture "$2")
   # 约束名按 PG 报错里的 "name" 带引号精确匹配（避免 ck_res 误命中 ck_res_int）；含空格的 $3 视为错误片段子串匹配
   local pat="\"$3\""; case "$3" in *" "*) pat="$3";; esac
   case "$out" in
@@ -114,7 +144,7 @@ expect_block() {  # $1 描述  $2 SQL  $3 期望命中的约束名（或错误�
   esac
 }
 expect_allow() {  # $1 描述  $2 SQL —— 参数顺序与 expect_block 保持一致
-  local out; out=$(psql -q -c "$2")
+  local out; out=$(psql_capture "$2")
   case "$out" in *ERROR*) bad "$1 → 被误拦：$out";; *) ok "$1 → 通过";; esac
 }
 
@@ -122,6 +152,7 @@ expect_block "I2 超占（allocated>on_hand）" \
   "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,allocated_qty_milli) VALUES (900,1,1,1,1,'KG',10000,99000);" \
   "ck_stock_nonneg"
 seed "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (1,'OBT1',1,'SALE','MALL','M-2026-001','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'CREATED','2026-10-16');"
+assert_n "种子 outbound_order" "SELECT count(*) FROM outbound_order" 1
 expect_block "§4.6② 业务层幂等（source_system+source_order_no 重复）" \
   "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (2,'OBT2',1,'SALE','MALL','M-2026-001','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'CREATED','2026-10-16');" \
   "uq_obo_src"
@@ -149,6 +180,7 @@ expect_block "04 I4 非法出库单状态" \
   "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (5,'OBT5',1,'SALE','MALL','M-2026-005','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'ALLOCATING','2026-10-16');" \
   "ck_obo_status"
 seed "INSERT INTO outbound_line (id,outbound_id,line_no,sku_id,order_qty_milli,picked_qty_milli,uom) VALUES (1,1,1,1,10000,5000,'KG');"
+assert_n "种子 outbound_line" "SELECT count(*) FROM outbound_line" 1
 expect_block "04 D4 回冲超过拣出（reversed > picked）" \
   "UPDATE outbound_line SET reversed_qty_milli = 6000 WHERE id = 1;" \
   "ck_obl_reversed"
@@ -307,7 +339,7 @@ expect_block "N1 改冻结明细数量 hold_qty_milli" \
 expect_block "N1 改冻结来源 source_type/source_id" \
   "BEGIN; UPDATE stock_hold SET source_type='MANUAL', source_id=0 WHERE id=31; COMMIT;" \
   "hold_immutable"
-OUT=$(psql -q -c "SET ROLE wms_app; UPDATE stock_hold SET hold_type='MANUAL', reason_code='DAMAGE', operator_id=7 WHERE id=31;")
+OUT=$(psql_capture "SET ROLE wms_app; UPDATE stock_hold SET hold_type='MANUAL', reason_code='DAMAGE', operator_id=7 WHERE id=31;")
 case "$OUT" in *"permission denied for table stock_hold"*) ok "N1 wms_app 对 stock_hold.hold_type 无 UPDATE 列权限";; *) bad "wms_app 改 hold_type 未被拒：$OUT";; esac
 R=$(psql -t -A -c "BEGIN; UPDATE stock_hold SET released_qty_milli = released_qty_milli + 1000, version = version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = 31 AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 1000; UPDATE stock SET hold_qty_milli = hold_qty_milli - 1000, version = version + 1 WHERE id = 40 AND hold_qty_milli >= 1000; SELECT s.hold_qty_milli||'/'||h.released_qty_milli||'/'||h.status FROM stock s JOIN stock_hold h ON h.stock_id=s.id WHERE h.id=31; ROLLBACK;" | grep '/')
 [ "$R" = "4000/1000/HELD" ] && ok "N1 正常释放仍可：SCRAP_PENDING 释放 1000 + stock.hold_qty −1000 → $R（事务内验证后回滚）" || bad "N1 正常释放 = $R（期望 4000/1000/HELD）"
@@ -321,12 +353,12 @@ R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = hold_qty_milli, st
 [ "$R" = "UPDATE 0" ] && ok "release_scrap_hold 非 SCRAP_PENDING 冻结 rowcount=0（→ 40930）" || bad "非报损冻结被释放：$R"
 expect_block "R1 已释放冻结改回 HELD（released 清零）" "BEGIN; UPDATE stock_hold SET released_qty_milli = 0, status = 'HELD' WHERE id = 30; COMMIT;" "hold_immutable"
 expect_block "R1 释放量减少（5000→1000）" "BEGIN; UPDATE stock_hold SET released_qty_milli = 1000, status = 'HELD' WHERE id = 30; COMMIT;" "hold_immutable"
-OUT=$(psql -q -c "SET ROLE wms_app; UPDATE stock_hold SET released_qty_milli = 0, status = 'HELD' WHERE id = 30;")
+OUT=$(psql_capture "SET ROLE wms_app; UPDATE stock_hold SET released_qty_milli = 0, status = 'HELD' WHERE id = 30;")
 case "$OUT" in *"hold_immutable"*) ok "R1 wms_app 改回 HELD 被触发器拦（列级授权放行了这两列，靠触发器）";; *) bad "wms_app 改回 HELD 未被拦：$OUT";; esac
 expect_block "R2 超级用户 DELETE 冻结明细" "BEGIN; DELETE FROM stock_hold WHERE id = 31; COMMIT;" "hold_immutable"
-OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM stock_hold WHERE id = 31;")
+OUT=$(psql_capture "SET ROLE wms_app; DELETE FROM stock_hold WHERE id = 31;")
 case "$OUT" in *"permission denied for table stock_hold"*) ok "R2 wms_app DELETE stock_hold → permission denied";; *) bad "wms_app DELETE 未被拒：$OUT";; esac
-OUT=$(psql -q -c "TRUNCATE stock_hold CASCADE;")   # 有 fk_hr_hold 后不带 CASCADE 会先报外键；CASCADE 时两表触发器都拦
+OUT=$(psql_capture "TRUNCATE stock_hold CASCADE;")   # 有 fk_hr_hold 后不带 CASCADE 会先报外键；CASCADE 时两表触发器都拦
 case "$OUT" in *"hold_immutable"*) ok "R2 超级用户 TRUNCATE stock_hold 被语句级触发器拦";; *) bad "TRUNCATE 未被拦：$OUT";; esac
 R=$(psql -t -A -c "SELECT hold_type||'/'||status||'/'||released_qty_milli FROM stock_hold WHERE id=31")
 [ "$R" = "SCRAP_PENDING/HELD/0" ] && ok "R2 绕过尝试后 id=31 仍为 $R" || bad "id=31 被改成 $R"
@@ -336,18 +368,18 @@ expect_block "报损冻结不能再用 MANUAL/SCRAP（只能 SCRAP_PENDING）" \
 expect_block "SCRAP_PENDING 必须挂报损单且为系统冻结" \
   "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (34,40,'SCRAP_PENDING','SCRAP','RETURN_RECORD',601,'H34',1000,0,'HELD',7); COMMIT;" \
   "ck_hold_scrap"
-OUT=$(psql -q -c "TRUNCATE stock_movement_key CASCADE;")
+OUT=$(psql_capture "TRUNCATE stock_movement_key CASCADE;")
 case "$OUT" in *"append_only_violation"*) ok "C5 超级用户 TRUNCATE 去重表被语句级触发器拦下";; *) bad "TRUNCATE 未被拦：$OUT";; esac
-OUT=$(psql -q -c "TRUNCATE stock_movement;")
+OUT=$(psql_capture "TRUNCATE stock_movement;")
 case "$OUT" in *"append_only_violation"*) ok "C5 超级用户 TRUNCATE 流水表被拦";; *) bad "TRUNCATE 流水未被拦：$OUT";; esac
-OUT=$(psql -q -c "SET ROLE wms_app; UPDATE stock_ledger_line SET src_kind='DOC' WHERE biz_no='PK2';")
+OUT=$(psql_capture "SET ROLE wms_app; UPDATE stock_ledger_line SET src_kind='DOC' WHERE biz_no='PK2';")
 case "$OUT" in *"permission denied"*) ok "C3 wms_app 无 stock_ledger_line.src_kind 列的 UPDATE 权限";; *) bad "wms_app 改 src_kind 未被拒：$OUT";; esac
 XP1=$(psql -t -A -c "SELECT count(*) FROM stock_movement WHERE biz_no='XP1'")
 XPP=$(psql -t -A -c "SELECT count(DISTINCT tableoid) FROM stock_movement WHERE biz_no='XP1' OR id=4")
 [ "$XP1" = "1" ] && ok "跨分区去重：被拦那笔随事务回滚（XP1 只有 1 条；样本流水分布在 $XPP 个分区）" || bad "XP1 流水 $XP1 条"
-OUT=$(psql -q -c "SET ROLE wms_app; UPDATE stock_movement SET remark='x' WHERE id=4;")
+OUT=$(psql_capture "SET ROLE wms_app; UPDATE stock_movement SET remark='x' WHERE id=4;")
 case "$OUT" in *"permission denied for table stock_movement"*) ok "只追加：应用角色 wms_app 无 UPDATE 权限";; *) bad "wms_app UPDATE 未被拒：$OUT";; esac
-OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM stock_movement_key WHERE movement_id=4;")
+OUT=$(psql_capture "SET ROLE wms_app; DELETE FROM stock_movement_key WHERE movement_id=4;")
 case "$OUT" in *"permission denied for table stock_movement_key"*) ok "只追加：应用角色 wms_app 无 DELETE 权限";; *) bad "wms_app DELETE 未被拒：$OUT";; esac
 
 echo "=== 2f. A3 RETURN_QC 系统冻结、release_qc_hold、QUALITY/RETURN_QC → SCRAP_PENDING ==="
@@ -368,27 +400,27 @@ R=$(psql -t -A -c "SELECT quality_hold_qty_milli||'/'||hold_qty_milli||'/'||(on_
 expect_block "A3 stock_hold_release 只追加（UPDATE）" "BEGIN; UPDATE stock_hold_release SET qty_milli = 2000 WHERE op_key = 'QCR:7001:1'; COMMIT;" "hold_immutable"
 echo "=== 2f2. 小赵五轮 Q1/S5/S6 stock_hold_release；Q2 去重记录与 outbox 清理 ==="
 expect_block "S6 释放记录挂不存在的冻结（外键）" "BEGIN; INSERT INTO stock_hold_release (id,hold_id,op_key,qty_milli) VALUES (4,999999,'QCR:x:1',1); COMMIT;" "fk_hr_hold"
-OUT=$(psql -q -c "TRUNCATE stock_hold_release;")
+OUT=$(psql_capture "TRUNCATE stock_hold_release;")
 case "$OUT" in *"hold_immutable"*) ok "S5 超级用户 TRUNCATE stock_hold_release 被语句级触发器拦";; *) bad "TRUNCATE stock_hold_release 未被拦：$OUT";; esac
 R=$(psql -t -A -c "SELECT count(*) FROM (SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.released_qty_milli <> COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id = h.id), 0) + COALESCE((SELECT SUM(c.hold_qty_milli) FROM stock_hold c WHERE c.from_hold_id = h.id), 0)) t")
 [ "$R" = "0" ] && ok "S6 I3e 对账：RETURN_QC 已释放 = Σ释放记录 + 转报损量（无差异行）" || bad "I3e 差异行 $R"
 R=$(psql -t -A -c "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (55,41,'RETURN_QC','RETURN_QC','QC',7003,'RQC:7003',2000,0,'HELD',0); UPDATE stock_hold SET released_qty_milli = 500, version = version + 1 WHERE id = 55; SELECT 'ids=' || string_agg(id::text, ',') FROM (SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.released_qty_milli <> COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id = h.id), 0) + COALESCE((SELECT SUM(c.hold_qty_milli) FROM stock_hold c WHERE c.from_hold_id = h.id), 0)) t; ROLLBACK;" | grep '^ids=')
 [ "$R" = "ids=55" ] && ok "S6 I3e 反向：绕过释放记录直接 UPDATE 释放 → 对账查出 hold 55" || bad "I3e 未查出：$R"
 expect_allow "Q2 准备：去重记录（未过期/已过期）+ outbox（PENDING / 8 天前 SENT / 刚 SENT）" "BEGIN; INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,expires_at) VALUES ('live','h','{}',200,now()+interval '1 day'),('dead','h','{}',200,now()-interval '1 hour'); INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at) VALUES (8801,'t','k','{}','PENDING',NULL),(8802,'t','k','{}','SENT',now()-interval '8 days'),(8803,'t','k','{}','SENT',now()); COMMIT;"
-OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM idempotency_record WHERE idem_key='dead';")
+OUT=$(psql_capture "SET ROLE wms_app; DELETE FROM idempotency_record WHERE idem_key='dead';")
 case "$OUT" in *"permission denied for table idempotency_record"*) ok "Q2 wms_app DELETE idempotency_record → permission denied";; *) bad "wms_app DELETE idem 未被拒：$OUT";; esac
-OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM outbox_event WHERE id=8802;")
+OUT=$(psql_capture "SET ROLE wms_app; DELETE FROM outbox_event WHERE id=8802;")
 case "$OUT" in *"permission denied for table outbox_event"*) ok "Q2 wms_app DELETE outbox_event → permission denied";; *) bad "wms_app DELETE outbox 未被拒：$OUT";; esac
-OUT=$(psql -q -c "SET ROLE wms_app; TRUNCATE outbox_event;")
+OUT=$(psql_capture "SET ROLE wms_app; TRUNCATE outbox_event;")
 case "$OUT" in *"permission denied"*) ok "Q2 wms_app TRUNCATE outbox_event → permission denied";; *) bad "wms_app TRUNCATE 未被拒：$OUT";; esac
-OUT=$(psql -q -c "SET ROLE wms_cleaner; DELETE FROM idempotency_record WHERE idem_key='dead';")
+OUT=$(psql_capture "SET ROLE wms_cleaner; DELETE FROM idempotency_record WHERE idem_key='dead';")
 case "$OUT" in *"permission denied for table idempotency_record"*) ok "Q2 wms_cleaner 直接 DELETE → permission denied（只能 EXECUTE 函数）";; *) bad "wms_cleaner 直接 DELETE 未被拒：$OUT";; esac
-OUT=$(psql -q -c "SET ROLE wms_app; SELECT * FROM purge_expired();")
+OUT=$(psql_capture "SET ROLE wms_app; SELECT * FROM purge_expired();")
 case "$OUT" in *"permission denied for function purge_expired"*) ok "Q2 wms_app 调 purge_expired() → permission denied";; *) bad "wms_app 调函数未被拒：$OUT";; esac
 expect_block "Q2 超级用户删未过期去重记录（触发器兜底）" "BEGIN; DELETE FROM idempotency_record WHERE idem_key='live'; COMMIT;" "purge_not_allowed: idempotency_record"
 expect_block "Q2 超级用户删 PENDING 事件" "BEGIN; DELETE FROM outbox_event WHERE id=8801; COMMIT;" "purge_not_allowed: outbox_event"
 expect_block "Q2 超级用户删刚投递（未过保留期）事件" "BEGIN; DELETE FROM outbox_event WHERE id=8803; COMMIT;" "purge_not_allowed: outbox_event"
-OUT=$(psql -q -c "TRUNCATE idempotency_record;")
+OUT=$(psql_capture "TRUNCATE idempotency_record;")
 case "$OUT" in *"purge_not_allowed"*) ok "Q2 超级用户 TRUNCATE idempotency_record 被拦";; *) bad "TRUNCATE idem 未被拦：$OUT";; esac
 R=$(psql -t -A -c "SELECT p.prosecdef::text || '/' || array_to_string(p.proconfig, ',') || '/' || r.rolsuper::text || '/' || r.rolname || '/' || has_function_privilege('public', p.oid, 'EXECUTE')::text FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner WHERE p.proname = 'purge_expired'")
 [ "$R" = "true/search_path=pg_catalog, public/false/wms_purge_owner/false" ] && ok "Q2 purge_expired：SECURITY DEFINER、固定 search_path、属主非超级用户、PUBLIC 无 EXECUTE（$R）" || bad "purge_expired 属性：$R"
@@ -425,7 +457,7 @@ expect_allow "R1 补洞正向：wms_app 以 PENDING 插入（不带 sent_at）" 
 expect_block "R1 PENDING → SENT 时 sent_at 写成 1 小时前" "BEGIN; SET LOCAL ROLE wms_app; UPDATE outbox_event SET status='SENT', sent_at=(now() AT TIME ZONE 'UTC') - interval '1 hour' WHERE id=8801; ROLLBACK;" "sent_at_not_now"
 expect_block "R1 PENDING → SENT 时 sent_at 写成 1 小时后" "BEGIN; SET LOCAL ROLE wms_app; UPDATE outbox_event SET status='SENT', sent_at=(now() AT TIME ZONE 'UTC') + interval '1 hour' WHERE id=8801; ROLLBACK;" "sent_at_not_now"
 expect_allow "R1 正向：PENDING → SENT 写当前 UTC（容差内 +3 秒）" "BEGIN; SET LOCAL ROLE wms_app; UPDATE outbox_event SET status='SENT', sent_at=(now() AT TIME ZONE 'UTC') + interval '3 seconds' WHERE id=8801; ROLLBACK;"
-psql -q -c "INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,created_at,expires_at) VALUES ('tz_live12h','h','{}',200,now() AT TIME ZONE 'UTC',(now() AT TIME ZONE 'UTC') + interval '12 hours'),('tz_dead','h','{}',200,now() AT TIME ZONE 'UTC',(now() AT TIME ZONE 'UTC') - interval '1 hour');" >/dev/null
+seed "INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,created_at,expires_at) VALUES ('tz_live12h','h','{}',200,now() AT TIME ZONE 'UTC',(now() AT TIME ZONE 'UTC') + interval '12 hours'),('tz_dead','h','{}',200,now() AT TIME ZONE 'UTC',(now() AT TIME ZONE 'UTC') - interval '1 hour');"
 # POSIX 记号相反：Etc/GMT-8 = UTC+8，Etc/GMT+10 = UTC-10，Etc/GMT-14 = UTC+14（小赵 P1 的复现时区）
 TZR=""
 for Z in Etc/GMT-8 Etc/GMT+10 Etc/GMT-14; do
@@ -438,8 +470,8 @@ R=$(psql -t -A -c "SET TimeZone='Etc/GMT-14'; SET ROLE wms_cleaner; SELECT 'n=' 
 R2=$(psql -t -A -c "SELECT string_agg(idem_key, ',' ORDER BY idem_key) FROM idempotency_record WHERE idem_key LIKE 'tz_%'")
 [ "$R/$R2" = "n=1/tz_live12h" ] && ok "P1 +14 时区实删后 tz_live12h 仍在（$R/$R2）" || bad "P1 +14 实删：$R/$R2"
 echo "=== 2f3. 误报回转 SCRAP_PENDING → RETURN_QC（SCRAP_MISREPORT 审批）==="
-psql -v ON_ERROR_STOP=1 -q -c "CREATE TABLE IF NOT EXISTS approval_request (     id BIGINT PRIMARY KEY,     code VARCHAR(64) NOT NULL,     CONSTRAINT uq_apr_code UNIQUE (code) ); INSERT INTO approval_request (id, code) VALUES  (5001,'APR-WHSH01-20261015-000001'),  (5002,'APR-WHSH01-20261015-000002'),  (5003,'APR-WHSH01-20261015-000003'),  (5004,'APR-WHSH01-20261015-000004'),  (5009,'APR-WHSH01-20261015-000009'),  (5099,'APR-WHSH01-20261015-000099'),  (5123,'APR-WHSH01-20261015-000123'),  (5999,'APR-WHSH01-20261231-999999'),  (5160,'APR-Z9Z9Z9Z9Z9Z9Z9Z9-20260101-000000'),  (5011,'APR-W1-20261015-000001'),  (5000,'APR-WHSH01-20260101-000000'),  (5029,'APR-WHSH01-20280229-000001') ON CONFLICT (code) DO NOTHING;" >/dev/null
-ok "审批号底数：合法 APR 先写入 approval_request（供 #9 外键）"
+seed "CREATE TABLE IF NOT EXISTS approval_request (id BIGINT PRIMARY KEY, code VARCHAR(64) NOT NULL, CONSTRAINT uq_apr_code UNIQUE (code)); INSERT INTO approval_request (id, code) VALUES (5001,'APR-WHSH01-20261015-000001'), (5002,'APR-WHSH01-20261015-000002'), (5003,'APR-WHSH01-20261015-000003'), (5004,'APR-WHSH01-20261015-000004'), (5009,'APR-WHSH01-20261015-000009'), (5099,'APR-WHSH01-20261015-000099'), (5123,'APR-WHSH01-20261015-000123'), (5999,'APR-WHSH01-20261231-999999'), (5160,'APR-Z9Z9Z9Z9Z9Z9Z9Z9-20260101-000000'), (5011,'APR-W1-20261015-000001'), (5000,'APR-WHSH01-20260101-000000'), (5029,'APR-WHSH01-20280229-000001') ON CONFLICT (code) DO NOTHING;"
+assert_n "审批号底数：合法 APR 写入 approval_request" "SELECT count(*) FROM approval_request" 12
 R=$(psql -t -A -c "SELECT quality_hold_qty_milli||'/'||hold_qty_milli||'/'||(on_hand_qty_milli-allocated_qty_milli-reserved_qty_milli-quality_hold_qty_milli-hold_qty_milli) FROM stock WHERE id=41")
 [ "$R" = "0/8000/1000" ] && ok "误报回转前 quality/hold/available = $R" || bad "误报回转前 = $R（期望 0/8000/1000）"
 expect_block "误报回转缺审批单号（→ 应用层 40930，库层 ck_hold_approval 兜底）" "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no,is_reversal) VALUES (57,41,'RETURN_QC','RETURN_QC','QC',7011,'CVT:53',5000,0,'HELD',0,NULL,NULL,true); COMMIT;" "ck_hold_approval"
@@ -482,32 +514,33 @@ expect_block "N1 RETURN_QC 的 CVT 明细未标回转（不带审批伪造回转
 R=$(psql -t -A -c "SELECT count(*) FROM stock_hold WHERE id >= 70 AND id < 100")
 [ "$R" = "0" ] && ok "审批单号格式用例全部回滚，无残留明细" || bad "审批单号格式用例残留 $R 行"
 echo "=== 2c. docs/02 40906：库位锁定写进扣减原语的 WHERE ==="
-psql -q -c "UPDATE location SET status='LOCKED' WHERE id=3;" >/dev/null
+seed "UPDATE location SET status='LOCKED' WHERE id=3;"
 DEDUCT="UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 13 AND on_hand_qty_milli - allocated_qty_milli - reserved_qty_milli - quality_hold_qty_milli - hold_qty_milli >= 1000 AND EXISTS (SELECT 1 FROM location l WHERE l.id = stock.location_id AND l.status <> 'LOCKED');"
 R=$(psql -t -A -c "$DEDUCT")
 [ "$R" = "UPDATE 0" ] && ok "库位 LOCKED：扣减 rowcount=0" || bad "锁定库位仍扣减：$R"
-psql -q -c "UPDATE location SET status='AVAILABLE' WHERE id=3;" >/dev/null
+seed "UPDATE location SET status='AVAILABLE' WHERE id=3;"
 R=$(psql -t -A -c "$DEDUCT")
 [ "$R" = "UPDATE 1" ] && ok "库位解锁后 rowcount=1" || bad "解锁后：$R"
-psql -q -c "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli + 1000, ledger_seq = ledger_seq - 1 WHERE id = 13;" >/dev/null
+seed "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli + 1000, ledger_seq = ledger_seq - 1 WHERE id = 13;"
 echo "=== 2c2. post_in：REVERSE_PICK 放行库位锁（盘点期间流水），其他来源仍拦 ==="
-psql -q -c "UPDATE location SET status='LOCKED' WHERE id=3;" >/dev/null
+seed "UPDATE location SET status='LOCKED' WHERE id=3;"
 R=$(psql -t -A -c "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli + 1000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 13 AND ('REVERSE_PICK' = 'REVERSE_PICK' OR EXISTS (SELECT 1 FROM location l WHERE l.id = stock.location_id AND l.status <> 'LOCKED'))")
 [ "$R" = "UPDATE 1" ] && ok "库位 LOCKED：REVERSE_PICK 入账 rowcount=1" || bad "REVERSE_PICK 被锁拦：$R"
 R=$(psql -t -A -c "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli + 1000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 13 AND ('RECEIVE' = 'REVERSE_PICK' OR EXISTS (SELECT 1 FROM location l WHERE l.id = stock.location_id AND l.status <> 'LOCKED'))")
 [ "$R" = "UPDATE 0" ] && ok "库位 LOCKED：RECEIVE 入账 rowcount=0（→ 40906）" || bad "RECEIVE 未被锁拦：$R"
 R=$(psql -t -A -c "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli + 1000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 13 AND ('MOVE' = 'REVERSE_PICK' OR EXISTS (SELECT 1 FROM location l WHERE l.id = stock.location_id AND l.status <> 'LOCKED'))")
 [ "$R" = "UPDATE 0" ] && ok "库位 LOCKED：MOVE 目标腿 rowcount=0" || bad "MOVE 未被锁拦：$R"
-psql -q -c "UPDATE location SET status='AVAILABLE' WHERE id=3; UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq - 1 WHERE id = 13;" >/dev/null
+seed "UPDATE location SET status='AVAILABLE' WHERE id=3; UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq - 1 WHERE id = 13;"
 
 echo "=== 2d. Q7：PG 写入 bigint 的取整行为（QA 在 PG16.14 实测，已关闭）==="
 # 临时表只活在一个会话里：建表、插入、查询必须在同一次 psql 调用（小赵 C1）
-Q7=$(psql -q -t -A -c "CREATE TEMP TABLE q7 (v BIGINT); INSERT INTO q7 VALUES (3.5), (2.5), (2.5::float8); SELECT string_agg(v::text, ',' ORDER BY ctid) FROM q7;")
+Q7=$(psql -q -t -A -c "CREATE TEMP TABLE q7 (v BIGINT); INSERT INTO q7 VALUES (3.5), (2.5), (2.5::float8); SELECT string_agg(v::text, ',' ORDER BY ctid) FROM q7;") || { echo "  ✗ Q7 语句失败"; exit 2; }
 [ "$Q7" = "4,3,2" ] && ok "numeric 3.5→4、2.5→3（四舍五入），float8 2.5→2（银行家舍入）→ 应用层只绑定整数" \
                   || bad "Q7 取整结果 = $Q7（期望 4,3,2）"
 
 echo "=== 3. §5.6 盘点差异生成列（实盘 − 基准账面 − 期间流水）==="
 seed "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000);"
+assert_n "种子 count_line" "SELECT count(*) FROM count_line" 1
 D=$(psql -t -A -c "SELECT diff_qty_milli FROM count_line WHERE id=1")
 [ "$D" = "-2000" ] && ok "diff_qty_milli = $D（预期 -2000）" || bad "diff_qty_milli = $D（预期 -2000）"
 
@@ -617,6 +650,28 @@ R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = released_qty_milli
 [ "$R" = "UPDATE 0" ] && ok "consume_live_hold 超量 rowcount=0（→ 40905）" || bad "超量 consume_live：$R"
 R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = released_qty_milli + 100, version = version + 1 WHERE id = 120 AND hold_type = 'LIVE_HOLD' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 100")
 [ "$R" = "UPDATE 0" ] && ok "consume_live_hold 不接受 PROCESSING（rowcount=0）" || bad "PROCESSING 被 consume_live：$R"
+expect_allow "N-1 consume_process_hold：stock 53 冻结 3000，一次扣完并提交" \
+  "BEGIN; INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (53,1,1,2,3,'KG',3000,3000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (140,53,'PROCESSING','PROCESSING','PROCESS_ORDER',5301,'PRCI:5301',3000,0,'HELD',0); SELECT id FROM stock WHERE id=53 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id=140 ORDER BY id FOR UPDATE; UPDATE stock SET hold_qty_milli = hold_qty_milli - 3000, on_hand_qty_milli = on_hand_qty_milli - 3000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 53 AND hold_qty_milli >= 3000 AND on_hand_qty_milli >= 3000; UPDATE stock_hold SET released_qty_milli = released_qty_milli + 3000, status = CASE WHEN released_qty_milli + 3000 = hold_qty_milli THEN 'RELEASED' ELSE 'HELD' END, version = version + 1 WHERE id = 140 AND hold_type = 'PROCESSING' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 3000; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('PRC3',1,'DOC',NULL); INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,hold_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (230,'PRC3',1,1,1,'DOC','PROCESS_CONSUME',-1,53,140,1,1,1,2,3,NULL,NULL,NULL,NULL,3000,3000,0,'2026-10-16','PRC3:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (230,'PRC3:1:D1:1','PRC3',1,1,1,'DOC',NULL,NULL,NULL,NULL,53,1,-1,'2026-10-16'); COMMIT;"
+R=$(psql -t -A -c "BEGIN; SELECT id||'/'||move_qty_milli||'/'||on_hand_before_qty_milli||'/'||on_hand_after_qty_milli FROM stock_movement WHERE idempotency_key = 'PRC3:1:D1:1'; COMMIT;" | tr -d '\r' | grep '/')
+[ "$R" = "230/3000/3000/0" ] && ok "N-1 加工消耗重放：等值命中原流水，扣减之前就返回 = $R" || bad "N-1 加工预查 = $R（期望 230/3000/3000/0）"
+R=$(psql -t -A -c "SELECT s.version||'/'||s.on_hand_qty_milli||'/'||s.hold_qty_milli||'/'||h.released_qty_milli||'/'||h.status||'/'||(SELECT count(*) FROM stock_movement WHERE idempotency_key='PRC3:1:D1:1') FROM stock s JOIN stock_hold h ON h.id=140 WHERE s.id=53")
+[ "$R" = "1/0/0/3000/RELEASED/1" ] && ok "N-1 加工重放未再扣、未再记账 = $R" || bad "N-1 加工重放后 = $R（期望 1/0/0/3000/RELEASED/1）"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = released_qty_milli + 3000, version = version + 1 WHERE id = 140 AND hold_type = 'PROCESSING' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 3000")
+[ "$R" = "UPDATE 0" ] && ok "N-1 加工：跳过预查时余量扣减 rowcount=0（→ 40905），原语不得走到这一步" || bad "N-1 加工 40905 对照 = $R"
+expect_allow "N-1 consume_live_hold：stock 54 冻结 3000，一次扣完并提交" \
+  "BEGIN; INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (54,1,1,2,2,'KG',3000,3000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (141,54,'LIVE_HOLD','LIVE_HOLD','LIVE_TANK_HOLD',6602,'LH:6602',3000,0,'HELD',0); SELECT id FROM stock WHERE id=54 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id=141 ORDER BY id FOR UPDATE; UPDATE stock SET hold_qty_milli = hold_qty_milli - 3000, on_hand_qty_milli = on_hand_qty_milli - 3000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 54 AND hold_qty_milli >= 3000 AND on_hand_qty_milli >= 3000; UPDATE stock_hold SET released_qty_milli = released_qty_milli + 3000, status = CASE WHEN released_qty_milli + 3000 = hold_qty_milli THEN 'RELEASED' ELSE 'HELD' END, version = version + 1 WHERE id = 141 AND hold_type = 'LIVE_HOLD' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 3000; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('LD3',1,'DOC',NULL); INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,hold_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (231,'LD3',1,1,1,'DOC','SCRAP',-1,54,141,1,1,1,2,2,NULL,NULL,NULL,NULL,3000,3000,0,'2026-10-16','LD3:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (231,'LD3:1:D1:1','LD3',1,1,1,'DOC',NULL,NULL,NULL,NULL,54,1,-1,'2026-10-16'); COMMIT;"
+R=$(psql -t -A -c "BEGIN; SELECT id||'/'||move_qty_milli||'/'||on_hand_before_qty_milli||'/'||on_hand_after_qty_milli FROM stock_movement WHERE idempotency_key = 'LD3:1:D1:1'; COMMIT;" | tr -d '\r' | grep '/')
+[ "$R" = "231/3000/3000/0" ] && ok "N-1 活鲜消耗重放：等值命中原流水，扣减之前就返回 = $R" || bad "N-1 活鲜预查 = $R（期望 231/3000/3000/0）"
+R=$(psql -t -A -c "SELECT s.version||'/'||s.on_hand_qty_milli||'/'||s.hold_qty_milli||'/'||h.released_qty_milli||'/'||h.status||'/'||(SELECT count(*) FROM stock_movement WHERE idempotency_key='LD3:1:D1:1') FROM stock s JOIN stock_hold h ON h.id=141 WHERE s.id=54")
+[ "$R" = "1/0/0/3000/RELEASED/1" ] && ok "N-1 活鲜重放未再扣、未再记账 = $R" || bad "N-1 活鲜重放后 = $R（期望 1/0/0/3000/RELEASED/1）"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = released_qty_milli + 3000, version = version + 1 WHERE id = 141 AND hold_type = 'LIVE_HOLD' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 3000")
+[ "$R" = "UPDATE 0" ] && ok "N-1 活鲜：跳过预查时余量扣减 rowcount=0（→ 40905），原语不得走到这一步" || bad "N-1 活鲜 40905 对照 = $R"
+expect_allow "N-2 顺序：stock 61 整池释放一次后提交" \
+  "BEGIN; INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (61,1,3,2,3,'KG',3000,3000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (172,61,'LIVE_HOLD','LIVE_HOLD','LIVE_TANK_HOLD',7903,'LH:7903',3000,0,'HELD',0); SELECT id FROM stock WHERE id=61 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id=172 AND status='HELD' ORDER BY id FOR UPDATE; INSERT INTO stock_hold_release (id,hold_id,op_key,qty_milli) SELECT 193, h.id, 'LTH:7903:9003:' || h.id, h.hold_qty_milli - h.released_qty_milli FROM stock_hold h WHERE h.id=172 AND h.status='HELD'; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status='RELEASED', version=version+1 WHERE id=172 AND status='HELD'; UPDATE stock SET hold_qty_milli = hold_qty_milli - (SELECT COALESCE(SUM(r.qty_milli),0) FROM stock_hold_release r WHERE r.id=193), version=version+1 WHERE id=61 AND hold_qty_milli >= (SELECT COALESCE(SUM(r.qty_milli),0) FROM stock_hold_release r WHERE r.id=193); COMMIT;"
+R=$(psql -t -A -c "BEGIN; SELECT (SELECT count(*) FROM stock_hold WHERE id=172 AND status='HELD') || '/' || (SELECT id||':'||qty_milli FROM stock_hold_release WHERE op_key='LTH:7903:9003:172'); COMMIT;" | tr -d '\r' | grep '/')
+[ "$R" = "0/193:3000" ] && ok "N-2 顺序：第 1 步锁到 0 条 HELD 后重跑幂等查询，返回原释放 = $R" || bad "N-2 顺序重查 = $R（期望 0/193:3000）"
+R=$(psql -t -A -c "SELECT s.version||'/'||s.on_hand_qty_milli||'/'||s.hold_qty_milli||'/'||(SELECT count(*) FROM stock_hold_release WHERE hold_id=172)||'/'||h.version FROM stock s JOIN stock_hold h ON h.id=172 WHERE s.id=61")
+[ "$R" = "1/3000/0/1/1" ] && ok "N-2 顺序重放不插空释放、不抬 version = $R" || bad "N-2 顺序重放后 = $R（期望 1/3000/0/1/1）"
 expect_allow "ck_recon_code 活鲜四码可写入" \
   "BEGIN; INSERT INTO stock_recon_alert (id,check_code,warehouse_id,stock_id,expected_qty_milli,actual_qty_milli) VALUES (9101,'LIVE_COUNT_WEIGHT',1,46,1,0),(9102,'LIVE_COUNT_LEDGER',1,46,1,0),(9103,'LIVE_HOLD_MISMATCH',1,47,1,0),(9104,'LIVE_INSPECT_OVERDUE',1,47,1,0); ROLLBACK;"
 expect_block "已有批次 sell_deadline 从 NULL 补写" "UPDATE lot SET sell_deadline = '2026-11-01' WHERE id = 1;" "sell_deadline_immutable"
@@ -651,12 +706,12 @@ AV=$(psql -t -A -c "SELECT available_qty_milli FROM v_stock_available WHERE stoc
 [ "$AV" = "20000" ] && ok "available_qty_milli = 30000 − 10000 = $AV" || bad "可用量计算错误：$AV"
 
 echo "=== 5. §4.3 并发防超卖：50 个独立连接同时扣 3 KG，起始 100 KG ==="
-psql -q -c "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (999,1,1,1,1,'KG',100000);" >/dev/null
+seed "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (999,1,1,1,1,'KG',100000);"
 CT_DIR=$(mktemp -d)
 for _ in $(seq 1 50); do
   psql -t -A -c \
     "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 3000, ledger_seq = ledger_seq + 1, version = version + 1, updated_at = now() WHERE id = 999 AND on_hand_qty_milli >= 3000;" \
-    > "$CT_DIR/ct_$_.out" &
+    > "$CT_DIR/ct_$_.out" 2>&1 &
 done
 wait
 succ=$(grep -c 'UPDATE 1' "$CT_DIR"/ct_*.out 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
@@ -673,7 +728,7 @@ expect_allow "并发底数：stock 60，LIVE_HOLD 3000 + MANUAL 2000" \
   "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (60,1,2,2,2,'KG',5000,5000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (160,60,'LIVE_HOLD','LIVE_HOLD','LIVE_TANK_HOLD',7801,'LH:7801',3000,0,'HELD',0),(161,60,'MANUAL','DAMAGE','MANUAL',0,'HOLD:161',2000,0,'HELD',7);"
 REL_A=$(mktemp)
 REL_B=$(mktemp)
-psql -v ON_ERROR_STOP=1 >"$REL_A" <<'SQL' &
+psql >"$REL_A" 2>&1 <<'SQL' &
 BEGIN;
 SELECT id FROM stock WHERE id = 60 ORDER BY id FOR UPDATE;
 SELECT id FROM stock_hold WHERE stock_id = 60 ORDER BY id FOR UPDATE;
@@ -703,7 +758,7 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 if [ "$locked" = "1" ]; then ok "释放会话已锁住库存行并停在 pg_sleep，消耗会话才开始"; else bad "没等到释放会话进入 pg_sleep"; echo "--- release ---"; cat "$REL_A"; fi
-psql -v ON_ERROR_STOP=1 >"$REL_B" <<'SQL'
+psql >"$REL_B" 2>&1 <<'SQL'
 DO $$
 DECLARE
   n_stock int;
@@ -744,6 +799,80 @@ else
 fi
 R=$(psql -t -A -c "SELECT s.on_hand_qty_milli||'/'||s.hold_qty_milli||'/'||h160.status||'/'||h160.released_qty_milli||'/'||h161.status||'/'||(h161.hold_qty_milli - h161.released_qty_milli)||'/'||(SELECT qty_milli FROM stock_hold_release WHERE id=181) FROM stock s JOIN stock_hold h160 ON h160.id=160 JOIN stock_hold h161 ON h161.id=161 WHERE s.id=60")
 [ "$R" = "5000/2000/RELEASED/3000/HELD/2000/3000" ] && ok "并发后 on_hand/hold_qty/活鲜状态/已释放/MANUAL状态/MANUAL余量/释放量 = $R（MANUAL 2000 没被扣）" || bad "并发后 = $R（期望 5000/2000/RELEASED/3000/HELD/2000/3000）"
+rm -f "$REL_A" "$REL_B"
+
+echo "=== 5c. N-2 release_live_hold 同一 op_key 并发：锁到 0 条 HELD 就重查，不提交空释放、不抬 version ==="
+expect_allow "N-2 并发底数：stock 62（container 1）LIVE_HOLD 3000" \
+  "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,container_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (62,1,3,2,3,1,'KG',3000,3000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (171,62,'LIVE_HOLD','LIVE_HOLD','LIVE_TANK_HOLD',7902,'LH:7902',3000,0,'HELD',0);"
+REL_A=$(mktemp)
+REL_B=$(mktemp)
+psql >"$REL_A" 2>&1 <<'SQL' &
+BEGIN;
+SELECT id FROM stock WHERE id = 62 ORDER BY id FOR UPDATE;
+SELECT id FROM stock_hold WHERE id = 171 ORDER BY id FOR UPDATE;
+SELECT pg_sleep(2);
+INSERT INTO stock_hold_release (id, hold_id, op_key, qty_milli)
+SELECT 192, h.id, 'LTH:7902:9002:' || h.id, h.hold_qty_milli - h.released_qty_milli
+  FROM stock_hold h
+ WHERE h.id = 171 AND h.status = 'HELD';
+UPDATE stock_hold
+   SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1
+ WHERE id = 171 AND status = 'HELD';
+UPDATE stock
+   SET hold_qty_milli = hold_qty_milli - (
+         SELECT COALESCE(SUM(r.qty_milli), 0) FROM stock_hold_release r WHERE r.id = 192),
+       version = version + 1
+ WHERE id = 62
+   AND hold_qty_milli >= (
+         SELECT COALESCE(SUM(r.qty_milli), 0) FROM stock_hold_release r WHERE r.id = 192);
+COMMIT;
+SQL
+APID=$!
+locked=0
+for _ in $(seq 1 50); do
+  n=$(psql -t -A -c "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND state = 'active' AND query LIKE '%pg_sleep%';")
+  n=$(printf '%s' "$n" | tr -d '[:space:]')
+  if [ -n "$n" ] && [ "$n" != "0" ]; then locked=1; break; fi
+  sleep 0.1
+done
+if [ "$locked" = "1" ]; then ok "N-2 释放会话已持锁并停在 pg_sleep，重放会话才开始"; else bad "N-2 没等到释放会话进入 pg_sleep"; echo "--- release ---"; cat "$REL_A"; fi
+psql >"$REL_B" 2>&1 <<'SQL'
+DO $$
+DECLARE
+  n0 int;
+  n_held int;
+  n2 int;
+BEGIN
+  SELECT count(*) INTO n0 FROM stock_hold_release WHERE op_key = 'LTH:7902:9002:171';
+  PERFORM id FROM stock WHERE id = 62 ORDER BY id FOR UPDATE;
+  PERFORM id FROM stock_hold WHERE id = 171 AND status = 'HELD' ORDER BY id FOR UPDATE;
+  SELECT count(*) INTO n_held FROM stock_hold WHERE id = 171 AND status = 'HELD';
+  IF n_held <> 0 THEN
+    RAISE EXCEPTION 'held_still %', n_held;
+  END IF;
+  SELECT count(*) INTO n2 FROM stock_hold_release WHERE op_key = 'LTH:7902:9002:171';
+  IF n0 <> 0 OR n2 <> 1 THEN
+    RAISE EXCEPTION 'replay_bad n0=% held=% n2=%', n0, n_held, n2;
+  END IF;
+  RAISE NOTICE 'replay_return n0=% held=% releases=%', n0, n_held, n2;
+END
+$$;
+SQL
+BSTAT=$?
+wait "$APID"
+ASTAT=$?
+if [ "$ASTAT" = "0" ] && ! grep -q deadlock "$REL_A"; then
+  ok "N-2 并发释放会话提交成功，无死锁"
+else
+  bad "N-2 并发释放会话退出 $ASTAT"; echo "--- release ---"; cat "$REL_A"
+fi
+if [ "$BSTAT" = "0" ] && grep -q 'replay_return n0=0 held=0 releases=1' "$REL_B" && ! grep -q deadlock "$REL_B"; then
+  ok "N-2 重放会话等到锁后 HELD 为 0，重查到原释放并返回，无死锁"
+else
+  bad "N-2 重放会话退出 $BSTAT"; echo "--- replay ---"; cat "$REL_B"
+fi
+R=$(psql -t -A -c "SELECT s.version||'/'||s.on_hand_qty_milli||'/'||s.hold_qty_milli||'/'||h.status||'/'||h.version||'/'||(SELECT count(*) FROM stock_hold_release WHERE op_key='LTH:7902:9002:171')||'/'||(SELECT qty_milli FROM stock_hold_release WHERE id=192) FROM stock s JOIN stock_hold h ON h.id=171 WHERE s.id=62")
+[ "$R" = "1/3000/0/RELEASED/1/1/3000" ] && ok "N-2 并发后 version/on_hand/hold_qty/状态/明细 version/释放行数/释放量 = $R（没有第二次释放）" || bad "N-2 并发后 = $R（期望 1/3000/0/RELEASED/1/1/3000）"
 rm -f "$REL_A" "$REL_B"
 
 echo "=== 汇总 ==="

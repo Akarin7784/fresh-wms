@@ -19,3 +19,13 @@ END $$;                                                                         
 ALTER FUNCTION public.purge_expired() OWNER TO wms_purge_owner;                        -- @pg-only
 REVOKE ALL ON FUNCTION public.purge_expired() FROM PUBLIC;                             -- @pg-only
 GRANT EXECUTE ON FUNCTION public.purge_expired() TO wms_cleaner;                       -- @pg-only
+-- upstream_push_log / purge_push_log() 属于第 11 篇。本分支的 11_integration.sql 还没有这张表，也没有这个函数。 -- @pg-only
+-- 表或函数不存在就跳过对应 GRANT，避免 99 在 #11 落库前把 verify 打红。当前两次目录检查都不命中，两笔授权都跳过。 -- @pg-only
+DO $$ BEGIN                                                                              -- @pg-only
+  IF to_regclass('public.upstream_push_log') IS NOT NULL THEN                           -- @pg-only
+    GRANT SELECT, DELETE ON upstream_push_log TO wms_purge_owner;                       -- @pg-only
+  END IF;                                                                                -- @pg-only
+  IF to_regprocedure('public.purge_push_log()') IS NOT NULL THEN                        -- @pg-only
+    GRANT EXECUTE ON FUNCTION public.purge_push_log() TO wms_cleaner;                   -- @pg-only
+  END IF;                                                                                -- @pg-only
+END $$;                                                                                  -- @pg-only

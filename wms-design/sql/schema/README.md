@@ -32,3 +32,4 @@
 | `received_qty_milli`、`qc_passed_qty_milli`、`qc_failed_qty_milli` | `inbound_line` | 第 10 篇 `10_returns.sql`（尚未加入加载列表） | 02 §7.1.3 `release_qc_hold` 按这三列累加质检合格量。不登记 `claimed_qty_milli`。`03_inbound.sql` 里现有的 `received_qty` 仍是 `NUMERIC(14,3)`，本篇不改 03 | 待 #5 落库 |
 | `ck_inbl_int`、`ck_inbl_qc` | `inbound_line` | 第 10 篇 `10_returns.sql` | `ck_inbl_int`：上述 milli 列为整数。`ck_inbl_qc`：非负，且 `qc_passed_qty_milli + qc_failed_qty_milli ≤ received_qty_milli` | 待 #5 落库 |
 | `ck_inb_rtn_src` | `inbound_order` | 第 10 篇 `10_returns.sql`（对 03 入库单 ALTER） | 限制退货入库来源。PostgreSQL 用 CHECK；SQLite 用触发器 | 待 #5 落库 |
+| `upstream_push_log` 的 SELECT、DELETE 给 `wms_purge_owner`；`purge_push_log()` 的 EXECUTE 给 `wms_cleaner` | `upstream_push_log` | `99_grants.sql`（目录检查，表或函数不存在则跳过） | 第 11 篇清理角色。本分支还没有这张表和这个函数，两笔 GRANT 当前都跳过 | 待 #11 落库（当前跳过） |
