@@ -290,6 +290,14 @@ CREATE TABLE stock_hold (
         OR (hold_type = 'RETURN_QC' AND op_key LIKE 'CVT:%'
             AND approval_type = 'SCRAP_MISREPORT' AND approval_no IS NOT NULL AND length(approval_no) > 0)
     ),
+    -- 审批单号格式 APR-{仓库编码}-{yyyyMMdd}-{6 位数字}；仓库编码字符集 [A-Z0-9]{1,32}（01 §2 warehouse.code，VARCHAR(32)，单号仓前缀不含 '-'）
+    CONSTRAINT ck_hold_approval_no CHECK (approval_no IS NULL OR approval_no ~ '^APR-[A-Z0-9]{1,32}-[0-9]{4}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])-[0-9]{6}$'),  -- @pg-only
+-- @sqlite-only     CONSTRAINT ck_hold_approval_no CHECK (approval_no IS NULL OR (
+-- @sqlite-only         length(approval_no) BETWEEN 21 AND 52 AND substr(approval_no, 1, 4) = 'APR-'
+-- @sqlite-only         AND substr(approval_no, 5, length(approval_no) - 20) NOT GLOB '*[^A-Z0-9]*'
+-- @sqlite-only         AND substr(approval_no, -16) GLOB '-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]'
+-- @sqlite-only         AND (substr(approval_no, -11, 2) GLOB '0[1-9]' OR substr(approval_no, -11, 2) GLOB '1[0-2]')
+-- @sqlite-only         AND (substr(approval_no, -9, 2) GLOB '0[1-9]' OR substr(approval_no, -9, 2) GLOB '[12][0-9]' OR substr(approval_no, -9, 2) GLOB '3[01]'))),
     CONSTRAINT ck_hold_scrap CHECK (
         hold_type <> 'SCRAP_PENDING'
         OR (source_type = 'SCRAP' AND source_id > 0 AND operator_id = 0)
@@ -1154,7 +1162,7 @@ CREATE TABLE user_device_binding (
     warehouse_id        BIGINT       NOT NULL,
     status              VARCHAR(16)  NOT NULL DEFAULT 'PENDING',   -- PENDING（待主管确认）/ ACTIVE / REVOKED（终态）
     approval_id         BIGINT,                      -- DEVICE_BIND 审批单
-    bound_at            TIMESTAMP    NOT NULL DEFAULT now(),
+    bound_at            TIMESTAMP    NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),   -- UTC
     activated_at        TIMESTAMP,
     revoked_at          TIMESTAMP,
     revoked_by          BIGINT,
@@ -1212,7 +1220,7 @@ CREATE TABLE approval_request (
     reject_reason       VARCHAR(256),
     expires_at          TIMESTAMP    NOT NULL,
     version             INT          NOT NULL DEFAULT 0,
-    created_at          TIMESTAMP    NOT NULL DEFAULT now(),
+    created_at          TIMESTAMP    NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),   -- UTC；expires_at 等时间列一律存 UTC（对齐 02 ad8ec1b P1）
     CONSTRAINT uq_apr_code UNIQUE (code),
     CONSTRAINT ck_apr_type CHECK (approval_type IN ('POD_CORRECT','CANCEL_AFTER_PICK','UNPLANNED_FAILOVER','DEVICE_BIND','SCRAP_MISREPORT')),
     -- 非计划切换 = 发起人 + 仓库主管 + 中心运维三人（00 §9.1），角色字符串固定；是否真持有该角色由 trg_apr_transition 查 sys_user_role
@@ -1290,7 +1298,7 @@ BEGIN                                                                           
        OR (OLD.second_approver_id IS NOT NULL AND NEW.second_approver_id IS DISTINCT FROM OLD.second_approver_id) THEN  -- @pg-only
         RAISE EXCEPTION 'approval_approver_immutable' USING ERRCODE = '23514';                               -- @pg-only
     END IF;                                                                                                   -- @pg-only
-    IF NEW.status IN ('PARTIAL','APPROVED') AND NEW.status <> OLD.status AND OLD.expires_at <= now() THEN      -- @pg-only
+    IF NEW.status IN ('PARTIAL','APPROVED') AND NEW.status <> OLD.status AND COALESCE(OLD.expires_at <= (now() AT TIME ZONE 'UTC'), false) THEN  -- @pg-only
         RAISE EXCEPTION 'approval_expired' USING ERRCODE = '23514';                                          -- @pg-only
     END IF;                                                                                                   -- @pg-only
     IF NEW.approval_type = 'UNPLANNED_FAILOVER' AND (                                                         -- @pg-only
@@ -1346,7 +1354,7 @@ CREATE TRIGGER trg_apr_final BEFORE UPDATE ON approval_request FOR EACH ROW EXEC
 -- @sqlite-only   OR (OLD.second_approver_id IS NOT NULL AND NEW.second_approver_id IS NOT OLD.second_approver_id)
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'approval_approver_immutable'); END;
 -- @sqlite-only CREATE TRIGGER trg_apr_expired BEFORE UPDATE ON approval_request
--- @sqlite-only WHEN NEW.status IN ('PARTIAL','APPROVED') AND NEW.status <> OLD.status AND datetime(OLD.expires_at) <= datetime('now', 'localtime')
+-- @sqlite-only WHEN NEW.status IN ('PARTIAL','APPROVED') AND NEW.status <> OLD.status AND COALESCE(datetime(OLD.expires_at) <= datetime('now'), 0)
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'approval_expired'); END;
 -- @sqlite-only CREATE TRIGGER trg_apr_role BEFORE UPDATE ON approval_request
 -- @sqlite-only WHEN NEW.approval_type = 'UNPLANNED_FAILOVER' AND (

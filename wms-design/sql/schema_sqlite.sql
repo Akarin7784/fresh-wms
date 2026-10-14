@@ -1,8 +1,8 @@
 -- 本文件由 sql/verify_sqlite.py 从 schema_postgres.sql 机械生成，请勿手改。
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
---   2. 41 处 DEFAULT now()、3 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
---   3. 方言专属行：删除 245 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 133 行 @sqlite-only（等价触发器）
+--   2. 39 处 DEFAULT now()、5 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
+--   3. 方言专属行：删除 246 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 139 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -297,6 +297,13 @@ CREATE TABLE stock_hold (
         OR (hold_type = 'RETURN_QC' AND op_key LIKE 'CVT:%'
             AND approval_type = 'SCRAP_MISREPORT' AND approval_no IS NOT NULL AND length(approval_no) > 0)
     ),
+    -- 审批单号格式 APR-{仓库编码}-{yyyyMMdd}-{6 位数字}；仓库编码字符集 [A-Z0-9]{1,32}（01 §2 warehouse.code，VARCHAR(32)，单号仓前缀不含 '-'）
+    CONSTRAINT ck_hold_approval_no CHECK (approval_no IS NULL OR (
+        length(approval_no) BETWEEN 21 AND 52 AND substr(approval_no, 1, 4) = 'APR-'
+        AND substr(approval_no, 5, length(approval_no) - 20) NOT GLOB '*[^A-Z0-9]*'
+        AND substr(approval_no, -16) GLOB '-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]'
+        AND (substr(approval_no, -11, 2) GLOB '0[1-9]' OR substr(approval_no, -11, 2) GLOB '1[0-2]')
+        AND (substr(approval_no, -9, 2) GLOB '0[1-9]' OR substr(approval_no, -9, 2) GLOB '[12][0-9]' OR substr(approval_no, -9, 2) GLOB '3[01]'))),
     CONSTRAINT ck_hold_scrap CHECK (
         hold_type <> 'SCRAP_PENDING'
         OR (source_type = 'SCRAP' AND source_id > 0 AND operator_id = 0)
@@ -1056,7 +1063,7 @@ CREATE TABLE user_device_binding (
     warehouse_id        BIGINT       NOT NULL,
     status              VARCHAR(16)  NOT NULL DEFAULT 'PENDING',   -- PENDING（待主管确认）/ ACTIVE / REVOKED（终态）
     approval_id         BIGINT,                      -- DEVICE_BIND 审批单
-    bound_at            TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    bound_at            TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- UTC
     activated_at        TIMESTAMP,
     revoked_at          TIMESTAMP,
     revoked_by          BIGINT,
@@ -1113,7 +1120,7 @@ CREATE TABLE approval_request (
     reject_reason       VARCHAR(256),
     expires_at          TIMESTAMP    NOT NULL,
     version             INT          NOT NULL DEFAULT 0,
-    created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- UTC；expires_at 等时间列一律存 UTC（对齐 02 ad8ec1b P1）
     CONSTRAINT uq_apr_code UNIQUE (code),
     CONSTRAINT ck_apr_type CHECK (approval_type IN ('POD_CORRECT','CANCEL_AFTER_PICK','UNPLANNED_FAILOVER','DEVICE_BIND','SCRAP_MISREPORT')),
     -- 非计划切换 = 发起人 + 仓库主管 + 中心运维三人（00 §9.1），角色字符串固定；是否真持有该角色由 trg_apr_transition 查 sys_user_role
@@ -1189,7 +1196,7 @@ WHEN (OLD.first_approver_id IS NOT NULL AND (NEW.first_approver_id IS NOT OLD.fi
   OR (OLD.second_approver_id IS NOT NULL AND NEW.second_approver_id IS NOT OLD.second_approver_id)
 BEGIN SELECT RAISE(ABORT, 'approval_approver_immutable'); END;
 CREATE TRIGGER trg_apr_expired BEFORE UPDATE ON approval_request
-WHEN NEW.status IN ('PARTIAL','APPROVED') AND NEW.status <> OLD.status AND datetime(OLD.expires_at) <= datetime('now', 'localtime')
+WHEN NEW.status IN ('PARTIAL','APPROVED') AND NEW.status <> OLD.status AND COALESCE(datetime(OLD.expires_at) <= datetime('now'), 0)
 BEGIN SELECT RAISE(ABORT, 'approval_expired'); END;
 CREATE TRIGGER trg_apr_role BEFORE UPDATE ON approval_request
 WHEN NEW.approval_type = 'UNPLANNED_FAILOVER' AND (
