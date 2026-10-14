@@ -518,7 +518,7 @@ expect_block "06 删复核行" "DELETE FROM check_line WHERE id=611;" "check_imm
 expect_block "06 改复核单复核人" "UPDATE check_record SET checker_id=9 WHERE id=601;" "check_immutable"
 expect_allow "06 check_op 扫描（四元键）" "INSERT INTO check_op (id,check_id,line_no,device_instance_id,op_seq,op_type,barcode,qty_milli) VALUES (621,601,1,'DEV-C',1,'SCAN','6900000000001',5000);"
 expect_block "06 check_op 同四元键重放（不同数量）→ 40910 依据" "INSERT INTO check_op (id,check_id,line_no,device_instance_id,op_seq,op_type,barcode,qty_milli) VALUES (622,601,1,'DEV-C',1,'SCAN','6900000000001',4000);" "uq_check_op"
-expect_block "06 SQLite REPLACE 覆盖 check_op" "INSERT INTO check_op (id,check_id,line_no,device_instance_id,op_seq,op_type,barcode,qty_milli) VALUES (621,601,1,'DEV-C',9,'SCAN','x',1) ON CONFLICT (id) DO UPDATE SET qty_milli=1;" "check_op_immutable"
+expect_block "06 同 id 覆盖 check_op（普通 INSERT）" "INSERT INTO check_op (id,check_id,line_no,device_instance_id,op_seq,op_type,barcode,qty_milli) VALUES (621,601,1,'DEV-C',9,'SCAN','x',1);" "check_op_pkey"
 expect_block "06 check_op 数量 0" "INSERT INTO check_op (id,check_id,line_no,device_instance_id,op_seq,op_type,barcode,qty_milli) VALUES (623,601,1,'DEV-C',2,'SCAN','x',0);" "ck_check_op_qty"
 expect_block "06 check_op 未完成却带 result_code" "INSERT INTO check_op (id,check_id,line_no,device_instance_id,op_seq,op_type,barcode,qty_milli,result_code) VALUES (624,601,1,'DEV-C',3,'SCAN','x',1,'42210');" "ck_check_op_finish"
 expect_block "06 check_op result_code 非 5 位码" "INSERT INTO check_op (id,check_id,line_no,device_instance_id,op_seq,op_type,barcode,qty_milli,result_code,finished_at) VALUES (625,601,1,'DEV-C',4,'SCAN','x',1,'OK',now());" "ck_check_op_result"
@@ -543,7 +543,7 @@ expect_block "06 SEALED 直接 SHIPPED（跳过集货）" "UPDATE pack_box SET s
 expect_allow "06 集货" "UPDATE pack_box SET status='STAGED', stage_location_id=2 WHERE id=631;"
 expect_block "06 改箱码" "UPDATE pack_box SET code='BOX-X' WHERE id=631;" "box_immutable"
 expect_block "06 删箱" "DELETE FROM pack_box WHERE id=631;" "box_immutable"
-expect_block "06 SQLite REPLACE 覆盖箱" "INSERT INTO pack_box (id,code,warehouse_id,outbound_id) VALUES (631,'BOX-1',1,9) ON CONFLICT (id) DO UPDATE SET outbound_id=9;" "box_immutable"
+expect_block "06 同 id 覆盖箱（普通 INSERT）" "INSERT INTO pack_box (id,code,warehouse_id,outbound_id) VALUES (631,'BOX-1',1,9);" "pack_box_pkey"
 expect_allow "06 发运单（CREATED）" "INSERT INTO shipment (id,code,warehouse_id,vehicle_no) VALUES (1,'SHP-1',1,'沪A12345');"
 expect_block "06 发运状态非法（SIGNED 归 16）" "INSERT INTO shipment (id,code,warehouse_id,status) VALUES (2,'SHP-2',1,'SIGNED');" "ck_shp_status"
 expect_block "06 交接缺 handed_over / box_count" "UPDATE shipment SET status='HANDED_OVER' WHERE id=1;" "ck_shp_handover"
@@ -557,7 +557,7 @@ expect_block "06 交接后撤回" "UPDATE shipment SET status='CREATED' WHERE id
 expect_allow "06 发运单直接作废（CANCELLED）" "INSERT INTO shipment (id,code,warehouse_id,status) VALUES (3,'SHP-3',1,'CANCELLED');"
 expect_block "06 CANCELLED 后复活" "UPDATE shipment SET status='CREATED' WHERE id=3;" "shipment_closed"
 expect_block "06 删发运单" "DELETE FROM shipment WHERE id=1;" "shipment_immutable"
-expect_block "06 SQLite REPLACE 覆盖发运单" "INSERT INTO shipment (id,code,warehouse_id) VALUES (1,'SHP-1',1) ON CONFLICT (id) DO UPDATE SET status='CREATED';" "shipment_closed"
+expect_block "06 同 id 覆盖发运单（普通 INSERT）" "INSERT INTO shipment (id,code,warehouse_id) VALUES (1,'SHP-1',1);" "shipment_pkey"
 OUT=$(psql -q -c "TRUNCATE check_op;")
 case "$OUT" in *"append_only_violation"*) ok "06 TRUNCATE check_op 被拦";; *) bad "TRUNCATE check_op 未拦：$OUT";; esac
 OUT=$(psql -q -c "TRUNCATE pack_box;")
