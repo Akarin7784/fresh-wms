@@ -203,8 +203,12 @@ seed = [
     "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000)",
     "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (1,'OBT1',1,'SALE','MALL','M-2026-001','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'CREATED','2026-10-16')",
 ]
-for s in seed:
-    conn.execute(s)
+for s in seed:  # fail-fast：任何种子失败立即退出非零
+    try:
+        conn.execute(s)
+    except sqlite3.Error as e:
+        print(f"  ✗ 种子失败：{e}\n    {s}")
+        sys.exit(1)
 conn.commit()
 ok("种子数据写入（含 TIME/DATE/TIMESTAMP/BOOLEAN/NUMERIC 列，未做任何列型改写）")
 
@@ -694,14 +698,15 @@ expect_allow_tx('06 集货', ["UPDATE pack_box SET status='STAGED', stage_locati
 expect_block_tx('06 改箱码', ["UPDATE pack_box SET code='BOX-X' WHERE id=631"], 'box_immutable')
 expect_block_tx('06 删箱', ['DELETE FROM pack_box WHERE id=631'], 'box_immutable')
 expect_block_tx('06 SQLite REPLACE 覆盖箱', ["INSERT OR REPLACE INTO pack_box (id,code,warehouse_id,outbound_id) VALUES (631,'BOX-1',1,9)"], 'box_duplicate')
-expect_allow_tx('06 发运单（CREATED）', ["INSERT INTO shipment (id,code,warehouse_id,vehicle_no) VALUES (1,'SHP-1',1,'沪A12345')"])
+expect_allow_tx('06 发运单（CREATED）', ["INSERT INTO shipment (id,code,warehouse_id) VALUES (1,'SHP-1',1)"])
 expect_block_tx('06 发运状态非法（SIGNED 归 16）', ["INSERT INTO shipment (id,code,warehouse_id,status) VALUES (2,'SHP-2',1,'SIGNED')"], 'CHECK constraint failed: ck_shp_status')
 expect_block_tx('06 交接缺 handed_over / box_count', ["UPDATE shipment SET status='HANDED_OVER' WHERE id=1"], 'CHECK constraint failed: ck_shp_handover')
 expect_allow_tx('06 箱发货出库（STAGED→SHIPPED）', ["UPDATE pack_box SET status='SHIPPED', shipment_id=1, shipped_at=datetime('now') WHERE id=631"])
 expect_block_tx('06 SHIPPED 箱回退', ["UPDATE pack_box SET status='STAGED' WHERE id=631"], 'box_state')
 expect_block_tx('06 SHIPPED 不挂发运单', ["INSERT INTO pack_box (id,code,warehouse_id,outbound_id,status,sealed,packed_at,checker_id,stage_location_id,shipped_at) VALUES (632,'BOX-2',1,1,'SHIPPED',1,datetime('now'),8,2,datetime('now'))"], 'CHECK constraint failed: ck_box_shipped')
-expect_allow_tx('06 发运交接（HANDED_OVER）', ["UPDATE shipment SET status='HANDED_OVER', handed_over_at=datetime('now'), handed_over_by=8, box_count=1, version=version+1 WHERE id=1"])
-expect_allow_tx('06 交接后 16 回写 departed_at（不冻结）', ["UPDATE shipment SET departed_at=datetime('now') WHERE id=1"])
+expect_allow_tx('06 发运交接（HANDED_OVER）', ["UPDATE shipment SET status='HANDED_OVER', handed_over_at=datetime('now'), handed_over_by=8, box_count=1, waybill_id=9001, version=version+1 WHERE id=1"])
+expect_block_tx('06 交接后改 waybill_id', ["UPDATE shipment SET waybill_id=9002 WHERE id=1"], 'shipment_closed')
+expect_block_tx('06 箱重量负数', ["UPDATE pack_box SET weight_g=-1 WHERE id=631"], 'CHECK constraint failed: ck_box_weight')
 expect_block_tx('06 交接后改箱数', ['UPDATE shipment SET box_count=2 WHERE id=1'], 'shipment_closed')
 expect_block_tx('06 交接后撤回', ["UPDATE shipment SET status='CREATED' WHERE id=1"], 'shipment_closed')
 expect_allow_tx('06 发运单直接作废（CANCELLED）', ["INSERT INTO shipment (id,code,warehouse_id,status) VALUES (3,'SHP-3',1,'CANCELLED')"])

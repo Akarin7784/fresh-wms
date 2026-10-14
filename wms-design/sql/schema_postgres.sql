@@ -828,7 +828,7 @@ CREATE TABLE pack_box (
     shipment_id     BIGINT,
     stage_location_id BIGINT,                       -- 集货位
     box_type        VARCHAR(24)  NOT NULL DEFAULT 'CARTON',  -- CARTON/TURNBOX（周转筐）
-    weight_g        NUMERIC(10,2),                  -- docs/06 Q6：拟改 weight_mg BIGINT（R2），待 PM
+    weight_g        BIGINT,                         -- docs/06 Q6 已定：整数克
     status          VARCHAR(16)  NOT NULL DEFAULT 'OPEN',    -- docs/06 §5.2：OPEN/SEALED/STAGED/SHIPPED/CANCELLED；装车扫箱归 docs/16
     sealed          BOOLEAN      NOT NULL DEFAULT false,     -- 兼容旧字段，= status<>'OPEN' 且 <>'CANCELLED'
     checker_id      BIGINT,
@@ -837,6 +837,7 @@ CREATE TABLE pack_box (
     version         INT          NOT NULL DEFAULT 0,
     created_at      TIMESTAMP    NOT NULL DEFAULT now(),
     CONSTRAINT uq_box_code UNIQUE (code),
+    CONSTRAINT ck_box_weight CHECK (weight_g IS NULL OR (weight_g >= 0 AND weight_g = CAST(weight_g AS BIGINT))),
     CONSTRAINT ck_box_status CHECK (status IN ('OPEN','SEALED','STAGED','SHIPPED','CANCELLED')),
     CONSTRAINT ck_box_sealed CHECK ((status IN ('OPEN','CANCELLED') AND sealed = false)
                                  OR (status IN ('SEALED','STAGED','SHIPPED') AND sealed = true AND packed_at IS NOT NULL AND checker_id IS NOT NULL)),
@@ -907,16 +908,10 @@ CREATE TABLE shipment (
     code            VARCHAR(64)  NOT NULL,
     warehouse_id    BIGINT       NOT NULL,
     carrier_code    VARCHAR(32),
-    vehicle_no      VARCHAR(24),
-    driver_id       BIGINT,
-    driver_name     VARCHAR(64),
-    driver_phone    VARCHAR(32),
     status          VARCHAR(16)  NOT NULL DEFAULT 'CREATED', -- docs/06 §5.3：CREATED/HANDED_OVER/CANCELLED；HANDED_OVER 后装车、发车、在途、签收归 docs/16（waybill 1:1）
-    planned_depart_at TIMESTAMP,
-    departed_at     TIMESTAMP,
-    signed_at       TIMESTAMP,
     temp_log_ref    VARCHAR(128),                   -- 温控记录对象存储 key
     dock_location_id BIGINT,                        -- 月台
+    waybill_id      BIGINT,                         -- docs/16 waybill.id（1:1，交接同事务由 create_from_shipment 生成后回填）；司机、车辆、发车、签收都在 16
     box_count       INT          NOT NULL DEFAULT 0,       -- 交接时冻结：SHIPPED 箱数
     handed_over_at  TIMESTAMP,                      -- 发货出库交接时间（UTC）
     handed_over_by  BIGINT,
@@ -925,15 +920,15 @@ CREATE TABLE shipment (
     updated_at      TIMESTAMP    NOT NULL DEFAULT now(),
     CONSTRAINT uq_shp_code UNIQUE (code),
     CONSTRAINT ck_shp_status CHECK (status IN ('CREATED','HANDED_OVER','CANCELLED')),
-    CONSTRAINT ck_shp_handover CHECK (status <> 'HANDED_OVER' OR (handed_over_at IS NOT NULL AND handed_over_by IS NOT NULL AND vehicle_no IS NOT NULL AND box_count > 0)),
+    CONSTRAINT ck_shp_handover CHECK (status <> 'HANDED_OVER' OR (handed_over_at IS NOT NULL AND handed_over_by IS NOT NULL AND waybill_id IS NOT NULL AND box_count > 0)),
     CONSTRAINT ck_shp_box_count CHECK (box_count >= 0)
 );
--- docs/06 §5.3：HANDED_OVER / CANCELLED 终态（之后的 departed_at/signed_at 等由 docs/16 回写，不在本触发器冻结列内）；不可删
+-- docs/06 §5.3：HANDED_OVER / CANCELLED 终态（交接后在途、签收都在 docs/16）；不可删
 CREATE FUNCTION trg_shp_guard() RETURNS trigger LANGUAGE plpgsql AS $$                                    -- @pg-only
 BEGIN                                                                                                      -- @pg-only
     IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'shipment_immutable'; END IF;                                 -- @pg-only
     IF OLD.status IN ('HANDED_OVER','CANCELLED') AND (NEW.status <> OLD.status OR NEW.box_count <> OLD.box_count  -- @pg-only
-       OR NEW.vehicle_no IS DISTINCT FROM OLD.vehicle_no OR NEW.handed_over_at IS DISTINCT FROM OLD.handed_over_at)  -- @pg-only
+       OR NEW.waybill_id IS DISTINCT FROM OLD.waybill_id OR NEW.handed_over_at IS DISTINCT FROM OLD.handed_over_at)  -- @pg-only
     THEN RAISE EXCEPTION 'shipment_closed'; END IF;                                                        -- @pg-only
     IF NEW.status <> OLD.status AND NOT (                                                                  -- @pg-only
         (OLD.status = 'CREATED' AND NEW.status IN ('HANDED_OVER','CANCELLED')))                          -- @pg-only
@@ -942,7 +937,7 @@ BEGIN                                                                           
 END $$;                                                                                                    -- @pg-only
 CREATE TRIGGER trg_shp_guard BEFORE UPDATE OR DELETE ON shipment FOR EACH ROW EXECUTE FUNCTION trg_shp_guard();  -- @pg-only
 -- @sqlite-only CREATE TRIGGER trg_shp_closed BEFORE UPDATE ON shipment
--- @sqlite-only WHEN OLD.status IN ('HANDED_OVER','CANCELLED') AND (NEW.status <> OLD.status OR NEW.box_count <> OLD.box_count OR NEW.vehicle_no IS NOT OLD.vehicle_no OR NEW.handed_over_at IS NOT OLD.handed_over_at)
+-- @sqlite-only WHEN OLD.status IN ('HANDED_OVER','CANCELLED') AND (NEW.status <> OLD.status OR NEW.box_count <> OLD.box_count OR NEW.waybill_id IS NOT OLD.waybill_id OR NEW.handed_over_at IS NOT OLD.handed_over_at)
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'shipment_closed'); END;
 -- @sqlite-only CREATE TRIGGER trg_shp_state BEFORE UPDATE OF status ON shipment
 -- @sqlite-only WHEN OLD.status NOT IN ('HANDED_OVER','CANCELLED') AND NEW.status <> OLD.status AND NOT (OLD.status = 'CREATED' AND NEW.status IN ('HANDED_OVER','CANCELLED'))
@@ -951,7 +946,6 @@ CREATE TRIGGER trg_shp_guard BEFORE UPDATE OR DELETE ON shipment FOR EACH ROW EX
 -- @sqlite-only CREATE TRIGGER trg_shp_dup BEFORE INSERT ON shipment
 -- @sqlite-only WHEN EXISTS (SELECT 1 FROM shipment x WHERE x.id = NEW.id OR x.code = NEW.code)
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'shipment_duplicate'); END;
-CREATE INDEX ix_shp_driver ON shipment(driver_id, status, planned_depart_at);
 
 -- ============================================================
 -- docs/06 复核、装箱、发货

@@ -19,7 +19,7 @@ SCHEMA=sql/schema_postgres.sql
 # 分区子表及其继承来的索引不计）/ 1 视图。二轮 C2 加 uq_mvk_mv（外键被引用键）→ 115；A3 加 stock_hold_release（PK、uq_hr_op、ix_hr_hold）→ 43 表 / 118。改 DDL 必须同步改这里。
 # 必须用新建的空库跑（DROP SCHEMA public 重建会丢 wms_app 的 USAGE；schema 里已 GRANT USAGE 兜底，小赵 C6）。
 EXPECT_TABLES=46
-EXPECT_INDEXES=129
+EXPECT_INDEXES=128
 EXPECT_VIEWS=1
 
 CTR=wms-pg-verify
@@ -73,7 +73,10 @@ ACT=$(psql -t -A -c "SELECT string_agg(x, ' ' ORDER BY x) FROM (SELECT c.relname
 if [ "$ACT" = "$EXPECT_PRIVS" ]; then ok "S4 wms_app 权限矩阵与期望逐表一致（$(echo "$ACT" | wc -w) 个对象；列级 UPDATE 另测）"
 else bad "S4 wms_app 权限矩阵不符：$(diff <(echo "$EXPECT_PRIVS" | tr ' ' '\n') <(echo "$ACT" | tr ' ' '\n') | grep '^[<>]' | tr '\n' ' ')"; fi
 echo "=== 2. 库层不变量断言（§4.1 I1–I5 + §2.2 SoD + §4.6 幂等）==="
-seed() { psql -q -c "$1" >/dev/null; }
+seed() {  # fail-fast：任何种子失败立即退出非零，避免后续断言在残缺数据上"假通过"
+  local out rc; out=$(psql -v ON_ERROR_STOP=1 -q -c "$1"); rc=$?
+  if [ $rc -ne 0 ] || [[ "$out" == *ERROR* ]]; then echo "  ✗ 种子失败（rc=$rc）：$1"; echo "$out" | head -5; cleanup; exit 1; fi
+}
 seed "INSERT INTO warehouse (id,code,name,cutoff_time,work_date_offset) VALUES (1,'WHSH01','上海青浦仓','20:00',-1);"
 seed "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (1,1,'Z-C1','冷藏拣货区','CHILLED','PICK'),(2,1,'Z-C2','冷藏存储区','CHILLED','STORAGE');"
 seed "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (1,1,1,'A01-02-03','BIN',2,'A010'),(2,1,1,'A01-03-01','BIN',2,'A020'),(3,1,2,'B02-01-05','PALLET',8,'B010');"
@@ -544,14 +547,15 @@ expect_allow "06 集货" "UPDATE pack_box SET status='STAGED', stage_location_id
 expect_block "06 改箱码" "UPDATE pack_box SET code='BOX-X' WHERE id=631;" "box_immutable"
 expect_block "06 删箱" "DELETE FROM pack_box WHERE id=631;" "box_immutable"
 expect_block "06 同 id 覆盖箱（普通 INSERT）" "INSERT INTO pack_box (id,code,warehouse_id,outbound_id) VALUES (631,'BOX-1',1,9);" "pack_box_pkey"
-expect_allow "06 发运单（CREATED）" "INSERT INTO shipment (id,code,warehouse_id,vehicle_no) VALUES (1,'SHP-1',1,'沪A12345');"
+expect_allow "06 发运单（CREATED）" "INSERT INTO shipment (id,code,warehouse_id) VALUES (1,'SHP-1',1);"
 expect_block "06 发运状态非法（SIGNED 归 16）" "INSERT INTO shipment (id,code,warehouse_id,status) VALUES (2,'SHP-2',1,'SIGNED');" "ck_shp_status"
 expect_block "06 交接缺 handed_over / box_count" "UPDATE shipment SET status='HANDED_OVER' WHERE id=1;" "ck_shp_handover"
 expect_allow "06 箱发货出库（STAGED→SHIPPED）" "UPDATE pack_box SET status='SHIPPED', shipment_id=1, shipped_at=now() WHERE id=631;"
 expect_block "06 SHIPPED 箱回退" "UPDATE pack_box SET status='STAGED' WHERE id=631;" "box_state"
 expect_block "06 SHIPPED 不挂发运单" "INSERT INTO pack_box (id,code,warehouse_id,outbound_id,status,sealed,packed_at,checker_id,stage_location_id,shipped_at) VALUES (632,'BOX-2',1,1,'SHIPPED',true,now(),8,2,now());" "ck_box_shipped"
-expect_allow "06 发运交接（HANDED_OVER）" "UPDATE shipment SET status='HANDED_OVER', handed_over_at=now(), handed_over_by=8, box_count=1, version=version+1 WHERE id=1;"
-expect_allow "06 交接后 16 回写 departed_at（不冻结）" "UPDATE shipment SET departed_at=now() WHERE id=1;"
+expect_allow "06 发运交接（HANDED_OVER）" "UPDATE shipment SET status='HANDED_OVER', handed_over_at=now(), handed_over_by=8, box_count=1, waybill_id=9001, version=version+1 WHERE id=1;"
+expect_block "06 交接后改 waybill_id" "UPDATE shipment SET waybill_id=9002 WHERE id=1;" "shipment_closed"
+expect_block "06 箱重量负数" "UPDATE pack_box SET weight_g=-1 WHERE id=631;" "ck_box_weight"
 expect_block "06 交接后改箱数" "UPDATE shipment SET box_count=2 WHERE id=1;" "shipment_closed"
 expect_block "06 交接后撤回" "UPDATE shipment SET status='CREATED' WHERE id=1;" "shipment_closed"
 expect_allow "06 发运单直接作废（CANCELLED）" "INSERT INTO shipment (id,code,warehouse_id,status) VALUES (3,'SHP-3',1,'CANCELLED');"
