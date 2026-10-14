@@ -1129,7 +1129,7 @@ CREATE INDEX ix_offline_binding ON offline_token(binding_id) WHERE revoked_at IS
 CREATE TABLE approval_request (
     id                  BIGINT       PRIMARY KEY,
     code                VARCHAR(64)  NOT NULL,       -- 审批单号 APR-{warehouse_code}-{yyyyMMdd}-{6 位序号}（ck_apr_code）；02 stock_hold.approval_no 存本列
-    approval_type       VARCHAR(32)  NOT NULL,       -- POD_CORRECT / CANCEL_AFTER_PICK / UNPLANNED_FAILOVER / DEVICE_BIND / SCRAP_MISREPORT
+    approval_type       VARCHAR(32)  NOT NULL,       -- POD_CORRECT / CANCEL_AFTER_PICK / UNPLANNED_FAILOVER / DEVICE_BIND / SCRAP_MISREPORT / PAPER_BACKFILL / BOX_VOID / PROCESS_YIELD_DEVIATION / LIVE_DEATH_OVER
     warehouse_id        BIGINT       NOT NULL,
     target_type         VARCHAR(32)  NOT NULL,
     target_id           VARCHAR(64)  NOT NULL,
@@ -1151,7 +1151,7 @@ CREATE TABLE approval_request (
     version             INT          NOT NULL DEFAULT 0,
     created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- UTC；expires_at 等时间列一律存 UTC（对齐 02 ad8ec1b P1）
     CONSTRAINT uq_apr_code UNIQUE (code),
-    CONSTRAINT ck_apr_type CHECK (approval_type IN ('POD_CORRECT','CANCEL_AFTER_PICK','UNPLANNED_FAILOVER','DEVICE_BIND','SCRAP_MISREPORT')),
+    CONSTRAINT ck_apr_type CHECK (approval_type IN ('POD_CORRECT','CANCEL_AFTER_PICK','UNPLANNED_FAILOVER','DEVICE_BIND','SCRAP_MISREPORT','PAPER_BACKFILL','BOX_VOID','PROCESS_YIELD_DEVIATION','LIVE_DEATH_OVER')),
     -- 非计划切换 = 发起人 + 仓库主管 + 中心运维三人（00 §9.1），角色字符串固定；是否真持有该角色由 trg_apr_transition 查 sys_user_role
     CONSTRAINT ck_apr_failover_roles CHECK (approval_type <> 'UNPLANNED_FAILOVER'
         OR ((first_approver_id IS NULL OR first_approver_role = 'WH_SUPERVISOR')
