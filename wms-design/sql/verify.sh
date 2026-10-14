@@ -17,7 +17,7 @@ SCHEMA=sql/schema_postgres.sql
 # stock_movement_key、stock_ledger_line → 42 表 / 114 索引（含 PK、UNIQUE 自动索引和分区父表上的分区索引；
 # 分区子表及其继承来的索引不计）/ 1 视图。改 DDL 必须同步改这里。
 EXPECT_TABLES=44
-EXPECT_INDEXES=121
+EXPECT_INDEXES=122
 EXPECT_VIEWS=1
 
 CTR=wms-pg-verify
