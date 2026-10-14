@@ -14,9 +14,9 @@ cd "$(dirname "$0")/.."
 
 SCHEMA=sql/schema_postgres.sql
 # 期望值：main 8ed5f0c 为 38 表 / 99 索引 / 1 视图；docs/02 新增 stock_hold、stock_recon_alert
-# 两张表及若干 UNIQUE/索引 → 40 表 / 110 索引（含 PK 与 UNIQUE 自动索引）/ 1 视图。改 DDL 必须同步改这里。
+# 两张表及若干 UNIQUE/索引 → 40 表 / 111 索引（含 PK 与 UNIQUE 自动索引）/ 1 视图。改 DDL 必须同步改这里。
 EXPECT_TABLES=40
-EXPECT_INDEXES=110
+EXPECT_INDEXES=111
 EXPECT_VIEWS=1
 
 CTR=wms-pg-verify
@@ -151,6 +151,18 @@ expect_block "02 占用超消耗（consumed+released > reserve）" \
 expect_block "02 冻结明细超释放（released > hold）" \
   "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,op_key,hold_qty_milli,released_qty_milli,operator_id) VALUES (1,11,'MANUAL','DAMAGE','MANUAL','HOLD:1',1000,2000,7);" \
   "ck_hold"
+
+expect_allow "02 待回库 RETURN_PENDING 冻结（明细）" \
+  "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,operator_id) VALUES (10,14,'MANUAL','RETURN_PENDING','RETURN_RECORD',501,'RTP:501',5000,7);"
+expect_block "02 同一待回库记录重复冻结" \
+  "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,operator_id) VALUES (11,14,'MANUAL','RETURN_PENDING','RETURN_RECORD',501,'RTP:501:dup',5000,7);" \
+  "uq_hold_return"
+expect_block "02 RETURN_PENDING 必须挂待回库记录且计入 frozen" \
+  "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,operator_id) VALUES (12,14,'QUALITY','RETURN_PENDING','MANUAL',0,'RTP:x',1000,7);" \
+  "ck_hold_return"
+expect_block "02 冻结原因不在码表" \
+  "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,operator_id) VALUES (13,14,'MANUAL','WHATEVER','MANUAL',0,'H:13',1000,7);" \
+  "ck_hold_reason"
 
 echo "=== 3. §5.6 盘点差异生成列（实盘 − 基准账面 − 期间流水）==="
 seed "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000);"

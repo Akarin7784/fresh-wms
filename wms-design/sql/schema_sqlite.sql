@@ -248,8 +248,8 @@ CREATE TABLE stock_hold (
     id                  BIGINT          PRIMARY KEY,
     stock_id            BIGINT          NOT NULL,
     hold_type           VARCHAR(16)     NOT NULL,   -- QUALITY（计入 quality_hold）/ MANUAL（计入 frozen）
-    reason_code         VARCHAR(24)     NOT NULL,
-    source_type         VARCHAR(24)     NOT NULL,   -- INBOUND_QC/COUNT/RETURN/EXCEPTION/MANUAL
+    reason_code         VARCHAR(24)     NOT NULL,   -- 见 ck_hold_reason；新增原因走迁移
+    source_type         VARCHAR(24)     NOT NULL,   -- INBOUND_QC/COUNT/RETURN/EXCEPTION/MANUAL/RETURN_RECORD（第 5 篇待回库记录）
     source_id           BIGINT          NOT NULL DEFAULT 0,
     op_key              VARCHAR(80)     NOT NULL,
     hold_qty_milli      BIGINT          NOT NULL,
@@ -261,6 +261,13 @@ CREATE TABLE stock_hold (
     updated_at          TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT uq_hold_op UNIQUE (op_key),
     CONSTRAINT ck_hold_type CHECK (hold_type IN ('QUALITY','MANUAL')),
+    CONSTRAINT ck_hold_reason CHECK (reason_code IN
+        ('QC_PENDING','COUNT_LOCK','RETURN_QC','DAMAGE','EXCEPTION','RETURN_PENDING','OTHER')),
+    -- RETURN_PENDING：待回库占位，计入 frozen，必须挂在一条待回库记录上
+    CONSTRAINT ck_hold_return CHECK (
+        reason_code <> 'RETURN_PENDING'
+        OR (hold_type = 'MANUAL' AND source_type = 'RETURN_RECORD' AND source_id > 0)
+    ),
     CONSTRAINT ck_hold_int CHECK (
         hold_qty_milli = CAST(hold_qty_milli AS BIGINT)
         AND released_qty_milli = CAST(released_qty_milli AS BIGINT)
@@ -268,6 +275,8 @@ CREATE TABLE stock_hold (
     CONSTRAINT ck_hold CHECK (hold_qty_milli > 0 AND released_qty_milli >= 0 AND released_qty_milli <= hold_qty_milli)
 );
 CREATE INDEX ix_hold_stock ON stock_hold(stock_id, hold_type, status);
+CREATE UNIQUE INDEX uq_hold_return ON stock_hold(source_id) WHERE source_type = 'RETURN_RECORD';
+-- ↑ 一条待回库记录最多一条 RETURN_PENDING 冻结（重复拒收复用已有记录，不会重复冻结）
 -- 原文档 §4.2"冻结记 stock_freeze"在此落地为 stock_hold，使 quality_hold/frozen 与 allocated/reserved 一样可对账（I3）
 
 CREATE TABLE stock_movement (
