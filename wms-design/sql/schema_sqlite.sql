@@ -1,8 +1,8 @@
 -- 本文件由 sql/verify_sqlite.py 从 schema_postgres.sql 机械生成，请勿手改。
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
---   2. 42 处 DEFAULT now()、3 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
---   3. 方言专属行：删除 200 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 106 行 @sqlite-only（等价触发器）
+--   2. 43 处 DEFAULT now()、3 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
+--   3. 方言专属行：删除 293 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 179 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -761,108 +761,17 @@ CREATE TABLE pick_task_line (
 );
 CREATE INDEX ix_ptl_loc ON pick_task_line(location_id, status);
 
-CREATE TABLE pack_box (
-    id              BIGINT       PRIMARY KEY,
-    code            VARCHAR(64)  NOT NULL,          -- 箱码，司机端逐箱扫
-    warehouse_id    BIGINT       NOT NULL,
-    outbound_id     BIGINT       NOT NULL,
-    check_id        BIGINT,                         -- docs/06：装箱必须挂在一张 PASSED 复核单上（应用层校验）
-    shipment_id     BIGINT,
-    stage_location_id BIGINT,                       -- 集货位
-    box_type        VARCHAR(24)  NOT NULL DEFAULT 'CARTON',  -- CARTON/TURNBOX（周转筐）
-    weight_g        BIGINT,                         -- docs/06 Q6 已定：整数克
-    status          VARCHAR(16)  NOT NULL DEFAULT 'OPEN',    -- docs/06 §5.2：OPEN/SEALED/STAGED/SHIPPED/CANCELLED；装车扫箱归 docs/16
-    sealed          BOOLEAN      NOT NULL DEFAULT false,     -- 兼容旧字段，= status<>'OPEN' 且 <>'CANCELLED'
-    checker_id      BIGINT,
-    packed_at       TIMESTAMP,                      -- 封箱时间（UTC）
-    shipped_at      TIMESTAMP,                      -- 发货出库时间（UTC）
-    version         INT          NOT NULL DEFAULT 0,
-    created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
-    CONSTRAINT uq_box_code UNIQUE (code),
-    CONSTRAINT ck_box_weight CHECK (weight_g IS NULL OR (weight_g >= 0 AND weight_g = CAST(weight_g AS BIGINT))),
-    CONSTRAINT ck_box_status CHECK (status IN ('OPEN','SEALED','STAGED','SHIPPED','CANCELLED')),
-    CONSTRAINT ck_box_sealed CHECK ((status IN ('OPEN','CANCELLED') AND sealed = false)
-                                 OR (status IN ('SEALED','STAGED','SHIPPED') AND sealed = true AND packed_at IS NOT NULL AND checker_id IS NOT NULL)),
-    CONSTRAINT ck_box_staged CHECK (status NOT IN ('STAGED','SHIPPED') OR stage_location_id IS NOT NULL),
-    CONSTRAINT ck_box_shipped CHECK (status <> 'SHIPPED' OR (shipment_id IS NOT NULL AND shipped_at IS NOT NULL))
-);
-CREATE INDEX ix_box_outbound ON pack_box(outbound_id, status);
-CREATE INDEX ix_box_shipment ON pack_box(shipment_id);
--- docs/06 §5.2：箱状态只能前进；SHIPPED / CANCELLED 终态；箱身份列（code/outbound_id/warehouse_id）不可改；不可删
-CREATE TRIGGER trg_box_upd BEFORE UPDATE ON pack_box
-WHEN NEW.code <> OLD.code OR NEW.outbound_id <> OLD.outbound_id OR NEW.warehouse_id <> OLD.warehouse_id
-BEGIN SELECT RAISE(ABORT, 'box_immutable'); END;
-CREATE TRIGGER trg_box_state BEFORE UPDATE OF status ON pack_box
-WHEN NEW.status <> OLD.status AND NOT ((OLD.status = 'OPEN' AND NEW.status IN ('SEALED','CANCELLED')) OR (OLD.status = 'SEALED' AND NEW.status IN ('STAGED','OPEN')) OR (OLD.status = 'STAGED' AND NEW.status IN ('SHIPPED','SEALED')))
-BEGIN SELECT RAISE(ABORT, 'box_state'); END;
-CREATE TRIGGER trg_box_del BEFORE DELETE ON pack_box BEGIN SELECT RAISE(ABORT, 'box_immutable'); END;
-CREATE TRIGGER trg_box_dup BEFORE INSERT ON pack_box
-WHEN EXISTS (SELECT 1 FROM pack_box b WHERE b.id = NEW.id OR b.code = NEW.code)
-BEGIN SELECT RAISE(ABORT, 'box_duplicate'); END;
-
-CREATE TABLE pack_box_line (
-    id          BIGINT          PRIMARY KEY,
-    box_id      BIGINT          NOT NULL,
-    sku_id      BIGINT          NOT NULL,
-    lot_id      BIGINT          NOT NULL DEFAULT 0,   -- 0 = 未记批次；同 stock.container_id，不可空（uq 含 NULL 会失效）
-    qty_milli   BIGINT          NOT NULL,   -- 基本单位 milli
-    uom         VARCHAR(16)     NOT NULL,
-    CONSTRAINT ck_box_line_qty CHECK (qty_milli > 0 AND qty_milli = CAST(qty_milli AS BIGINT)),
-    CONSTRAINT uq_box_line UNIQUE (box_id, sku_id, lot_id)
-);
--- docs/06 §5.2：箱明细只在箱 OPEN 时可增改删；封箱后冻结（解封回 OPEN 才能改，需 pack.unseal 权限 + audit_log）
-CREATE TRIGGER trg_box_line_ins BEFORE INSERT ON pack_box_line
-WHEN COALESCE((SELECT status FROM pack_box WHERE id = NEW.box_id), '') <> 'OPEN'
-BEGIN SELECT RAISE(ABORT, 'box_sealed'); END;
-CREATE TRIGGER trg_box_line_upd BEFORE UPDATE ON pack_box_line
-WHEN NEW.box_id <> OLD.box_id OR COALESCE((SELECT status FROM pack_box WHERE id = OLD.box_id), '') <> 'OPEN'
-BEGIN SELECT RAISE(ABORT, 'box_sealed'); END;
-CREATE TRIGGER trg_box_line_del BEFORE DELETE ON pack_box_line
-WHEN COALESCE((SELECT status FROM pack_box WHERE id = OLD.box_id), '') <> 'OPEN'
-BEGIN SELECT RAISE(ABORT, 'box_sealed'); END;
-
-CREATE TABLE shipment (
-    id              BIGINT       PRIMARY KEY,
-    code            VARCHAR(64)  NOT NULL,
-    warehouse_id    BIGINT       NOT NULL,
-    carrier_code    VARCHAR(32),
-    status          VARCHAR(16)  NOT NULL DEFAULT 'CREATED', -- docs/06 §5.3：CREATED/HANDED_OVER/CANCELLED；HANDED_OVER 后装车、发车、在途、签收归 docs/16（waybill 1:1）
-    temp_log_ref    VARCHAR(128),                   -- 温控记录对象存储 key
-    dock_location_id BIGINT,                        -- 月台
-    waybill_id      BIGINT,                         -- docs/16 waybill.id（1:1，交接同事务由 create_from_shipment 生成后回填）；司机、车辆、发车、签收都在 16
-    box_count       INT          NOT NULL DEFAULT 0,       -- 交接时冻结：SHIPPED 箱数
-    handed_over_at  TIMESTAMP,                      -- 发货出库交接时间（UTC）
-    handed_over_by  BIGINT,
-    version         INT          NOT NULL DEFAULT 0,
-    created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
-    updated_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
-    CONSTRAINT uq_shp_code UNIQUE (code),
-    CONSTRAINT ck_shp_status CHECK (status IN ('CREATED','HANDED_OVER','CANCELLED')),
-    CONSTRAINT ck_shp_handover CHECK (status <> 'HANDED_OVER' OR (handed_over_at IS NOT NULL AND handed_over_by IS NOT NULL AND waybill_id IS NOT NULL AND box_count > 0)),
-    CONSTRAINT ck_shp_box_count CHECK (box_count >= 0)
-);
--- docs/06 §5.3：HANDED_OVER / CANCELLED 终态（交接后在途、签收都在 docs/16）；不可删
-CREATE TRIGGER trg_shp_closed BEFORE UPDATE ON shipment
-WHEN OLD.status IN ('HANDED_OVER','CANCELLED') AND (NEW.status <> OLD.status OR NEW.box_count <> OLD.box_count OR NEW.waybill_id IS NOT OLD.waybill_id OR NEW.handed_over_at IS NOT OLD.handed_over_at)
-BEGIN SELECT RAISE(ABORT, 'shipment_closed'); END;
-CREATE TRIGGER trg_shp_state BEFORE UPDATE OF status ON shipment
-WHEN OLD.status NOT IN ('HANDED_OVER','CANCELLED') AND NEW.status <> OLD.status AND NOT (OLD.status = 'CREATED' AND NEW.status IN ('HANDED_OVER','CANCELLED'))
-BEGIN SELECT RAISE(ABORT, 'shipment_state'); END;
-CREATE TRIGGER trg_shp_del BEFORE DELETE ON shipment BEGIN SELECT RAISE(ABORT, 'shipment_immutable'); END;
-CREATE TRIGGER trg_shp_dup BEFORE INSERT ON shipment
-WHEN EXISTS (SELECT 1 FROM shipment x WHERE x.id = NEW.id OR x.code = NEW.code)
-BEGIN SELECT RAISE(ABORT, 'shipment_duplicate'); END;
-
 -- ============================================================
--- docs/06 复核、装箱、发货
+-- docs/06 复核、装箱、发货（复核表放在 pack_box 之前，供外键引用）
 -- ============================================================
--- 复核单：一张出库单同一时刻至多一张 OPEN 复核；复核人 ≠ 拣货人（SoD，与 outbound_order.ck_ob_sod 同口径）
+-- 复核单：一张出库单同一时刻至多一张 OPEN 复核。INSERT 只能是 OPEN（H2）。
+-- SoD（H1）：复核人不得是该单任一拣货人；拣货人全集写在 check_picker（开单同事务），picker_id 只作展示
 CREATE TABLE check_record (
     id                  BIGINT       PRIMARY KEY,
     code                VARCHAR(64)  NOT NULL,
     warehouse_id        BIGINT       NOT NULL,
     outbound_id         BIGINT       NOT NULL,
-    picker_id           BIGINT,                      -- 开单时从 outbound_order.picker_id 冻结
+    picker_id           BIGINT,                      -- 展示用（主拣货人）；SoD 以 check_picker 为准
     checker_id          BIGINT       NOT NULL,
     device_instance_id  VARCHAR(64),
     status              VARCHAR(16)  NOT NULL DEFAULT 'OPEN',  -- OPEN/PASSED/FAILED/CANCELLED
@@ -880,12 +789,37 @@ CREATE TABLE check_record (
     CONSTRAINT ck_chk_mismatch CHECK (mismatch_count >= 0)
 );
 CREATE UNIQUE INDEX uq_chk_open ON check_record(outbound_id) WHERE status = 'OPEN';
--- 关单后终态；身份列不可改；不可删
+
+-- 拣货人全集（H1）：开单时把该单所有 pick_task.assigned_to 与 pick_op 操作人写入；只追加
+CREATE TABLE check_picker (
+    check_id    BIGINT  NOT NULL REFERENCES check_record(id),
+    user_id     BIGINT  NOT NULL,
+    PRIMARY KEY (check_id, user_id)
+);
+CREATE TRIGGER trg_chkp_upd BEFORE UPDATE ON check_picker BEGIN SELECT RAISE(ABORT, 'check_immutable'); END;
+CREATE TRIGGER trg_chkp_del BEFORE DELETE ON check_picker BEGIN SELECT RAISE(ABORT, 'check_immutable'); END;
+CREATE TRIGGER trg_chkp_dup BEFORE INSERT ON check_picker
+WHEN EXISTS (SELECT 1 FROM check_picker p WHERE p.check_id = NEW.check_id AND p.user_id = NEW.user_id)
+BEGIN SELECT RAISE(ABORT, 'check_duplicate'); END;
+CREATE TRIGGER trg_chkp_closed BEFORE INSERT ON check_picker
+WHEN COALESCE((SELECT status FROM check_record WHERE id = NEW.check_id), '') <> 'OPEN'
+BEGIN SELECT RAISE(ABORT, 'check_closed'); END;
+CREATE TRIGGER trg_chkp_sod BEFORE INSERT ON check_picker
+WHEN EXISTS (SELECT 1 FROM check_record c WHERE c.id = NEW.check_id AND c.checker_id = NEW.user_id)
+BEGIN SELECT RAISE(ABORT, 'check_sod'); END;
+
+-- 复核单守卫：INSERT 只能 OPEN；关单后终态；身份列不可改；不可删；
+-- 转 PASSED（H2）：至少一行、无 checked<>expected 的行、至少登记了一个拣货人
+CREATE TRIGGER trg_chk_ins BEFORE INSERT ON check_record WHEN NEW.status <> 'OPEN'
+BEGIN SELECT RAISE(ABORT, 'check_state'); END;
 CREATE TRIGGER trg_chk_upd BEFORE UPDATE ON check_record
 WHEN NEW.outbound_id <> OLD.outbound_id OR NEW.checker_id <> OLD.checker_id OR NEW.picker_id IS NOT OLD.picker_id OR NEW.code <> OLD.code
 BEGIN SELECT RAISE(ABORT, 'check_immutable'); END;
 CREATE TRIGGER trg_chk_closed BEFORE UPDATE ON check_record WHEN OLD.status <> 'OPEN'
 BEGIN SELECT RAISE(ABORT, 'check_closed'); END;
+CREATE TRIGGER trg_chk_pass BEFORE UPDATE OF status ON check_record
+WHEN OLD.status = 'OPEN' AND NEW.status = 'PASSED' AND (NOT EXISTS (SELECT 1 FROM check_line l WHERE l.check_id = NEW.id) OR EXISTS (SELECT 1 FROM check_line l WHERE l.check_id = NEW.id AND l.checked_qty_milli <> l.expected_qty_milli) OR NOT EXISTS (SELECT 1 FROM check_picker p WHERE p.check_id = NEW.id))
+BEGIN SELECT RAISE(ABORT, 'check_not_complete'); END;
 CREATE TRIGGER trg_chk_del BEFORE DELETE ON check_record BEGIN SELECT RAISE(ABORT, 'check_immutable'); END;
 CREATE TRIGGER trg_chk_dup BEFORE INSERT ON check_record
 WHEN EXISTS (SELECT 1 FROM check_record c WHERE c.id = NEW.id OR c.code = NEW.code OR (c.outbound_id = NEW.outbound_id AND c.status = 'OPEN' AND NEW.status = 'OPEN'))
@@ -894,7 +828,7 @@ BEGIN SELECT RAISE(ABORT, 'check_duplicate'); END;
 -- 复核行：按出库行汇总；checked ≤ expected（多扫 → 42214 OVER_QTY，detail.reason=OVER_CHECK）
 CREATE TABLE check_line (
     id                  BIGINT       PRIMARY KEY,
-    check_id            BIGINT       NOT NULL,
+    check_id            BIGINT       NOT NULL REFERENCES check_record(id),
     line_no             INT          NOT NULL,       -- = outbound_line.line_no
     outbound_line_id    BIGINT       NOT NULL,
     sku_id              BIGINT       NOT NULL,
@@ -951,11 +885,193 @@ CREATE TRIGGER trg_check_op_dup BEFORE INSERT ON check_op
 WHEN EXISTS (SELECT 1 FROM check_op o WHERE o.id = NEW.id OR (o.check_id = NEW.check_id AND o.line_no = NEW.line_no AND o.device_instance_id = NEW.device_instance_id AND o.op_seq = NEW.op_seq) OR (NEW.scan_event_id IS NOT NULL AND o.check_id = NEW.check_id AND o.scan_event_id = NEW.scan_event_id))
 BEGIN SELECT RAISE(ABORT, 'check_op_duplicate'); END;
 
-CREATE TABLE shipment_order (
-    shipment_id BIGINT NOT NULL,
-    outbound_id BIGINT NOT NULL,
-    PRIMARY KEY (shipment_id, outbound_id)
+-- 发运单（docs/06 §5.3）：CREATED/HANDED_OVER/CANCELLED；司机、车辆、发车、签收在 docs/16 waybill
+CREATE TABLE shipment (
+    id              BIGINT       PRIMARY KEY,
+    code            VARCHAR(64)  NOT NULL,
+    warehouse_id    BIGINT       NOT NULL,
+    carrier_code    VARCHAR(32),
+    status          VARCHAR(16)  NOT NULL DEFAULT 'CREATED',
+    temp_log_ref    VARCHAR(128),                   -- 温控记录对象存储 key
+    dock_location_id BIGINT,                        -- 月台
+    waybill_id      BIGINT,                         -- docs/16 waybill.id（1:1，交接同事务由 create_from_shipment 生成后回填）
+    box_count       INT          NOT NULL DEFAULT 0,       -- 交接时冻结：= 本车次 STAGED 箱数（触发器核对，H4）
+    handed_over_at  TIMESTAMP,                      -- 发货出库交接时间（UTC）
+    handed_over_by  BIGINT,
+    version         INT          NOT NULL DEFAULT 0,
+    created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    updated_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT uq_shp_code UNIQUE (code),
+    CONSTRAINT ck_shp_status CHECK (status IN ('CREATED','HANDED_OVER','CANCELLED')),
+    CONSTRAINT ck_shp_handover CHECK (status <> 'HANDED_OVER' OR (handed_over_at IS NOT NULL AND handed_over_by IS NOT NULL AND waybill_id IS NOT NULL AND box_count > 0)),
+    CONSTRAINT ck_shp_box_count CHECK (box_count >= 0)
 );
+-- H4：INSERT 只能 CREATED；终态冻结；CANCELLED 要求车次下无箱、无出库单；HANDED_OVER 要求 box_count = 本车次 STAGED 箱数
+CREATE TRIGGER trg_shp_ins BEFORE INSERT ON shipment WHEN NEW.status <> 'CREATED'
+BEGIN SELECT RAISE(ABORT, 'shipment_state'); END;
+CREATE TRIGGER trg_shp_closed BEFORE UPDATE ON shipment
+WHEN OLD.status IN ('HANDED_OVER','CANCELLED') AND (NEW.status <> OLD.status OR NEW.box_count <> OLD.box_count OR NEW.waybill_id IS NOT OLD.waybill_id OR NEW.handed_over_at IS NOT OLD.handed_over_at)
+BEGIN SELECT RAISE(ABORT, 'shipment_closed'); END;
+CREATE TRIGGER trg_shp_state BEFORE UPDATE OF status ON shipment
+WHEN OLD.status NOT IN ('HANDED_OVER','CANCELLED') AND NEW.status <> OLD.status AND NOT (OLD.status = 'CREATED' AND NEW.status IN ('HANDED_OVER','CANCELLED'))
+BEGIN SELECT RAISE(ABORT, 'shipment_state'); END;
+CREATE TRIGGER trg_shp_cancel BEFORE UPDATE OF status ON shipment
+WHEN OLD.status = 'CREATED' AND NEW.status = 'CANCELLED' AND (EXISTS (SELECT 1 FROM pack_box b WHERE b.shipment_id = NEW.id) OR EXISTS (SELECT 1 FROM shipment_order o WHERE o.shipment_id = NEW.id))
+BEGIN SELECT RAISE(ABORT, 'shipment_not_empty'); END;
+CREATE TRIGGER trg_shp_count BEFORE UPDATE OF status ON shipment
+WHEN OLD.status = 'CREATED' AND NEW.status = 'HANDED_OVER' AND NEW.box_count <> (SELECT count(*) FROM pack_box b WHERE b.shipment_id = NEW.id AND b.status = 'STAGED')
+BEGIN SELECT RAISE(ABORT, 'shipment_box_count'); END;
+CREATE TRIGGER trg_shp_del BEFORE DELETE ON shipment BEGIN SELECT RAISE(ABORT, 'shipment_immutable'); END;
+CREATE TRIGGER trg_shp_dup BEFORE INSERT ON shipment
+WHEN EXISTS (SELECT 1 FROM shipment x WHERE x.id = NEW.id OR x.code = NEW.code)
+BEGIN SELECT RAISE(ABORT, 'shipment_duplicate'); END;
+
+-- H5：一张出库单只能挂一个车次（uq_sho_outbound）；车次非 CREATED 时不可增删；任何时候不可改（摘挂 = 删 + 插）
+CREATE TABLE shipment_order (
+    shipment_id BIGINT NOT NULL REFERENCES shipment(id),
+    outbound_id BIGINT NOT NULL,
+    PRIMARY KEY (shipment_id, outbound_id),
+    CONSTRAINT uq_sho_outbound UNIQUE (outbound_id)
+);
+CREATE TRIGGER trg_sho_upd BEFORE UPDATE ON shipment_order BEGIN SELECT RAISE(ABORT, 'shipment_order_immutable'); END;
+CREATE TRIGGER trg_sho_del BEFORE DELETE ON shipment_order
+WHEN COALESCE((SELECT status FROM shipment WHERE id = OLD.shipment_id), '') <> 'CREATED'
+BEGIN SELECT RAISE(ABORT, 'shipment_closed'); END;
+CREATE TRIGGER trg_sho_ins BEFORE INSERT ON shipment_order
+WHEN COALESCE((SELECT status FROM shipment WHERE id = NEW.shipment_id), '') <> 'CREATED'
+BEGIN SELECT RAISE(ABORT, 'shipment_closed'); END;
+CREATE TRIGGER trg_sho_dup BEFORE INSERT ON shipment_order
+WHEN EXISTS (SELECT 1 FROM shipment_order o WHERE o.outbound_id = NEW.outbound_id)
+BEGIN SELECT RAISE(ABORT, 'sho_duplicate'); END;
+
+CREATE TABLE pack_box (
+    id              BIGINT       PRIMARY KEY,
+    code            VARCHAR(64)  NOT NULL,          -- 箱码，司机端逐箱扫
+    warehouse_id    BIGINT       NOT NULL,
+    outbound_id     BIGINT       NOT NULL,
+    check_id        BIGINT       REFERENCES check_record(id),  -- 封箱时必须指向同单 PASSED 复核单（H3，触发器）
+    shipment_id     BIGINT       REFERENCES shipment(id),
+    stage_location_id BIGINT,                       -- 集货位
+    box_type        VARCHAR(24)  NOT NULL DEFAULT 'CARTON',  -- CARTON/TURNBOX（周转筐）
+    weight_g        BIGINT,                         -- docs/06 Q6 已定：整数克
+    status          VARCHAR(16)  NOT NULL DEFAULT 'OPEN',    -- docs/06 §5.2：OPEN/SEALED/STAGED/SHIPPED/CANCELLED/VOIDED
+    sealed          BOOLEAN      NOT NULL DEFAULT false,
+    checker_id      BIGINT,                         -- 封箱人，必须 = 复核单 checker_id（40930 SEALER_NOT_CHECKER）
+    packed_at       TIMESTAMP,                      -- 封箱时间（UTC）
+    shipped_at      TIMESTAMP,                      -- 发货出库时间（UTC）
+    voided_at       TIMESTAMP,                      -- 作废时间（UTC，Q8）
+    version         INT          NOT NULL DEFAULT 0,
+    created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT uq_box_code UNIQUE (code),
+    CONSTRAINT ck_box_weight CHECK (weight_g IS NULL OR (weight_g >= 0 AND weight_g = CAST(weight_g AS BIGINT))),
+    CONSTRAINT ck_box_status CHECK (status IN ('OPEN','SEALED','STAGED','SHIPPED','CANCELLED','VOIDED')),
+    CONSTRAINT ck_box_sealed CHECK ((status IN ('OPEN','CANCELLED') AND sealed = false)
+                                 OR (status IN ('SEALED','STAGED','SHIPPED','VOIDED') AND sealed = true AND packed_at IS NOT NULL AND checker_id IS NOT NULL AND check_id IS NOT NULL)),
+    CONSTRAINT ck_box_staged CHECK (status NOT IN ('STAGED','SHIPPED') OR stage_location_id IS NOT NULL),
+    CONSTRAINT ck_box_shipped CHECK (status <> 'SHIPPED' OR (shipment_id IS NOT NULL AND shipped_at IS NOT NULL)),
+    CONSTRAINT ck_box_voided CHECK ((status = 'VOIDED' AND voided_at IS NOT NULL) OR (status <> 'VOIDED' AND voided_at IS NULL))
+);
+CREATE INDEX ix_box_outbound ON pack_box(outbound_id, status);
+CREATE INDEX ix_box_shipment ON pack_box(shipment_id);
+CREATE INDEX ix_box_check ON pack_box(check_id);
+-- docs/06 §5.2 箱守卫（H3/H4/H6）：
+--  INSERT 只能 OPEN；不可删；身份列不可改；SHIPPED/CANCELLED/VOIDED 整行只读（box_closed）
+--  状态边：OPEN→SEALED/CANCELLED；SEALED→STAGED/OPEN/VOIDED；STAGED→SHIPPED/SEALED
+--  封箱后（新旧都非 OPEN）check_id/checker_id/packed_at/weight_g 不可改（box_sealed → 40937）
+--  OPEN→SEALED：check_id 指向同单 PASSED 复核单（box_check_invalid）；checker_id = 复核人（sealer_not_checker）；
+--               该复核单下所有有效箱按 SKU 合计 ≤ 复核量（box_over_check）
+--  shipment_id 只能在 STAGED 期间、新旧车次都是 CREATED 时挂/摘（box_shipment）；STAGED→SEALED 前须先摘车
+--  STAGED→SHIPPED：shipment_id 不变且车次已 HANDED_OVER（box_shipment）
+--  SEALED→VOIDED：须有 APPROVED 作废申请（box_void_unapproved）
+CREATE TRIGGER trg_box_ins BEFORE INSERT ON pack_box WHEN NEW.status <> 'OPEN'
+BEGIN SELECT RAISE(ABORT, 'box_state'); END;
+CREATE TRIGGER trg_box_upd BEFORE UPDATE ON pack_box
+WHEN NEW.code <> OLD.code OR NEW.outbound_id <> OLD.outbound_id OR NEW.warehouse_id <> OLD.warehouse_id
+BEGIN SELECT RAISE(ABORT, 'box_immutable'); END;
+CREATE TRIGGER trg_box_closed BEFORE UPDATE ON pack_box WHEN OLD.status IN ('SHIPPED','CANCELLED','VOIDED')
+BEGIN SELECT RAISE(ABORT, 'box_closed'); END;
+CREATE TRIGGER trg_box_state BEFORE UPDATE OF status ON pack_box
+WHEN OLD.status NOT IN ('SHIPPED','CANCELLED','VOIDED') AND NEW.status <> OLD.status AND NOT ((OLD.status = 'OPEN' AND NEW.status IN ('SEALED','CANCELLED')) OR (OLD.status = 'SEALED' AND NEW.status IN ('STAGED','OPEN','VOIDED')) OR (OLD.status = 'STAGED' AND NEW.status IN ('SHIPPED','SEALED')))
+BEGIN SELECT RAISE(ABORT, 'box_state'); END;
+CREATE TRIGGER trg_box_frozen BEFORE UPDATE ON pack_box
+WHEN OLD.status NOT IN ('OPEN','SHIPPED','CANCELLED','VOIDED') AND NEW.status <> 'OPEN' AND (NEW.check_id IS NOT OLD.check_id OR NEW.checker_id IS NOT OLD.checker_id OR NEW.packed_at IS NOT OLD.packed_at OR NEW.weight_g IS NOT OLD.weight_g)
+BEGIN SELECT RAISE(ABORT, 'box_sealed'); END;
+CREATE TRIGGER trg_box_seal_check BEFORE UPDATE OF status ON pack_box
+WHEN OLD.status = 'OPEN' AND NEW.status = 'SEALED' AND NOT EXISTS (SELECT 1 FROM check_record c WHERE c.id = NEW.check_id AND c.outbound_id = NEW.outbound_id AND c.status = 'PASSED')
+BEGIN SELECT RAISE(ABORT, 'box_check_invalid'); END;
+CREATE TRIGGER trg_box_seal_sod BEFORE UPDATE OF status ON pack_box
+WHEN OLD.status = 'OPEN' AND NEW.status = 'SEALED' AND EXISTS (SELECT 1 FROM check_record c WHERE c.id = NEW.check_id AND c.outbound_id = NEW.outbound_id AND c.status = 'PASSED') AND NEW.checker_id IS NOT (SELECT checker_id FROM check_record WHERE id = NEW.check_id)
+BEGIN SELECT RAISE(ABORT, 'sealer_not_checker'); END;
+CREATE TRIGGER trg_box_seal_qty BEFORE UPDATE OF status ON pack_box
+WHEN OLD.status = 'OPEN' AND NEW.status = 'SEALED' AND NEW.checker_id IS (SELECT checker_id FROM check_record WHERE id = NEW.check_id AND outbound_id = NEW.outbound_id AND status = 'PASSED') AND EXISTS (SELECT 1 FROM (SELECT l.sku_id AS sku_id, SUM(l.qty_milli) AS q FROM pack_box_line l JOIN pack_box b ON b.id = l.box_id WHERE (b.check_id = NEW.check_id OR b.id = NEW.id) AND b.status NOT IN ('CANCELLED','VOIDED') GROUP BY l.sku_id) x WHERE x.q > COALESCE((SELECT SUM(cl.checked_qty_milli) FROM check_line cl WHERE cl.check_id = NEW.check_id AND cl.sku_id = x.sku_id), 0))
+BEGIN SELECT RAISE(ABORT, 'box_over_check'); END;
+CREATE TRIGGER trg_box_ship_attach BEFORE UPDATE OF shipment_id ON pack_box
+WHEN OLD.status NOT IN ('SHIPPED','CANCELLED','VOIDED') AND NEW.shipment_id IS NOT OLD.shipment_id AND NOT (OLD.status = 'STAGED' AND NEW.status = 'STAGED' AND (OLD.shipment_id IS NULL OR (SELECT status FROM shipment WHERE id = OLD.shipment_id) = 'CREATED') AND (NEW.shipment_id IS NULL OR (SELECT status FROM shipment WHERE id = NEW.shipment_id) = 'CREATED'))
+BEGIN SELECT RAISE(ABORT, 'box_shipment'); END;
+CREATE TRIGGER trg_box_ship_go BEFORE UPDATE OF status ON pack_box
+WHEN (OLD.status = 'STAGED' AND NEW.status = 'SHIPPED' AND (SELECT status FROM shipment WHERE id = NEW.shipment_id) IS NOT 'HANDED_OVER') OR (OLD.status = 'STAGED' AND NEW.status = 'SEALED' AND NEW.shipment_id IS NOT NULL)
+BEGIN SELECT RAISE(ABORT, 'box_shipment'); END;
+CREATE TRIGGER trg_box_void BEFORE UPDATE OF status ON pack_box
+WHEN OLD.status = 'SEALED' AND NEW.status = 'VOIDED' AND NOT EXISTS (SELECT 1 FROM box_void_request r WHERE r.box_id = NEW.id AND r.status = 'APPROVED')
+BEGIN SELECT RAISE(ABORT, 'box_void_unapproved'); END;
+CREATE TRIGGER trg_box_del BEFORE DELETE ON pack_box BEGIN SELECT RAISE(ABORT, 'box_immutable'); END;
+CREATE TRIGGER trg_box_dup BEFORE INSERT ON pack_box
+WHEN EXISTS (SELECT 1 FROM pack_box b WHERE b.id = NEW.id OR b.code = NEW.code)
+BEGIN SELECT RAISE(ABORT, 'box_duplicate'); END;
+
+-- 箱作废申请（Q8）：只对 SEALED 箱；申请人 ≠ 审批人；一箱同时至多一张 PENDING；只能 PENDING→APPROVED/REJECTED 一次
+CREATE TABLE box_void_request (
+    id              BIGINT       PRIMARY KEY,
+    box_id          BIGINT       NOT NULL REFERENCES pack_box(id),
+    reason_code     VARCHAR(16)  NOT NULL,          -- LOST / DAMAGED
+    remark          VARCHAR(500),
+    photo_ids       TEXT,                           -- JSON 数组（对象存储 key）
+    requested_by    BIGINT       NOT NULL,
+    requested_at    TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    status          VARCHAR(16)  NOT NULL DEFAULT 'PENDING',  -- PENDING/APPROVED/REJECTED
+    decided_by      BIGINT,
+    decided_at      TIMESTAMP,
+    version         INT          NOT NULL DEFAULT 0,
+    CONSTRAINT ck_bvr_reason CHECK (reason_code IN ('LOST','DAMAGED')),
+    CONSTRAINT ck_bvr_status CHECK (status IN ('PENDING','APPROVED','REJECTED')),
+    CONSTRAINT ck_bvr_decided CHECK ((status = 'PENDING' AND decided_by IS NULL AND decided_at IS NULL)
+                                  OR (status <> 'PENDING' AND decided_by IS NOT NULL AND decided_at IS NOT NULL)),
+    CONSTRAINT ck_bvr_self CHECK (decided_by IS NULL OR decided_by <> requested_by)
+);
+CREATE UNIQUE INDEX uq_bvr_pending ON box_void_request(box_id) WHERE status = 'PENDING';
+CREATE TRIGGER trg_bvr_ins BEFORE INSERT ON box_void_request
+WHEN NEW.status <> 'PENDING' OR COALESCE((SELECT status FROM pack_box WHERE id = NEW.box_id), '') <> 'SEALED'
+BEGIN SELECT RAISE(ABORT, 'box_void_state'); END;
+CREATE TRIGGER trg_bvr_closed BEFORE UPDATE ON box_void_request WHEN OLD.status <> 'PENDING'
+BEGIN SELECT RAISE(ABORT, 'bvr_closed'); END;
+CREATE TRIGGER trg_bvr_upd BEFORE UPDATE ON box_void_request
+WHEN OLD.status = 'PENDING' AND (NEW.box_id <> OLD.box_id OR NEW.reason_code <> OLD.reason_code OR NEW.requested_by <> OLD.requested_by OR NEW.remark IS NOT OLD.remark OR NEW.photo_ids IS NOT OLD.photo_ids OR NEW.requested_at <> OLD.requested_at)
+BEGIN SELECT RAISE(ABORT, 'bvr_immutable'); END;
+CREATE TRIGGER trg_bvr_del BEFORE DELETE ON box_void_request BEGIN SELECT RAISE(ABORT, 'bvr_immutable'); END;
+CREATE TRIGGER trg_bvr_dup BEFORE INSERT ON box_void_request
+WHEN EXISTS (SELECT 1 FROM box_void_request r WHERE r.id = NEW.id OR (r.box_id = NEW.box_id AND r.status = 'PENDING'))
+BEGIN SELECT RAISE(ABORT, 'bvr_duplicate'); END;
+
+CREATE TABLE pack_box_line (
+    id          BIGINT          PRIMARY KEY,
+    box_id      BIGINT          NOT NULL,
+    sku_id      BIGINT          NOT NULL,
+    lot_id      BIGINT          NOT NULL DEFAULT 0,   -- 0 = 未记批次；同 stock.container_id，不可空（uq 含 NULL 会失效）
+    qty_milli   BIGINT          NOT NULL,   -- 基本单位 milli
+    uom         VARCHAR(16)     NOT NULL,
+    CONSTRAINT ck_box_line_qty CHECK (qty_milli > 0 AND qty_milli = CAST(qty_milli AS BIGINT)),
+    CONSTRAINT uq_box_line UNIQUE (box_id, sku_id, lot_id)
+);
+-- docs/06 §5.2：箱明细只在箱 OPEN 时可增改删；封箱后冻结（解封回 OPEN 才能改，需 pack.unseal 权限 + audit_log）
+CREATE TRIGGER trg_box_line_ins BEFORE INSERT ON pack_box_line
+WHEN COALESCE((SELECT status FROM pack_box WHERE id = NEW.box_id), '') <> 'OPEN'
+BEGIN SELECT RAISE(ABORT, 'box_sealed'); END;
+CREATE TRIGGER trg_box_line_upd BEFORE UPDATE ON pack_box_line
+WHEN NEW.box_id <> OLD.box_id OR COALESCE((SELECT status FROM pack_box WHERE id = OLD.box_id), '') <> 'OPEN'
+BEGIN SELECT RAISE(ABORT, 'box_sealed'); END;
+CREATE TRIGGER trg_box_line_del BEFORE DELETE ON pack_box_line
+WHEN COALESCE((SELECT status FROM pack_box WHERE id = OLD.box_id), '') <> 'OPEN'
+BEGIN SELECT RAISE(ABORT, 'box_sealed'); END;
 
 -- -----------------------------------------------------------------------------
 -- 盘点 / 调整
@@ -1084,6 +1200,11 @@ BEGIN SELECT RAISE(ABORT, 'purge_not_allowed: idempotency_record'); END;
 CREATE TRIGGER trg_outbox_purge_guard BEFORE DELETE ON outbox_event WHEN NOT COALESCE(OLD.status = 'SENT' AND OLD.sent_at < datetime('now', '-7 days'), 0)
 BEGIN SELECT RAISE(ABORT, 'purge_not_allowed: outbox_event'); END;
 -- 九轮 P2：过期/投递时间写入后只许往后改，不许改早；created_at 不可改；SENT 是终态；sent_at 首次写入不得早于 created_at
+-- 十六轮 R1 补洞：wms_app 只能以初始状态 PENDING（不带 sent_at）插入 outbox；SENT 只能经 UPDATE 写入（受 sent_at_not_now 约束）。
+-- 种子/迁移用超级用户或迁移角色写入，不受此限
+-- SQLite 没有角色：应用只能插入 PENDING（不带 sent_at）；验证脚本造 SENT 种子时临时 DROP 本触发器、写完重建（单独的种子路径）
+CREATE TRIGGER trg_outbox_insert_pending BEFORE INSERT ON outbox_event WHEN NEW.status IS NOT 'PENDING' OR NEW.sent_at IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'outbox_insert_not_pending'); END;
 CREATE TRIGGER trg_idem_expiry_fwd BEFORE UPDATE ON idempotency_record WHEN NEW.created_at IS NOT OLD.created_at OR NEW.expires_at < OLD.expires_at
 BEGIN SELECT RAISE(ABORT, 'expiry_backdate: idempotency_record'); END;
 CREATE TRIGGER trg_outbox_expiry_fwd BEFORE UPDATE ON outbox_event WHEN NEW.created_at IS NOT OLD.created_at OR (OLD.sent_at IS NOT NULL AND (NEW.sent_at IS NULL OR NEW.sent_at < OLD.sent_at)) OR (OLD.sent_at IS NULL AND NEW.sent_at < OLD.created_at) OR (OLD.status = 'SENT' AND NEW.status <> 'SENT')

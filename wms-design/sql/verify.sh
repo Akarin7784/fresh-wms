@@ -18,8 +18,8 @@ SCHEMA=sql/schema_postgres.sql
 # stock_movement_key、stock_ledger_line → 42 表 / 114 索引（含 PK、UNIQUE 自动索引和分区父表上的分区索引；
 # 分区子表及其继承来的索引不计）/ 1 视图。二轮 C2 加 uq_mvk_mv（外键被引用键）→ 115；A3 加 stock_hold_release（PK、uq_hr_op、ix_hr_hold）→ 43 表 / 118。改 DDL 必须同步改这里。
 # 必须用新建的空库跑（DROP SCHEMA public 重建会丢 wms_app 的 USAGE；schema 里已 GRANT USAGE 兜底，小赵 C6）。
-EXPECT_TABLES=46
-EXPECT_INDEXES=128
+EXPECT_TABLES=48
+EXPECT_INDEXES=133
 EXPECT_VIEWS=1
 
 CTR=wms-pg-verify
@@ -68,7 +68,7 @@ echo "  → 表 $T 张 / 索引 $I 个 / 视图 $V 个"
 [ "$V" = "$EXPECT_VIEWS" ]   && ok "视图数 = $V" || bad "视图数 = $V，期望 $EXPECT_VIEWS"
 
 # 小赵 S4：按期望权限矩阵逐表核对 wms_app（表、分区父表、视图、物化视图；序列查 USAGE），多给、少给、漏表都失败
-EXPECT_PRIVS="adjust_line:SELECT,INSERT,UPDATE adjust_order:SELECT,INSERT,UPDATE api_credential:SELECT,INSERT,UPDATE audit_log:SELECT,INSERT check_line:SELECT,INSERT,UPDATE check_op:SELECT,INSERT check_record:SELECT,INSERT,UPDATE count_line:SELECT,INSERT,UPDATE count_order:SELECT,INSERT,UPDATE idempotency_record:SELECT,INSERT,UPDATE inbound_line:SELECT,INSERT,UPDATE inbound_message:SELECT,INSERT,UPDATE inbound_order:SELECT,INSERT,UPDATE location:SELECT,INSERT,UPDATE lot:SELECT,INSERT,UPDATE numbering_segment:SELECT,INSERT,UPDATE outbound_line:SELECT,INSERT,UPDATE outbound_order:SELECT,INSERT,UPDATE outbox_event:SELECT,INSERT,UPDATE pack_box:SELECT,INSERT,UPDATE pack_box_line:SELECT,INSERT,UPDATE pick_task:SELECT,INSERT,UPDATE pick_task_line:SELECT,INSERT,UPDATE shipment:SELECT,INSERT,UPDATE shipment_order:SELECT,INSERT,UPDATE sku:SELECT,INSERT,UPDATE sku_barcode:SELECT,INSERT,UPDATE sku_unit:SELECT,INSERT,UPDATE stock:SELECT,INSERT,UPDATE stock_hold:SELECT,INSERT stock_hold_release:SELECT,INSERT stock_ledger_line:SELECT,INSERT stock_movement:SELECT,INSERT stock_movement_key:SELECT,INSERT stock_recon_alert:SELECT,INSERT,UPDATE stock_reservation:SELECT,INSERT,UPDATE stock_snapshot_daily:SELECT,INSERT sys_permission:SELECT,INSERT,UPDATE sys_role:SELECT,INSERT,UPDATE sys_role_perm:SELECT,INSERT,UPDATE sys_user:SELECT,INSERT,UPDATE sys_user_role:SELECT,INSERT,UPDATE sys_user_warehouse:SELECT,INSERT,UPDATE v_stock_available:SELECT warehouse:SELECT,INSERT,UPDATE wave:SELECT,INSERT,UPDATE zone:SELECT,INSERT,UPDATE"
+EXPECT_PRIVS="adjust_line:SELECT,INSERT,UPDATE adjust_order:SELECT,INSERT,UPDATE api_credential:SELECT,INSERT,UPDATE audit_log:SELECT,INSERT box_void_request:SELECT,INSERT,UPDATE check_line:SELECT,INSERT,UPDATE check_op:SELECT,INSERT check_picker:SELECT,INSERT check_record:SELECT,INSERT,UPDATE count_line:SELECT,INSERT,UPDATE count_order:SELECT,INSERT,UPDATE idempotency_record:SELECT,INSERT,UPDATE inbound_line:SELECT,INSERT,UPDATE inbound_message:SELECT,INSERT,UPDATE inbound_order:SELECT,INSERT,UPDATE location:SELECT,INSERT,UPDATE lot:SELECT,INSERT,UPDATE numbering_segment:SELECT,INSERT,UPDATE outbound_line:SELECT,INSERT,UPDATE outbound_order:SELECT,INSERT,UPDATE outbox_event:SELECT,INSERT,UPDATE pack_box:SELECT,INSERT,UPDATE pack_box_line:SELECT,INSERT,UPDATE,DELETE pick_task:SELECT,INSERT,UPDATE pick_task_line:SELECT,INSERT,UPDATE shipment:SELECT,INSERT,UPDATE shipment_order:SELECT,INSERT,UPDATE,DELETE sku:SELECT,INSERT,UPDATE sku_barcode:SELECT,INSERT,UPDATE sku_unit:SELECT,INSERT,UPDATE stock:SELECT,INSERT,UPDATE stock_hold:SELECT,INSERT stock_hold_release:SELECT,INSERT stock_ledger_line:SELECT,INSERT stock_movement:SELECT,INSERT stock_movement_key:SELECT,INSERT stock_recon_alert:SELECT,INSERT,UPDATE stock_reservation:SELECT,INSERT,UPDATE stock_snapshot_daily:SELECT,INSERT sys_permission:SELECT,INSERT,UPDATE sys_role:SELECT,INSERT,UPDATE sys_role_perm:SELECT,INSERT,UPDATE sys_user:SELECT,INSERT,UPDATE sys_user_role:SELECT,INSERT,UPDATE sys_user_warehouse:SELECT,INSERT,UPDATE v_stock_available:SELECT warehouse:SELECT,INSERT,UPDATE wave:SELECT,INSERT,UPDATE zone:SELECT,INSERT,UPDATE"
 ACT=$(psql -t -A -c "SELECT string_agg(x, ' ' ORDER BY x) FROM (SELECT c.relname || ':' || COALESCE(NULLIF(concat_ws(',', CASE WHEN c.relkind='S' THEN (CASE WHEN has_sequence_privilege('wms_app', c.oid, 'USAGE') THEN 'USAGE' END) ELSE (CASE WHEN has_table_privilege('wms_app', c.oid, 'SELECT') THEN 'SELECT' END) END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'INSERT') THEN 'INSERT' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'UPDATE') THEN 'UPDATE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'DELETE') THEN 'DELETE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'TRUNCATE') THEN 'TRUNCATE' END), ''), 'NONE') AS x FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','S') AND NOT c.relispartition) t")
 if [ "$ACT" = "$EXPECT_PRIVS" ]; then ok "S4 wms_app 权限矩阵与期望逐表一致（$(echo "$ACT" | wc -w) 个对象；列级 UPDATE 另测）"
 else bad "S4 wms_app 权限矩阵不符：$(diff <(echo "$EXPECT_PRIVS" | tr ' ' '\n') <(echo "$ACT" | tr ' ' '\n') | grep '^[<>]' | tr '\n' ' ')"; fi
@@ -391,6 +391,9 @@ expect_block "P2 wms_app PENDING → SENT 时 sent_at 倒填 2000-01-01（R1 起
 expect_block "P2 SENT 退回 PENDING" "UPDATE outbox_event SET status='PENDING' WHERE id=8803;" "expiry_backdate: status"
 expect_allow "P2 正向：idem expires_at 往后延" "BEGIN; SET LOCAL ROLE wms_app; UPDATE idempotency_record SET expires_at=(now() AT TIME ZONE 'UTC') + interval '2 days' WHERE idem_key='live'; ROLLBACK;"
 expect_allow "P2 正向：sent_at 往后改、PENDING → SENT 写当前 UTC" "BEGIN; SET LOCAL ROLE wms_app; UPDATE outbox_event SET sent_at=sent_at + interval '1 minute' WHERE id=8803; UPDATE outbox_event SET status='SENT', sent_at=now() AT TIME ZONE 'UTC' WHERE id=8801; ROLLBACK;"
+expect_block "R1 补洞：wms_app 以 SENT 状态插入 outbox（sent_at 倒写 1 天前）" "BEGIN; SET LOCAL ROLE wms_app; INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at) VALUES (8811,'t','k','{}','SENT',(now() AT TIME ZONE 'UTC') - interval '1 day'); ROLLBACK;" "outbox_insert_not_pending"
+expect_block "R1 补洞：wms_app 以 PENDING 插入但带过去的 sent_at" "BEGIN; SET LOCAL ROLE wms_app; INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at) VALUES (8812,'t','k','{}','PENDING',(now() AT TIME ZONE 'UTC') - interval '8 days'); ROLLBACK;" "outbox_insert_not_pending"
+expect_allow "R1 补洞正向：wms_app 以 PENDING 插入（不带 sent_at）" "BEGIN; SET LOCAL ROLE wms_app; INSERT INTO outbox_event (id,topic,biz_key,payload) VALUES (8813,'t','k','{}'); ROLLBACK;"
 expect_block "R1 PENDING → SENT 时 sent_at 写成 1 小时前" "BEGIN; SET LOCAL ROLE wms_app; UPDATE outbox_event SET status='SENT', sent_at=(now() AT TIME ZONE 'UTC') - interval '1 hour' WHERE id=8801; ROLLBACK;" "sent_at_not_now"
 expect_block "R1 PENDING → SENT 时 sent_at 写成 1 小时后" "BEGIN; SET LOCAL ROLE wms_app; UPDATE outbox_event SET status='SENT', sent_at=(now() AT TIME ZONE 'UTC') + interval '1 hour' WHERE id=8801; ROLLBACK;" "sent_at_not_now"
 expect_allow "R1 正向：PENDING → SENT 写当前 UTC（容差内 +3 秒）" "BEGIN; SET LOCAL ROLE wms_app; UPDATE outbox_event SET status='SENT', sent_at=(now() AT TIME ZONE 'UTC') + interval '3 seconds' WHERE id=8801; ROLLBACK;"
@@ -513,14 +516,20 @@ echo "  → 成功 $succ / 拒绝 $rej / 剩余 $FINAL / version $VER"
   || bad "并发结果偏离预期"
 
 echo "=== 6. docs/06 复核、装箱、发货 ==="
-expect_allow "06 复核单开单（拣货人 7 ≠ 复核人 8）" "INSERT INTO check_record (id,code,warehouse_id,outbound_id,picker_id,checker_id,device_instance_id) VALUES (601,'CHK-1',1,1,7,8,'DEV-C');"
-expect_block "06 SoD 复核人 = 拣货人" "INSERT INTO check_record (id,code,warehouse_id,outbound_id,picker_id,checker_id) VALUES (602,'CHK-2',1,2,7,7);" "ck_chk_sod"
-expect_block "06 同一出库单第二张 OPEN 复核" "INSERT INTO check_record (id,code,warehouse_id,outbound_id,picker_id,checker_id) VALUES (603,'CHK-3',1,1,7,9);" "uq_chk_open"
-expect_block "06 状态非法值" "INSERT INTO check_record (id,code,warehouse_id,outbound_id,checker_id,status,closed_by,closed_at) VALUES (604,'CHK-4',1,4,8,'DONE',8,now());" "ck_chk_status"
-expect_block "06 关单不填 closed_by/closed_at" "INSERT INTO check_record (id,code,warehouse_id,outbound_id,checker_id,status) VALUES (605,'CHK-5',1,5,8,'FAILED');" "ck_chk_closed"
-expect_block "06 PASSED 但 mismatch_count>0" "INSERT INTO check_record (id,code,warehouse_id,outbound_id,checker_id,status,mismatch_count,closed_by,closed_at) VALUES (606,'CHK-6',1,6,8,'PASSED',1,8,now());" "ck_chk_pass"
+expect_allow "06 复核单开单（复核人 8）" "INSERT INTO check_record (id,code,warehouse_id,outbound_id,picker_id,checker_id,device_instance_id) VALUES (601,'CHK-1',1,1,7,8,'DEV-C');"
+expect_block "06 H2 直接插入 PASSED" "INSERT INTO check_record (id,code,warehouse_id,outbound_id,checker_id,status,closed_by,closed_at) VALUES (602,'CHK-2',1,2,8,'PASSED',8,now());" "check_state"
+expect_block "06 SoD 主拣货人 = 复核人" "INSERT INTO check_record (id,code,warehouse_id,outbound_id,picker_id,checker_id) VALUES (603,'CHK-3',1,3,7,7);" "ck_chk_sod"
+expect_block "06 同一出库单第二张 OPEN 复核" "INSERT INTO check_record (id,code,warehouse_id,outbound_id,checker_id) VALUES (604,'CHK-4',1,1,9);" "uq_chk_open"
+expect_block "06 状态非法值" "UPDATE check_record SET status='DONE', closed_by=8, closed_at=now() WHERE id=601;" "ck_chk_status"
+expect_block "06 关单不填 closed_by/closed_at" "UPDATE check_record SET status='FAILED' WHERE id=601;" "ck_chk_closed"
 expect_allow "06 复核行（期望 5kg）" "INSERT INTO check_line (id,check_id,line_no,outbound_line_id,sku_id,expected_qty_milli) VALUES (611,601,1,1,1,5000);"
 expect_block "06 同单同 line_no 重复复核行" "INSERT INTO check_line (id,check_id,line_no,outbound_line_id,sku_id,expected_qty_milli) VALUES (612,601,1,2,1,5000);" "uq_chkl_line"
+expect_block "06 复核行挂不存在的复核单（外键）" "INSERT INTO check_line (id,check_id,line_no,outbound_line_id,sku_id,expected_qty_milli) VALUES (613,9999,1,1,1,5000);" "check_closed"
+expect_allow "06 H1 登记拣货人 7" "INSERT INTO check_picker (check_id,user_id) VALUES (601,7);"
+expect_allow "06 H1 登记第二拣货人 9" "INSERT INTO check_picker (check_id,user_id) VALUES (601,9);"
+expect_block "06 H1 复核人 8 也拣过（任一拣货人）" "INSERT INTO check_picker (check_id,user_id) VALUES (601,8);" "check_sod"
+expect_block "06 H1 删拣货人" "DELETE FROM check_picker WHERE check_id=601 AND user_id=9;" "check_immutable"
+expect_block "06 H2 一行没扫就 PASSED" "UPDATE check_record SET status='PASSED', closed_by=8, closed_at=now() WHERE id=601;" "check_not_complete"
 expect_allow "06 累计复核 5kg（= 期望）" "UPDATE check_line SET checked_qty_milli=5000, version=version+1 WHERE id=611;"
 expect_block "06 复核超期望（OVER_CHECK 库层兜底）" "UPDATE check_line SET checked_qty_milli=5001 WHERE id=611;" "ck_chkl_qty"
 expect_block "06 改复核行期望数" "UPDATE check_line SET expected_qty_milli=6000 WHERE id=611;" "check_immutable"
@@ -528,55 +537,107 @@ expect_block "06 删复核行" "DELETE FROM check_line WHERE id=611;" "check_imm
 expect_block "06 改复核单复核人" "UPDATE check_record SET checker_id=9 WHERE id=601;" "check_immutable"
 expect_allow "06 check_op 扫描（四元键）" "INSERT INTO check_op (id,check_id,line_no,device_instance_id,op_seq,op_type,barcode,qty_milli) VALUES (621,601,1,'DEV-C',1,'SCAN','6900000000001',5000);"
 expect_block "06 check_op 同四元键重放（不同数量）→ 40910 依据" "INSERT INTO check_op (id,check_id,line_no,device_instance_id,op_seq,op_type,barcode,qty_milli) VALUES (622,601,1,'DEV-C',1,'SCAN','6900000000001',4000);" "uq_check_op"
-expect_block "06 同 id 覆盖 check_op（普通 INSERT）" "INSERT INTO check_op (id,check_id,line_no,device_instance_id,op_seq,op_type,barcode,qty_milli) VALUES (621,601,1,'DEV-C',9,'SCAN','x',1);" "check_op_pkey"
+expect_block "06 同 id 覆盖 check_op（PG 普通 INSERT / SQLite REPLACE）" "INSERT INTO check_op (id,check_id,line_no,device_instance_id,op_seq,op_type,barcode,qty_milli) VALUES (621,601,1,'DEV-C',9,'SCAN','x',1);" "check_op_pkey"
 expect_block "06 check_op 数量 0" "INSERT INTO check_op (id,check_id,line_no,device_instance_id,op_seq,op_type,barcode,qty_milli) VALUES (623,601,1,'DEV-C',2,'SCAN','x',0);" "ck_check_op_qty"
 expect_block "06 check_op 未完成却带 result_code" "INSERT INTO check_op (id,check_id,line_no,device_instance_id,op_seq,op_type,barcode,qty_milli,result_code) VALUES (624,601,1,'DEV-C',3,'SCAN','x',1,'42210');" "ck_check_op_finish"
 expect_block "06 check_op result_code 非 5 位码" "INSERT INTO check_op (id,check_id,line_no,device_instance_id,op_seq,op_type,barcode,qty_milli,result_code,finished_at) VALUES (625,601,1,'DEV-C',4,'SCAN','x',1,'OK',now());" "ck_check_op_result"
+expect_allow "06 check_op 失败结果（SELL_EXPIRED → 42214）" "INSERT INTO check_op (id,check_id,line_no,device_instance_id,op_seq,op_type,barcode,qty_milli,result_code,finished_at) VALUES (626,601,1,'DEV-C',5,'SCAN','x',1,'42214',now());"
 expect_allow "06 check_op 写结果（成功 NULL）" "UPDATE check_op SET finished_at=now() WHERE id=621;"
 expect_block "06 check_op 结果二次改写" "UPDATE check_op SET result_code='42210' WHERE id=621;" "check_op_immutable"
 expect_block "06 删 check_op" "DELETE FROM check_op WHERE id=621;" "check_op_immutable"
 expect_allow "06 复核通过关单" "UPDATE check_record SET status='PASSED', closed_by=8, closed_at=now(), version=version+1 WHERE id=601;"
 expect_block "06 复核单关后复活" "UPDATE check_record SET status='OPEN', closed_by=NULL, closed_at=NULL WHERE id=601;" "check_closed"
 expect_block "06 关单后再改复核行" "UPDATE check_line SET checked_qty_milli=4000 WHERE id=611;" "check_closed"
-expect_block "06 关单后补复核行" "INSERT INTO check_line (id,check_id,line_no,outbound_line_id,sku_id,expected_qty_milli) VALUES (613,601,2,2,1,1000);" "check_closed"
+expect_block "06 关单后补复核行" "INSERT INTO check_line (id,check_id,line_no,outbound_line_id,sku_id,expected_qty_milli) VALUES (614,601,2,2,1,1000);" "check_closed"
+expect_block "06 关单后补拣货人" "INSERT INTO check_picker (check_id,user_id) VALUES (601,10);" "check_closed"
 expect_block "06 删复核单" "DELETE FROM check_record WHERE id=601;" "check_immutable"
-expect_allow "06 新开箱（OPEN）" "INSERT INTO pack_box (id,code,warehouse_id,outbound_id,check_id) VALUES (631,'BOX-1',1,1,601);"
-expect_allow "06 OPEN 箱装明细" "INSERT INTO pack_box_line (id,box_id,sku_id,lot_id,qty_milli,uom) VALUES (641,631,1,1,5000,'KG');"
-expect_block "06 封箱缺 packed_at / checker" "UPDATE pack_box SET status='SEALED', sealed=true WHERE id=631;" "ck_box_sealed"
-expect_block "06 status/sealed 不一致" "UPDATE pack_box SET sealed=true WHERE id=631;" "ck_box_sealed"
-expect_allow "06 封箱" "UPDATE pack_box SET status='SEALED', sealed=true, packed_at=now(), checker_id=8, version=version+1 WHERE id=631;"
-expect_block "06 封箱后加明细" "INSERT INTO pack_box_line (id,box_id,sku_id,lot_id,qty_milli,uom) VALUES (642,631,1,2,1000,'KG');" "box_sealed"
+expect_allow "06 新开箱（OPEN，挂复核单 601）" "INSERT INTO pack_box (id,code,warehouse_id,outbound_id,check_id) VALUES (631,'BOX-1',1,1,601);"
+expect_block "06 H6 直接插入 SHIPPED 箱" "INSERT INTO pack_box (id,code,warehouse_id,outbound_id,check_id,status,sealed,packed_at,checker_id,stage_location_id,shipment_id,shipped_at) VALUES (632,'BOX-2',1,1,601,'SHIPPED',true,now(),8,2,NULL,now());" "box_state"
+expect_allow "06 OPEN 箱装明细 5kg" "INSERT INTO pack_box_line (id,box_id,sku_id,lot_id,qty_milli,uom) VALUES (641,631,1,1,5000,'KG');"
+expect_allow "06 不挂复核单的箱（633）" "INSERT INTO pack_box (id,code,warehouse_id,outbound_id) VALUES (633,'BOX-3',1,1);"
+expect_block "06 H3 不挂复核单就封箱" "UPDATE pack_box SET status='SEALED', sealed=true, packed_at=now(), checker_id=8 WHERE id=633;" "box_check_invalid"
+expect_block "06 H3 封箱人不是复核人 → 40930 SEALER_NOT_CHECKER" "UPDATE pack_box SET status='SEALED', sealed=true, packed_at=now(), checker_id=9 WHERE id=631;" "sealer_not_checker"
+expect_allow "06 第二箱（634）装 1kg" "INSERT INTO pack_box (id,code,warehouse_id,outbound_id,check_id) VALUES (634,'BOX-4',1,1,601);"
+expect_allow "06 第二箱明细" "INSERT INTO pack_box_line (id,box_id,sku_id,lot_id,qty_milli,uom) VALUES (644,634,1,1,1000,'KG');"
+expect_block "06 H3 箱内合计超复核量（5+1 > 5）" "UPDATE pack_box SET status='SEALED', sealed=true, packed_at=now(), checker_id=8 WHERE id=634;" "box_over_check"
+expect_allow "06 第二箱作废（OPEN→CANCELLED）" "UPDATE pack_box SET status='CANCELLED' WHERE id=634;"
+expect_block "06 封箱缺 packed_at" "UPDATE pack_box SET status='SEALED', sealed=true, checker_id=8 WHERE id=631;" "ck_box_sealed"
+expect_allow "06 封箱（复核人 8）" "UPDATE pack_box SET status='SEALED', sealed=true, packed_at=now(), checker_id=8, weight_g=5200, version=version+1 WHERE id=631;"
+expect_block "06 封箱后加明细 → 40937" "INSERT INTO pack_box_line (id,box_id,sku_id,lot_id,qty_milli,uom) VALUES (642,631,1,2,1000,'KG');" "box_sealed"
 expect_block "06 封箱后改明细数量" "UPDATE pack_box_line SET qty_milli=4000 WHERE id=641;" "box_sealed"
 expect_block "06 封箱后删明细" "DELETE FROM pack_box_line WHERE id=641;" "box_sealed"
+expect_block "06 H6 封箱后改重量" "UPDATE pack_box SET weight_g=1 WHERE id=631;" "box_sealed"
+expect_block "06 H6 封箱后换封箱人" "UPDATE pack_box SET checker_id=9 WHERE id=631;" "box_sealed"
+expect_block "06 SEALED 直接 SHIPPED（跳过集货）" "UPDATE pack_box SET status='SHIPPED', stage_location_id=2, shipped_at=now() WHERE id=631;" "box_state"
 expect_block "06 STAGED 不填集货位" "UPDATE pack_box SET status='STAGED' WHERE id=631;" "ck_box_staged"
-expect_block "06 SEALED 直接 SHIPPED（跳过集货）" "UPDATE pack_box SET status='SHIPPED', stage_location_id=2, shipment_id=1, shipped_at=now() WHERE id=631;" "box_state"
 expect_allow "06 集货" "UPDATE pack_box SET status='STAGED', stage_location_id=2 WHERE id=631;"
 expect_block "06 改箱码" "UPDATE pack_box SET code='BOX-X' WHERE id=631;" "box_immutable"
 expect_block "06 删箱" "DELETE FROM pack_box WHERE id=631;" "box_immutable"
-expect_block "06 同 id 覆盖箱（普通 INSERT）" "INSERT INTO pack_box (id,code,warehouse_id,outbound_id) VALUES (631,'BOX-1',1,9);" "pack_box_pkey"
-expect_allow "06 发运单（CREATED）" "INSERT INTO shipment (id,code,warehouse_id) VALUES (1,'SHP-1',1);"
-expect_block "06 发运状态非法（SIGNED 归 16）" "INSERT INTO shipment (id,code,warehouse_id,status) VALUES (2,'SHP-2',1,'SIGNED');" "ck_shp_status"
-expect_block "06 交接缺 handed_over / box_count" "UPDATE shipment SET status='HANDED_OVER' WHERE id=1;" "ck_shp_handover"
-expect_allow "06 箱发货出库（STAGED→SHIPPED）" "UPDATE pack_box SET status='SHIPPED', shipment_id=1, shipped_at=now() WHERE id=631;"
-expect_block "06 SHIPPED 箱回退" "UPDATE pack_box SET status='STAGED' WHERE id=631;" "box_state"
-expect_block "06 SHIPPED 不挂发运单" "INSERT INTO pack_box (id,code,warehouse_id,outbound_id,status,sealed,packed_at,checker_id,stage_location_id,shipped_at) VALUES (632,'BOX-2',1,1,'SHIPPED',true,now(),8,2,now());" "ck_box_shipped"
+expect_block "06 同 id 覆盖箱（PG 普通 INSERT / SQLite REPLACE）" "INSERT INTO pack_box (id,code,warehouse_id,outbound_id) VALUES (631,'BOX-1',1,9);" "pack_box_pkey"
+expect_allow "06 发运单 1（CREATED）" "INSERT INTO shipment (id,code,warehouse_id) VALUES (1,'SHP-1',1);"
+expect_allow "06 发运单 2（CREATED）" "INSERT INTO shipment (id,code,warehouse_id) VALUES (2,'SHP-2',1);"
+expect_block "06 H4 直接插入 HANDED_OVER" "INSERT INTO shipment (id,code,warehouse_id,status,box_count,handed_over_at,handed_over_by,waybill_id) VALUES (3,'SHP-3',1,'HANDED_OVER',5,now(),8,9009);" "shipment_state"
+expect_block "06 发运状态 SIGNED（归 16）" "UPDATE shipment SET status='SIGNED' WHERE id=1;" "shipment_state"
+expect_allow "06 箱挂车次 1" "UPDATE pack_box SET shipment_id=1 WHERE id=631;"
+expect_allow "06 出库单挂车次 1" "INSERT INTO shipment_order (shipment_id,outbound_id) VALUES (1,1);"
+expect_block "06 H5 同一出库单再挂车次 2" "INSERT INTO shipment_order (shipment_id,outbound_id) VALUES (2,1);" "uq_sho_outbound"
+expect_block "06 H5 改 shipment_order" "UPDATE shipment_order SET outbound_id=99 WHERE shipment_id=1;" "shipment_order_immutable"
+expect_block "06 H5 挂不存在的车次（外键）" "INSERT INTO shipment_order (shipment_id,outbound_id) VALUES (999,5);" "shipment_closed"
+expect_block "06 H4 有箱时取消车次" "UPDATE shipment SET status='CANCELLED' WHERE id=1;" "shipment_not_empty"
+expect_block "06 H4 车次未交接箱先 SHIPPED" "UPDATE pack_box SET status='SHIPPED', shipped_at=now() WHERE id=631;" "box_shipment"
+expect_block "06 H4 交接 box_count 与实际不符" "UPDATE shipment SET status='HANDED_OVER', handed_over_at=now(), handed_over_by=8, box_count=2, waybill_id=9001 WHERE id=1;" "shipment_box_count"
+expect_block "06 交接缺 waybill_id" "UPDATE shipment SET status='HANDED_OVER', handed_over_at=now(), handed_over_by=8, box_count=1 WHERE id=1;" "ck_shp_handover"
 expect_allow "06 发运交接（HANDED_OVER）" "UPDATE shipment SET status='HANDED_OVER', handed_over_at=now(), handed_over_by=8, box_count=1, waybill_id=9001, version=version+1 WHERE id=1;"
+expect_block "06 交接后再挂新箱" "UPDATE pack_box SET shipment_id=1 WHERE id=633;" "box_shipment"
+expect_allow "06 箱发货出库（STAGED→SHIPPED）" "UPDATE pack_box SET status='SHIPPED', shipped_at=now() WHERE id=631;"
+expect_block "06 H6 SHIPPED 箱换车次" "UPDATE pack_box SET shipment_id=2 WHERE id=631;" "box_closed"
+expect_block "06 H6 SHIPPED 箱改重量" "UPDATE pack_box SET weight_g=1 WHERE id=631;" "box_closed"
+expect_block "06 SHIPPED 箱回退" "UPDATE pack_box SET status='STAGED' WHERE id=631;" "box_closed"
+expect_block "06 H5 交接后再挂出库单" "INSERT INTO shipment_order (shipment_id,outbound_id) VALUES (1,5);" "shipment_closed"
+expect_block "06 H5 交接后摘出库单" "DELETE FROM shipment_order WHERE shipment_id=1;" "shipment_closed"
 expect_block "06 交接后改 waybill_id" "UPDATE shipment SET waybill_id=9002 WHERE id=1;" "shipment_closed"
-expect_block "06 箱重量负数" "UPDATE pack_box SET weight_g=-1 WHERE id=631;" "ck_box_weight"
 expect_block "06 交接后改箱数" "UPDATE shipment SET box_count=2 WHERE id=1;" "shipment_closed"
 expect_block "06 交接后撤回" "UPDATE shipment SET status='CREATED' WHERE id=1;" "shipment_closed"
-expect_allow "06 发运单直接作废（CANCELLED）" "INSERT INTO shipment (id,code,warehouse_id,status) VALUES (3,'SHP-3',1,'CANCELLED');"
-expect_block "06 CANCELLED 后复活" "UPDATE shipment SET status='CREATED' WHERE id=3;" "shipment_closed"
+expect_allow "06 空车次取消" "UPDATE shipment SET status='CANCELLED' WHERE id=2;"
+expect_block "06 CANCELLED 后复活" "UPDATE shipment SET status='CREATED' WHERE id=2;" "shipment_closed"
 expect_block "06 删发运单" "DELETE FROM shipment WHERE id=1;" "shipment_immutable"
-expect_block "06 同 id 覆盖发运单（普通 INSERT）" "INSERT INTO shipment (id,code,warehouse_id) VALUES (1,'SHP-1',1);" "shipment_pkey"
-OUT=$(psql -q -c "TRUNCATE check_op;")
+expect_block "06 同 id 覆盖发运单（PG 普通 INSERT / SQLite REPLACE）" "INSERT INTO shipment (id,code,warehouse_id) VALUES (1,'SHP-1',1);" "shipment_pkey"
+expect_allow "06 Q8 待作废箱 635 开箱" "INSERT INTO pack_box (id,code,warehouse_id,outbound_id,check_id) VALUES (635,'BOX-5',1,1,601);"
+expect_block "06 Q8 OPEN 箱不能申请作废" "INSERT INTO box_void_request (id,box_id,reason_code,requested_by) VALUES (700,635,'LOST',8);" "box_void_state"
+expect_allow "06 Q8 封箱 635" "UPDATE pack_box SET status='SEALED', sealed=true, packed_at=now(), checker_id=8 WHERE id=635;"
+expect_block "06 Q8 无批准直接 VOIDED" "UPDATE pack_box SET status='VOIDED', voided_at=now() WHERE id=635;" "box_void_unapproved"
+expect_block "06 Q8 原因码非法" "INSERT INTO box_void_request (id,box_id,reason_code,requested_by) VALUES (700,635,'STOLEN',8);" "ck_bvr_reason"
+expect_allow "06 Q8 申请作废（LOST，申请人 8）" "INSERT INTO box_void_request (id,box_id,reason_code,remark,photo_ids,requested_by) VALUES (701,635,'LOST','集货位找不到','[\"p1\"]',8);"
+expect_block "06 Q8 同箱第二张 PENDING" "INSERT INTO box_void_request (id,box_id,reason_code,requested_by) VALUES (702,635,'DAMAGED',9);" "uq_bvr_pending"
+expect_block "06 Q8 自批" "UPDATE box_void_request SET status='APPROVED', decided_by=8, decided_at=now() WHERE id=701;" "ck_bvr_self"
+expect_block "06 Q8 改申请原因" "UPDATE box_void_request SET reason_code='DAMAGED' WHERE id=701;" "bvr_immutable"
+expect_allow "06 Q8 主管 9 批准" "UPDATE box_void_request SET status='APPROVED', decided_by=9, decided_at=now(), version=version+1 WHERE id=701;"
+expect_block "06 Q8 批准后再改" "UPDATE box_void_request SET status='REJECTED' WHERE id=701;" "bvr_closed"
+expect_block "06 Q8 删申请" "DELETE FROM box_void_request WHERE id=701;" "bvr_immutable"
+expect_block "06 Q8 VOIDED 不填 voided_at" "UPDATE pack_box SET status='VOIDED' WHERE id=635;" "ck_box_voided"
+expect_allow "06 Q8 作废箱（SEALED→VOIDED）" "UPDATE pack_box SET status='VOIDED', voided_at=now() WHERE id=635;"
+expect_block "06 Q8 VOIDED 箱再改" "UPDATE pack_box SET status='SEALED', voided_at=NULL WHERE id=635;" "box_closed"
+expect_block "06 箱重量负数" "UPDATE pack_box SET weight_g=-1 WHERE id=633;" "ck_box_weight"
+OUT=$(psql -q -c "TRUNCATE check_op CASCADE;")
 case "$OUT" in *"append_only_violation"*) ok "06 TRUNCATE check_op 被拦";; *) bad "TRUNCATE check_op 未拦：$OUT";; esac
-OUT=$(psql -q -c "TRUNCATE pack_box;")
+OUT=$(psql -q -c "TRUNCATE pack_box CASCADE;")
 case "$OUT" in *"append_only_violation"*) ok "06 TRUNCATE pack_box 被拦";; *) bad "TRUNCATE pack_box 未拦：$OUT";; esac
+OUT=$(psql -q -c "TRUNCATE check_picker CASCADE;")
+case "$OUT" in *"append_only_violation"*) ok "06 TRUNCATE check_picker 被拦";; *) bad "TRUNCATE check_picker 未拦：$OUT";; esac
+OUT=$(psql -q -c "TRUNCATE shipment_order CASCADE;")
+case "$OUT" in *"append_only_violation"*) ok "06 TRUNCATE shipment_order 被拦";; *) bad "TRUNCATE shipment_order 未拦：$OUT";; esac
+OUT=$(psql -q -c "TRUNCATE box_void_request CASCADE;")
+case "$OUT" in *"append_only_violation"*) ok "06 TRUNCATE box_void_request 被拦";; *) bad "TRUNCATE box_void_request 未拦：$OUT";; esac
+OUT=$(psql -q -c "TRUNCATE check_record CASCADE;")
+case "$OUT" in *"append_only_violation"*) ok "06 TRUNCATE check_record 被拦";; *) bad "TRUNCATE check_record 未拦：$OUT";; esac
+OUT=$(psql -q -c "TRUNCATE shipment CASCADE;")
+case "$OUT" in *"append_only_violation"*) ok "06 TRUNCATE shipment 被拦";; *) bad "TRUNCATE shipment 未拦：$OUT";; esac
 OUT=$(psql -q -c "SET ROLE wms_app; UPDATE check_op SET qty_milli=1 WHERE id=621;")
 case "$OUT" in *"permission denied"*) ok "06 wms_app 不能改 check_op.qty_milli（列级授权）";; *) bad "wms_app 可改 check_op.qty_milli：$OUT";; esac
 OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM pack_box_line WHERE id=641;")
-case "$OUT" in *"permission denied"*) ok "06 wms_app 无 DELETE pack_box_line";; *) bad "wms_app 可删箱明细：$OUT";; esac
+case "$OUT" in *"box_sealed"*) ok "06 wms_app 有 DELETE 但箱已封 → box_sealed";; *) bad "wms_app 删封箱明细：$OUT";; esac
+OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM pack_box_line WHERE id=644;")
+case "$OUT" in *"box_closed"*|*"box_sealed"*) ok "06 wms_app 删已作废箱明细被拦";; *) bad "wms_app 删作废箱明细：$OUT";; esac
 
 echo "=== 汇总 ==="
 echo "  通过 $pass 项 / 失败 $fail 项"
