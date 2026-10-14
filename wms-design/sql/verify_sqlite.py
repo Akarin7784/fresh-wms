@@ -636,13 +636,8 @@ c = conn.execute("UPDATE stock_hold SET released_qty_milli = hold_qty_milli, sta
 ok("PROCESSING 人工解冻 rowcount=0（→ 40933）") if c == 0 else bad(f"人工解冻了 PROCESSING rowcount={c}")
 c = conn.execute("UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED' WHERE id = 121 AND status = 'HELD' AND hold_type IN ('QUALITY','MANUAL')").rowcount
 ok("LIVE_HOLD 人工解冻 rowcount=0（→ 40933）") if c == 0 else bad(f"人工解冻了 LIVE_HOLD rowcount={c}")
-conn.execute("BEGIN")
-conn.execute("INSERT INTO stock_hold_release (id,hold_id,op_key,qty_milli) VALUES (80,121,'LTH:121:1',500)")
-conn.execute("UPDATE stock_hold SET released_qty_milli = released_qty_milli + 500, status = CASE WHEN released_qty_milli + 500 = hold_qty_milli THEN 'RELEASED' ELSE 'HELD' END, version = version + 1 WHERE id = 121 AND hold_type = 'LIVE_HOLD' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 500")
-conn.execute("UPDATE stock SET hold_qty_milli = hold_qty_milli - 500, version = version + 1 WHERE id = 47 AND hold_qty_milli >= 500")
-r = tuple(one("SELECT s.on_hand_qty_milli, s.hold_qty_milli, s.on_hand_qty_milli-s.allocated_qty_milli-s.reserved_qty_milli-s.quality_hold_qty_milli-s.hold_qty_milli, h.released_qty_milli, h.status FROM stock s JOIN stock_hold h ON s.id = h.stock_id AND h.id=121"))
-conn.execute("ROLLBACK")
-ok(f"release_hold 部分释放 LIVE_HOLD 500 → {r}（货还在，已回滚）") if r == (3000, 2500, 500, 500, "HELD") else bad(f"release_hold {r}")
+c = conn.execute("UPDATE stock_hold SET released_qty_milli = released_qty_milli + 500, version = version + 1 WHERE id = 121 AND hold_type = 'PROCESSING' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 500").rowcount
+ok("release_hold 不释放 LIVE_HOLD（WHERE 限 PROCESSING，rowcount=0）") if c == 0 else bad(f"release_hold 误放了 LIVE_HOLD rowcount={c}")
 expect_allow_tx("consume_process_hold 扣 2000（hold 与 on_hand 同一条 UPDATE，记 PROCESS_CONSUME）", [
     "UPDATE stock_hold SET released_qty_milli = released_qty_milli + 2000, status = CASE WHEN released_qty_milli + 2000 = hold_qty_milli THEN 'RELEASED' ELSE 'HELD' END, version = version + 1 WHERE id = 120 AND hold_type = 'PROCESSING' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 2000",
     "UPDATE stock SET hold_qty_milli = hold_qty_milli - 2000, on_hand_qty_milli = on_hand_qty_milli - 2000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 46 AND hold_qty_milli >= 2000 AND on_hand_qty_milli >= 2000",
@@ -669,12 +664,71 @@ expect_block_tx("consume 重放同一幂等键，整笔回滚（不二次扣减�
 ], "stock_movement_key.idempotency_key")
 r = one("SELECT s.on_hand_qty_milli, s.hold_qty_milli, h.released_qty_milli, (SELECT count(*) FROM stock_movement WHERE stock_id=46) FROM stock s JOIN stock_hold h ON s.id = h.stock_id AND h.id=120")
 ok(f"重放回滚后 on_hand/hold/released/流水 = {tuple(r)}") if tuple(r) == (2000, 2000, 3000, 2) else bad(f"重放后 {r}")
+r = one("SELECT CASE WHEN h.released_qty_milli = COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id=h.id),0) + COALESCE((SELECT SUM(m.move_qty_milli) FROM stock_movement m WHERE m.stock_id=h.stock_id AND m.biz_type='PROCESS_CONSUME' AND m.direction=-1),0) THEN 1 ELSE 0 END FROM stock_hold h WHERE h.id=120")
+ok("I3f PROCESSING 已释放 = 释放记录 + PROCESS_CONSUME 流水") if r[0] == 1 else bad(f"I3f = {r}")
 c = conn.execute("UPDATE stock_hold SET released_qty_milli = released_qty_milli + 3000, version = version + 1 WHERE id = 120 AND hold_type = 'PROCESSING' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 3000").rowcount
 ok("consume 超过 PROCESSING 余量 rowcount=0（→ 40905）") if c == 0 else bad(f"超量 consume rowcount={c}")
 c = conn.execute("UPDATE stock_hold SET released_qty_milli = released_qty_milli + 100, version = version + 1 WHERE id = 121 AND hold_type = 'PROCESSING' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 100").rowcount
 ok("consume_process_hold 不接受 LIVE_HOLD（rowcount=0）") if c == 0 else bad(f"LIVE_HOLD 被 consume rowcount={c}")
 c = conn.execute("UPDATE stock_hold SET released_qty_milli = released_qty_milli + 100, version = version + 1 WHERE id = 31 AND hold_type = 'PROCESSING' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 100").rowcount
 ok("consume_process_hold 不接受 SCRAP_PENDING（rowcount=0）") if c == 0 else bad(f"非 PROCESSING 被 consume rowcount={c}")
+expect_allow_tx("同池两条 LIVE_HOLD（stock 48/51，source 7701，sku 2，不进 FEFO）", [
+    "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (48,1,1,2,1,'KG',2000,2000),(51,1,3,2,2,'KG',3500,3500)",
+    "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (123,48,'LIVE_HOLD','LIVE_HOLD','LIVE_TANK_HOLD',7701,'LH:7701:48',2000,0,'HELD',0),(126,51,'LIVE_HOLD','LIVE_HOLD','LIVE_TANK_HOLD',7701,'LH:7701:51',3500,0,'HELD',0)",
+])
+_REL_INS = "INSERT INTO stock_hold_release (id,hold_id,op_key,qty_milli) SELECT CASE h.id WHEN 123 THEN 81 WHEN 126 THEN 82 END, h.id, 'LTH:7701:8801:' || h.id, h.hold_qty_milli - h.released_qty_milli FROM stock_hold h WHERE h.hold_type='LIVE_HOLD' AND h.source_type='LIVE_TANK_HOLD' AND h.source_id=7701 AND h.status='HELD'"
+_REL_HOLD = "UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status='RELEASED', version=version+1 WHERE hold_type='LIVE_HOLD' AND source_type='LIVE_TANK_HOLD' AND source_id=7701 AND status='HELD'"
+_REL_STOCK = "UPDATE stock SET hold_qty_milli = hold_qty_milli - (SELECT COALESCE(SUM(r.qty_milli),0) FROM stock_hold_release r JOIN stock_hold h ON h.id=r.hold_id WHERE h.stock_id=stock.id AND r.op_key LIKE 'LTH:7701:8801:%'), version=version+1 WHERE id IN (SELECT h.stock_id FROM stock_hold_release r JOIN stock_hold h ON h.id=r.hold_id WHERE r.op_key LIKE 'LTH:7701:8801:%') AND hold_qty_milli >= (SELECT COALESCE(SUM(r.qty_milli),0) FROM stock_hold_release r JOIN stock_hold h ON h.id=r.hold_id WHERE h.stock_id=stock.id AND r.op_key LIKE 'LTH:7701:8801:%')"
+_REL_COUNT = "SELECT (SELECT count(*) FROM stock_hold_release WHERE op_key LIKE 'LTH:7701:8801:%') || '/' || (SELECT count(*) FROM stock_hold WHERE source_type='LIVE_TANK_HOLD' AND source_id=7701 AND status='RELEASED') || '/' || (SELECT count(*) FROM stock WHERE id IN (48,51) AND hold_qty_milli=0)"
+conn.execute("BEGIN")
+conn.execute(_REL_INS)
+conn.execute(_REL_HOLD)
+conn.execute(_REL_STOCK + " AND 1=0")
+r = one(_REL_COUNT)[0]
+conn.execute("ROLLBACK")
+ok(f"release_live_hold 行数不一致 释放/明细/汇总 = {r}，已回滚（→ 50010）") if r == "2/2/0" else bad(f"行数不一致 = {r}")
+r = one("SELECT (SELECT status FROM stock_hold WHERE id=123)||'/'||(SELECT status FROM stock_hold WHERE id=126)")[0]
+ok("行数不一致回滚后两条仍 HELD") if r == "HELD/HELD" else bad(f"回滚后状态 = {r}")
+expect_allow_tx("release_live_hold 整池释放 source 7701", [_REL_INS, _REL_HOLD, _REL_STOCK])
+r = one("SELECT (SELECT count(*) FROM stock_hold_release WHERE op_key LIKE 'LTH:7701:8801:%')||'/'||(SELECT count(*) FROM stock_hold WHERE source_type='LIVE_TANK_HOLD' AND source_id=7701 AND status='RELEASED')||'/'||(SELECT count(*) FROM stock WHERE id IN (48,51) AND hold_qty_milli=0)||'/'||(SELECT on_hand_qty_milli FROM stock WHERE id=48)||'/'||(SELECT hold_qty_milli FROM stock WHERE id=48)||'/'||(SELECT on_hand_qty_milli FROM stock WHERE id=51)||'/'||(SELECT hold_qty_milli FROM stock WHERE id=51)")[0]
+ok(f"整池释放 释放行/明细/汇总/两行 on_hand/hold = {r}") if r == "2/2/2/2000/0/3500/0" else bad(f"整池释放 = {r}")
+expect_block_tx("release_live_hold 重放同一 op_key", ["INSERT INTO stock_hold_release (id,hold_id,op_key,qty_milli) VALUES (83,123,'LTH:7701:8801:123',2000)"], "hold_duplicate")
+r = one("SELECT (SELECT count(*) FROM stock_hold_release WHERE op_key LIKE 'LTH:7701:8801:%')||'/'||(SELECT on_hand_qty_milli FROM stock WHERE id=48)||'/'||(SELECT hold_qty_milli FROM stock WHERE id=48)||'/'||(SELECT on_hand_qty_milli FROM stock WHERE id=51)||'/'||(SELECT hold_qty_milli FROM stock WHERE id=51)")[0]
+ok(f"重放回滚后整池释放行数与在库不变 = {r}") if r == "2/2000/0/3500/0" else bad(f"重放后整池 = {r}")
+expect_allow_tx("consume_live_hold 准备：stock 50 LIVE_HOLD 4000（source 7702）", [
+    "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (50,1,2,2,1,'KG',4000,4000)",
+    "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (125,50,'LIVE_HOLD','LIVE_HOLD','LIVE_TANK_HOLD',7702,'LH:7702',4000,0,'HELD',0)",
+])
+expect_allow_tx("consume_live_hold 部分扣 1500（LIVE_DEATH，一条 SCRAP -1）", [
+    "UPDATE stock_hold SET released_qty_milli = released_qty_milli + 1500, status = CASE WHEN released_qty_milli + 1500 = hold_qty_milli THEN 'RELEASED' ELSE 'HELD' END, version = version + 1 WHERE id = 125 AND hold_type = 'LIVE_HOLD' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 1500",
+    "UPDATE stock SET hold_qty_milli = hold_qty_milli - 1500, on_hand_qty_milli = on_hand_qty_milli - 1500, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 50 AND hold_qty_milli >= 1500 AND on_hand_qty_milli >= 1500",
+    "INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('LD1',1,'DOC',NULL)",
+    "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (210,'LD1',1,1,1,'DOC','SCRAP',-1,50,1,1,2,2,1,NULL,NULL,NULL,NULL,1500,4000,2500,'2026-10-16','LD1:1:D1:1')",
+    "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (210,'LD1:1:D1:1','LD1',1,1,1,'DOC',NULL,NULL,NULL,NULL,50,1,-1,'2026-10-16')",
+])
+r = one("SELECT s.on_hand_qty_milli, s.hold_qty_milli, s.on_hand_qty_milli-s.allocated_qty_milli-s.reserved_qty_milli-s.quality_hold_qty_milli-s.hold_qty_milli, h.released_qty_milli, h.status, (SELECT count(*) FROM stock_movement WHERE stock_id=50 AND biz_type='SCRAP' AND direction=-1) FROM stock s JOIN stock_hold h ON s.id=h.stock_id AND h.id=125")
+ok(f"死亡一次只有一条 -1 流水，部分扣后 = {tuple(r)}") if tuple(r) == (2500, 2500, 0, 1500, "HELD", 1) else bad(f"consume_live_hold {r}")
+expect_block_tx("consume_live_hold 重放同一幂等键", [
+    "UPDATE stock_hold SET released_qty_milli = released_qty_milli + 1500, version = version + 1 WHERE id = 125 AND hold_type = 'LIVE_HOLD' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 1500",
+    "UPDATE stock SET hold_qty_milli = hold_qty_milli - 1500, on_hand_qty_milli = on_hand_qty_milli - 1500, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 50 AND hold_qty_milli >= 1500 AND on_hand_qty_milli >= 1500",
+    "INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('LD9',1,'DOC',NULL)",
+    "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (212,'LD9',1,1,1,'DOC','SCRAP',-1,50,9,1,2,2,1,NULL,NULL,NULL,NULL,1500,2500,1000,'2026-10-16','LD1:1:D1:1')",
+    "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (212,'LD1:1:D1:1','LD9',1,1,1,'DOC',NULL,NULL,NULL,NULL,50,9,-1,'2026-10-16')",
+], "stock_movement_key.idempotency_key")
+r = one("SELECT s.on_hand_qty_milli, s.hold_qty_milli, h.released_qty_milli, (SELECT count(*) FROM stock_movement WHERE stock_id=50 AND direction=-1) FROM stock s JOIN stock_hold h ON s.id=h.stock_id AND h.id=125")
+ok(f"死亡重放不二次扣减，仍一条 -1 流水 = {tuple(r)}") if tuple(r) == (2500, 2500, 1500, 1) else bad(f"死亡重放后 {r}")
+expect_allow_tx("consume_live_hold 再扣 500，另一幂等键", [
+    "UPDATE stock_hold SET released_qty_milli = released_qty_milli + 500, status = CASE WHEN released_qty_milli + 500 = hold_qty_milli THEN 'RELEASED' ELSE 'HELD' END, version = version + 1 WHERE id = 125 AND hold_type = 'LIVE_HOLD' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 500",
+    "UPDATE stock SET hold_qty_milli = hold_qty_milli - 500, on_hand_qty_milli = on_hand_qty_milli - 500, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 50 AND hold_qty_milli >= 500 AND on_hand_qty_milli >= 500",
+    "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (211,'LD1',1,2,1,'DOC','SCRAP',-1,50,2,1,2,2,1,NULL,NULL,NULL,NULL,500,2500,2000,'2026-10-16','LD1:1:D2:1')",
+    "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (211,'LD1:1:D2:1','LD1',1,2,1,'DOC',NULL,NULL,NULL,NULL,50,2,-1,'2026-10-16')",
+])
+r = one("SELECT s.on_hand_qty_milli, s.hold_qty_milli, s.on_hand_qty_milli-s.allocated_qty_milli-s.reserved_qty_milli-s.quality_hold_qty_milli-s.hold_qty_milli, h.released_qty_milli, (SELECT count(*) FROM stock_movement WHERE stock_id=50 AND direction=-1) FROM stock s JOIN stock_hold h ON s.id=h.stock_id AND h.id=125")
+ok(f"consume_live_hold 再扣 500 后 = {tuple(r)}") if tuple(r) == (2000, 2000, 0, 2000, 2) else bad(f"第二次 consume_live {r}")
+c = conn.execute("UPDATE stock_hold SET released_qty_milli = released_qty_milli + 3000, version = version + 1 WHERE id = 125 AND hold_type = 'LIVE_HOLD' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 3000").rowcount
+ok("consume_live_hold 超量 rowcount=0（→ 40905）") if c == 0 else bad(f"超量 consume_live rowcount={c}")
+c = conn.execute("UPDATE stock_hold SET released_qty_milli = released_qty_milli + 100, version = version + 1 WHERE id = 120 AND hold_type = 'LIVE_HOLD' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 100").rowcount
+ok("consume_live_hold 不接受 PROCESSING（rowcount=0）") if c == 0 else bad(f"PROCESSING 被 consume_live rowcount={c}")
 expect_allow_tx("ck_recon_code 活鲜四码可写入", ["INSERT INTO stock_recon_alert (id,check_code,warehouse_id,stock_id,expected_qty_milli,actual_qty_milli) VALUES (9101,'LIVE_COUNT_WEIGHT',1,46,1,0),(9102,'LIVE_COUNT_LEDGER',1,46,1,0),(9103,'LIVE_HOLD_MISMATCH',1,47,1,0),(9104,'LIVE_INSPECT_OVERDUE',1,47,1,0)"])
 expect_block_tx("已有批次 sell_deadline 从 NULL 补写", ["UPDATE lot SET sell_deadline = '2026-11-01' WHERE id = 1"], "sell_deadline_immutable")
 expect_allow_tx("新建批次写入 sell_deadline", ["INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date,sell_deadline) VALUES (90,1,'LOT-SD','2026-12-01','2026-10-01','2026-11-01')"])
