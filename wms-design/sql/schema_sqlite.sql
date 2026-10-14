@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 45 处 DEFAULT now() → DEFAULT (datetime('now'))（表达式默认值需括号）
---   3. 方言专属行：删除 157 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 81 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 157 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 84 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -723,6 +723,10 @@ CREATE TABLE wave_capacity_config (
     CONSTRAINT ck_wcc_type CHECK (wave_type IN ('NORMAL','URGENT','REPLENISH_FIRST')),
     CONSTRAINT ck_wcc_cap CHECK (max_order_count > 0 AND max_pick_lines > 0)
 );
+-- SQLite：INSERT OR REPLACE / UPSERT 会先删冲突行或改写已有配置，绕过 version 条件更新；BEFORE INSERT 先拦（PG 无 REPLACE，UPSERT 走 UPDATE 授权 + version）
+CREATE TRIGGER trg_wcc_dup BEFORE INSERT ON wave_capacity_config
+WHEN EXISTS (SELECT 1 FROM wave_capacity_config c WHERE c.id = NEW.id OR (c.warehouse_id = NEW.warehouse_id AND c.wave_type = NEW.wave_type))
+BEGIN SELECT RAISE(ABORT, 'wcc_duplicate'); END;
 
 CREATE TABLE pick_task (
     id              BIGINT       PRIMARY KEY,

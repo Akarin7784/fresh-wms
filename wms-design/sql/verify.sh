@@ -573,6 +573,19 @@ expect_allow "05 S 巡检告警 RR_HOLD_MISMATCH 可写入" \
   "INSERT INTO stock_recon_alert (id,check_code,warehouse_id,stock_id,expected_qty_milli,actual_qty_milli) VALUES (20,'RR_HOLD_MISMATCH',1,14,5000,0);"
 expect_allow "05 S 巡检告警 RR_HOLD_FAILED 可写入" \
   "INSERT INTO stock_recon_alert (id,check_code,warehouse_id,stock_id,expected_qty_milli,actual_qty_milli) VALUES (21,'RR_HOLD_FAILED',1,12,1000,0);"
+expect_block "05 B3 CONFIRMED 不可复活（CONFIRMED→OPEN）" \
+  "UPDATE return_record SET status='OPEN', resolution=NULL, closed_by=NULL, closed_at=NULL WHERE id=501;" \
+  "rr_closed"
+expect_block "05 B3 CONFIRMED 不可改成 RESOLVED" \
+  "UPDATE return_record SET status='RESOLVED', resolution='RETURNED_TO_ORIGINAL' WHERE id=501;" \
+  "rr_closed"
+OUT=$(psql -q -c "TRUNCATE pick_op;")
+case "$OUT" in *"pick_op_immutable"*) ok "05 B1 超级用户 TRUNCATE pick_op 被触发器拦";; *) bad "TRUNCATE pick_op 未被拦：$OUT";; esac
+OUT=$(psql -q -c "TRUNCATE return_record;")
+case "$OUT" in *"rr_immutable"*) ok "05 B1 超级用户 TRUNCATE return_record 被触发器拦";; *) bad "TRUNCATE return_record 未被拦：$OUT";; esac
+OUT=$(psql -q -c "SET ROLE wms_app; INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (9,1,'NORMAL',1,1) ON CONFLICT (warehouse_id,wave_type) DO UPDATE SET max_order_count=1 WHERE wave_capacity_config.version = -1;")
+R=$(psql -t -A -c "SELECT max_order_count FROM wave_capacity_config WHERE warehouse_id=1 AND wave_type='NORMAL'")
+[ "$R" = "180" ] && ok "05 Q7 PG UPSERT 不带正确 version 不改写容量配置（仍 180）" || bad "容量配置被改写：$R / $OUT"
 R=$(psql -t -A -c "SELECT op_type||'/'||qty_milli||'/'||COALESCE(result_code,'ok')||'/'||movement_id FROM pick_op WHERE id=30")
 [ "$R" = "CONFIRM/1000/ok/11" ] && ok "05 B1/B2 覆盖尝试后 pick_op 30 仍为 $R" || bad "pick_op 30 = $R"
 ND=$(psql -t -A -c "SELECT coalesce(string_agg(c.relname, ',' ORDER BY c.relname),'') FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p') AND c.relname IN ('pick_op','return_record','wave','pick_task','pick_task_line','wave_capacity_config') AND (has_table_privilege('wms_app', c.oid, 'DELETE') OR has_table_privilege('wms_app', c.oid, 'TRUNCATE'))")

@@ -435,7 +435,7 @@ expect_allow("05 Q7 容量配置 REPLENISH_FIRST", "INSERT INTO wave_capacity_co
 expect_block("05 Q7 容量配置类型非法（BATCH）", "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (5,1,'BATCH',200,1500)", "ck_wcc_type")
 expect_allow("05 Q7 容量配置（仓 1 / NORMAL）", "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (1,1,'NORMAL',200,1500)")
 expect_allow("05 Q7 同仓不同波次类型（URGENT）", "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (2,1,'URGENT',50,300)")
-expect_block("05 Q7 同仓同类型重复配置", "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (3,1,'NORMAL',100,800)", "wave_capacity_config.warehouse_id, wave_capacity_config.wave_type")
+expect_block_tx("05 Q7 同仓同类型重复配置", ["INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (3,1,'NORMAL',100,800)"], "wcc_duplicate")
 expect_block("05 Q7 容量上限为 0", "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (4,2,'NORMAL',0,1500)", "ck_wcc_cap")
 
 print("=== 2f2. docs/05 #7 复评：REPLENISH 可空、CLOSED 终态、pick_op/return_record 不可改（B1–B3）===")
@@ -482,6 +482,13 @@ expect_block_tx('05 B1 return_record 删除', ['DELETE FROM return_record WHERE 
 expect_block_tx('05 B1 覆盖已有 RR（PG upsert / SQLite REPLACE）', ["INSERT OR REPLACE INTO return_record (id,code,warehouse_id,source_type,outbound_line_id,ref_movement_id,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli) VALUES (520,'RR-11',1,'CANCEL_AFTER_PICK',1,23,7,12,2,1,1,1)"], 'rr_duplicate')
 expect_allow_tx('05 S 巡检告警 RR_HOLD_MISMATCH 可写入', ["INSERT INTO stock_recon_alert (id,check_code,warehouse_id,stock_id,expected_qty_milli,actual_qty_milli) VALUES (20,'RR_HOLD_MISMATCH',1,14,5000,0)"])
 expect_allow_tx('05 S 巡检告警 RR_HOLD_FAILED 可写入', ["INSERT INTO stock_recon_alert (id,check_code,warehouse_id,stock_id,expected_qty_milli,actual_qty_milli) VALUES (21,'RR_HOLD_FAILED',1,12,1000,0)"])
+expect_block_tx("05 SQLite REPLACE 覆盖容量配置（绕过 version）", ["INSERT OR REPLACE INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (9,1,'NORMAL',1,1)"], "wcc_duplicate")
+expect_block_tx("05 SQLite UPSERT 覆盖容量配置", ["INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (9,1,'NORMAL',1,1) ON CONFLICT (warehouse_id,wave_type) DO UPDATE SET max_order_count=1"], "wcc_duplicate")
+expect_block_tx("05 SQLite UPSERT 改写 pick_op", ["INSERT INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli) VALUES (30,3,2,'DEV-B',1,'CONFIRM',1000) ON CONFLICT (id) DO UPDATE SET qty_milli=9"], "pick_op_duplicate")
+expect_block_tx("05 SQLite UPSERT 改写 return_record", ["INSERT INTO return_record (id,code,warehouse_id,source_type,outbound_line_id,ref_movement_id,picker_id,stock_id,location_id,sku_id,lot_id,qty_milli) VALUES (511,'RR-11',1,'CANCEL_AFTER_PICK',1,22,7,12,2,1,1,1000) ON CONFLICT (id) DO UPDATE SET qty_milli=1"], "rr_duplicate")
+expect_block_tx("05 SQLite INSERT OR IGNORE 也被挡（pick_op）", ["INSERT OR IGNORE INTO pick_op (id,task_id,line_no,device_instance_id,op_seq,op_type,qty_milli) VALUES (33,3,2,'DEV-B',1,'CONFIRM',1000)"], "pick_op_duplicate")
+expect_block_tx("05 B3 CONFIRMED 不可复活（CONFIRMED→OPEN）", ["UPDATE return_record SET status='OPEN', resolution=NULL, closed_by=NULL, closed_at=NULL WHERE id=501"], "rr_closed")
+expect_block_tx("05 B3 CONFIRMED 不可改成 RESOLVED", ["UPDATE return_record SET status='RESOLVED', resolution='RETURNED_TO_ORIGINAL' WHERE id=501"], "rr_closed")
 r = one("SELECT op_type||'/'||qty_milli||'/'||COALESCE(result_code,'ok')||'/'||movement_id FROM pick_op WHERE id=30")[0]
 ok(f"05 B1/B2 覆盖尝试后 pick_op 30 仍为 {r}") if r == "CONFIRM/1000/ok/11" else bad(f"pick_op 30 = {r}")
 r = one("SELECT count(*)||'/'||max(qty_milli) FROM return_record WHERE code='RR-11'")[0]
