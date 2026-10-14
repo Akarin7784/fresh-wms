@@ -447,17 +447,33 @@ BEGIN                                                                           
        OR NEW.hold_type IS DISTINCT FROM OLD.hold_type OR NEW.reason_code IS DISTINCT FROM OLD.reason_code    -- @pg-only
        OR NEW.source_type IS DISTINCT FROM OLD.source_type OR NEW.source_id IS DISTINCT FROM OLD.source_id    -- @pg-only
        OR NEW.op_key IS DISTINCT FROM OLD.op_key OR NEW.hold_qty_milli IS DISTINCT FROM OLD.hold_qty_milli   -- @pg-only
-       OR NEW.operator_id IS DISTINCT FROM OLD.operator_id OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN  -- @pg-only
+       OR NEW.operator_id IS DISTINCT FROM OLD.operator_id OR NEW.created_at IS DISTINCT FROM OLD.created_at  -- @pg-only
+       OR NEW.released_qty_milli < OLD.released_qty_milli  -- R1 释放量只增不减 -- @pg-only
+       OR (OLD.status = 'RELEASED' AND NEW.status <> 'RELEASED') THEN  -- R1 RELEASED 不能回 HELD -- @pg-only
         RAISE EXCEPTION 'hold_immutable' USING ERRCODE = '23514';                                            -- @pg-only
     END IF;                                                                                                   -- @pg-only
     RETURN NEW;                                                                                               -- @pg-only
 END $$;                                                                                                       -- @pg-only
 CREATE TRIGGER trg_hold_immutable BEFORE UPDATE ON stock_hold FOR EACH ROW EXECUTE FUNCTION trg_hold_immutable();  -- @pg-only
+-- R2：冻结明细不可删除（wms_app 本就没有 DELETE/TRUNCATE 权限；这里兜底超级用户/迁移脚本，与流水表写法一致）
+CREATE FUNCTION trg_hold_no_delete() RETURNS trigger LANGUAGE plpgsql AS $$                                -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    RAISE EXCEPTION 'hold_immutable' USING ERRCODE = '23514';                                                -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_hold_no_delete   BEFORE DELETE   ON stock_hold FOR EACH ROW       EXECUTE FUNCTION trg_hold_no_delete();  -- @pg-only
+CREATE TRIGGER trg_hold_no_truncate BEFORE TRUNCATE ON stock_hold FOR EACH STATEMENT EXECUTE FUNCTION trg_hold_no_delete();  -- @pg-only
 -- @sqlite-only CREATE TRIGGER trg_hold_immutable BEFORE UPDATE ON stock_hold
 -- @sqlite-only WHEN NEW.id IS NOT OLD.id OR NEW.stock_id IS NOT OLD.stock_id OR NEW.hold_type IS NOT OLD.hold_type OR NEW.reason_code IS NOT OLD.reason_code
 -- @sqlite-only   OR NEW.source_type IS NOT OLD.source_type OR NEW.source_id IS NOT OLD.source_id OR NEW.op_key IS NOT OLD.op_key
 -- @sqlite-only   OR NEW.hold_qty_milli IS NOT OLD.hold_qty_milli OR NEW.operator_id IS NOT OLD.operator_id OR NEW.created_at IS NOT OLD.created_at
+-- @sqlite-only   OR NEW.released_qty_milli < OLD.released_qty_milli OR (OLD.status = 'RELEASED' AND NEW.status <> 'RELEASED')
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'hold_immutable'); END;
+-- R2（SQLite）：拒删除；REPLACE 冲突时删旧行在 recursive_triggers=OFF（默认，且是连接级开关）下不触发 DELETE 触发器，
+-- 所以另用 BEFORE INSERT 在 id / op_key 已存在时直接 ABORT，REPLACE 走不到删除那一步（库级生效，不依赖连接设置）
+-- @sqlite-only CREATE TRIGGER trg_hold_no_delete BEFORE DELETE ON stock_hold BEGIN SELECT RAISE(ABORT, 'hold_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_hold_no_replace BEFORE INSERT ON stock_hold
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM stock_hold h WHERE h.id = NEW.id OR h.op_key = NEW.op_key)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'hold_duplicate'); END;
 
 -- 只追加：流水表与去重表禁止 UPDATE / DELETE。PG 侧收回应用角色权限 + 触发器（防超级用户/运维脚本误操作）；SQLite 侧触发器
 CREATE FUNCTION trg_append_only() RETURNS trigger LANGUAGE plpgsql AS $$                                   -- @pg-only
