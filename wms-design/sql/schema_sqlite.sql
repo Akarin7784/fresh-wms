@@ -1,8 +1,9 @@
--- 本文件由 sql/verify_sqlite.py 从 schema_postgres.sql 机械生成，请勿手改。
--- 翻译产生的改动共 3 类：
+-- 本文件由 sql/verify_sqlite.py 从 sql/schema/*.sql 按加载顺序机械生成，请勿手改。
+-- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
---   2. 38 处 DEFAULT now() → DEFAULT (datetime('now'))（表达式默认值需括号）
---   3. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
+--   2. 39 处 DEFAULT now()、3 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
+--   3. 方言专属行：删除 159 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 65 行 @sqlite-only（等价触发器）
+--   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
 --  生鲜配送中心 WMS —— 核心表结构（PostgreSQL 16 方言）
@@ -13,7 +14,6 @@
 --  3. SQLite 差异见每张表末尾的 "-- [SQLite]" 注释，以及 §3.1 的十条规则。
 --  4. 所有主键由应用层生成（号段），不用数据库自增 —— 见 D1/R1。
 -- =============================================================================
-
 
 
 -- -----------------------------------------------------------------------------
@@ -141,13 +141,14 @@ CREATE TABLE lot (
     id                  BIGINT       PRIMARY KEY,
     sku_id              BIGINT       NOT NULL,
     lot_code            VARCHAR(64)  NOT NULL,
-    production_date     TIMESTAMP,
-    expiry_date         TIMESTAMP    NOT NULL,          -- FEFO 排序键
+    production_date     DATE,                           -- 日历日（04 I5）
+    expiry_date         DATE         NOT NULL,          -- FEFO 排序键；日历日，禁发期按仓库时区自然日计算（04 I5）
     receive_date        TIMESTAMP    NOT NULL,
     supplier_id         BIGINT,
     origin_batch        VARCHAR(64),
     quality_status      VARCHAR(16)  NOT NULL DEFAULT 'QUALIFIED',
     remaining_life_days SMALLINT     NOT NULL DEFAULT 9999,  -- 冗余，定时刷新
+    sell_deadline       DATE,                           -- 可售截止日 = COALESCE(production_date, receive_date 的日期) + sku.sell_days；sku.sell_days 为空时为 NULL。建档写入后不可改（trg_lot_sell_deadline：含 NULL→日期、改早、改晚、清空）
     cert_no             VARCHAR(64),                    -- 检疫合格证等
     created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     updated_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
@@ -156,7 +157,10 @@ CREATE TABLE lot (
 CREATE INDEX ix_lot_expiry ON lot(sku_id, expiry_date) WHERE quality_status = 'QUALIFIED';
 CREATE INDEX ix_lot_aging  ON lot(remaining_life_days, sku_id);
 -- [SQLite] 两个部分索引均支持；ix_lot_aging 支撑效期预警列表
-
+-- sell_deadline 建档固定、不回溯：其余列仍可更新，只有这一列（含 NULL）写入后不可改
+CREATE TRIGGER trg_lot_sell_deadline BEFORE UPDATE ON lot
+WHEN NEW.sell_deadline IS NOT OLD.sell_deadline
+BEGIN SELECT RAISE(ABORT, 'sell_deadline_immutable'); END;
 -- -----------------------------------------------------------------------------
 -- 库存（核心）
 -- -----------------------------------------------------------------------------
@@ -178,10 +182,10 @@ CREATE TABLE stock (
     on_hand_qty_milli       BIGINT          NOT NULL DEFAULT 0,   -- 在库总量
     allocated_qty_milli     BIGINT          NOT NULL DEFAULT 0,   -- 已分配未拣（= ALLOCATE 占用汇总）
     reserved_qty_milli      BIGINT          NOT NULL DEFAULT 0,   -- 已预占（= RESERVE 占用汇总）
-    quality_hold_qty_milli  BIGINT          NOT NULL DEFAULT 0,   -- 质检/盘点冻结（= QUALITY 冻结汇总）
-    frozen_qty_milli        BIGINT          NOT NULL DEFAULT 0,   -- 人工冻结（= MANUAL 冻结汇总）
+    quality_hold_qty_milli  BIGINT          NOT NULL DEFAULT 0,   -- 质检/盘点冻结（= QUALITY + RETURN_QC 冻结汇总）
+    hold_qty_milli        BIGINT          NOT NULL DEFAULT 0,   -- 冻结（= MANUAL + RETURN_PENDING + SCRAP_PENDING + PROCESSING + LIVE_HOLD 冻结汇总），从 available 扣除，FEFO 分不到
 
-    ledger_seq              BIGINT          NOT NULL DEFAULT 0,   -- 本行 on_hand 变更计数，与流水 stock_seq 一一对应（快照水位线）
+    ledger_seq              BIGINT          NOT NULL DEFAULT 0,   -- 本行 on_hand 变更计数，与流水 stock_seq 一一对应（快照水位线）；期初/迁移行的第 1 条流水是 OPENING
     version                 BIGINT          NOT NULL DEFAULT 0,
     created_at              TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     updated_at              TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
@@ -197,13 +201,13 @@ CREATE TABLE stock (
         AND allocated_qty_milli = CAST(allocated_qty_milli AS BIGINT)
         AND reserved_qty_milli = CAST(reserved_qty_milli AS BIGINT)
         AND quality_hold_qty_milli = CAST(quality_hold_qty_milli AS BIGINT)
-        AND frozen_qty_milli = CAST(frozen_qty_milli AS BIGINT)
+        AND hold_qty_milli = CAST(hold_qty_milli AS BIGINT)
     ),
     -- 数据库层兜底不变量 I1/I2：即使 Service 写错，也不会出现负数或超占
     CONSTRAINT ck_stock_nonneg CHECK (
         on_hand_qty_milli >= 0 AND allocated_qty_milli >= 0 AND reserved_qty_milli >= 0
-        AND quality_hold_qty_milli >= 0 AND frozen_qty_milli >= 0
-        AND (allocated_qty_milli + reserved_qty_milli + quality_hold_qty_milli + frozen_qty_milli) <= on_hand_qty_milli
+        AND quality_hold_qty_milli >= 0 AND hold_qty_milli >= 0
+        AND (allocated_qty_milli + reserved_qty_milli + quality_hold_qty_milli + hold_qty_milli) <= on_hand_qty_milli
     )
 );
 CREATE INDEX ix_stock_sku_avail ON stock(sku_id, warehouse_id, lot_id) WHERE on_hand_qty_milli > 0;
@@ -219,11 +223,11 @@ CREATE TABLE stock_reservation (
     source_type         VARCHAR(24)     NOT NULL,   -- OUTBOUND_LINE/WAVE/COUNT/MANUAL
     source_id           BIGINT          NOT NULL,
     source_line_id      BIGINT          NOT NULL DEFAULT 0,   -- R11：0 哨兵
-    op_key              VARCHAR(80)     NOT NULL,   -- 占用操作幂等键，调用方给定
+    op_key              VARCHAR(80)     NOT NULL,   -- RES:{doc_no}:{line_no}:{alloc_round}:{stock_id}；alloc_round 在出库行上，每次重新分配 +1
     reserve_qty_milli   BIGINT          NOT NULL,
     consumed_qty_milli  BIGINT          NOT NULL DEFAULT 0,
     released_qty_milli  BIGINT          NOT NULL DEFAULT 0,
-    status              VARCHAR(16)     NOT NULL DEFAULT 'RESERVED',  -- RESERVED/CONSUMED/RELEASED
+    status              VARCHAR(16)     NOT NULL DEFAULT 'RESERVED',  -- RESERVED/CONSUMED/RELEASED，由余量决定
     expires_at          TIMESTAMP,                  -- 超时自动释放，防死锁
     version             BIGINT          NOT NULL DEFAULT 0,
     created_at          TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
@@ -238,6 +242,13 @@ CREATE TABLE stock_reservation (
     CONSTRAINT ck_res CHECK (
         reserve_qty_milli > 0 AND consumed_qty_milli >= 0 AND released_qty_milli >= 0
         AND consumed_qty_milli + released_qty_milli <= reserve_qty_milli
+    ),
+    -- 状态与余量绑定（超量由 ck_res 单独拦）：余量>0 ⇔ RESERVED；余量=0 时有消耗为 CONSUMED，否则 RELEASED。
+    -- 这样过期任务按 status='RESERVED'（ix_res_exp）一定能找到所有还占着量的记录
+    CONSTRAINT ck_res_status CHECK (
+        (status = 'RESERVED' AND consumed_qty_milli + released_qty_milli < reserve_qty_milli)
+        OR (status = 'CONSUMED' AND consumed_qty_milli + released_qty_milli >= reserve_qty_milli AND consumed_qty_milli > 0)
+        OR (status = 'RELEASED' AND consumed_qty_milli + released_qty_milli >= reserve_qty_milli AND consumed_qty_milli = 0)
     )
 );
 CREATE INDEX ix_res_stock  ON stock_reservation(stock_id, stage, status);
@@ -247,35 +258,155 @@ CREATE INDEX ix_res_exp    ON stock_reservation(expires_at) WHERE status = 'RESE
 CREATE TABLE stock_hold (
     id                  BIGINT          PRIMARY KEY,
     stock_id            BIGINT          NOT NULL,
-    hold_type           VARCHAR(16)     NOT NULL,   -- QUALITY（计入 quality_hold）/ MANUAL（计入 frozen）
-    reason_code         VARCHAR(24)     NOT NULL,
-    source_type         VARCHAR(24)     NOT NULL,   -- INBOUND_QC/COUNT/RETURN/EXCEPTION/MANUAL
+    hold_type           VARCHAR(16)     NOT NULL,   -- QUALITY、RETURN_QC → quality_hold；MANUAL、RETURN_PENDING、SCRAP_PENDING、PROCESSING、LIVE_HOLD → hold_qty
+    reason_code         VARCHAR(24)     NOT NULL,   -- 见 ck_hold_reason；新增原因走迁移
+    source_type         VARCHAR(24)     NOT NULL,   -- INBOUND_QC/QC/COUNT/RETURN/EXCEPTION/MANUAL/RETURN_RECORD/SCRAP/PROCESS_ORDER/LIVE_TANK_HOLD
     source_id           BIGINT          NOT NULL DEFAULT 0,
-    op_key              VARCHAR(80)     NOT NULL,
+    op_key              VARCHAR(80)     NOT NULL,   -- RETURN_PENDING 固定 RRH:{return_record_id}；convert_hold 的 op_key 由调用方传入（全量常用 CVT:{原 hold_id}，部分用 CVT:{line_id}:{op_seq}）；PROCESSING 必须 PRCI:（大小写敏感）
     hold_qty_milli      BIGINT          NOT NULL,
     released_qty_milli  BIGINT          NOT NULL DEFAULT 0,
-    status              VARCHAR(16)     NOT NULL DEFAULT 'HELD',      -- HELD/RELEASED
-    operator_id         BIGINT          NOT NULL,
+    status              VARCHAR(16)     NOT NULL DEFAULT 'HELD',      -- HELD/RELEASED，由余量决定
+    operator_id         BIGINT          NOT NULL,   -- 系统冻结填 0
+    approval_type       VARCHAR(24),                -- 需要审批的转换才填：SCRAP_MISREPORT（SCRAP_PENDING → RETURN_QC 误报回转）
+    approval_no         VARCHAR(64),                -- 审批单号
+    is_reversal         BOOLEAN         NOT NULL DEFAULT false,  -- 误报回转明细（SCRAP_PENDING → RETURN_QC）显式标记，替代 op_key LIKE 'CVT:%' 识别（小赵 N1）
+    from_hold_id        BIGINT,                 -- convert_hold 子明细指向被转出的父冻结；一条父冻结可多次部分转出。I3e 按此汇总，不再用 op_key = 'CVT:' || id
     version             BIGINT          NOT NULL DEFAULT 0,
     created_at          TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     updated_at          TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT uq_hold_op UNIQUE (op_key),
-    CONSTRAINT ck_hold_type CHECK (hold_type IN ('QUALITY','MANUAL')),
+    CONSTRAINT ck_hold_type CHECK (hold_type IN ('QUALITY','RETURN_QC','MANUAL','RETURN_PENDING','SCRAP_PENDING','PROCESSING','LIVE_HOLD')),
+    -- 一套方案：hold_type 是大类（决定计入哪一列），reason_code 是细分原因，二者成对约束。
+    -- PROCESSING / LIVE_HOLD 由本篇统一收进码表；#12/#13 不要再改这条 CHECK。
+    CONSTRAINT ck_hold_reason CHECK (
+        hold_type NOT IN ('QUALITY','RETURN_QC','MANUAL','RETURN_PENDING','SCRAP_PENDING','PROCESSING','LIVE_HOLD')      -- 类型非法交给 ck_hold_type 报，避免两条约束同时报
+        OR (hold_type = 'QUALITY'        AND reason_code IN ('QC_PENDING','COUNT_LOCK'))
+        OR (hold_type = 'RETURN_QC'      AND reason_code = 'RETURN_QC')     -- 退货待检（A3：系统冻结，只能由质检 release_qc_hold 释放）
+        OR (hold_type = 'MANUAL'      AND reason_code IN ('DAMAGE','EXCEPTION','OTHER'))
+        OR (hold_type = 'RETURN_PENDING' AND reason_code = 'RETURN_PENDING')
+        OR (hold_type = 'SCRAP_PENDING'  AND reason_code = 'SCRAP')        -- 报损待处置（convert_hold 自 RETURN_PENDING 转入，docs/02 §7.1.1）
+        OR (hold_type = 'PROCESSING'     AND reason_code = 'PROCESSING')   -- 加工领料系统锁（第 17 篇 place_hold）
+        OR (hold_type = 'LIVE_HOLD'      AND reason_code = 'LIVE_HOLD')    -- 活鲜暂存系统锁（第 18 篇 place_hold）
+    ),
+    -- RETURN_PENDING 是系统冻结：必须挂在一条待回库记录上、operator_id=0；人工解冻接口拒绝它（应用层），只能由 confirm/resolve 同事务释放
+    CONSTRAINT ck_hold_return CHECK (
+        hold_type <> 'RETURN_PENDING'
+        OR (source_type = 'RETURN_RECORD' AND source_id > 0 AND operator_id = 0)
+    ),
+    -- SCRAP_PENDING 也是系统冻结：挂报损单（source_type=SCRAP）、operator_id=0；人工解冻拒绝（40933，应用层），只能由第 9 篇报损完成/撤销释放
+    -- RETURN_QC 系统冻结（A3）：挂质检单（source_type=QC，source_id=质检单 id）、operator_id=0；人工解冻拒绝（40933），只能由 release_qc_hold 释放
+    CONSTRAINT ck_hold_retqc CHECK (
+        hold_type <> 'RETURN_QC'
+        OR (source_type = 'QC' AND source_id > 0 AND operator_id = 0)
+    ),
+    -- 误报回转（SCRAP_PENDING → RETURN_QC，convert_hold 生成 op_key=CVT:{原 hold_id}）必须带 SCRAP_MISREPORT 审批单号；其余明细不带审批
+    CONSTRAINT ck_hold_approval CHECK (
+        (NOT is_reversal AND approval_type IS NULL AND approval_no IS NULL)
+        OR (is_reversal AND approval_type = 'SCRAP_MISREPORT' AND approval_no IS NOT NULL AND length(approval_no) > 0)
+    ),
+    -- 回转标记与类型/op_key 双向一致：只有 RETURN_QC 能是回转，RETURN_QC 的 CVT 明细必须标回转（防止不带审批伪造回转）
+    -- LIKE 在 PG 区分大小写、在 SQLite 默认不区分；回转前缀用 GLOB（SQLite 区分大小写）对齐，避免 'cvt:' 在 SQLite 被当成回转
+    CONSTRAINT ck_hold_reversal_key CHECK (is_reversal = (hold_type = 'RETURN_QC' AND op_key GLOB 'CVT:*')),
+    -- 审批单号格式 APR-{仓库编码}-{yyyyMMdd}-{6 位数字}；仓库编码字符集 [A-Z0-9]{2,16}（以第 1 篇 #8 为准）
+    CONSTRAINT ck_hold_approval_no CHECK (approval_no IS NULL OR (
+        length(approval_no) BETWEEN 22 AND 36 AND substr(approval_no, 1, 4) = 'APR-'
+        AND substr(approval_no, 5, length(approval_no) - 20) NOT GLOB '*[^A-Z0-9]*'
+        AND substr(approval_no, -16) GLOB '-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]'
+        AND (substr(approval_no, -11, 2) GLOB '0[1-9]' OR substr(approval_no, -11, 2) GLOB '1[0-2]')
+        AND (substr(approval_no, -9, 2) GLOB '0[1-9]' OR substr(approval_no, -9, 2) GLOB '[12][0-9]' OR substr(approval_no, -9, 2) GLOB '3[01]')
+        -- 真实日历日（N1）：SQLite date() 会把 02-30 规范成 03-02，与原串不等即拒
+        AND substr(approval_no, -15, 4) <> '0000'
+        AND date(substr(approval_no, -15, 4) || '-' || substr(approval_no, -11, 2) || '-' || substr(approval_no, -9, 2)) = substr(approval_no, -15, 4) || '-' || substr(approval_no, -11, 2) || '-' || substr(approval_no, -9, 2))),
+    CONSTRAINT ck_hold_scrap CHECK (
+        hold_type <> 'SCRAP_PENDING'
+        OR (source_type = 'SCRAP' AND source_id > 0 AND operator_id = 0)
+    ),
+    CONSTRAINT fk_hold_from FOREIGN KEY (from_hold_id) REFERENCES stock_hold(id),
+    CONSTRAINT ck_hold_from CHECK (from_hold_id IS NULL OR from_hold_id <> id),
+    -- PROCESSING：挂加工单、系统操作员、op_key 前缀 PRCI:（大小写敏感，同 CVT 的方言拆分）
+    CONSTRAINT ck_hold_process CHECK (
+        hold_type <> 'PROCESSING'
+        OR (source_type = 'PROCESS_ORDER' AND source_id > 0 AND operator_id = 0 AND op_key GLOB 'PRCI:*')
+    ),
+    -- LIVE_HOLD：挂活鲜暂养冻结单。不强制 op_key 前缀（第 18 篇没有规定前缀，强制会拒掉合法插入）
+    CONSTRAINT ck_hold_live CHECK (
+        hold_type <> 'LIVE_HOLD'
+        OR (source_type = 'LIVE_TANK_HOLD' AND source_id > 0 AND operator_id = 0)
+    ),
     CONSTRAINT ck_hold_int CHECK (
         hold_qty_milli = CAST(hold_qty_milli AS BIGINT)
         AND released_qty_milli = CAST(released_qty_milli AS BIGINT)
     ),
-    CONSTRAINT ck_hold CHECK (hold_qty_milli > 0 AND released_qty_milli >= 0 AND released_qty_milli <= hold_qty_milli)
+    CONSTRAINT ck_hold CHECK (hold_qty_milli > 0 AND released_qty_milli >= 0 AND released_qty_milli <= hold_qty_milli),
+    CONSTRAINT ck_hold_status CHECK (
+        (status = 'HELD' AND released_qty_milli < hold_qty_milli)
+        OR (status = 'RELEASED' AND released_qty_milli >= hold_qty_milli)   -- 超释放由 ck_hold 单独拦
+    )
 );
 CREATE INDEX ix_hold_stock ON stock_hold(stock_id, hold_type, status);
+CREATE UNIQUE INDEX uq_hold_return ON stock_hold(source_id) WHERE hold_type = 'RETURN_PENDING';
+-- 非唯一：一条父冻结可以多次部分转出，多条子明细共享同一个 from_hold_id
+CREATE INDEX ix_hold_from ON stock_hold(from_hold_id) WHERE from_hold_id IS NOT NULL;
+
+-- 冻结部分释放的操作去重（A3，release_qc_hold / release_hold）：一次释放一行，op_key 由调用方传入（质检如 QCR:{inbound_line_id}:{op_seq}），
+-- 与 inbound_line.qc_passed 累加、stock_hold 释放、stock.quality_hold 扣减同一事务；重放撞 uq_hr_op → 整个事务回滚，不重复解冻。只追加。
+-- 没有 qc_line 表。质检单 = inbound_order，质检行 = inbound_line（第 3/10 篇）。本表 source 不存行 id。
+CREATE TABLE stock_hold_release (
+    id                  BIGINT          PRIMARY KEY,
+    hold_id             BIGINT          NOT NULL,
+    op_key              VARCHAR(80)     NOT NULL,
+    qty_milli           BIGINT          NOT NULL,
+    created_at          TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT uq_hr_op UNIQUE (op_key),
+    CONSTRAINT fk_hr_hold FOREIGN KEY (hold_id) REFERENCES stock_hold(id),   -- 小赵 S6：释放记录必须挂在真实冻结上
+    CONSTRAINT ck_hr_qty CHECK (qty_milli > 0 AND qty_milli = CAST(qty_milli AS BIGINT))
+);
+CREATE INDEX ix_hr_hold ON stock_hold_release(hold_id);
+CREATE TRIGGER trg_hr_no_update BEFORE UPDATE ON stock_hold_release BEGIN SELECT RAISE(ABORT, 'hold_immutable'); END;
+CREATE TRIGGER trg_hr_no_delete BEFORE DELETE ON stock_hold_release BEGIN SELECT RAISE(ABORT, 'hold_immutable'); END;
+-- 小赵 Q1：REPLACE 冲突删旧行不触发 DELETE 触发器，同 trg_hold_no_replace 用 BEFORE INSERT 先拦（重放撞这里，按 op_key 查回）
+CREATE TRIGGER trg_hr_no_replace BEFORE INSERT ON stock_hold_release
+WHEN EXISTS (SELECT 1 FROM stock_hold_release r WHERE r.id = NEW.id OR r.op_key = NEW.op_key)
+BEGIN SELECT RAISE(ABORT, 'hold_duplicate'); END;
+-- ↑ 一条待回库记录最多一条 RETURN_PENDING 冻结（重复拒收复用已有记录，不会重复冻结）。
+--   只约束 RETURN_PENDING：convert_hold 转出的报损明细（SCRAP_PENDING/SCRAP）不受它约束（小赵 D1）
 -- 原文档 §4.2"冻结记 stock_freeze"在此落地为 stock_hold，使 quality_hold/frozen 与 allocated/reserved 一样可对账（I3）
 
+-- 记账去重表：不分区，承载所有流水业务唯一键。每条流水在同一事务里写一行，撞任一唯一键 → 整个事务回滚。
+CREATE TABLE stock_movement_key (
+    movement_id         BIGINT          PRIMARY KEY,    -- = stock_movement.id（雪花 ID 跨分区也唯一）
+    idempotency_key     VARCHAR(160)    NOT NULL,       -- 唯一格式 {biz_no}:{line_no}:{op_ref}:{leg}，op_ref = D{op_no} | P{device_instance_id}.{op_seq}
+    biz_no              VARCHAR(64)     NOT NULL,
+    line_no             INT             NOT NULL,
+    op_no               INT             NOT NULL,
+    leg                 SMALLINT        NOT NULL,
+    src_kind            VARCHAR(8)      NOT NULL,
+    src_task_id         BIGINT,
+    src_line_no         INT,
+    device_instance_id  VARCHAR(64),
+    src_op_seq          INT,
+    stock_id            BIGINT          NOT NULL,
+    stock_seq           BIGINT          NOT NULL,
+    direction           SMALLINT        NOT NULL,
+    occurred_at         TIMESTAMP       NOT NULL,       -- 冗余，便于按 key 找到所在分区
+    CONSTRAINT uq_mvk_idem UNIQUE (idempotency_key),
+    CONSTRAINT ck_mvk_kind CHECK (
+        (src_kind = 'DOC' AND src_task_id IS NULL AND src_line_no IS NULL AND device_instance_id IS NULL AND src_op_seq IS NULL AND op_no >= 1)
+        OR (src_kind = 'PDA' AND src_task_id IS NOT NULL AND src_line_no IS NOT NULL AND device_instance_id IS NOT NULL AND src_op_seq IS NOT NULL AND op_no = 0)
+    ),
+    -- 流水外键 fk_mv_key 的被引用键：流水的 id 与全部非空业务列必须和 key 行逐列一致（小赵 C2）
+    CONSTRAINT uq_mvk_mv UNIQUE (movement_id, idempotency_key, biz_no, line_no, op_no, leg, src_kind, stock_id, stock_seq, direction, occurred_at)
+);
+-- 流水主表：只追加。PG 侧按月 RANGE 分区（分区表的唯一约束必须含分区键，只能保证分区内唯一），
+-- 所以所有业务唯一键都放到不分区的 stock_movement_key，同一事务写入（见 docs/02 §4.4）。
 CREATE TABLE stock_movement (
-    id                          BIGINT          PRIMARY KEY,
+    id                          BIGINT          NOT NULL,
     biz_no                      VARCHAR(64)     NOT NULL,
     line_no                     INT             NOT NULL,   -- 业务单据行号；无行的单据填 1
+    op_no                       INT             NOT NULL DEFAULT 1,  -- 非 PDA：调用方在该行上的第几次操作（如分批收货）；PDA 恒 0
     leg                         SMALLINT        NOT NULL DEFAULT 1,  -- 同一操作的第几条腿：拣货/收货恒 1；移库/上架 1=出 2=入
-    biz_type                    VARCHAR(24)     NOT NULL,
+    src_kind                    VARCHAR(8)      NOT NULL,   -- DOC / PDA
+    biz_type                    VARCHAR(24)     NOT NULL,   -- RECEIVE/PUTAWAY/PICK/REVERSE_PICK/SHIP/MOVE/ADJUST/COUNT/RETURN/SCRAP/CROSS_DOCK/OPENING/PROCESS_ISSUE/PROCESS_CONSUME/PROCESS_OUTPUT/PROCESS_REVERSE（无 CHECK，第 17 篇登记）
     direction                   SMALLINT        NOT NULL,   -- 1 入 / -1 出 / 0 纯事件（如 SHIP，不改 on_hand）
     stock_id                    BIGINT          NOT NULL,   -- 记账到哪一行库存，按行回放的依据
     stock_seq                   BIGINT          NOT NULL,   -- = 该次条件 UPDATE 后的 stock.ledger_seq；direction=0 时填当前 ledger_seq（不入链）
@@ -285,7 +416,7 @@ CREATE TABLE stock_movement (
     sku_id                      BIGINT          NOT NULL,
     lot_id                      BIGINT          NOT NULL,
     container_id                BIGINT          NOT NULL DEFAULT 0,
-    -- PDA 作业来源 = 第 5 篇业务幂等键 (task_id, line_no, device_instance_id, op_seq)；非 PDA 作业四列全 NULL
+    -- PDA 作业来源 = 00 总体设计 §6.5 四元组 (task_id, line_no, device_instance_id, op_seq)；DOC 行四列全 NULL
     src_task_id                 BIGINT,
     src_line_no                 INT,
     device_instance_id          VARCHAR(64),
@@ -298,13 +429,13 @@ CREATE TABLE stock_movement (
     occurred_at                 TIMESTAMP       NOT NULL,
     recorded_at                 TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     cost_amount                 BIGINT,                     -- 分
-    idempotency_key             VARCHAR(80)     NOT NULL,   -- = {biz_type}:{biz_no}:{line_no}:{leg}
+    idempotency_key             VARCHAR(160)    NOT NULL,   -- 唯一格式见 stock_movement_key
     remark                      VARCHAR(256),
-    CONSTRAINT uq_mv_idem UNIQUE (idempotency_key),
+    PRIMARY KEY (id, occurred_at),
     CONSTRAINT ck_mv_dir     CHECK (direction IN (-1, 0, 1)),
-    CONSTRAINT ck_mv_pda_src CHECK (   -- 业务键四列同生同灭，避免半截键让 uq_mv_pda_op 静默失效（R11 同类问题）
-        (src_task_id IS NULL AND src_line_no IS NULL AND device_instance_id IS NULL AND src_op_seq IS NULL)
-        OR (src_task_id IS NOT NULL AND src_line_no IS NOT NULL AND device_instance_id IS NOT NULL AND src_op_seq IS NOT NULL)
+    CONSTRAINT ck_mv_kind    CHECK (
+        (src_kind = 'DOC' AND src_task_id IS NULL AND src_line_no IS NULL AND device_instance_id IS NULL AND src_op_seq IS NULL AND op_no >= 1)
+        OR (src_kind = 'PDA' AND src_task_id IS NOT NULL AND src_line_no IS NOT NULL AND device_instance_id IS NOT NULL AND src_op_seq IS NOT NULL AND op_no = 0)
     ),
     CONSTRAINT ck_mv_int     CHECK (
         move_qty_milli = CAST(move_qty_milli AS BIGINT)
@@ -312,23 +443,84 @@ CREATE TABLE stock_movement (
         AND on_hand_after_qty_milli = CAST(on_hand_after_qty_milli AS BIGINT)
     ),
     CONSTRAINT ck_mv_pos     CHECK (move_qty_milli > 0 AND on_hand_after_qty_milli >= 0),
-    CONSTRAINT ck_mv_balance CHECK (on_hand_after_qty_milli = on_hand_before_qty_milli + move_qty_milli * direction)
-);
+    CONSTRAINT ck_mv_balance CHECK (on_hand_after_qty_milli = on_hand_before_qty_milli + move_qty_milli * direction),
+    CONSTRAINT ck_mv_opening CHECK (biz_type <> 'OPENING' OR (direction = 1 AND stock_seq = 1 AND on_hand_before_qty_milli = 0)),
+    -- 库层绑定（小赵 C2）：没有对应 key 行、或 key 行内容对不上，流水写不进去。
+    -- 只列 NOT NULL 列：MATCH SIMPLE 下任一列为 NULL 会跳过整条外键检查；PDA 四元组由 ck_mv_kind / ck_mvk_kind + uq_mvk_pda_op 管。
+    -- DEFERRABLE INITIALLY DEFERRED：提交时检查，同一事务内流水与 key 的写入顺序不限。
+    -- PG 11+ 支持分区表引用普通表的外键，所以这里不用触发器；SQLite 需每个连接 PRAGMA foreign_keys = ON（docs/02 §4.8）。
+    CONSTRAINT fk_mv_key FOREIGN KEY (id, idempotency_key, biz_no, line_no, op_no, leg, src_kind, stock_id, stock_seq, direction, occurred_at)
+        REFERENCES stock_movement_key (movement_id, idempotency_key, biz_no, line_no, op_no, leg, src_kind, stock_id, stock_seq, direction, occurred_at)
+        DEFERRABLE INITIALLY DEFERRED
+)
+;
 CREATE INDEX ix_mv_biz      ON stock_movement(biz_type, biz_no);
-CREATE UNIQUE INDEX uq_mv_stock_seq ON stock_movement(stock_id, stock_seq) WHERE direction <> 0;
--- ↑ 每行库存的记账链无分叉：同一 stock 同一序号只能有一条改 on_hand 的流水；direction=0 的事件流水不入链
 CREATE INDEX ix_mv_stock    ON stock_movement(stock_id, stock_seq);
-CREATE UNIQUE INDEX uq_mv_biz_line ON stock_movement(biz_no, line_no, leg) WHERE src_task_id IS NULL;
--- ↑ 非 PDA 单据：同一单据行同一腿只能过账一次，重复过账在库层冲突
-CREATE UNIQUE INDEX uq_mv_pda_op ON stock_movement(src_task_id, src_line_no, device_instance_id, src_op_seq, leg)
-    WHERE src_task_id IS NOT NULL;
--- ↑ PDA 作业：Idempotency-Key 过期（24h）后重放同一操作，第 5 篇业务键在记账层兜底，不会二次扣减。
---   leg 由操作类型决定（拣货恒 1；移库 1=出 2=入），不是计数器，所以重放拿到的 leg 相同。
---   一行任务可多次操作（部分确认、撤销），由 op_seq 区分，不占用 uq_mv_biz_line。
 CREATE INDEX ix_mv_time     ON stock_movement(warehouse_id, occurred_at DESC);
 CREATE INDEX ix_mv_sku_time ON stock_movement(sku_id, occurred_at DESC);
--- 这张表只 INSERT，REVOKE UPDATE/DELETE。I5 不变量由 ck_mv_balance 在库层兜底。
--- 数据量大：PG 侧按月 RANGE 分区；SQLite 侧按月归档导出。
+-- 数据量大：PG 侧按月 RANGE 分区（分区由运维任务提前一个月建好，DEFAULT 分区兜底）；SQLite 侧按月归档导出。
+
+CREATE UNIQUE INDEX uq_mvk_biz_line  ON stock_movement_key(biz_no, line_no, op_no, leg) WHERE src_kind = 'DOC';
+CREATE UNIQUE INDEX uq_mvk_pda_op    ON stock_movement_key(src_task_id, src_line_no, device_instance_id, src_op_seq, leg) WHERE src_kind = 'PDA';
+CREATE UNIQUE INDEX uq_mvk_stock_seq ON stock_movement_key(stock_id, stock_seq) WHERE direction <> 0;
+-- ↑ 每行库存的记账链无分叉；direction=0 的事件流水不入链
+
+-- 单据行的记账来源归属：一行单据只能由 DOC 或 PDA 其中一种来源记账，二者互斥（docs/02 §8.4）
+CREATE TABLE stock_ledger_line (
+    biz_no          VARCHAR(64)     NOT NULL,
+    line_no         INT             NOT NULL,
+    src_kind        VARCHAR(8)      NOT NULL,
+    owner_device_instance_id VARCHAR(64),           -- PDA 行：当前唯一允许记账的设备实例；改派/重新领取时由第 5 篇条件更新换主
+    post_count      INT             NOT NULL DEFAULT 0,
+    created_at      TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
+    updated_at      TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (biz_no, line_no),
+    CONSTRAINT ck_sll_kind CHECK (
+        (src_kind = 'DOC' AND owner_device_instance_id IS NULL)
+        OR (src_kind = 'PDA' AND owner_device_instance_id IS NOT NULL)
+    )
+);
+
+-- 去重表与归属表绑定：写入 key 时，该单据行的归属必须已存在、来源一致，PDA 行还必须是当前持有设备（两库各一份触发器，语义相同）
+CREATE TRIGGER trg_mvk_line_kind BEFORE INSERT ON stock_movement_key
+WHEN NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = NEW.biz_no AND l.line_no = NEW.line_no AND l.src_kind = NEW.src_kind
+                 AND (NEW.src_kind = 'DOC' OR l.owner_device_instance_id = NEW.device_instance_id))
+BEGIN SELECT RAISE(ABORT, 'ledger_line_owner_mismatch'); END;
+
+-- 归属行的来源不可改（小赵 C3）：src_kind / biz_no / line_no 写入后禁止 UPDATE，否则把 PDA 行改成 DOC 就能绕过互斥
+CREATE TRIGGER trg_sll_immutable BEFORE UPDATE ON stock_ledger_line
+WHEN NEW.src_kind IS NOT OLD.src_kind OR NEW.biz_no IS NOT OLD.biz_no OR NEW.line_no IS NOT OLD.line_no
+BEGIN SELECT RAISE(ABORT, 'ledger_line_immutable'); END;
+
+-- 冻结明细写入后不可改（小赵 N1）：只放行释放路径要写的 released_qty_milli / status / version / updated_at。
+-- 类型转换只走 convert_hold（关旧建新），任何路径都不需要改 hold_type；否则先把 SCRAP_PENDING 改成 MANUAL 就能绕过 40933
+-- R2：冻结明细不可删除（wms_app 本就没有 DELETE/TRUNCATE 权限；这里兜底超级用户/迁移脚本，与流水表写法一致）
+-- stock_hold_release 只追加（A3）；TRUNCATE 也拦（小赵 S5）
+CREATE TRIGGER trg_hold_immutable BEFORE UPDATE ON stock_hold
+WHEN NEW.id IS NOT OLD.id OR NEW.stock_id IS NOT OLD.stock_id OR NEW.hold_type IS NOT OLD.hold_type OR NEW.reason_code IS NOT OLD.reason_code
+  OR NEW.source_type IS NOT OLD.source_type OR NEW.source_id IS NOT OLD.source_id OR NEW.op_key IS NOT OLD.op_key
+  OR NEW.hold_qty_milli IS NOT OLD.hold_qty_milli OR NEW.operator_id IS NOT OLD.operator_id OR NEW.created_at IS NOT OLD.created_at
+  OR NEW.approval_type IS NOT OLD.approval_type OR NEW.approval_no IS NOT OLD.approval_no OR NEW.is_reversal IS NOT OLD.is_reversal
+  OR NEW.from_hold_id IS NOT OLD.from_hold_id
+  OR NEW.released_qty_milli < OLD.released_qty_milli OR (OLD.status = 'RELEASED' AND NEW.status <> 'RELEASED')
+BEGIN SELECT RAISE(ABORT, 'hold_immutable'); END;
+-- R2（SQLite）：拒删除；REPLACE 冲突时删旧行在 recursive_triggers=OFF（默认，且是连接级开关）下不触发 DELETE 触发器，
+-- 所以另用 BEFORE INSERT 在 id / op_key 已存在时直接 ABORT，REPLACE 走不到删除那一步（库级生效，不依赖连接设置）
+CREATE TRIGGER trg_hold_no_delete BEFORE DELETE ON stock_hold BEGIN SELECT RAISE(ABORT, 'hold_immutable'); END;
+CREATE TRIGGER trg_hold_no_replace BEFORE INSERT ON stock_hold
+WHEN EXISTS (SELECT 1 FROM stock_hold h WHERE h.id = NEW.id OR h.op_key = NEW.op_key)
+BEGIN SELECT RAISE(ABORT, 'hold_duplicate'); END;
+
+-- 只追加：流水表与去重表禁止 UPDATE / DELETE。PG 侧收回应用角色权限 + 触发器（防超级用户/运维脚本误操作）；SQLite 侧触发器
+-- TRUNCATE 不触发行级触发器，单独加语句级触发器拦（小赵 C5）；归档走 DETACH PARTITION，不用 TRUNCATE
+-- 应用角色授权清单（小赵 C3，docs/02 §4.9）：库存类表只给 SELECT/INSERT/UPDATE，不给 DELETE/TRUNCATE；
+-- stock_ledger_line 只能改换主相关列（第 5 篇改派/重新领取），来源与单据行由 trg_sll_immutable 再拦一道（防超级用户/迁移脚本）
+-- stock_hold 只授释放相关列（小赵 N1）；其余列由 trg_hold_immutable 再拦一道（防超级用户/迁移脚本）
+CREATE TRIGGER trg_mv_no_update  BEFORE UPDATE ON stock_movement     BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement'); END;
+CREATE TRIGGER trg_mv_no_delete  BEFORE DELETE ON stock_movement     BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement'); END;
+CREATE TRIGGER trg_mvk_no_update BEFORE UPDATE ON stock_movement_key BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement_key'); END;
+CREATE TRIGGER trg_mvk_no_delete BEFORE DELETE ON stock_movement_key BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement_key'); END;
+-- 归档：PG 侧按分区 DETACH（DDL，不触发行级触发器，需 DBA 权限）；SQLite 侧导出后由维护脚本 DROP 触发器→删除→重建，全程审计
 
 CREATE TABLE stock_snapshot_daily (
     work_date               DATE            NOT NULL,
@@ -342,7 +534,7 @@ CREATE TABLE stock_snapshot_daily (
     allocated_qty_milli     BIGINT          NOT NULL,
     reserved_qty_milli      BIGINT          NOT NULL,
     quality_hold_qty_milli  BIGINT          NOT NULL,
-    frozen_qty_milli        BIGINT          NOT NULL,
+    hold_qty_milli        BIGINT          NOT NULL,
     ledger_seq              BIGINT          NOT NULL,   -- 快照水位线：回放该行 stock_seq <= ledger_seq 的流水应等于 on_hand
     cost_amount             BIGINT          NOT NULL DEFAULT 0,
     created_at              TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
@@ -352,20 +544,27 @@ CREATE INDEX ix_snap_sku ON stock_snapshot_daily(work_date, warehouse_id, sku_id
 
 CREATE TABLE stock_recon_alert (
     id                      BIGINT          PRIMARY KEY,
-    check_code              VARCHAR(16)     NOT NULL,   -- I3/I4/I5/SNAP
+    check_code              VARCHAR(24)     NOT NULL,   -- 码表见 ck_recon_code；CHECK_BOX_MISMATCH 18 位，16 放不下
     warehouse_id            BIGINT          NOT NULL,
-    stock_id                BIGINT          NOT NULL DEFAULT 0,
+    stock_id                BIGINT          NOT NULL DEFAULT 0,   -- 0 = 仓级汇总差异（R11）
     expected_qty_milli      BIGINT          NOT NULL,
     actual_qty_milli        BIGINT          NOT NULL,
     watermark_ledger_seq    BIGINT          NOT NULL DEFAULT 0,
+    hit_count               INT             NOT NULL DEFAULT 1,   -- 同一差异重复检出只累加，不新建
     status                  VARCHAR(16)     NOT NULL DEFAULT 'OPEN',   -- OPEN/ACKED/RESOLVED
     resolved_by             BIGINT,
     resolution              VARCHAR(256),
-    detected_at             TIMESTAMP       NOT NULL DEFAULT (datetime('now'))
+    detected_at             TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
+    last_seen_at            TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT ck_recon_status CHECK (status IN ('OPEN','ACKED','RESOLVED')),
+    CONSTRAINT ck_recon_code CHECK (check_code IN ('I3a','I3b','I3c','I3d','I3e','I4','I5','SNAP','RR_HOLD_FAILED','RR_HOLD_MISMATCH','CHECK_BOX_MISMATCH','SHIP_EVENT_MISSING','LIVE_COUNT_WEIGHT','LIVE_COUNT_LEDGER','LIVE_HOLD_MISMATCH','LIVE_INSPECT_OVERDUE'))   -- 码表见 docs/02 §4.6；活鲜四码见第 18 篇 §9 / Q6
 );
 CREATE INDEX ix_recon_open ON stock_recon_alert(warehouse_id, status, detected_at DESC);
--- 对账只告警不修数：本表只记录差异，任何修正必须走调整单（adjust_order）+ 审批生成新流水
+CREATE UNIQUE INDEX uq_recon_open ON stock_recon_alert(check_code, warehouse_id, stock_id) WHERE status <> 'RESOLVED';
+-- ↑ 未闭环的同一差异只有一条；对账任务用 INSERT … ON CONFLICT DO UPDATE SET hit_count = hit_count + 1, last_seen_at = …
+--   （PG 与 SQLite ≥ 3.24 写法相同；部分唯一索引作冲突目标时两库都要求带同样的 WHERE）
 
+-- 对账只告警不修数：本表只记录差异，任何修正必须走调整单（adjust_order）+ 审批生成新流水
 -- -----------------------------------------------------------------------------
 -- 单据
 -- -----------------------------------------------------------------------------
@@ -410,14 +609,13 @@ CREATE TABLE inbound_line (
     rejected_qty    NUMERIC(14,3)   NOT NULL DEFAULT 0,
     uom             VARCHAR(16)     NOT NULL,
     lot_id          BIGINT,
-    production_date TIMESTAMP,
-    expiry_date     TIMESTAMP,
+    production_date DATE,
+    expiry_date     DATE,
     location_id     BIGINT,
     cost_amount     BIGINT,
     quality_status  VARCHAR(16),
     CONSTRAINT uq_inb_line UNIQUE (inbound_id, line_no)
 );
-
 CREATE TABLE outbound_order (
     id                      BIGINT          PRIMARY KEY,
     code                    VARCHAR(64)     NOT NULL,
@@ -432,14 +630,15 @@ CREATE TABLE outbound_order (
     work_date               DATE            NOT NULL,
     cutoff_at               TIMESTAMP,
     priority                SMALLINT        NOT NULL DEFAULT 5,
-    status                  VARCHAR(24)     NOT NULL,
+    status                  VARCHAR(24)     NOT NULL,   -- 迁移表见 docs/04 §5.1
+    source_hash             VARCHAR(64)     NOT NULL,   -- 上游单据规范化内容的 SHA-256 hex；同号不同 hash → 40910（04 I1）；无默认值（小赵 D6）
     wave_id                 BIGINT,
     short_ship_policy       VARCHAR(16)     NOT NULL DEFAULT 'ALLOW_SHORT',
-    total_qty               NUMERIC(14,3)   NOT NULL DEFAULT 0,
-    allocated_qty           NUMERIC(14,3)   NOT NULL DEFAULT 0,
-    picked_qty              NUMERIC(14,3)   NOT NULL DEFAULT 0,
-    shipped_qty             NUMERIC(14,3)   NOT NULL DEFAULT 0,
-    short_qty               NUMERIC(14,3)   NOT NULL DEFAULT 0,
+    total_qty_milli         BIGINT          NOT NULL DEFAULT 0,   -- 以下汇总量均为基本单位 milli（00 R2），由 Service 维护
+    allocated_qty_milli     BIGINT          NOT NULL DEFAULT 0,
+    picked_qty_milli        BIGINT          NOT NULL DEFAULT 0,
+    shipped_qty_milli       BIGINT          NOT NULL DEFAULT 0,
+    short_qty_milli         BIGINT          NOT NULL DEFAULT 0,
     total_amount            BIGINT          NOT NULL DEFAULT 0,
     picker_id               BIGINT,
     checker_id              BIGINT,
@@ -454,12 +653,26 @@ CREATE TABLE outbound_order (
     created_at              TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     updated_at              TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     status_changed_at       TIMESTAMP,
+    reserve_expires_at      TIMESTAMP,                   -- 预占过期时刻（04 T6）
+    version                 BIGINT          NOT NULL DEFAULT 0,   -- 状态条件更新时 +1
     shipped_at              TIMESTAMP,
     delivered_at            TIMESTAMP,
     created_by              BIGINT,
     CONSTRAINT uq_obo_code UNIQUE (code),
     CONSTRAINT uq_obo_src  UNIQUE (source_system, source_order_no),
-    CONSTRAINT ck_obo_sod  CHECK (checker_id IS NULL OR picker_id IS NULL OR picker_id <> checker_id)
+    CONSTRAINT ck_obo_sod  CHECK (checker_id IS NULL OR picker_id IS NULL OR picker_id <> checker_id),
+    -- 小写十六进制 64 位（小赵 N4）。两库通用写法：不用 PG 的 ~、也不用 SQLite 的 GLOB，嵌套 replace 去掉 0-9a-f 后必须为空串；
+    -- 大写 A-F、非 hex、汉字都会剩下字符。生成器原样输出到 SQLite，两库约束文本一致
+    CONSTRAINT ck_obo_hash CHECK (length(source_hash) = 64 AND lower(source_hash) = source_hash AND replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(source_hash,'0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9',''),'a',''),'b',''),'c',''),'d',''),'e',''),'f','') = ''),
+    CONSTRAINT ck_obo_qty CHECK (
+        total_qty_milli >= 0 AND allocated_qty_milli >= 0 AND picked_qty_milli >= 0
+        AND shipped_qty_milli >= 0 AND short_qty_milli >= 0
+        AND total_qty_milli = CAST(total_qty_milli AS BIGINT) AND allocated_qty_milli = CAST(allocated_qty_milli AS BIGINT)
+        AND picked_qty_milli = CAST(picked_qty_milli AS BIGINT) AND shipped_qty_milli = CAST(shipped_qty_milli AS BIGINT)
+        AND short_qty_milli = CAST(short_qty_milli AS BIGINT)
+    ),
+    CONSTRAINT ck_obo_status CHECK (status IN ('CREATED','PENDING_ALLOC','ALLOCATED','SHORT','WAVED','PICKING','PICKED',
+                                               'CHECKED','STAGED','SHIPPED','DELIVERED','COMPLETED','CANCELLED'))
 );
 CREATE INDEX ix_obo_pool   ON outbound_order(warehouse_id, route_code, temperature_required, priority)
     WHERE status = 'ALLOCATED';                          -- 波次待处理池
@@ -472,19 +685,37 @@ CREATE TABLE outbound_line (
     outbound_id     BIGINT          NOT NULL,
     line_no         SMALLINT        NOT NULL,
     sku_id          BIGINT          NOT NULL,
-    order_qty       NUMERIC(14,3)   NOT NULL,
-    allocated_qty   NUMERIC(14,3)   NOT NULL DEFAULT 0,
-    picked_qty      NUMERIC(14,3)   NOT NULL DEFAULT 0,
-    shipped_qty     NUMERIC(14,3)   NOT NULL DEFAULT 0,
-    short_qty       NUMERIC(14,3)   NOT NULL DEFAULT 0,
+    order_qty_milli     BIGINT      NOT NULL,             -- 基本单位 milli（00 R2）
+    reserved_qty_milli  BIGINT      NOT NULL DEFAULT 0,
+    allocated_qty_milli BIGINT      NOT NULL DEFAULT 0,
+    picked_qty_milli    BIGINT      NOT NULL DEFAULT 0,   -- 累计拣出量（不因撤销/回冲减少）
+    shipped_qty_milli   BIGINT      NOT NULL DEFAULT 0,
+    short_qty_milli     BIGINT      NOT NULL DEFAULT 0,
     uom             VARCHAR(16)     NOT NULL,
     unit_price      BIGINT          NOT NULL DEFAULT 0,
     amount          BIGINT          NOT NULL DEFAULT 0,
     short_reason    VARCHAR(24),
+    alloc_round     INT             NOT NULL DEFAULT 0,   -- 每次重新分配 +1，进入占用幂等键（04 B1）
+    reversed_qty_milli  BIGINT      NOT NULL DEFAULT 0,   -- 已撤销/回冲累计量；条件更新 reversed + qty <= picked，否则 42214（04 §6.3）
+    CONSTRAINT ck_obl_int CHECK (
+        order_qty_milli = CAST(order_qty_milli AS BIGINT) AND reserved_qty_milli = CAST(reserved_qty_milli AS BIGINT)
+        AND allocated_qty_milli = CAST(allocated_qty_milli AS BIGINT) AND picked_qty_milli = CAST(picked_qty_milli AS BIGINT)
+        AND shipped_qty_milli = CAST(shipped_qty_milli AS BIGINT) AND short_qty_milli = CAST(short_qty_milli AS BIGINT)
+        AND reversed_qty_milli = CAST(reversed_qty_milli AS BIGINT)
+    ),
+    CONSTRAINT ck_obl_nonneg CHECK (
+        order_qty_milli > 0 AND reserved_qty_milli >= 0 AND allocated_qty_milli >= 0 AND picked_qty_milli >= 0
+        AND shipped_qty_milli >= 0 AND short_qty_milli >= 0 AND reversed_qty_milli >= 0
+    ),
+    CONSTRAINT ck_obl_reversed CHECK (reversed_qty_milli <= picked_qty_milli),   -- 库层兜底：回冲不超过拣出（04 D4）
+    CONSTRAINT ck_obl_sum CHECK (
+        (picked_qty_milli - reversed_qty_milli) + short_qty_milli <= order_qty_milli
+        AND reserved_qty_milli + allocated_qty_milli + (picked_qty_milli - reversed_qty_milli) <= order_qty_milli
+        AND shipped_qty_milli <= picked_qty_milli - reversed_qty_milli
+    ),
     CONSTRAINT uq_obo_line UNIQUE (outbound_id, line_no)
 );
 CREATE INDEX ix_obl_sku ON outbound_line(sku_id);
-
 CREATE TABLE wave (
     id                  BIGINT       PRIMARY KEY,
     code                VARCHAR(64)  NOT NULL,
@@ -539,20 +770,22 @@ CREATE TABLE pick_task_line (
     lot_id              BIGINT          NOT NULL,
     stock_id            BIGINT          NOT NULL,
     outbound_line_id    BIGINT,                     -- 分播墙按单分发时用
-    plan_qty            NUMERIC(14,3)   NOT NULL,
-    plan_qty_base       NUMERIC(14,3)   NOT NULL,
-    actual_qty          NUMERIC(14,3)   NOT NULL DEFAULT 0,
-    uom                 VARCHAR(16)     NOT NULL,
+    planned_qty_milli   BIGINT          NOT NULL,   -- 应拣量，基本单位 milli（原 plan_qty_base）
+    confirmed_qty_milli BIGINT          NOT NULL DEFAULT 0,  -- 已确认量；条件更新 confirmed + qty <= planned，否则 42214（00 §6.5）
+    uom                 VARCHAR(16)     NOT NULL,   -- 作业单位，仅展示
     barcode_expected    VARCHAR(64),
     status              VARCHAR(16)     NOT NULL DEFAULT 'PENDING',
     short_reason_code   VARCHAR(24),
     scanned_at          TIMESTAMP,
     override_reason     VARCHAR(128),               -- FEFO 越权原因（RK4）
     override_by         BIGINT,
+    CONSTRAINT ck_ptl_qty CHECK (
+        planned_qty_milli > 0 AND confirmed_qty_milli >= 0 AND confirmed_qty_milli <= planned_qty_milli
+        AND planned_qty_milli = CAST(planned_qty_milli AS BIGINT) AND confirmed_qty_milli = CAST(confirmed_qty_milli AS BIGINT)
+    ),
     CONSTRAINT uq_ptl UNIQUE (pick_task_id, seq)
 );
 CREATE INDEX ix_ptl_loc ON pick_task_line(location_id, status);
-
 CREATE TABLE pack_box (
     id              BIGINT       PRIMARY KEY,
     code            VARCHAR(64)  NOT NULL,          -- 箱码，司机端逐箱扫
@@ -573,8 +806,9 @@ CREATE TABLE pack_box_line (
     box_id      BIGINT          NOT NULL,
     sku_id      BIGINT          NOT NULL,
     lot_id      BIGINT          NOT NULL DEFAULT 0,   -- 0 = 未记批次；同 stock.container_id，不可空（uq 含 NULL 会失效）
-    quantity    NUMERIC(14,3)   NOT NULL,
+    qty_milli   BIGINT          NOT NULL,   -- 基本单位 milli
     uom         VARCHAR(16)     NOT NULL,
+    CONSTRAINT ck_box_line_qty CHECK (qty_milli > 0 AND qty_milli = CAST(qty_milli AS BIGINT)),
     CONSTRAINT uq_box_line UNIQUE (box_id, sku_id, lot_id)
 );
 
@@ -603,7 +837,6 @@ CREATE TABLE shipment_order (
     outbound_id BIGINT NOT NULL,
     PRIMARY KEY (shipment_id, outbound_id)
 );
-
 -- -----------------------------------------------------------------------------
 -- 盘点 / 调整
 -- -----------------------------------------------------------------------------
@@ -641,6 +874,12 @@ CREATE TABLE count_line (
     counted_by      BIGINT,
     counted_at      TIMESTAMP,
     adjust_id       BIGINT,
+    CONSTRAINT ck_cnt_int CHECK (
+        book_qty_milli = CAST(book_qty_milli AS BIGINT)
+        AND movement_qty_milli = CAST(movement_qty_milli AS BIGINT)
+        AND (actual_qty_milli IS NULL OR actual_qty_milli = CAST(actual_qty_milli AS BIGINT))
+        AND (recount_qty_milli IS NULL OR recount_qty_milli = CAST(recount_qty_milli AS BIGINT))
+    ),
     CONSTRAINT uq_cnt_line UNIQUE (count_id, location_id, sku_id, lot_id)
 );
 -- [SQLite] GENERATED 列 SQLite 3.31+ 支持 STORED；若低于该版本改为应用层计算 + 普通列
@@ -670,7 +909,6 @@ CREATE TABLE adjust_line (
     delta_qty       NUMERIC(14,3)   NOT NULL,   -- 正入负出
     CONSTRAINT ck_adj_delta CHECK (delta_qty <> 0)
 );
-
 -- -----------------------------------------------------------------------------
 -- 幂等 / 集成 / 审计
 -- -----------------------------------------------------------------------------
@@ -680,8 +918,10 @@ CREATE TABLE idempotency_record (
     req_hash     VARCHAR(64)  NOT NULL,
     response     TEXT         NOT NULL,
     status_code  INT          NOT NULL,
-    created_at   TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
-    expires_at   TIMESTAMP    NOT NULL
+    created_at   TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- 一律存 UTC（P1）
+    expires_at   TIMESTAMP    NOT NULL                -- UTC；写入后只许往后改（trg_idem_expiry_fwd，P2）
+    -- 小赵 S1：SQLite 不约束时间类型，'garbage'、T 格式、整数都能写进去，按文本比较永远清不掉；限定为 'YYYY-MM-DD HH:MM:SS' 且是真实日期时间
+    , CONSTRAINT ck_idem_ts CHECK ((typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) IS NOT NULL AND time(created_at) IS NOT NULL AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8) AND substr(created_at, 12, 2) <= '23') AND (typeof(expires_at) = 'text' AND length(expires_at) = 19 AND expires_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(expires_at) IS NOT NULL AND time(expires_at) IS NOT NULL AND date(expires_at) = substr(expires_at, 1, 10) AND time(expires_at) = substr(expires_at, 12, 8) AND substr(expires_at, 12, 2) <= '23'))
 );
 CREATE INDEX ix_idem_exp ON idempotency_record(expires_at);
 
@@ -710,13 +950,38 @@ CREATE TABLE outbox_event (
     headers         TEXT,
     status          VARCHAR(16)  NOT NULL DEFAULT 'PENDING',
     retry_count     SMALLINT     NOT NULL DEFAULT 0,
-    next_retry_at   TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    next_retry_at   TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- UTC
     last_error      VARCHAR(512),
-    created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
-    sent_at         TIMESTAMP
+    created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- UTC
+    sent_at         TIMESTAMP,                          -- UTC；写入后只许往后改（P2）
+    CONSTRAINT ck_outbox_sent CHECK (status <> 'SENT' OR sent_at IS NOT NULL)   -- P3
+    , CONSTRAINT ck_outbox_ts CHECK ((typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) IS NOT NULL AND time(created_at) IS NOT NULL AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8) AND substr(created_at, 12, 2) <= '23') AND (typeof(next_retry_at) = 'text' AND length(next_retry_at) = 19 AND next_retry_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(next_retry_at) IS NOT NULL AND time(next_retry_at) IS NOT NULL AND date(next_retry_at) = substr(next_retry_at, 1, 10) AND time(next_retry_at) = substr(next_retry_at, 12, 8) AND substr(next_retry_at, 12, 2) <= '23') AND (sent_at IS NULL OR (typeof(sent_at) = 'text' AND length(sent_at) = 19 AND sent_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(sent_at) IS NOT NULL AND time(sent_at) IS NOT NULL AND date(sent_at) = substr(sent_at, 1, 10) AND time(sent_at) = substr(sent_at, 12, 8) AND substr(sent_at, 12, 2) <= '23')))   -- 小赵 S1
 );
 CREATE INDEX ix_outbox_pending ON outbox_event(status, next_retry_at);
 CREATE INDEX ix_outbox_bizkey  ON outbox_event(biz_key, id);   -- 同键串行发送
+
+-- 小赵 Q2：去重记录与 outbox 只能清理"已过期 / 已投递且过保留期"的行（两库触发器，条件与 purge_expired() 一致）
+CREATE TRIGGER trg_idem_purge_guard BEFORE DELETE ON idempotency_record WHEN NOT COALESCE(OLD.expires_at < datetime('now'), 0)
+BEGIN SELECT RAISE(ABORT, 'purge_not_allowed: idempotency_record'); END;
+CREATE TRIGGER trg_outbox_purge_guard BEFORE DELETE ON outbox_event WHEN NOT COALESCE(OLD.status = 'SENT' AND OLD.sent_at < datetime('now', '-7 days'), 0)
+BEGIN SELECT RAISE(ABORT, 'purge_not_allowed: outbox_event'); END;
+-- 九轮 P2：过期/投递时间写入后只许往后改，不许改早；created_at 不可改；SENT 是终态；sent_at 首次写入不得早于 created_at
+-- 十六轮 R1 补洞：wms_app 只能以初始状态 PENDING（不带 sent_at）插入 outbox；SENT 只能经 UPDATE 写入（受 sent_at_not_now 约束）。
+-- 种子/迁移用超级用户或迁移角色写入，不受此限
+-- SQLite 没有角色：应用只能插入 PENDING（不带 sent_at）；验证脚本造 SENT 种子时临时 DROP 本触发器、写完重建（单独的种子路径）
+CREATE TRIGGER trg_outbox_insert_pending BEFORE INSERT ON outbox_event WHEN NEW.status IS NOT 'PENDING' OR NEW.sent_at IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'outbox_insert_not_pending'); END;
+CREATE TRIGGER trg_idem_expiry_fwd BEFORE UPDATE ON idempotency_record WHEN NEW.created_at IS NOT OLD.created_at OR NEW.expires_at < OLD.expires_at
+BEGIN SELECT RAISE(ABORT, 'expiry_backdate: idempotency_record'); END;
+CREATE TRIGGER trg_outbox_expiry_fwd BEFORE UPDATE ON outbox_event WHEN NEW.created_at IS NOT OLD.created_at OR (OLD.sent_at IS NOT NULL AND (NEW.sent_at IS NULL OR NEW.sent_at < OLD.sent_at)) OR (OLD.sent_at IS NULL AND NEW.sent_at < OLD.created_at) OR (OLD.status = 'SENT' AND NEW.status <> 'SENT')
+BEGIN SELECT RAISE(ABORT, 'expiry_backdate: outbox_event'); END;
+CREATE TRIGGER trg_outbox_sent_now BEFORE UPDATE ON outbox_event WHEN NEW.status = 'SENT' AND OLD.status <> 'SENT' AND abs(julianday(NEW.sent_at) - julianday('now')) * 86400 > 5
+BEGIN SELECT RAISE(ABORT, 'sent_at_not_now'); END;
+-- SQLite REPLACE 冲突删旧行不触发 DELETE 触发器 → BEFORE INSERT 主键已存在就中止（应用把 idem_duplicate 当作"键已存在"处理，与 PG 23505 同分支）
+CREATE TRIGGER trg_idem_no_replace BEFORE INSERT ON idempotency_record WHEN EXISTS (SELECT 1 FROM idempotency_record r WHERE r.idem_key = NEW.idem_key)
+BEGIN SELECT RAISE(ABORT, 'idem_duplicate'); END;
+CREATE TRIGGER trg_outbox_no_replace BEFORE INSERT ON outbox_event WHEN EXISTS (SELECT 1 FROM outbox_event o WHERE o.id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'outbox_duplicate'); END;
 
 CREATE TABLE audit_log (
     id              BIGINT       PRIMARY KEY,
@@ -748,7 +1013,6 @@ CREATE TABLE numbering_segment (
 -- 取号（号段预取，两库语义一致）：
 --   UPDATE numbering_segment SET next_value = next_value + step WHERE biz_prefix=? AND date_key=?
 --   然后 SELECT next_value - step 作为本段起点。多实例安全，不依赖 Redis 持久化。
-
 -- -----------------------------------------------------------------------------
 -- 权限（RBAC + 数据权限）
 -- -----------------------------------------------------------------------------
@@ -801,7 +1065,6 @@ CREATE TABLE api_credential (
     last_used_at     TIMESTAMP,
     CONSTRAINT uq_api_key UNIQUE (api_key)
 );
-
 -- -----------------------------------------------------------------------------
 -- 视图：可用量（避免每个查询手写减法，也避免算错）
 -- -----------------------------------------------------------------------------
@@ -826,9 +1089,9 @@ SELECT
     s.allocated_qty_milli,
     s.reserved_qty_milli,
     s.quality_hold_qty_milli,
-    s.frozen_qty_milli,
-    (s.on_hand_qty_milli - s.allocated_qty_milli - s.reserved_qty_milli - s.quality_hold_qty_milli - s.frozen_qty_milli) AS available_qty_milli,
-    (s.on_hand_qty_milli - s.quality_hold_qty_milli - s.frozen_qty_milli - s.allocated_qty_milli)                        AS pickable_qty_milli
+    s.hold_qty_milli,
+    (s.on_hand_qty_milli - s.allocated_qty_milli - s.reserved_qty_milli - s.quality_hold_qty_milli - s.hold_qty_milli) AS available_qty_milli,
+    (s.on_hand_qty_milli - s.quality_hold_qty_milli - s.hold_qty_milli - s.allocated_qty_milli)                        AS pickable_qty_milli
 FROM stock s
 JOIN location l ON l.id = s.location_id
 JOIN zone z     ON z.id = l.zone_id
@@ -838,3 +1101,9 @@ WHERE s.on_hand_qty_milli > 0 AND l.status = 'AVAILABLE' AND l.deleted_at IS NUL
 -- [SQLite] 视图支持一致；now() 在 SQLite 侧用 datetime('now')，故未在本文件使用
 
 
+-- ============================================================
+-- 清理角色与 purge_expired()。各表的 wms_app GRANT 写在该表所在的篇文件末尾，
+-- 后续篇章只加自己的 sql/schema/NN_*.sql，不要再改一份总 GRANT。
+-- ============================================================
+-- 清理只能经 purge_expired()：属主 wms_purge_owner（非超级用户、NOLOGIN，只有这两张表的 SELECT/DELETE），
+-- 调用方 wms_cleaner 只有 EXECUTE，对表没有任何权限；删除条件写死在函数里，不接受参数
