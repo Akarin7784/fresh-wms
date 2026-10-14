@@ -73,7 +73,12 @@ ACT=$(psql -t -A -c "SELECT string_agg(x, ' ' ORDER BY x) FROM (SELECT c.relname
 if [ "$ACT" = "$EXPECT_PRIVS" ]; then ok "S4 wms_app 权限矩阵与期望逐表一致（$(echo "$ACT" | wc -w) 个对象；列级 UPDATE 另测）"
 else bad "S4 wms_app 权限矩阵不符：$(diff <(echo "$EXPECT_PRIVS" | tr ' ' '\n') <(echo "$ACT" | tr ' ' '\n') | grep '^[<>]' | tr '\n' ' ')"; fi
 echo "=== 2. 库层不变量断言（§4.1 I1–I5 + §2.2 SoD + §4.6 幂等）==="
-seed() { psql -q -c "$1" >/dev/null; }
+seed() {  # 小赵 U2：种子失败直接非 0 退出，避免仓库等基础数据悄悄建不出来
+  local out
+  if ! out=$(psql -v ON_ERROR_STOP=1 -q -c "$1" 2>&1 >/dev/null); then
+    echo "  ✗ 种子失败，中止：$1"; echo "$out"; exit 1
+  fi
+}
 seed "INSERT INTO warehouse (id,code,name,cutoff_time,work_date_offset) VALUES (1,'WHSH01','上海青浦仓','20:00',-1);"
 seed "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (1,1,'Z-C1','冷藏拣货区','CHILLED','PICK'),(2,1,'Z-C2','冷藏存储区','CHILLED','STORAGE');"
 seed "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (1,1,1,'A01-02-03','BIN',2,'A010'),(2,1,1,'A01-03-01','BIN',2,'A020'),(3,1,2,'B02-01-05','PALLET',8,'B010');"
@@ -452,15 +457,17 @@ R=$(psql -t -A -c "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli + 1000
 [ "$R" = "UPDATE 0" ] && ok "库位 LOCKED：MOVE 目标腿 rowcount=0" || bad "MOVE 未被锁拦：$R"
 psql -q -c "UPDATE location SET status='AVAILABLE' WHERE id=3; UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq - 1 WHERE id = 13;" >/dev/null
 
-echo "=== 2e. docs/12 权限与审计（小赵评审 B1、I1–I7、S1 + SCRAP_MISREPORT 权限点与审批单号格式 + UTC）==="
+echo "=== 2e. docs/12 权限与审计（小赵评审 B1、I1–I7、S1 + SCRAP_MISREPORT）==="
 seed "INSERT INTO sys_user (id,username,password_hash) VALUES (101,'picker01','x');"
 seed "UPDATE sys_user SET perm_version = 3 WHERE id = 101;"
 seed "INSERT INTO sys_role (id,code,name) VALUES (1,'WH_SUPERVISOR','仓库主管'),(2,'CENTER_OPS','中心运维'),(3,'QC_SUPERVISOR','质检主管');"
-seed "INSERT INTO sys_user_role (user_id,role_id) VALUES (202,1),(202,2),(203,2),(205,3),(206,1),(207,3);"
-seed "INSERT INTO sys_user_warehouse (user_id,warehouse_id) VALUES (202,1),(203,1),(204,1),(205,1),(206,1);"
+seed "INSERT INTO sys_permission (id,code,name,module) VALUES (1,'device.binding.approve','设备绑定审批','12'),(2,'delivery.pod.correct.approve','POD 更正审批','15'),(3,'outbound.order.cancel_after_pick','拣后取消审批','04');"
+seed "INSERT INTO sys_role_perm (role_id,perm_id) VALUES (1,1),(1,2),(1,3);"
+seed "INSERT INTO sys_user_role (user_id,role_id) VALUES (202,1),(202,2),(203,2),(205,3),(206,1),(207,3),(101,1),(208,1),(201,1);"
+seed "INSERT INTO sys_user_warehouse (user_id,warehouse_id) VALUES (202,1),(203,1),(204,1),(205,1),(206,1),(101,1),(201,1);"
 seed "INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id) VALUES (1,'DEV-A','PDA',101,1);"
 seed "INSERT INTO offline_token (id,jti,binding_id,user_id,device_instance_id,warehouse_id,perm_version,issued_at,expires_at) VALUES (1,'J1',1,101,'DEV-A',1,1,'2026-10-15 08:00','2026-10-15 20:00');"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (1,'APR-WH01-20261015-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (1,'APR-WHSH01-20261015-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');"
 seed "INSERT INTO audit_log (id,action,node_id,node_seq,warehouse_id) VALUES (1,'outbound.cancel_after_pick',7,1,1);"
 expect_block "12 审计重复回传同 (node_id,node_seq)" \
   "INSERT INTO audit_log (id,action,node_id,node_seq) VALUES (2,'x',7,1);" "uq_audit_node_seq"
@@ -478,19 +485,19 @@ expect_block "12 REVOKED 没有吊销时间" \
   "UPDATE user_device_binding SET status='REVOKED' WHERE id=1;" "ck_udb_status"
 expect_block "12 I3 用不存在的审批激活" \
   "UPDATE user_device_binding SET status='ACTIVE', approval_id=999, activated_at='2026-10-15 09:00' WHERE id=1;" "binding_approval_invalid"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (7,'APR-WH01-20261015-000007','DEVICE_BIND',1,'DEVICE_BINDING','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',202,'2099-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (7,'APR-WHSH01-20261015-000007','DEVICE_BIND',1,'DEVICE_BINDING','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',202,'2099-01-01');"
 seed "UPDATE approval_request SET status='APPROVED', first_approver_id=101, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=7;"
 expect_block "12 S1 审批人 = 绑定使用人" \
   "UPDATE user_device_binding SET status='ACTIVE', approval_id=7, activated_at='2026-10-15 09:00' WHERE id=1;" "binding_approval_invalid"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (8,'APR-WH01-20261015-000008','DEVICE_BIND',1,'DEVICE_BINDING','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',101,'2099-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (8,'APR-WHSH01-20261015-000008','DEVICE_BIND',1,'DEVICE_BINDING','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',101,'2099-01-01');"
 seed "UPDATE approval_request SET status='REJECTED', decided_at='2026-10-15 09:00', reject_reason='x' WHERE id=8;"
 expect_block "12 I3 用已驳回的审批激活" \
   "UPDATE user_device_binding SET status='ACTIVE', approval_id=8, activated_at='2026-10-15 09:00' WHERE id=1;" "binding_approval_invalid"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (9,'APR-WH01-20261015-000009','CANCEL_AFTER_PICK',1,'DEVICE_BINDING','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',101,'2099-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (9,'APR-WHSH01-20261015-000009','CANCEL_AFTER_PICK',1,'DEVICE_BINDING','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',101,'2099-01-01');"
 seed "UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=9;"
 expect_block "12 I3 用别的类型的审批激活" \
   "UPDATE user_device_binding SET status='ACTIVE', approval_id=9, activated_at='2026-10-15 09:00' WHERE id=1;" "binding_approval_invalid"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (10,'APR-WH01-20261015-000010','DEVICE_BIND',1,'DEVICE_BINDING','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',101,'2099-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (10,'APR-WHSH01-20261015-000010','DEVICE_BIND',1,'DEVICE_BINDING','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',101,'2099-01-01');"
 seed "UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=10;"
 expect_allow "12 I3 正向：DEVICE_BIND 已通过、审批人≠使用人 → PENDING→ACTIVE" \
   "BEGIN; UPDATE user_device_binding SET status='ACTIVE', approval_id=10, activated_at='2026-10-15 09:00' WHERE id=1 AND status='PENDING'; COMMIT;"
@@ -519,9 +526,9 @@ expect_allow "12 I4 正向：吊销" \
 expect_block "12 I4 吊销后恢复" \
   "UPDATE offline_token SET revoked_at=NULL WHERE id=1;" "offline_token_immutable"
 expect_block "12 I2 直接插成 APPROVED" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at,status) VALUES (20,'APR-WH01-20261015-000020','POD_CORRECT',1,'POD','20','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01','APPROVED');" "approval_insert_not_pending"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at,status) VALUES (20,'APR-WHSH01-20261015-000020','POD_CORRECT',1,'POD','20','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01','APPROVED');" "approval_insert_not_pending"
 expect_block "12 同一目标两条待审批" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (21,'APR-WH01-20261015-000021','CANCEL_AFTER_PICK',1,'OUTBOUND','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',203,'2099-01-01');" "uq_apr_open"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (21,'APR-WHSH01-20261015-000021','CANCEL_AFTER_PICK',1,'OUTBOUND','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',203,'2099-01-01');" "uq_apr_open"
 expect_block "12 SoD：申请人自己审批" \
   "UPDATE approval_request SET status='APPROVED', first_approver_id=201, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=1;" "ck_apr_sod"
 expect_block "12 I2 单人审批进 PARTIAL" \
@@ -536,16 +543,16 @@ expect_block "12 I1/I2 APPROVED 改回 PENDING" \
   "UPDATE approval_request SET status='PENDING', decided_at=NULL WHERE id=1;" "approval_final"
 expect_block "12 审批不可删除" \
   "DELETE FROM approval_request WHERE id=1;" "append_only_violation: approval_request"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (4,'APR-WH01-20261015-000004','POD_CORRECT',1,'POD','4','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2020-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (4,'APR-WHSH01-20261015-000004','POD_CORRECT',1,'POD','4','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2020-01-01');"
 expect_block "12 I2 过期后审批" \
   "UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=4;" "approval_expired"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (41,'APR-WH01-20261015-000041','POD_CORRECT',1,'POD','41','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,(now() AT TIME ZONE 'UTC') - interval '1 minute');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (41,'APR-WHSH01-20261015-000041','POD_CORRECT',1,'POD','41','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,(now() AT TIME ZONE 'UTC') - interval '1 minute');"
 expect_block "12 UTC 反向：expires_at = UTC 当前 −1 分钟，已过期不能再批" \
   "UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=41;" "approval_expired"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (42,'APR-WH01-20261015-000042','POD_CORRECT',1,'POD','42','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,(now() AT TIME ZONE 'UTC') + interval '2 hours');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (42,'APR-WHSH01-20261015-000042','POD_CORRECT',1,'POD','42','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,(now() AT TIME ZONE 'UTC') + interval '2 hours');"
 expect_allow "12 UTC 正向：expires_at = UTC 当前 +2 小时（比本地 UTC+8 早）仍可批" \
   "BEGIN; UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=42; COMMIT;"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (3,'APR-WH01-20261015-000003','UNPLANNED_FAILOVER',1,'WAREHOUSE','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (3,'APR-WHSH01-20261015-000003','UNPLANNED_FAILOVER',1,'WAREHOUSE','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');"
 expect_block "12 I5 第一确认人不持有任何角色" \
   "UPDATE approval_request SET status='PARTIAL', first_approver_id=204, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00' WHERE id=3;" "approval_role_not_held"
 expect_block "12 I5 第一确认人只有 CENTER_OPS 却写 WH_SUPERVISOR" \
@@ -565,10 +572,10 @@ expect_block "12 非计划切换只有一人确认就 APPROVED" \
 expect_allow "12 I5 正向：中心运维第二确认 → APPROVED" \
   "BEGIN; UPDATE approval_request SET status='APPROVED', second_approver_id=203, second_approver_role='CENTER_OPS', second_approved_at='2026-10-15 09:30', decided_at='2026-10-15 09:30' WHERE id=3; COMMIT;"
 expect_block "12 SM 发起人不是本仓仓库主管（只有 CENTER_OPS）" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (23,'APR-WH01-20261015-000023','SCRAP_MISREPORT',1,'SCRAP_ORDER','9009','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',203,'2099-01-01');" "approval_role_not_held"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (23,'APR-WHSH01-20261015-000023','SCRAP_MISREPORT',1,'SCRAP_ORDER','9009','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',203,'2099-01-01');" "approval_role_not_held"
 expect_block "12 SM 发起人是质检主管而非仓库主管" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (24,'APR-WH01-20261015-000024','SCRAP_MISREPORT',1,'SCRAP_ORDER','9010','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',205,'2099-01-01');" "approval_role_not_held"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (5,'APR-WH01-20261015-000005','SCRAP_MISREPORT',1,'SCRAP_ORDER','9001','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',202,'2099-01-01');"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (24,'APR-WHSH01-20261015-000024','SCRAP_MISREPORT',1,'SCRAP_ORDER','9010','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',205,'2099-01-01');" "approval_role_not_held"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (5,'APR-WHSH01-20261015-000005','SCRAP_MISREPORT',1,'SCRAP_ORDER','9001','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',202,'2099-01-01');"
 expect_block "12 SM 发起人自己审批（202 兼 CENTER_OPS 也不行）" \
   "UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='CENTER_OPS', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=5;" "ck_apr_sod"
 expect_block "12 SM 审批角色写成仓库主管（另一主管 206 不具审批权）" \
@@ -579,7 +586,7 @@ expect_block "12 SM 质检主管不在本仓" \
   "UPDATE approval_request SET status='APPROVED', first_approver_id=207, first_approver_role='QC_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=5;" "approval_role_not_held"
 expect_allow "12 SM 正向：本仓质检主管审批" \
   "BEGIN; UPDATE approval_request SET status='APPROVED', first_approver_id=205, first_approver_role='QC_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=5; COMMIT;"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (6,'APR-WH01-20261015-000006','SCRAP_MISREPORT',1,'SCRAP_ORDER','9002','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',206,'2099-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (6,'APR-WHSH01-20261015-000006','SCRAP_MISREPORT',1,'SCRAP_ORDER','9002','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',206,'2099-01-01');"
 expect_allow "12 SM 正向：中心运维审批" \
   "BEGIN; UPDATE approval_request SET status='APPROVED', first_approver_id=203, first_approver_role='CENTER_OPS', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=6; COMMIT;"
 expect_block "12 审批单号格式：旧格式 SM-2026-001" \
@@ -603,11 +610,44 @@ expect_block "12 审批单号格式：仓库编码含 - APR-WH-01-20261015-00000
 expect_allow "12 审批单号格式正向：APR-SHPD01-20261231-999999" \
   "BEGIN; INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (40,'APR-SHPD01-20261231-999999','POD_CORRECT',1,'POD','40','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01'); COMMIT;"
 expect_block "12 审批类型不在码表" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (22,'APR-WH01-20261015-000022','BANANA',1,'X','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_type"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (22,'APR-WHSH01-20261015-000022','BANANA',1,'X','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_type"
 expect_block "12 perm_version 回退" \
   "UPDATE sys_user SET perm_version = 1 WHERE id = 101;" "perm_version_rewind"
 expect_allow "12 I7 正向：perm_version 前进" \
   "BEGIN; UPDATE sys_user SET perm_version = 4 WHERE id = 101; COMMIT;"
+expect_block "12 T1 审批单号：仓库编码小写 APR-sh01-20261015-000001" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (50,'APR-sh01-20261015-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','50','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+expect_block "12 T1 审批单号：仓库编码含下划线 APR-S_01-20261015-000002" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (51,'APR-S_01-20261015-000002','CANCEL_AFTER_PICK',1,'OUTBOUND','51','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+expect_block "12 T1 审批单号：仓库编码含空格 APR-S 01-20261015-000003" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (52,'APR-S 01-20261015-000003','CANCEL_AFTER_PICK',1,'OUTBOUND','52','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+expect_block "12 T1 审批单号：仓库编码长度 1 APR-A-20261015-000004" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (53,'APR-A-20261015-000004','CANCEL_AFTER_PICK',1,'OUTBOUND','53','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+expect_block "12 T1 审批单号：仓库编码长度 17 APR-ABCDEFGHIJKLMNOPQ-20261015-000005" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (54,'APR-ABCDEFGHIJKLMNOPQ-20261015-000005','CANCEL_AFTER_PICK',1,'OUTBOUND','54','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+expect_allow "12 T1 正向：仓库编码长度 2 / 16" \
+  "BEGIN; INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (56,'APR-W2-20261015-000006','POD_CORRECT',1,'POD','56','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01'); INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (57,'APR-ABCDEFGH12345678-20261015-000007','POD_CORRECT',1,'POD','57','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01'); COMMIT;"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (60,'APR-WHSH01-20261015-000060','DEVICE_BIND',1,'DEVICE_BINDING','60','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',101,'2099-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (61,'APR-WHSH01-20261015-000061','POD_CORRECT',1,'POD','61','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (62,'APR-WHSH01-20261015-000062','CANCEL_AFTER_PICK',1,'OUTBOUND','62','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');"
+expect_block "12 T2 DEVICE_BIND：无任何角色的用户（204）批准" \
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=204, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=60;" "approval_perm_not_held"
+expect_block "12 T2 POD_CORRECT：无任何角色的用户（204）批准" \
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=204, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=61;" "approval_perm_not_held"
+expect_block "12 T2 CANCEL_AFTER_PICK：无任何角色的用户（204）批准" \
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=204, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=62;" "approval_perm_not_held"
+expect_block "12 T2 DEVICE_BIND：角色存在但无该权限点（203 CENTER_OPS）" \
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=203, first_approver_role='CENTER_OPS', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=60;" "approval_perm_not_held"
+expect_block "12 T2 DEVICE_BIND：有主管角色但不在本仓（208）" \
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=208, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=60;" "approval_perm_not_held"
+expect_block "12 T2 POD_CORRECT：质检主管无该权限点（205）" \
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=205, first_approver_role='QC_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=61;" "approval_perm_not_held"
+expect_allow "12 T2 正向：本仓主管经 sys_role_perm 持有 device.binding.approve" \
+  "BEGIN; UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=60; COMMIT;"
+expect_allow "12 T2 正向：本仓主管持有 delivery.pod.correct.approve" \
+  "BEGIN; UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=61; COMMIT;"
+expect_allow "12 T2 正向：本仓主管持有 outbound.order.cancel_after_pick" \
+  "BEGIN; UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=62; COMMIT;"
 OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM approval_request WHERE id=1;" 2>&1)
 case "$OUT" in *"permission denied for table approval_request"*) ok "12 wms_app 不能删审批";; *) bad "12 wms_app 不能删审批 未被拒：$OUT";; esac
 OUT=$(psql -q -c "SET ROLE wms_app; UPDATE offline_token SET expires_at='2030-01-01' WHERE id=4;" 2>&1)

@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 39 处 DEFAULT now()、5 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
---   3. 方言专属行：删除 246 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 139 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 259 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 156 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -1146,14 +1146,13 @@ CREATE TABLE approval_request (
         OR (status IN ('PENDING','PARTIAL') AND decided_at IS NULL)
         OR status IN ('EXPIRED','WITHDRAWN')),
     -- 审批单号统一格式 APR-{warehouse_code}-{yyyyMMdd}-{6 位序号}（所有审批类型共用；02 stock_hold.approval_no 存的就是它）。
-    -- 两库通用写法：不用 PG 的 ~、也不用 SQLite 的 GLOB；尾部 16 位定长，日期 + 序号 14 位去掉数字后必须为空串，仓库编码段非空且不含 '-'
+    -- 小赵 T1：仓库编码段收紧为 [A-Z0-9]{2,16}（与 #8 ck_wh_code 一致），写法对齐 02 ck_hold_approval_no @92e1477：PG 用 ~，SQLite 用 GLOB + 总长 22–36
     CONSTRAINT ck_apr_code CHECK (
-        length(code) >= 21 AND substr(code, 1, 4) = 'APR-'
-        AND substr(code, length(code) - 15, 1) = '-' AND substr(code, length(code) - 6, 1) = '-'
-        AND replace(substr(code, 5, length(code) - 20), '-', '') = substr(code, 5, length(code) - 20)
-        AND replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(substr(code, length(code) - 14, 8) || substr(code, length(code) - 5, 6),'0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9','') = ''
-        AND substr(code, length(code) - 10, 2) BETWEEN '01' AND '12'
-        AND substr(code, length(code) - 8, 2) BETWEEN '01' AND '31'),
+        length(code) BETWEEN 22 AND 36 AND substr(code, 1, 4) = 'APR-'
+        AND substr(code, 5, length(code) - 20) NOT GLOB '*[^A-Z0-9]*'
+        AND substr(code, -16) GLOB '-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]'
+        AND (substr(code, -11, 2) GLOB '0[1-9]' OR substr(code, -11, 2) GLOB '1[0-2]')
+        AND (substr(code, -9, 2) GLOB '0[1-9]' OR substr(code, -9, 2) GLOB '[12][0-9]' OR substr(code, -9, 2) GLOB '3[01]')),
     -- SCRAP_MISREPORT 审批人：质检主管或中心运维（是否真持有由 trg_apr_final / trg_apr_role 查 sys_user_role）
     CONSTRAINT ck_apr_scrap_roles CHECK (approval_type <> 'SCRAP_MISREPORT'
         OR first_approver_id IS NULL OR first_approver_role IN ('QC_SUPERVISOR','CENTER_OPS'))
@@ -1208,6 +1207,17 @@ WHEN NEW.approval_type = 'UNPLANNED_FAILOVER' AND (
        SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
         WHERE ur.user_id = NEW.second_approver_id AND r.code = 'CENTER_OPS')))
 BEGIN SELECT RAISE(ABORT, 'approval_role_not_held'); END;
+CREATE TRIGGER trg_apr_perm BEFORE UPDATE ON approval_request
+WHEN NEW.approval_type IN ('DEVICE_BIND','POD_CORRECT','CANCEL_AFTER_PICK')
+  AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL AND NEW.first_approver_role IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
+      JOIN sys_role_perm rp ON rp.role_id = r.id JOIN sys_permission p ON p.id = rp.perm_id
+      JOIN sys_user_warehouse uw ON uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id
+     WHERE ur.user_id = NEW.first_approver_id AND r.code = NEW.first_approver_role
+       AND p.code = CASE NEW.approval_type WHEN 'DEVICE_BIND' THEN 'device.binding.approve'
+                                           WHEN 'POD_CORRECT' THEN 'delivery.pod.correct.approve'
+                                           ELSE 'outbound.order.cancel_after_pick' END)
+BEGIN SELECT RAISE(ABORT, 'approval_perm_not_held'); END;
 CREATE TRIGGER trg_apr_scrap_role BEFORE UPDATE ON approval_request
 WHEN NEW.approval_type = 'SCRAP_MISREPORT' AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL
   AND NOT EXISTS (SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id

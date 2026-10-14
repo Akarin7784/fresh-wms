@@ -1246,14 +1246,14 @@ CREATE TABLE approval_request (
         OR (status IN ('PENDING','PARTIAL') AND decided_at IS NULL)
         OR status IN ('EXPIRED','WITHDRAWN')),
     -- 审批单号统一格式 APR-{warehouse_code}-{yyyyMMdd}-{6 位序号}（所有审批类型共用；02 stock_hold.approval_no 存的就是它）。
-    -- 两库通用写法：不用 PG 的 ~、也不用 SQLite 的 GLOB；尾部 16 位定长，日期 + 序号 14 位去掉数字后必须为空串，仓库编码段非空且不含 '-'
-    CONSTRAINT ck_apr_code CHECK (
-        length(code) >= 21 AND substr(code, 1, 4) = 'APR-'
-        AND substr(code, length(code) - 15, 1) = '-' AND substr(code, length(code) - 6, 1) = '-'
-        AND replace(substr(code, 5, length(code) - 20), '-', '') = substr(code, 5, length(code) - 20)
-        AND replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(substr(code, length(code) - 14, 8) || substr(code, length(code) - 5, 6),'0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9','') = ''
-        AND substr(code, length(code) - 10, 2) BETWEEN '01' AND '12'
-        AND substr(code, length(code) - 8, 2) BETWEEN '01' AND '31'),
+    -- 小赵 T1：仓库编码段收紧为 [A-Z0-9]{2,16}（与 #8 ck_wh_code 一致），写法对齐 02 ck_hold_approval_no @92e1477：PG 用 ~，SQLite 用 GLOB + 总长 22–36
+    CONSTRAINT ck_apr_code CHECK (code ~ '^APR-[A-Z0-9]{2,16}-[0-9]{4}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])-[0-9]{6}$'),  -- @pg-only
+-- @sqlite-only     CONSTRAINT ck_apr_code CHECK (
+-- @sqlite-only         length(code) BETWEEN 22 AND 36 AND substr(code, 1, 4) = 'APR-'
+-- @sqlite-only         AND substr(code, 5, length(code) - 20) NOT GLOB '*[^A-Z0-9]*'
+-- @sqlite-only         AND substr(code, -16) GLOB '-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]'
+-- @sqlite-only         AND (substr(code, -11, 2) GLOB '0[1-9]' OR substr(code, -11, 2) GLOB '1[0-2]')
+-- @sqlite-only         AND (substr(code, -9, 2) GLOB '0[1-9]' OR substr(code, -9, 2) GLOB '[12][0-9]' OR substr(code, -9, 2) GLOB '3[01]')),
     -- SCRAP_MISREPORT 审批人：质检主管或中心运维（是否真持有由 trg_apr_final / trg_apr_role 查 sys_user_role）
     CONSTRAINT ck_apr_scrap_roles CHECK (approval_type <> 'SCRAP_MISREPORT'
         OR first_approver_id IS NULL OR first_approver_role IN ('QC_SUPERVISOR','CENTER_OPS'))
@@ -1311,6 +1311,18 @@ BEGIN                                                                           
              WHERE ur.user_id = NEW.second_approver_id AND r.code = 'CENTER_OPS'))) THEN                      -- @pg-only
         RAISE EXCEPTION 'approval_role_not_held' USING ERRCODE = '23514';                                    -- @pg-only
     END IF;                                                                                                   -- @pg-only
+    -- 小赵 T2：单人审批类型按角色权限表核对审批人持有对应审批权限点（审批时使用的角色 = first_approver_role，且在本仓）  -- @pg-only
+    IF NEW.approval_type IN ('DEVICE_BIND','POD_CORRECT','CANCEL_AFTER_PICK')                                -- @pg-only
+       AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL AND NEW.first_approver_role IS NOT NULL AND NOT EXISTS (  -- 角色缺失交给 ck_apr_pair  -- @pg-only
+         SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id                                  -- @pg-only
+           JOIN sys_role_perm rp ON rp.role_id = r.id JOIN sys_permission p ON p.id = rp.perm_id              -- @pg-only
+           JOIN sys_user_warehouse uw ON uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id        -- @pg-only
+          WHERE ur.user_id = NEW.first_approver_id AND r.code = NEW.first_approver_role                       -- @pg-only
+            AND p.code = CASE NEW.approval_type WHEN 'DEVICE_BIND' THEN 'device.binding.approve'              -- @pg-only
+                                                WHEN 'POD_CORRECT' THEN 'delivery.pod.correct.approve'        -- @pg-only
+                                                ELSE 'outbound.order.cancel_after_pick' END) THEN             -- @pg-only
+        RAISE EXCEPTION 'approval_perm_not_held' USING ERRCODE = '23514';                                    -- @pg-only
+    END IF;                                                                                                   -- @pg-only
     IF NEW.approval_type = 'SCRAP_MISREPORT' AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL  -- @pg-only
        AND NOT EXISTS (SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id                    -- @pg-only
              WHERE ur.user_id = NEW.first_approver_id AND r.code = NEW.first_approver_role                    -- @pg-only
@@ -1366,6 +1378,17 @@ CREATE TRIGGER trg_apr_final BEFORE UPDATE ON approval_request FOR EACH ROW EXEC
 -- @sqlite-only        SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
 -- @sqlite-only         WHERE ur.user_id = NEW.second_approver_id AND r.code = 'CENTER_OPS')))
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'approval_role_not_held'); END;
+-- @sqlite-only CREATE TRIGGER trg_apr_perm BEFORE UPDATE ON approval_request
+-- @sqlite-only WHEN NEW.approval_type IN ('DEVICE_BIND','POD_CORRECT','CANCEL_AFTER_PICK')
+-- @sqlite-only   AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL AND NEW.first_approver_role IS NOT NULL AND NOT EXISTS (
+-- @sqlite-only     SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
+-- @sqlite-only       JOIN sys_role_perm rp ON rp.role_id = r.id JOIN sys_permission p ON p.id = rp.perm_id
+-- @sqlite-only       JOIN sys_user_warehouse uw ON uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id
+-- @sqlite-only      WHERE ur.user_id = NEW.first_approver_id AND r.code = NEW.first_approver_role
+-- @sqlite-only        AND p.code = CASE NEW.approval_type WHEN 'DEVICE_BIND' THEN 'device.binding.approve'
+-- @sqlite-only                                            WHEN 'POD_CORRECT' THEN 'delivery.pod.correct.approve'
+-- @sqlite-only                                            ELSE 'outbound.order.cancel_after_pick' END)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'approval_perm_not_held'); END;
 -- @sqlite-only CREATE TRIGGER trg_apr_scrap_role BEFORE UPDATE ON approval_request
 -- @sqlite-only WHEN NEW.approval_type = 'SCRAP_MISREPORT' AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL
 -- @sqlite-only   AND NOT EXISTS (SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
