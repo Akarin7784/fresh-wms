@@ -1218,11 +1218,13 @@ CREATE TABLE box_void_request (
     status          VARCHAR(16)  NOT NULL DEFAULT 'PENDING',  -- PENDING/APPROVED/REJECTED
     decided_by      BIGINT,
     decided_at      TIMESTAMP,
+    decision_remark VARCHAR(500),                   -- 审批意见（接口同名字段）
     version         INT          NOT NULL DEFAULT 0,
     CONSTRAINT ck_bvr_reason CHECK (reason_code IN ('LOST','DAMAGED')),
     CONSTRAINT ck_bvr_status CHECK (status IN ('PENDING','APPROVED','REJECTED')),
     CONSTRAINT ck_bvr_decided CHECK ((status = 'PENDING' AND decided_by IS NULL AND decided_at IS NULL)
                                   OR (status <> 'PENDING' AND decided_by IS NOT NULL AND decided_at IS NOT NULL)),
+    CONSTRAINT ck_bvr_dremark CHECK (status <> 'PENDING' OR decision_remark IS NULL),
     CONSTRAINT ck_bvr_self CHECK (decided_by IS NULL OR decided_by <> requested_by)
 );
 CREATE UNIQUE INDEX uq_bvr_pending ON box_void_request(box_id) WHERE status = 'PENDING';

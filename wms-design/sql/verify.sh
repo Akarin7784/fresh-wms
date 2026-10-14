@@ -610,6 +610,7 @@ expect_block "06 Q8 原因码非法" "INSERT INTO box_void_request (id,box_id,re
 expect_allow "06 Q8 申请作废（LOST，申请人 8）" "INSERT INTO box_void_request (id,box_id,reason_code,remark,photo_ids,requested_by) VALUES (701,635,'LOST','集货位找不到','[\"p1\"]',8);"
 expect_block "06 Q8 同箱第二张 PENDING" "INSERT INTO box_void_request (id,box_id,reason_code,requested_by) VALUES (702,635,'DAMAGED',9);" "uq_bvr_pending"
 expect_block "06 Q8 自批" "UPDATE box_void_request SET status='APPROVED', decided_by=8, decided_at=now() WHERE id=701;" "ck_bvr_self"
+expect_block "06 Q8 PENDING 不能有审批意见" "UPDATE box_void_request SET decision_remark='x' WHERE id=701;" "ck_bvr_dremark"
 expect_block "06 Q8 改申请原因" "UPDATE box_void_request SET reason_code='DAMAGED' WHERE id=701;" "bvr_immutable"
 expect_allow "06 Q8 主管 9 批准" "UPDATE box_void_request SET status='APPROVED', decided_by=9, decided_at=now(), version=version+1 WHERE id=701;"
 expect_block "06 Q8 批准后再改" "UPDATE box_void_request SET status='REJECTED' WHERE id=701;" "bvr_closed"
