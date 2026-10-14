@@ -260,6 +260,7 @@ CREATE TABLE stock_hold (
     operator_id         BIGINT          NOT NULL,   -- 系统冻结填 0
     approval_type       VARCHAR(24),                -- 需要审批的转换才填：SCRAP_MISREPORT（SCRAP_PENDING → RETURN_QC 误报回转）
     approval_no         VARCHAR(64),                -- 审批单号
+    is_reversal         BOOLEAN         NOT NULL DEFAULT false,  -- 误报回转明细（SCRAP_PENDING → RETURN_QC）显式标记，替代 op_key LIKE 'CVT:%' 识别（小赵 N1）
     version             BIGINT          NOT NULL DEFAULT 0,
     created_at          TIMESTAMP       NOT NULL DEFAULT now(),
     updated_at          TIMESTAMP       NOT NULL DEFAULT now(),
@@ -287,18 +288,27 @@ CREATE TABLE stock_hold (
     ),
     -- 误报回转（SCRAP_PENDING → RETURN_QC，convert_hold 生成 op_key=CVT:{原 hold_id}）必须带 SCRAP_MISREPORT 审批单号；其余明细不带审批
     CONSTRAINT ck_hold_approval CHECK (
-        (NOT (hold_type = 'RETURN_QC' AND op_key LIKE 'CVT:%') AND approval_type IS NULL AND approval_no IS NULL)
-        OR (hold_type = 'RETURN_QC' AND op_key LIKE 'CVT:%'
-            AND approval_type = 'SCRAP_MISREPORT' AND approval_no IS NOT NULL AND length(approval_no) > 0)
+        (NOT is_reversal AND approval_type IS NULL AND approval_no IS NULL)
+        OR (is_reversal AND approval_type = 'SCRAP_MISREPORT' AND approval_no IS NOT NULL AND length(approval_no) > 0)
     ),
+    -- 回转标记与类型/op_key 双向一致：只有 RETURN_QC 能是回转，RETURN_QC 的 CVT 明细必须标回转（防止不带审批伪造回转）
+    CONSTRAINT ck_hold_reversal_key CHECK (is_reversal = (hold_type = 'RETURN_QC' AND op_key LIKE 'CVT:%')),
     -- 审批单号格式 APR-{仓库编码}-{yyyyMMdd}-{6 位数字}；仓库编码字符集 [A-Z0-9]{2,16}（以第 1 篇 #8 为准）
-    CONSTRAINT ck_hold_approval_no CHECK (approval_no IS NULL OR approval_no ~ '^APR-[A-Z0-9]{2,16}-[0-9]{4}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])-[0-9]{6}$'),  -- @pg-only
+    CONSTRAINT ck_hold_approval_no CHECK (approval_no IS NULL OR CASE  -- @pg-only
+        WHEN approval_no !~ '^APR-[A-Z0-9]{2,16}-[0-9]{4}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])-[0-9]{6}$' THEN false  -- @pg-only
+        WHEN substr(substr(right(approval_no, 15), 1, 8), 1, 4) = '0000' THEN false  -- @pg-only
+        -- 真实日历日（N1）：日 ≤ 当月天数（含闰年）；CASE 保证先过正则再做日期运算，不会因 2 月 30 日抛转换错误  -- @pg-only
+        ELSE substr(substr(right(approval_no, 15), 1, 8), 7, 2)::int <= extract(day FROM make_date(substr(substr(right(approval_no, 15), 1, 8), 1, 4)::int, substr(substr(right(approval_no, 15), 1, 8), 5, 2)::int, 1) + interval '1 month' - interval '1 day')  -- @pg-only
+    END),  -- @pg-only
 -- @sqlite-only     CONSTRAINT ck_hold_approval_no CHECK (approval_no IS NULL OR (
 -- @sqlite-only         length(approval_no) BETWEEN 22 AND 36 AND substr(approval_no, 1, 4) = 'APR-'
 -- @sqlite-only         AND substr(approval_no, 5, length(approval_no) - 20) NOT GLOB '*[^A-Z0-9]*'
 -- @sqlite-only         AND substr(approval_no, -16) GLOB '-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]'
 -- @sqlite-only         AND (substr(approval_no, -11, 2) GLOB '0[1-9]' OR substr(approval_no, -11, 2) GLOB '1[0-2]')
--- @sqlite-only         AND (substr(approval_no, -9, 2) GLOB '0[1-9]' OR substr(approval_no, -9, 2) GLOB '[12][0-9]' OR substr(approval_no, -9, 2) GLOB '3[01]'))),
+-- @sqlite-only         AND (substr(approval_no, -9, 2) GLOB '0[1-9]' OR substr(approval_no, -9, 2) GLOB '[12][0-9]' OR substr(approval_no, -9, 2) GLOB '3[01]')
+-- @sqlite-only         -- 真实日历日（N1）：SQLite date() 会把 02-30 规范成 03-02，与原串不等即拒
+-- @sqlite-only         AND substr(approval_no, -15, 4) <> '0000'
+-- @sqlite-only         AND date(substr(approval_no, -15, 4) || '-' || substr(approval_no, -11, 2) || '-' || substr(approval_no, -9, 2)) = substr(approval_no, -15, 4) || '-' || substr(approval_no, -11, 2) || '-' || substr(approval_no, -9, 2))),
     CONSTRAINT ck_hold_scrap CHECK (
         hold_type <> 'SCRAP_PENDING'
         OR (source_type = 'SCRAP' AND source_id > 0 AND operator_id = 0)
@@ -492,6 +502,7 @@ BEGIN                                                                           
        OR NEW.op_key IS DISTINCT FROM OLD.op_key OR NEW.hold_qty_milli IS DISTINCT FROM OLD.hold_qty_milli   -- @pg-only
        OR NEW.operator_id IS DISTINCT FROM OLD.operator_id OR NEW.created_at IS DISTINCT FROM OLD.created_at  -- @pg-only
        OR NEW.approval_type IS DISTINCT FROM OLD.approval_type OR NEW.approval_no IS DISTINCT FROM OLD.approval_no  -- @pg-only
+       OR NEW.is_reversal IS DISTINCT FROM OLD.is_reversal  -- @pg-only
        OR NEW.released_qty_milli < OLD.released_qty_milli  -- R1 释放量只增不减 -- @pg-only
        OR (OLD.status = 'RELEASED' AND NEW.status <> 'RELEASED') THEN  -- R1 RELEASED 不能回 HELD -- @pg-only
         RAISE EXCEPTION 'hold_immutable' USING ERRCODE = '23514';                                            -- @pg-only
@@ -513,7 +524,7 @@ CREATE TRIGGER trg_hr_append_only BEFORE UPDATE OR DELETE ON stock_hold_release 
 -- @sqlite-only WHEN NEW.id IS NOT OLD.id OR NEW.stock_id IS NOT OLD.stock_id OR NEW.hold_type IS NOT OLD.hold_type OR NEW.reason_code IS NOT OLD.reason_code
 -- @sqlite-only   OR NEW.source_type IS NOT OLD.source_type OR NEW.source_id IS NOT OLD.source_id OR NEW.op_key IS NOT OLD.op_key
 -- @sqlite-only   OR NEW.hold_qty_milli IS NOT OLD.hold_qty_milli OR NEW.operator_id IS NOT OLD.operator_id OR NEW.created_at IS NOT OLD.created_at
--- @sqlite-only   OR NEW.approval_type IS NOT OLD.approval_type OR NEW.approval_no IS NOT OLD.approval_no
+-- @sqlite-only   OR NEW.approval_type IS NOT OLD.approval_type OR NEW.approval_no IS NOT OLD.approval_no OR NEW.is_reversal IS NOT OLD.is_reversal
 -- @sqlite-only   OR NEW.released_qty_milli < OLD.released_qty_milli OR (OLD.status = 'RELEASED' AND NEW.status <> 'RELEASED')
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'hold_immutable'); END;
 -- R2（SQLite）：拒删除；REPLACE 冲突时删旧行在 recursive_triggers=OFF（默认，且是连接级开关）下不触发 DELETE 触发器，
@@ -956,6 +967,8 @@ CREATE TABLE idempotency_record (
     status_code  INT          NOT NULL,
     created_at   TIMESTAMP    NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),   -- 一律存 UTC（P1）
     expires_at   TIMESTAMP    NOT NULL                -- UTC；写入后只许往后改（trg_idem_expiry_fwd，P2）
+-- @sqlite-only     -- 小赵 S1：SQLite 不约束时间类型，'garbage'、T 格式、整数都能写进去，按文本比较永远清不掉；限定为 'YYYY-MM-DD HH:MM:SS' 且是真实日期时间
+-- @sqlite-only     , CONSTRAINT ck_idem_ts CHECK ((typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8)) AND (typeof(expires_at) = 'text' AND length(expires_at) = 19 AND expires_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(expires_at) = substr(expires_at, 1, 10) AND time(expires_at) = substr(expires_at, 12, 8)))
 );
 CREATE INDEX ix_idem_exp ON idempotency_record(expires_at);
 
@@ -989,6 +1002,7 @@ CREATE TABLE outbox_event (
     created_at      TIMESTAMP    NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),   -- UTC
     sent_at         TIMESTAMP,                          -- UTC；写入后只许往后改（P2）
     CONSTRAINT ck_outbox_sent CHECK (status <> 'SENT' OR sent_at IS NOT NULL)   -- P3
+-- @sqlite-only     , CONSTRAINT ck_outbox_ts CHECK ((typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8)) AND (typeof(next_retry_at) = 'text' AND length(next_retry_at) = 19 AND next_retry_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(next_retry_at) = substr(next_retry_at, 1, 10) AND time(next_retry_at) = substr(next_retry_at, 12, 8)) AND (sent_at IS NULL OR (typeof(sent_at) = 'text' AND length(sent_at) = 19 AND sent_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(sent_at) = substr(sent_at, 1, 10) AND time(sent_at) = substr(sent_at, 12, 8))))   -- 小赵 S1
 );
 CREATE INDEX ix_outbox_pending ON outbox_event(status, next_retry_at);
 CREATE INDEX ix_outbox_bizkey  ON outbox_event(biz_key, id);   -- 同键串行发送
@@ -1227,6 +1241,7 @@ CREATE TABLE sku_live_param (
     updated_by              BIGINT,
     updated_at              TIMESTAMP NOT NULL DEFAULT now(),
     CONSTRAINT ck_slp_bp CHECK (weigh_tolerance_bp BETWEEN 0 AND 10000 AND death_rate_threshold_bp BETWEEN 0 AND 10000 AND shrink_tolerance_bp BETWEEN 0 AND 10000)
+-- @sqlite-only     , CONSTRAINT ck_slp_ts CHECK ((typeof(updated_at) = 'text' AND length(updated_at) = 19 AND updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(updated_at) = substr(updated_at, 1, 10) AND time(updated_at) = substr(updated_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
 );
 CREATE FUNCTION trg_slp_guard() RETURNS trigger LANGUAGE plpgsql AS $$  -- @pg-only
 BEGIN                                                                                     -- @pg-only
@@ -1266,6 +1281,7 @@ CREATE TABLE live_tank (
     CONSTRAINT ck_lt_do CHECK (do_severe_min_x100 >= 0 AND do_severe_min_x100 <= do_min_x100),
     CONSTRAINT ck_lt_ph CHECK (ph_min_x100 >= 0 AND ph_min_x100 < ph_max_x100 AND ph_max_x100 <= 1400),
     CONSTRAINT ck_lt_interval CHECK (inspect_interval_min BETWEEN 10 AND 1440)
+-- @sqlite-only     , CONSTRAINT ck_lt_ts CHECK ((typeof(updated_at) = 'text' AND length(updated_at) = 19 AND updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(updated_at) = substr(updated_at, 1, 10) AND time(updated_at) = substr(updated_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
 );
 CREATE FUNCTION trg_lt_guard() RETURNS trigger LANGUAGE plpgsql AS $$  -- @pg-only
 BEGIN                                                                                     -- @pg-only
@@ -1290,6 +1306,7 @@ CREATE TABLE live_stock_count (
     version         INT      NOT NULL DEFAULT 0,
     updated_at      TIMESTAMP NOT NULL DEFAULT now(),
     CONSTRAINT ck_lsc_count CHECK (on_hand_count >= 0)
+-- @sqlite-only     , CONSTRAINT ck_lsc_ts CHECK ((typeof(updated_at) = 'text' AND length(updated_at) = 19 AND updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(updated_at) = substr(updated_at, 1, 10) AND time(updated_at) = substr(updated_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
 );
 CREATE FUNCTION trg_lsc_guard() RETURNS trigger LANGUAGE plpgsql AS $$                     -- @pg-only
 BEGIN                                                                                       -- @pg-only
@@ -1323,6 +1340,7 @@ CREATE TABLE live_count_ledger (
     CONSTRAINT uq_lcl_biz UNIQUE (biz_type, biz_no, line_no, stock_id),
     CONSTRAINT ck_lcl_type CHECK (biz_type IN ('RECEIVE','WEIGH_OUT','DEATH','COUNT_ADJ','MOVE_IN','MOVE_OUT','PROCESS_OUT')),
     CONSTRAINT ck_lcl_math CHECK (delta_count <> 0 AND count_before >= 0 AND count_after >= 0 AND count_after = count_before + delta_count)
+-- @sqlite-only     , CONSTRAINT ck_lcl_ts CHECK ((typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
 );
 CREATE TRIGGER trg_lcl_append_only BEFORE UPDATE OR DELETE ON live_count_ledger FOR EACH ROW EXECUTE FUNCTION trg_append_only();  -- @pg-only
 CREATE TRIGGER trg_lcl_no_truncate BEFORE TRUNCATE ON live_count_ledger FOR EACH STATEMENT EXECUTE FUNCTION trg_append_only();  -- @pg-only
@@ -1352,6 +1370,7 @@ CREATE TABLE live_inspection (
     CONSTRAINT ck_li_result CHECK (result IN ('NORMAL','ALARM','SEVERE')),
     CONSTRAINT ck_li_breach CHECK ((result = 'NORMAL' AND consecutive_breach = 0) OR (result <> 'NORMAL' AND consecutive_breach >= 1)),
     CONSTRAINT ck_li_range CHECK (do_x100 >= 0 AND ph_x100 BETWEEN 0 AND 1400)
+-- @sqlite-only     , CONSTRAINT ck_li_ts CHECK ((typeof(inspected_at) = 'text' AND length(inspected_at) = 19 AND inspected_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(inspected_at) = substr(inspected_at, 1, 10) AND time(inspected_at) = substr(inspected_at, 12, 8)) AND (typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
 );
 CREATE INDEX ix_li_tank ON live_inspection(location_id, inspected_at);
 CREATE TRIGGER trg_li_append_only BEFORE UPDATE OR DELETE ON live_inspection FOR EACH ROW EXECUTE FUNCTION trg_append_only();  -- @pg-only
@@ -1378,6 +1397,7 @@ CREATE TABLE live_tank_hold (
     CONSTRAINT ck_lth_status CHECK (status IN ('ACTIVE','RELEASED')),
     CONSTRAINT ck_lth_release CHECK ((status = 'ACTIVE' AND release_inspection_id IS NULL AND released_at IS NULL)
                                   OR (status = 'RELEASED' AND release_inspection_id IS NOT NULL AND released_at IS NOT NULL))
+-- @sqlite-only     , CONSTRAINT ck_lth_ts CHECK ((released_at IS NULL OR (typeof(released_at) = 'text' AND length(released_at) = 19 AND released_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(released_at) = substr(released_at, 1, 10) AND time(released_at) = substr(released_at, 12, 8))) AND (typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
 );
 CREATE UNIQUE INDEX uq_lth_active ON live_tank_hold(location_id) WHERE status = 'ACTIVE';
 CREATE FUNCTION trg_lth_guard() RETURNS trigger LANGUAGE plpgsql AS $$                     -- @pg-only
@@ -1436,6 +1456,7 @@ CREATE TABLE live_weigh (
     CONSTRAINT ck_lw_dual CHECK (qty_count = 0 OR net_qty_milli > 0),
     CONSTRAINT ck_lw_result CHECK ((result = 'ACCEPTED' AND result_code IS NULL AND movement_id IS NOT NULL)
                                 OR (result = 'REJECTED' AND result_code IS NOT NULL AND movement_id IS NULL))
+-- @sqlite-only     , CONSTRAINT ck_lw_ts CHECK ((typeof(weighed_at) = 'text' AND length(weighed_at) = 19 AND weighed_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(weighed_at) = substr(weighed_at, 1, 10) AND time(weighed_at) = substr(weighed_at, 12, 8)) AND (typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
 );
 CREATE TRIGGER trg_lw_append_only BEFORE UPDATE OR DELETE ON live_weigh FOR EACH ROW EXECUTE FUNCTION trg_append_only();  -- @pg-only
 CREATE TRIGGER trg_lw_no_truncate BEFORE TRUNCATE ON live_weigh FOR EACH STATEMENT EXECUTE FUNCTION trg_append_only();  -- @pg-only
@@ -1467,6 +1488,7 @@ CREATE TABLE live_death (
     CONSTRAINT uq_ld_op UNIQUE (device_instance_id, client_op_id),
     CONSTRAINT ck_ld_qty CHECK (death_count > 0 AND death_qty_milli > 0 AND day_rate_bp BETWEEN 0 AND 10000),
     CONSTRAINT ck_ld_apr CHECK (approval_no IS NULL OR (approval_no LIKE 'APR-%' AND length(approval_no) BETWEEN 22 AND 36))
+-- @sqlite-only     , CONSTRAINT ck_ld_ts CHECK ((typeof(reported_at) = 'text' AND length(reported_at) = 19 AND reported_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(reported_at) = substr(reported_at, 1, 10) AND time(reported_at) = substr(reported_at, 12, 8)) AND (typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
 );
 CREATE TRIGGER trg_ld_append_only BEFORE UPDATE OR DELETE ON live_death FOR EACH ROW EXECUTE FUNCTION trg_append_only();  -- @pg-only
 CREATE TRIGGER trg_ld_no_truncate BEFORE TRUNCATE ON live_death FOR EACH STATEMENT EXECUTE FUNCTION trg_append_only();  -- @pg-only
@@ -1499,6 +1521,7 @@ CREATE TABLE live_shrink_settlement (
     CONSTRAINT ck_lss_outcome CHECK ((outcome = 'NONE' AND shrink_qty_milli <= 0 AND scrap_order_id IS NULL AND count_order_id IS NULL)
                                   OR (outcome = 'LOSS' AND shrink_qty_milli > 0 AND shrink_bp <= tolerance_bp AND scrap_order_id IS NOT NULL AND count_order_id IS NULL)
                                   OR (outcome = 'VARIANCE' AND shrink_qty_milli > 0 AND shrink_bp > tolerance_bp AND count_order_id IS NOT NULL AND scrap_order_id IS NULL))
+-- @sqlite-only     , CONSTRAINT ck_lss_ts CHECK ((typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
 );
 CREATE TRIGGER trg_lss_append_only BEFORE UPDATE OR DELETE ON live_shrink_settlement FOR EACH ROW EXECUTE FUNCTION trg_append_only();  -- @pg-only
 CREATE TRIGGER trg_lss_no_truncate BEFORE TRUNCATE ON live_shrink_settlement FOR EACH STATEMENT EXECUTE FUNCTION trg_append_only();  -- @pg-only
