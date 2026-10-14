@@ -135,8 +135,8 @@ CREATE TABLE lot (
     id                  BIGINT       PRIMARY KEY,
     sku_id              BIGINT       NOT NULL,
     lot_code            VARCHAR(64)  NOT NULL,
-    production_date     TIMESTAMP,
-    expiry_date         TIMESTAMP    NOT NULL,          -- FEFO 排序键
+    production_date     DATE,                           -- 日历日（04 I5）
+    expiry_date         DATE         NOT NULL,          -- FEFO 排序键；日历日，禁发期按仓库时区自然日计算（04 I5）
     receive_date        TIMESTAMP    NOT NULL,
     supplier_id         BIGINT,
     origin_batch        VARCHAR(64),
@@ -512,8 +512,8 @@ CREATE TABLE inbound_line (
     rejected_qty    NUMERIC(14,3)   NOT NULL DEFAULT 0,
     uom             VARCHAR(16)     NOT NULL,
     lot_id          BIGINT,
-    production_date TIMESTAMP,
-    expiry_date     TIMESTAMP,
+    production_date DATE,
+    expiry_date     DATE,
     location_id     BIGINT,
     cost_amount     BIGINT,
     quality_status  VARCHAR(16),
@@ -534,7 +534,8 @@ CREATE TABLE outbound_order (
     work_date               DATE            NOT NULL,
     cutoff_at               TIMESTAMP,
     priority                SMALLINT        NOT NULL DEFAULT 5,
-    status                  VARCHAR(24)     NOT NULL,
+    status                  VARCHAR(24)     NOT NULL,   -- 迁移表见 docs/04 §5.1
+    source_hash             VARCHAR(64)     NOT NULL DEFAULT '',  -- 上游单据内容摘要，同号不同 hash → 40910（04 I1）
     wave_id                 BIGINT,
     short_ship_policy       VARCHAR(16)     NOT NULL DEFAULT 'ALLOW_SHORT',
     total_qty               NUMERIC(14,3)   NOT NULL DEFAULT 0,
@@ -561,7 +562,9 @@ CREATE TABLE outbound_order (
     created_by              BIGINT,
     CONSTRAINT uq_obo_code UNIQUE (code),
     CONSTRAINT uq_obo_src  UNIQUE (source_system, source_order_no),
-    CONSTRAINT ck_obo_sod  CHECK (checker_id IS NULL OR picker_id IS NULL OR picker_id <> checker_id)
+    CONSTRAINT ck_obo_sod  CHECK (checker_id IS NULL OR picker_id IS NULL OR picker_id <> checker_id),
+    CONSTRAINT ck_obo_status CHECK (status IN ('CREATED','PENDING_ALLOC','ALLOCATED','SHORT','WAVED','PICKING','PICKED',
+                                               'CHECKED','STAGED','SHIPPED','DELIVERED','COMPLETED','CANCELLED'))
 );
 CREATE INDEX ix_obo_pool   ON outbound_order(warehouse_id, route_code, temperature_required, priority)
     WHERE status = 'ALLOCATED';                          -- 波次待处理池
@@ -583,6 +586,7 @@ CREATE TABLE outbound_line (
     unit_price      BIGINT          NOT NULL DEFAULT 0,
     amount          BIGINT          NOT NULL DEFAULT 0,
     short_reason    VARCHAR(24),
+    alloc_round     INT             NOT NULL DEFAULT 0,   -- 每次重新分配 +1，进入占用幂等键（04 B1）
     CONSTRAINT uq_obo_line UNIQUE (outbound_id, line_no)
 );
 CREATE INDEX ix_obl_sku ON outbound_line(sku_id);
