@@ -209,7 +209,9 @@ outbox 每条：`{ op_id(uuid), local_seq, format_version, idem_key, device_inst
 | `50010` 不变量违反 | 服务端断言失败 | 通用错误提示 + `trace_id`；**不自动重试**，条目置 `failed` 红条交主管，上报日志 |
 | `42214 OVER_QTY` 且 `detail.reason=OVER_PICK`（拣货确认：已确认量 + 本次数量 > 计划量） | 数量录入错误或重复拣 | `failed` 红条，**不自动重试**，提示「请复核数量或联系主管」；复核后改数量为新操作（新 Key、新 `op_seq`，关联原条目） |
 | `42214 OVER_QTY` 且 `detail.reason=OVER_REVERSE`（撤销拣货：撤销量超过已拣未撤销量） | 撤销重复或数量错误 | `failed` 红条，**不自动重试**；红条显示「出库行 {outbound_line_id}：已拣 {picked_qty}，已撤销 {reversed_qty}，本次申请撤销 {requested_qty}」（`detail` 字段，数量为 3 位小数字符串，经 `formatQty` + `base_uom` 显示），提示复核或联系主管 |
-| `42214 OVER_QTY` 且 `detail.reason` 缺失或不是 `OVER_PICK`/`OVER_REVERSE` | 契约异常（`42214 OVER_QTY` 的 reason 只有这两个值） | `failed` 红条交人工，**不自动重试、不生成新 Key**，上报日志 |
+| `42214 OVER_QTY` 且 `detail.reason=OVER_CHECK`（复核：复核数量超过已拣数量） | 多扫或拣货少拣 | `failed` 红条「复核数量超过已拣数量」，长鸣，不自动重试；核对实物，必要时交主管 |
+| `42214 OVER_QTY` 且 `detail.reason=SELL_EXPIRED`（复核：批次已过可售期，00 §6.4） | 已拣批次超过 `sell_days` 可售截止 | `failed` 红条「批次已过可售期」，不自动重试；请主管发起拣后取消（`CANCEL_AFTER_PICK`） |
+| `42214 OVER_QTY` 且 `detail.reason` 缺失或不是 `OVER_PICK`/`OVER_REVERSE`/`OVER_CHECK`/`SELL_EXPIRED` | 契约异常（`42214 OVER_QTY` 的 reason 只有这四个值） | `failed` 红条交人工，**不自动重试、不生成新 Key**，上报日志 |
 | 409 `40920 TASK_REASSIGNED` | 离线超时回收或主管改派 | 见 §9.4.1 |
 | 409 `40921 TASK_CANCELLED` | 任务/出库单已取消 | 见 §9.4.1 |
 | 409 `40922 TASK_CLOSED` | 任务已关闭 | 见 §9.4.1 |
