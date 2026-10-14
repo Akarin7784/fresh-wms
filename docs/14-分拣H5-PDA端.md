@@ -189,9 +189,10 @@ outbox 每条：`{ op_id(uuid), local_seq, format_version, idem_key, device_inst
 | 409 `40921 TASK_CANCELLED` | 任务/出库单已取消 | 见 §9.4.1 |
 | 409 `40922 TASK_CLOSED` | 任务已关闭 | 见 §9.4.1 |
 | `40902` 库存不足 | 本地认为拣到但服务端扣不了 | 原条目 `failed`；选「重扫」生成**新操作、新 Key、新 `op_seq`**，新条目 `linked_op_id` 指向原条目，新条目成功后原条目置 `superseded`；或选「报缺」 |
-| `42210` 条码不匹配 / 批次效期不符 | 白名单过期 | 同上，重扫生成新条目并关联 |
-| 401 | token 失效 | 暂停该账号队列，同一账号重新登录后继续 |
-| 403 | 权限被收回 | 暂停该账号队列，交主管 |
+| `42210` 条码不匹配 | 白名单过期或扫错 | 同上，重扫生成新条目并关联 |
+| `40903` 批次效期不符 | 白名单过期 | 同上，重扫生成新条目并关联 |
+| 401 / `40110` | token 失效 | 暂停该账号队列，同一账号重新登录后继续 |
+| 403 / `40310`、`40311` | 权限或仓库数据权限被收回 | 暂停该账号队列，交主管 |
 
 #### 9.4.1 任务改派 / 取消 / 已关闭（40920 / 40921 / 40922）
 
@@ -227,7 +228,7 @@ flowchart LR
 | 主管处理 | `POST /api/v1/return-records/{returnRecordId}/resolve` | 后台（主管权限） | 必填原因；可选「就近放回」并指定目标库位（记一笔移库） |
 
 PDA 规则：
-- confirm 扫错库位 → 422：红条保留，提示「请扫原库位 XX」重扫。**PDA 不提供就近放回**，就近放回只能主管在后台 resolve。
+- confirm 扫错库位 → 422 `42212`（LOCATION_MISMATCH）：红条保留，提示「请扫原库位 XX」重扫。**PDA 不提供就近放回**，就近放回只能主管在后台 resolve。
 - confirm 和 resolve 都是 `status=OPEN` 条件更新，只有一方成功。输的一方收到 `40930`（通用非法状态迁移），响应体带 `currentStatus`、`handledBy`、`handledAt`。
 - PDA **仅当同时满足**以下两条时才视为已闭环、删除本地 `failed` 条目并提示「已由 XX 于 HH:mm 处理」：
   1. 该 `40930` 来自 return-records 接口（confirm 或 GET 详情相关调用）；
@@ -241,7 +242,7 @@ stateDiagram-v2
   [*] --> OPEN: 补交被拒 40920/40921/40922
   OPEN --> CONFIRMED: PDA confirm 扫原库位
   OPEN --> RESOLVED: 主管 resolve（可就近放回=移库）
-  OPEN --> OPEN: 扫错库位 422 / 原库位冻结或温区不符 422
+  OPEN --> OPEN: 扫错库位 42212 / resolve 原库位冻结或温区不符 42213
   CONFIRMED --> [*]
   RESOLVED --> [*]
 ```
@@ -259,7 +260,7 @@ stateDiagram-v2
 |---|---|---|
 | 单元 | Vitest + fake-indexeddb | outbox 写入原子性；Key 与 `op_seq` 在失败/重启/退避后不变；`local_seq` 排序（时钟回拨后顺序不变）；串行与失败暂停只影响本账号同任务；`failed` 不被 24h 清理、只在服务端回执后删除；撤销在确认被拒后置 `superseded`；重扫生成新条目并关联；`format_version` 迁移（含迁移失败标红）；数量字符串计算 |
 | 组件 | Vitest + @vue/test-utils | 三步扫码不可跳步、缺货跳行、30 秒撤销、BigButton ≥56dp、离线确认即时反馈；计件模式 1 秒扫 5 件得 5（不被去抖）；非计件模式壳重复广播被丢弃；outbox 非空不能登出、可交主管；首页显示其他账号待补交数 |
-| 模拟弱网 | MSW | 超时后重试同 Key；响应丢失；**Key 过期（服务端无 Key 记录）后补交按四元组重放，不重复扣减**；同四元组不同数量 409；40920/40921/40922 返回 `confirmedLines` + `returnRecordId`，重复被拒返回同一 id（按四元组）；confirm 扫错库位 422 红条保留并提示重扫原库位；confirm 成功后删除 failed 条目；confirm 与主管 resolve 并发：return-records 接口返回 `40930` 且 `currentStatus=CONFIRMED/RESOLVED` 时删除条目；**其他接口返回的 `40930` 不删除、红条保留**；**`40930` 且 `currentStatus=OPEN`（或缺失/未知）不删除、红条保留**；同四元组不同数量返回 `40910` 转人工；confirm 网络失败同 Key 重试；401 中途失效 |
+| 模拟弱网 | MSW | 超时后重试同 Key；响应丢失；**Key 过期（服务端无 Key 记录）后补交按四元组重放，不重复扣减**；同四元组不同数量 409；40920/40921/40922 返回 `confirmedLines` + `returnRecordId`，重复被拒返回同一 id（按四元组）；confirm 扫错库位 `42212` 红条保留并提示重扫原库位；confirm 成功后删除 failed 条目；confirm 与主管 resolve 并发：return-records 接口返回 `40930` 且 `currentStatus=CONFIRMED/RESOLVED` 时删除条目；**其他接口返回的 `40930` 不删除、红条保留**；**`40930` 且 `currentStatus=OPEN`（或缺失/未知）不删除、红条保留**；同四元组不同数量返回 `40910` 转人工；confirm 网络失败同 Key 重试；401 中途失效 |
 | 真机 | 手工清单 | 冷库断网 30 分钟及跨夜（>24h）后补交；拔电池/杀 WebView 后恢复；手动改系统时间后上传顺序；换班换账号；outbox 非空时强制更新 |
 
 覆盖率目标：`offline/`、`utils/`、`composables/` 行 ≥ 85%、分支 ≥ 75%；组件 ≥ 70%。
