@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 42 处 DEFAULT now()、3 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
---   3. 方言专属行：删除 196 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 104 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 200 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 106 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -515,7 +515,7 @@ CREATE INDEX ix_snap_sku ON stock_snapshot_daily(work_date, warehouse_id, sku_id
 
 CREATE TABLE stock_recon_alert (
     id                      BIGINT          PRIMARY KEY,
-    check_code              VARCHAR(16)     NOT NULL,   -- I3a/I3b/I3c/I3d/I4/I5/SNAP
+    check_code              VARCHAR(24)     NOT NULL,   -- 码表见 ck_recon_code；CHECK_BOX_MISMATCH 18 位，16 放不下
     warehouse_id            BIGINT          NOT NULL,
     stock_id                BIGINT          NOT NULL DEFAULT 0,   -- 0 = 仓级汇总差异（R11）
     expected_qty_milli      BIGINT          NOT NULL,
@@ -528,7 +528,7 @@ CREATE TABLE stock_recon_alert (
     detected_at             TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     last_seen_at            TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT ck_recon_status CHECK (status IN ('OPEN','ACKED','RESOLVED')),
-    CONSTRAINT ck_recon_code CHECK (check_code IN ('I3a','I3b','I3c','I3d','I3e','I4','I5','SNAP'))   -- 码表见 docs/02 §4.6；新增走迁移（小赵 C4）
+    CONSTRAINT ck_recon_code CHECK (check_code IN ('I3a','I3b','I3c','I3d','I3e','I4','I5','SNAP','RR_HOLD_FAILED','RR_HOLD_MISMATCH','CHECK_BOX_MISMATCH','SHIP_EVENT_MISSING'))   -- 码表见 docs/02 §4.6；新增走迁移（小赵 C4）
 );
 CREATE INDEX ix_recon_open ON stock_recon_alert(warehouse_id, status, detected_at DESC);
 CREATE UNIQUE INDEX uq_recon_open ON stock_recon_alert(check_code, warehouse_id, stock_id) WHERE status <> 'RESOLVED';
@@ -770,7 +770,7 @@ CREATE TABLE pack_box (
     shipment_id     BIGINT,
     stage_location_id BIGINT,                       -- 集货位
     box_type        VARCHAR(24)  NOT NULL DEFAULT 'CARTON',  -- CARTON/TURNBOX（周转筐）
-    weight_g        NUMERIC(10,2),                  -- docs/06 Q6：拟改 weight_mg BIGINT（R2），待 PM
+    weight_g        BIGINT,                         -- docs/06 Q6 已定：整数克
     status          VARCHAR(16)  NOT NULL DEFAULT 'OPEN',    -- docs/06 §5.2：OPEN/SEALED/STAGED/SHIPPED/CANCELLED；装车扫箱归 docs/16
     sealed          BOOLEAN      NOT NULL DEFAULT false,     -- 兼容旧字段，= status<>'OPEN' 且 <>'CANCELLED'
     checker_id      BIGINT,
@@ -779,6 +779,7 @@ CREATE TABLE pack_box (
     version         INT          NOT NULL DEFAULT 0,
     created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT uq_box_code UNIQUE (code),
+    CONSTRAINT ck_box_weight CHECK (weight_g IS NULL OR (weight_g >= 0 AND weight_g = CAST(weight_g AS BIGINT))),
     CONSTRAINT ck_box_status CHECK (status IN ('OPEN','SEALED','STAGED','SHIPPED','CANCELLED')),
     CONSTRAINT ck_box_sealed CHECK ((status IN ('OPEN','CANCELLED') AND sealed = false)
                                  OR (status IN ('SEALED','STAGED','SHIPPED') AND sealed = true AND packed_at IS NOT NULL AND checker_id IS NOT NULL)),
@@ -825,16 +826,10 @@ CREATE TABLE shipment (
     code            VARCHAR(64)  NOT NULL,
     warehouse_id    BIGINT       NOT NULL,
     carrier_code    VARCHAR(32),
-    vehicle_no      VARCHAR(24),
-    driver_id       BIGINT,
-    driver_name     VARCHAR(64),
-    driver_phone    VARCHAR(32),
     status          VARCHAR(16)  NOT NULL DEFAULT 'CREATED', -- docs/06 §5.3：CREATED/HANDED_OVER/CANCELLED；HANDED_OVER 后装车、发车、在途、签收归 docs/16（waybill 1:1）
-    planned_depart_at TIMESTAMP,
-    departed_at     TIMESTAMP,
-    signed_at       TIMESTAMP,
     temp_log_ref    VARCHAR(128),                   -- 温控记录对象存储 key
     dock_location_id BIGINT,                        -- 月台
+    waybill_id      BIGINT,                         -- docs/16 waybill.id（1:1，交接同事务由 create_from_shipment 生成后回填）；司机、车辆、发车、签收都在 16
     box_count       INT          NOT NULL DEFAULT 0,       -- 交接时冻结：SHIPPED 箱数
     handed_over_at  TIMESTAMP,                      -- 发货出库交接时间（UTC）
     handed_over_by  BIGINT,
@@ -843,12 +838,12 @@ CREATE TABLE shipment (
     updated_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT uq_shp_code UNIQUE (code),
     CONSTRAINT ck_shp_status CHECK (status IN ('CREATED','HANDED_OVER','CANCELLED')),
-    CONSTRAINT ck_shp_handover CHECK (status <> 'HANDED_OVER' OR (handed_over_at IS NOT NULL AND handed_over_by IS NOT NULL AND vehicle_no IS NOT NULL AND box_count > 0)),
+    CONSTRAINT ck_shp_handover CHECK (status <> 'HANDED_OVER' OR (handed_over_at IS NOT NULL AND handed_over_by IS NOT NULL AND waybill_id IS NOT NULL AND box_count > 0)),
     CONSTRAINT ck_shp_box_count CHECK (box_count >= 0)
 );
--- docs/06 §5.3：HANDED_OVER / CANCELLED 终态（之后的 departed_at/signed_at 等由 docs/16 回写，不在本触发器冻结列内）；不可删
+-- docs/06 §5.3：HANDED_OVER / CANCELLED 终态（交接后在途、签收都在 docs/16）；不可删
 CREATE TRIGGER trg_shp_closed BEFORE UPDATE ON shipment
-WHEN OLD.status IN ('HANDED_OVER','CANCELLED') AND (NEW.status <> OLD.status OR NEW.box_count <> OLD.box_count OR NEW.vehicle_no IS NOT OLD.vehicle_no OR NEW.handed_over_at IS NOT OLD.handed_over_at)
+WHEN OLD.status IN ('HANDED_OVER','CANCELLED') AND (NEW.status <> OLD.status OR NEW.box_count <> OLD.box_count OR NEW.waybill_id IS NOT OLD.waybill_id OR NEW.handed_over_at IS NOT OLD.handed_over_at)
 BEGIN SELECT RAISE(ABORT, 'shipment_closed'); END;
 CREATE TRIGGER trg_shp_state BEFORE UPDATE OF status ON shipment
 WHEN OLD.status NOT IN ('HANDED_OVER','CANCELLED') AND NEW.status <> OLD.status AND NOT (OLD.status = 'CREATED' AND NEW.status IN ('HANDED_OVER','CANCELLED'))
@@ -857,7 +852,6 @@ CREATE TRIGGER trg_shp_del BEFORE DELETE ON shipment BEGIN SELECT RAISE(ABORT, '
 CREATE TRIGGER trg_shp_dup BEFORE INSERT ON shipment
 WHEN EXISTS (SELECT 1 FROM shipment x WHERE x.id = NEW.id OR x.code = NEW.code)
 BEGIN SELECT RAISE(ABORT, 'shipment_duplicate'); END;
-CREATE INDEX ix_shp_driver ON shipment(driver_id, status, planned_depart_at);
 
 -- ============================================================
 -- docs/06 复核、装箱、发货
@@ -1094,6 +1088,8 @@ CREATE TRIGGER trg_idem_expiry_fwd BEFORE UPDATE ON idempotency_record WHEN NEW.
 BEGIN SELECT RAISE(ABORT, 'expiry_backdate: idempotency_record'); END;
 CREATE TRIGGER trg_outbox_expiry_fwd BEFORE UPDATE ON outbox_event WHEN NEW.created_at IS NOT OLD.created_at OR (OLD.sent_at IS NOT NULL AND (NEW.sent_at IS NULL OR NEW.sent_at < OLD.sent_at)) OR (OLD.sent_at IS NULL AND NEW.sent_at < OLD.created_at) OR (OLD.status = 'SENT' AND NEW.status <> 'SENT')
 BEGIN SELECT RAISE(ABORT, 'expiry_backdate: outbox_event'); END;
+CREATE TRIGGER trg_outbox_sent_now BEFORE UPDATE ON outbox_event WHEN NEW.status = 'SENT' AND OLD.status <> 'SENT' AND abs(julianday(NEW.sent_at) - julianday('now')) * 86400 > 5
+BEGIN SELECT RAISE(ABORT, 'sent_at_not_now'); END;
 -- SQLite REPLACE 冲突删旧行不触发 DELETE 触发器 → BEFORE INSERT 主键已存在就中止（应用把 idem_duplicate 当作"键已存在"处理，与 PG 23505 同分支）
 CREATE TRIGGER trg_idem_no_replace BEFORE INSERT ON idempotency_record WHEN EXISTS (SELECT 1 FROM idempotency_record r WHERE r.idem_key = NEW.idem_key)
 BEGIN SELECT RAISE(ABORT, 'idem_duplicate'); END;
