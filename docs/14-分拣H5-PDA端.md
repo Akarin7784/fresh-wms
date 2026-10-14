@@ -43,6 +43,7 @@ Hash 路由（WebView 兼容）。权限点为建议值，以第 12 篇为准。
 | `/pack/:orderCode` | 开箱、装箱、封箱、打印箱码；集货（扫箱码 + 集货位） | `outbound.pack.execute` / `outbound.stage.execute` |
 | `/receive/blind` | 无预约盲收登记（门店退货等） | `inbound.return.blind` |
 | `/receive/reservations` | 退货预约到货收货（扫预约单 → 收货进 `RETURN_QC`） | `return.reservation.receive` |
+| `/offline/paper` | 纸单补录（恢复联网后 24h 内，生成 `PAPER_BACKFILL` 审批） | `offline.paper.backfill` |
 | `/sync` | 补交队列（待上传/失败红条/已完成） | — |
 | `/putaway`、`/move` | 上架、移库 | `inbound.putaway.execute` / `inventory.move.execute` |
 | `/settings` | 声音/震动、扫码模式、版本与设备信息 | — |
@@ -101,6 +102,7 @@ Hash 路由（WebView 兼容）。权限点为建议值，以第 12 篇为准。
 | 集货 | 扫箱码 + 集货位（四元键） | `POST /api/v1/boxes/{code}/stage` |
 | 收货 | 盲收登记（返回收货记录号 + 异常单号） | `POST /api/v1/inbound/returns/blind` |
 | 收货 | 退货预约收货 | `POST /api/v1/returns/reservations/{id}/receive` |
+| 纸单补录 | 提交 `{action_type, occurred_at, operator_id, payload, photo_ids[]}` | `POST /api/v1/offline/paper-records` |
 | 心跳 / 断网状态 | `{stale_policy, paused, offline_since, offline_deadline_at, paused_actions[]}` | `GET /api/v1/me` 与 PDA 心跳 |
 
 ## 7. 权限点
@@ -295,7 +297,7 @@ stateDiagram-v2
 - **旧写节点拒写（`STALE_WRITE_NODE`）**：暂停 outbox → 重新取 write-endpoint → 按 `local_seq` 顺序**原样**重提交（原 `Idempotency-Key`、`device_instance_id`、`op_seq` 不变）；条目保持 `pending`，**不标红**，顶栏提示「系统切换中」。
   - 码值：**`50303 STALE_WRITE_NODE`**（总体设计 §6.4）。
   - `50302 ID_CLOCK_BACKWARD`（发号时钟回拨）**不触发**重取地址：按普通 503 处理，条目保持 `pending` 退避重试，不标红。
-- 收到 `50301` 或发现 `epoch` 变化时，同样重取地址后按上述规则重提交。
+- 收到 `50301`（`detail.reason` 不是 `STALE_STOCK_PAUSED`）或发现 `epoch` 变化时，同样重取地址后按上述规则重提交。`50301` 且 `detail.reason=STALE_STOCK_PAUSED` 是暂停，不是切换：见 §9.10。
 - **继承**：幂等记录、四元组唯一键约束、待回库记录随权威库迁移，新写节点直接继承；切换完成前旧节点只读。切换前已成功的操作重提交得到重放结果，不重复扣减。
 - **非计划切换（边缘硬件故障）**：从备份恢复到备用机，RPO 窗口内的写入可能丢失；PDA 只需重取地址，然后 outbox 按原业务键重提交补数，幂等保证不重复入账。恢复后的节点可能使用**新的节点号**，对 PDA 无影响（除重取地址外）。对账（动碰盘点）完成前若服务端暂不开放作业，写请求按 503 处理，条目保持 `pending`。
 - 任务包里的任务版本以新库为准；版本变化按 §9.4 处理。
@@ -334,7 +336,7 @@ stateDiagram-v2
 - 交接后装错车不可撤回：PDA 不提供撤回入口。封箱后丢失/损坏由主管走 `BOX_VOID` 审批（管理后台，第 13 篇），PDA 不处理。
 
 ### 9.10 断网可用清单与剩余离线时间（Yuri 裁定）
-- 断网状态由 `GET /api/v1/me` 与 PDA 心跳返回：`{stale_policy, paused, offline_since, offline_deadline_at, paused_actions[]}`（`stale_policy` 默认 `PAUSE`）。**首页宫格与按钮按 `paused_actions[]` 置灰**，不在前端写死清单；离线期间沿用最后一次收到的值。下表仅为示例（按 Yuri 裁定的默认口径），以服务端返回为准：
+- 断网状态由 `GET /api/v1/me` 与 PDA 心跳返回：`{stale_policy: PAUSE|DEGRADE, paused, offline_since, offline_deadline_at, paused_actions[]}`（00 §6.6.2；`offline_deadline_at` = `offline_since` + 12h）（`stale_policy` 默认 `PAUSE`）。**首页宫格与按钮按 `paused_actions[]` 置灰**，不在前端写死清单；离线期间沿用最后一次收到的值。下表仅为示例（按 Yuri 裁定的默认口径），以服务端返回为准：
 
 | 功能 | 断网时 |
 |---|---|
@@ -347,13 +349,16 @@ stateDiagram-v2
 | 待回库确认 | 置灰（需在线校验状态） |
 
 - 置灰项点击提示「断网期间不可用，联网后操作」。
+- 被暂停的操作若仍提交，服务端返回 `503` `50301`，`detail.reason=STALE_STOCK_PAUSED`：提示「该仓暂停跨网点分配/移动，稍后再试」，**不重试**，并立即重拉 `GET /api/v1/me` 刷新 `paused_actions[]`；不触发写节点重取（区别于 §9.5）。
 - **剩余离线时间**：顶栏常驻倒计时，取 `offline_deadline_at`（UTC，按本地显示；最长 12h，与离线令牌一致），前端不自行用 `offline_since` 推算；剩余 < 1 小时变红提醒；到期后停止新作业记录、只允许查看与联网补交（§9.7）。
 - 重连后按 §9.8 对账补交；补交冲突进入服务端异常队列，PDA 对应条目显示红条与异常单号（若响应提供）。
 
 ### 9.11 盲收登记与退货预约收货
-- **盲收**（无预约到货，`inbound.return.blind`）：`POST /api/v1/inbound/returns/blind`，body `{sku_id, qty, store_code?, box_label?, photo_ids[]}`（`qty` 为 3 位小数字符串；`store_code`、`box_label` 当前可选），带 `Idempotency-Key`。响应返回**收货记录号**与**自动生成的异常单号**，PDA 结果页同时显示二者，并提示「须在 48 小时内关联订单，超时升级主管」。离线时入 outbox，联网补交后再显示两个单号。退货原因与箱码是否改为必填待大肥鱼确认（Q25）。
+- **盲收**（无预约到货，`inbound.return.blind`）：`POST /api/v1/inbound/returns/blind`，body `{sku_id, qty, reason_code, container_code, store_code?, photo_ids[]}`（`qty` 为 3 位小数字符串；**`reason_code`、`container_code` 必填**，`store_code` 可选），带 `Idempotency-Key`。前端必填校验：未选退货原因、未扫箱码（`container_code`）时提交置灰并在字段下提示；服务端缺字段返回 `400`，按 `detail` 中的字段名在对应输入框下显示提示，不重试。响应返回**收货记录号**与**自动生成的异常单号**，PDA 结果页同时显示二者，并提示「须在 48 小时内关联订单，超时升级主管」。离线时入 outbox（入队前同样做必填校验），联网补交后再显示两个单号。
 - **退货预约收货**（`return.reservation.receive`）：扫/选预约单 → 核对行（`sku_id`、`qty`、`reason_code`）→ `POST /api/v1/returns/reservations/{id}/receive`；收货后进入 `RETURN_QC` 冻结，PDA 只显示「待质检」，不提供解冻。
-- **纸单兜底**：设备不可用时现场用纸质单据记录，事后补录并经主管审批；补录接口未定义，见 Q26。
+- **纸单兜底补录**（00 §6.6.1，审批类型 `PAPER_BACKFILL`）：设备不可用时现场用纸质单据记录；恢复联网后由操作人（`offline.paper.backfill`）在「纸单补录」入口提交 `POST /api/v1/offline/paper-records` `{action_type, occurred_at, operator_id, payload, photo_ids[]}`（`occurred_at` 为纸单记录的发生时间，按仓库时区录入、以 UTC 提交；纸单照片必传），带 `Idempotency-Key`，生成待主管审批（`offline.paper.approve`）的审批单，申请人不能自批。
+  - **24 小时时限**：必须在恢复联网后 24 小时内提交，超时由服务端转异常单（第 10 篇）。补录入口显示「补录剩余 HH:MM」倒计时，起点为本机记录的恢复联网时刻（仅提示，服务端为准；服务端截止字段见 Q27），<1 小时标红。
+  - 补录本身必须在线，不进 outbox。
 
 ## 10. 测试要点
 
@@ -362,7 +367,7 @@ stateDiagram-v2
 | 单元 | Vitest + fake-indexeddb | outbox 写入原子性；Key 与 `op_seq` 在失败/重启/退避后不变；`local_seq` 排序（时钟回拨后顺序不变）；串行与失败暂停只影响本账号同任务；`failed` 不被 24h 清理、只在服务端回执后删除；撤销在确认被拒后置 `superseded`；重扫生成新条目并关联；`format_version` 迁移（含迁移失败标红）；数量字符串计算 |
 | 组件 | Vitest + @vue/test-utils | 三步扫码不可跳步、缺货跳行、30 秒撤销、BigButton ≥56dp、离线确认即时反馈；计件模式 1 秒扫 5 件得 5（不被去抖）；非计件模式壳重复广播被丢弃；outbox 非空不能登出、可交主管；首页显示其他账号待补交数 |
 | 模拟弱网 | MSW | `40110 DEVICE_UNBOUND` 清令牌回登录且 outbox 保留；`40111 NOT_BOUND` 重新登录再发起绑定；`WAREHOUSE_MISMATCH` 提示主管；等待页按 approval_id 查询状态；离线令牌剩余时间取响应 `exp`；`40111 BINDING_PENDING` 显示等待页且 outbox 无写入、刷新后审批通过进入首页；`40920` 带 `new_holder_device_id` 时红条显示持有设备、排队操作转待回库队列、无重试请求；`40111` 暂停队列且不清 outbox；`40112` 四种 reason 分别提示、均不清 outbox；`40312` 红条显示 rule；离线令牌剩余 <1h 提醒、过期仍记录 outbox；离线用任务行 `expected_barcodes[]` 预校验（不匹配长鸣不入队）、本地通过但服务端 `42210` 时红条重扫（服务端胜出）；在线扫码调用 barcodes 解析；IndexedDB 无条码全表；`40110` 三种 reason：TOKEN_EXPIRED 刷新后同 Key 续传、PERM_VERSION_CHANGED 重拉 /me 后按权限继续或转红条、DEVICE_UNBOUND 进入重新绑定且 outbox 保留；`42214 OVER_QTY` 按 `detail.reason` 分支：`OVER_PICK` 超拣红条、`OVER_REVERSE` 红条按 `detail{outbound_line_id, picked_qty, reversed_qty, requested_qty}` 渲染且数量经 `formatQty` 显示（不做浮点运算）、缺失/未知红条交人工，三种情况均不自动重试（断言无二次请求）；超时后重试同 Key；响应丢失；**Key 过期（服务端无 Key 记录）后补交按四元组重放，不重复扣减**；`40932` detail 五字段齐全：非 `NEARBY_PUTBACK` 时 `target_location` 有值也被忽略（不提示去目标库位）、`NEARBY_PUTBACK` 且 `target_location` 为空按契约异常保留红条；`40932` 按 `resolution` 分支：`CONFIRMED`/`RETURNED_TO_ORIGINAL` 立即删除、`NEARBY_PUTBACK` 红条保留直到 `putback-ack` 成功（扫错 `42212` 重扫、ack 不写流水）、`SCRAP_HANDOVER` 红条保留直到 GET 详情 `handover_confirmed_at` 非空（为空保留）、缺失/未知保留；`40910` 的 `POD_OP`/`POD_CORRECT`/`SOURCE_ORDER` 按契约异常处理；断网时用缓存的 endpoint + epoch 继续作业且写请求带 `X-Write-Epoch`；`50303 STALE_WRITE_NODE` → 暂停 outbox、重取 write-endpoint、按 `local_seq` 原 Key 重放，不标红；`50302 ID_CLOCK_BACKWARD` 不触发重取地址、不与 STALE 混淆（只退避重试）；非计划切换后按原业务键重提交补数且新节点号无影响；`50301` 或 `epoch` 变化 → 重取 write-endpoint 后按 `local_seq` 用原 Key/`op_seq` 重提交，切换前已成功的操作得到重放不重复扣减；切换期间不标红；40920/40921/40922 返回 `confirmedLines` + `returnRecordId`，重复被拒返回同一 id（按四元组）；confirm 扫错库位 `42212` 红条保留并提示重扫原库位；confirm 成功后删除 failed 条目；confirm 与主管 resolve 并发：**`40930` 不删除、红条保留**；`40910` 按 `detail.key_type` 分支（`PDA_OP` 交主管、`IDEMPOTENCY_KEY` 上报；缺失/未知时红条、不自动重试、不生成新 Key）；`50000` 退避同 Key 重试；`50010` 不自动重试、红条；`42214 OVER_QTY`（`OVER_PICK`）超拣红条且不自动重试；`42212` 后修正重扫用同 Key 被重新执行（422 不缓存）；5xx/429 后同 Key 重试被重新执行且由业务键兜底不重复扣减；confirm 网络失败同 Key 重试；401 中途失效 |
-| 复核/装箱/离线清单 | Vitest + MSW | `40312` + `detail.reason=CHECK_SOD` 红条「换人复核」不重试，`40312` 其他 reason 走通用；`42214 OVER_CHECK` 长鸣红条不重试，文案区别于 OVER_PICK/OVER_REVERSE；未扫齐时提交置灰并提示先撤销拣货；SEALED 箱明细只读，`40937` 刷新不重试；扫到他单商品拒绝入箱；多人拣同一单时复核人与任一拣货人相同、或无拣货人记录均被 `40312 CHECK_SOD` 拒绝；零扫描「通过」置灰；复核未 PASSED 不显示封箱，封箱人规则拒绝走通用处理；SHIPPED 箱无编辑入口；`42215` 红条重扫集货位；重量只接受整数克；断网时领取新任务、新分配、调拨、波次下发、开复核/封箱置灰，已下发任务执行、复核扫码、收货与盲收登记可用并入 outbox；顶栏倒计时取离线令牌 `exp`（≤12h），<1h 变红、到期停止新记录；盲收提交成功显示收货记录号 + 异常单号与 48h 提示、离线时入队补交后显示；预约收货调用 receive 后显示待质检；置灰完全由 `paused_actions[]` 驱动（返回空数组时不置灰、返回新动作时置灰）；倒计时取 `offline_deadline_at` 而非本地推算；非复核人看不到封箱按钮，`40930 SEALER_NOT_CHECKER` 提示不重试 |
+| 复核/装箱/离线清单 | Vitest + MSW | `40312` + `detail.reason=CHECK_SOD` 红条「换人复核」不重试，`40312` 其他 reason 走通用；`42214 OVER_CHECK` 长鸣红条不重试，文案区别于 OVER_PICK/OVER_REVERSE；未扫齐时提交置灰并提示先撤销拣货；SEALED 箱明细只读，`40937` 刷新不重试；扫到他单商品拒绝入箱；多人拣同一单时复核人与任一拣货人相同、或无拣货人记录均被 `40312 CHECK_SOD` 拒绝；零扫描「通过」置灰；复核未 PASSED 不显示封箱，封箱人规则拒绝走通用处理；SHIPPED 箱无编辑入口；`42215` 红条重扫集货位；重量只接受整数克；断网时领取新任务、新分配、调拨、波次下发、开复核/封箱置灰，已下发任务执行、复核扫码、收货与盲收登记可用并入 outbox；顶栏倒计时取离线令牌 `exp`（≤12h），<1h 变红、到期停止新记录；盲收未选 `reason_code` 或未扫 `container_code` 时提交置灰、离线也不入队，服务端 `400` 按字段提示；纸单补录需 `offline.paper.backfill`、照片必传、在线提交生成 `PAPER_BACKFILL` 审批，恢复联网后 24h 倒计时 <1h 标红；`50301 STALE_STOCK_PAUSED` 提示暂停、不重试、重拉 /me、不重取写节点，其他 `50301` 仍走写节点重取；盲收提交成功显示收货记录号 + 异常单号与 48h 提示、离线时入队补交后显示；预约收货调用 receive 后显示待质检；置灰完全由 `paused_actions[]` 驱动（返回空数组时不置灰、返回新动作时置灰）；倒计时取 `offline_deadline_at` 而非本地推算；非复核人看不到封箱按钮，`40930 SEALER_NOT_CHECKER` 提示不重试 |
 | 真机 | 手工清单 | 冷库断网 30 分钟及跨夜（>24h）后补交；拔电池/杀 WebView 后恢复；手动改系统时间后上传顺序；换班换账号；outbox 非空时强制更新 |
 
 覆盖率目标：`offline/`、`utils/`、`composables/` 行 ≥ 85%、分支 ≥ 75%；组件 ≥ 70%。
@@ -390,9 +395,10 @@ stateDiagram-v2
 | Q17 | ~~`OVER_REVERSE` detail 字段~~ **已定**：`{outbound_line_id, picked_qty, reversed_qty, requested_qty}`，数量为 3 位小数字符串（00 §6.4 @5e44905） | 已关闭 |
 | Q18 | ~~离线条码预校验~~ **已定**：任务行 `expected_barcodes[]` 快照，仅预校验，服务端判定为准，见 §9.6 | 已关闭 |
 | Q19 | ~~me 与首次绑定确认~~ **已定**：`GET /api/v1/me`；首次绑定 PENDING + `DEVICE_BIND` 审批，审批前 `40111 BINDING_PENDING`，见 §9.7 | 已关闭 |
-| Q20 | 复核/装箱错误码在 00 §6.4 的登记：`40937 BOX_SEALED_IMMUTABLE`、`42215 STAGING_TEMP_ZONE_MISMATCH`、`40312` 的 `detail.reason=CHECK_SOD`（#11 @820d4e8 正文仍为 40310/42213，待按裁定更新） | 第 6 篇 / 00 |
+| Q20 | ~~复核/装箱码登记~~ **已定**（00 §6.4 @124b164）：`40937 BOX_SEALED_IMMUTABLE`、`42215 STAGING_TEMP_ZONE_MISMATCH`、`40312` `detail.reason=CHECK_SOD`、`40930` `SEALER_NOT_CHECKER`（无权限例外）、`50301` `STALE_STOCK_PAUSED` | 已关闭 |
 | Q21 | ~~断网状态下发~~ **已定**：`GET /api/v1/me` 与心跳返回 `{stale_policy, paused, offline_since, offline_deadline_at, paused_actions[]}`，见 §9.10 | 已关闭 |
 | Q22 | ~~盲收接口~~ **已定**：`POST /api/v1/inbound/returns/blind`（`inbound.return.blind`），返回收货记录号 + 异常单号，见 §9.11 | 已关闭 |
 | Q24 | ~~封箱人规则~~ **已定**：封箱人必须是复核人，否则 `40930` `detail.reason=SEALER_NOT_CHECKER`，见 §9.9 | 已关闭 |
-| Q25 | 盲收与退货的退货原因、箱码（`box_label`）是否改为必填 | 大肥鱼 |
-| Q26 | 纸单兜底的补录接口、字段与主管审批类型 | 第 3 / 10 / 12 篇 |
+| Q25 | ~~盲收必填~~ **已定**：`reason_code`、`container_code` 必填，缺失 `400`；`container_code` 更名为 `container_code` | 已关闭 |
+| Q26 | ~~纸单补录~~ **已定**：`POST /api/v1/offline/paper-records`，审批 `PAPER_BACKFILL`，`offline.paper.backfill` / `.approve`，联网后 24h 内（00 §6.6.1） | 已关闭 |
+| Q27 | 纸单补录 24h 截止的服务端字段（恢复联网时刻 / 截止时刻是否在 /me 或心跳下发） | 00 §6.6 |
