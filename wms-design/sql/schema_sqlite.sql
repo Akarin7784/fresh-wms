@@ -1,8 +1,8 @@
 -- 本文件由 sql/verify_sqlite.py 从 schema_postgres.sql 机械生成，请勿手改。
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
---   2. 44 处 DEFAULT now() → DEFAULT (datetime('now'))（表达式默认值需括号）
---   3. 方言专属行：删除 73 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 24 行 @sqlite-only（等价触发器）
+--   2. 45 处 DEFAULT now() → DEFAULT (datetime('now'))（表达式默认值需括号）
+--   3. 方言专属行：删除 74 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 24 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -692,6 +692,20 @@ CREATE TABLE wave (
     CONSTRAINT ck_wave_status CHECK (status IN ('PLANNED','RELEASED','PICKING','COMPLETED','HOLD','CANCELLED'))
 );
 CREATE INDEX ix_wave_wh ON wave(warehouse_id, status, work_date DESC);
+
+-- docs/05 Q7：波次容量参数，仓库级配置（不放主数据），按仓库 + 波次类型（= wave.pick_strategy 取值）唯一
+CREATE TABLE wave_capacity_config (
+    id                  BIGINT       PRIMARY KEY,
+    warehouse_id        BIGINT       NOT NULL,
+    wave_type           VARCHAR(24)  NOT NULL,
+    max_order_count     INT          NOT NULL DEFAULT 200,
+    max_pick_lines      INT          NOT NULL DEFAULT 1500,
+    version             BIGINT       NOT NULL DEFAULT 0,
+    updated_by          BIGINT,
+    updated_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT uq_wcc UNIQUE (warehouse_id, wave_type),
+    CONSTRAINT ck_wcc_cap CHECK (max_order_count > 0 AND max_pick_lines > 0)
+);
 
 CREATE TABLE pick_task (
     id              BIGINT       PRIMARY KEY,

@@ -748,6 +748,20 @@ CREATE TABLE wave (
 );
 CREATE INDEX ix_wave_wh ON wave(warehouse_id, status, work_date DESC);
 
+-- docs/05 Q7：波次容量参数，仓库级配置（不放主数据），按仓库 + 波次类型（= wave.pick_strategy 取值）唯一
+CREATE TABLE wave_capacity_config (
+    id                  BIGINT       PRIMARY KEY,
+    warehouse_id        BIGINT       NOT NULL,
+    wave_type           VARCHAR(24)  NOT NULL,
+    max_order_count     INT          NOT NULL DEFAULT 200,
+    max_pick_lines      INT          NOT NULL DEFAULT 1500,
+    version             BIGINT       NOT NULL DEFAULT 0,
+    updated_by          BIGINT,
+    updated_at          TIMESTAMP    NOT NULL DEFAULT now(),
+    CONSTRAINT uq_wcc UNIQUE (warehouse_id, wave_type),
+    CONSTRAINT ck_wcc_cap CHECK (max_order_count > 0 AND max_pick_lines > 0)
+);
+
 CREATE TABLE pick_task (
     id              BIGINT       PRIMARY KEY,
     code            VARCHAR(64)  NOT NULL,
@@ -879,6 +893,7 @@ CREATE UNIQUE INDEX uq_rr_cap ON return_record(outbound_line_id, ref_movement_id
 CREATE INDEX ix_rr_open   ON return_record(warehouse_id, status, created_at);
 CREATE INDEX ix_rr_picker ON return_record(picker_id, status);
 -- pick_op 的四元组、op_type、qty_milli 是 40910 PDA_OP 比对基准，应用角色只能补写首次结果列
+GRANT SELECT, INSERT, UPDATE ON wave_capacity_config TO wms_app;                                             -- @pg-only
 GRANT SELECT, INSERT ON pick_op, return_record TO wms_app;                                                     -- @pg-only
 GRANT UPDATE (status, resolution, target_location_id, putback_acked_at, putback_acked_by, scrap_doc_id, handover_confirmed_at, handover_confirmed_by, hold_id, hold_failed, closed_by, closed_at, version) ON return_record TO wms_app;  -- @pg-only
 GRANT UPDATE (result_code, movement_id, return_record_id) ON pick_op TO wms_app;                             -- @pg-only

@@ -119,7 +119,7 @@ NI = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='index' AND sql
 NV = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='view'").fetchone()[0]
 print(f"  → 表 {NT} 张 / 手工建索引 {NI} 个 / 视图 {NV} 个")
 # 期望值：main 8ed5f0c 为 38 表；docs/02 新增 stock_hold、stock_recon_alert、stock_movement_key、stock_ledger_line → 42 表（PG 分区子表不计）。改表数必须同步改这里和 verify.sh
-EXPECT_TABLES, EXPECT_VIEWS = 45, 1  # docs/02 A3 +stock_hold_release；docs/05 +pick_op +return_record
+EXPECT_TABLES, EXPECT_VIEWS = 46, 1  # docs/02 A3 +stock_hold_release；docs/05 +pick_op +return_record +wave_capacity_config
 ok(f"表数 = {NT}（期望 {EXPECT_TABLES}）") if NT == EXPECT_TABLES else bad(f"表数 = {NT}，期望 {EXPECT_TABLES}")
 ok(f"视图数 = {NV}") if NV == EXPECT_VIEWS else bad(f"视图数 = {NV}，期望 {EXPECT_VIEWS}")
 
@@ -423,6 +423,11 @@ f = one("SELECT op_type||'/'||qty_milli FROM pick_op WHERE task_id=3 AND line_no
 ok(f"05 Q2 40910 判定基准：ON CONFLICT DO NOTHING 0 行，读回首次 {f} ≠ 3000 → 40910 PDA_OP") if (n, f) == (0, "CONFIRM/2000") else bad(f"pick_op 比对基准 = {n} / {f}")
 m = one("SELECT count(*) FROM stock_movement WHERE biz_no='PT3'")[0]
 ok("05 Q2 报缺/拒收只写 pick_op，不产生流水（PT3 流水 0 条）") if m == 0 else bad(f"PT3 流水 {m} 条")
+
+expect_allow("05 Q7 容量配置（仓 1 / BATCH）", "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (1,1,'BATCH',200,1500)")
+expect_allow("05 Q7 同仓不同波次类型（DISCRETE）", "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (2,1,'DISCRETE',50,300)")
+expect_block("05 Q7 同仓同类型重复配置", "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (3,1,'BATCH',100,800)", "wave_capacity_config.warehouse_id, wave_capacity_config.wave_type")
+expect_block("05 Q7 容量上限为 0", "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (4,2,'BATCH',0,1500)", "ck_wcc_cap")
 
 print("=== 2c2. A3 RETURN_QC 系统冻结、release_qc_hold、QUALITY/RETURN_QC → SCRAP_PENDING ===")
 expect_allow_tx('A3 准备：stock 41 质检冻结 9000（RETURN_QC 6000 + QUALITY 3000）', ["INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,quality_hold_qty_milli) VALUES (41,1,2,2,3,'KG',9000,9000)", "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (50,41,'RETURN_QC','RETURN_QC','QC',7001,'RQC:7001',6000,0,'HELD',0)", "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (51,41,'QUALITY','QC_PENDING','INBOUND_QC',1,'H51',3000,0,'HELD',0)"])

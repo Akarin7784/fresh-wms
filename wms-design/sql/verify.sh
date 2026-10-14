@@ -15,10 +15,10 @@ cd "$(dirname "$0")/.."
 SCHEMA=sql/schema_postgres.sql
 # 期望值：main 8ed5f0c 为 38 表 / 99 索引 / 1 视图。docs/02 新增 stock_hold、stock_recon_alert、
 # stock_movement_key、stock_ledger_line → 42 表 / 114 索引（含 PK、UNIQUE 自动索引和分区父表上的分区索引；
-# 分区子表及其继承来的索引不计）/ 1 视图。二轮 C2 加 uq_mvk_mv（外键被引用键）→ 115；A3 加 stock_hold_release（PK、uq_hr_op、ix_hr_hold）→ 43 表 / 118；docs/05 加 pick_op（PK、uq_pick_op、uq_pick_op_scan）、return_record（PK、uq_rr_code、uq_rr_pda、uq_rr_cap、ix_rr_open、ix_rr_picker）→ 45 表 / 127。改 DDL 必须同步改这里。
+# 分区子表及其继承来的索引不计）/ 1 视图。二轮 C2 加 uq_mvk_mv（外键被引用键）→ 115；A3 加 stock_hold_release（PK、uq_hr_op、ix_hr_hold）→ 43 表 / 118；docs/05 加 pick_op（PK、uq_pick_op、uq_pick_op_scan）、return_record（PK、uq_rr_code、uq_rr_pda、uq_rr_cap、ix_rr_open、ix_rr_picker）→ 45 表 / 127；Q7 wave_capacity_config（PK、uq_wcc）→ 46 表 / 129。改 DDL 必须同步改这里。
 # 必须用新建的空库跑（DROP SCHEMA public 重建会丢 wms_app 的 USAGE；schema 里已 GRANT USAGE 兜底，小赵 C6）。
-EXPECT_TABLES=45
-EXPECT_INDEXES=127
+EXPECT_TABLES=46
+EXPECT_INDEXES=129
 EXPECT_VIEWS=1
 
 CTR=wms-pg-verify
@@ -428,7 +428,21 @@ case "$OUT" in *"permission denied for table pick_op"*) ok "05 Q2 wms_app 不能
 M=$(psql -t -A -c "SELECT count(*) FROM stock_movement WHERE biz_no='PT3'")
 [ "$M" = "0" ] && ok "05 Q2 报缺/拒收只写 pick_op，不产生流水（PT3 流水 0 条）" || bad "PT3 流水 $M 条"
 
-ND=$(psql -t -A -c "SELECT coalesce(string_agg(c.relname, ',' ORDER BY c.relname),'') FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p') AND c.relname IN ('pick_op','return_record','wave','pick_task','pick_task_line') AND (has_table_privilege('wms_app', c.oid, 'DELETE') OR has_table_privilege('wms_app', c.oid, 'TRUNCATE'))")
+expect_allow "05 Q7 容量配置（仓 1 / BATCH）" \
+  "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (1,1,'BATCH',200,1500);"
+expect_allow "05 Q7 同仓不同波次类型（DISCRETE）" \
+  "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (2,1,'DISCRETE',50,300);"
+expect_block "05 Q7 同仓同类型重复配置" \
+  "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (3,1,'BATCH',100,800);" \
+  "uq_wcc"
+expect_block "05 Q7 容量上限为 0" \
+  "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (4,2,'BATCH',0,1500);" \
+  "ck_wcc_cap"
+OUT=$(psql -q -c "SET ROLE wms_app; UPDATE wave_capacity_config SET max_order_count=180, version=version+1 WHERE id=1 AND version=0;")
+case "$OUT" in *ERROR*) bad "wms_app 改容量配置被拒：$OUT";; *) ok "05 Q7 wms_app 可按 version 改容量配置";; esac
+OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM wave_capacity_config WHERE id=2;")
+case "$OUT" in *"permission denied for table wave_capacity_config"*) ok "05 Q7 wms_app 不能删容量配置";; *) bad "wms_app 删配置未被拒：$OUT";; esac
+ND=$(psql -t -A -c "SELECT coalesce(string_agg(c.relname, ',' ORDER BY c.relname),'') FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p') AND c.relname IN ('pick_op','return_record','wave','pick_task','pick_task_line','wave_capacity_config') AND (has_table_privilege('wms_app', c.oid, 'DELETE') OR has_table_privilege('wms_app', c.oid, 'TRUNCATE'))")
 [ -z "$ND" ] && ok "05 wms_app 对 pick_op/return_record/wave/pick_task/pick_task_line 无 DELETE/TRUNCATE" || bad "wms_app 可删的表：$ND"
 OUT=$(psql -q -c "SET ROLE wms_app; UPDATE return_record SET qty_milli=1 WHERE id=501;")
 case "$OUT" in *"permission denied for table return_record"*) ok "05 Q1 wms_app 不能改 return_record.qty_milli（只能改处理列）";; *) bad "wms_app 改 RR 数量未被拒：$OUT";; esac
