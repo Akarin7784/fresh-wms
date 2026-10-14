@@ -626,7 +626,7 @@ CREATE TABLE inbound_order (
     CONSTRAINT uq_inb_code  UNIQUE (code),
     CONSTRAINT uq_inb_src   UNIQUE (source_system, source_order_no),  -- 业务层幂等
     -- docs/10：退货入库单（RTN）来源。WMS_DELIVERY=第 16 篇拒收回仓；STORE_RETURN=门店退货回仓；SCRAP_MISREPORT=第 9 篇交接误报回转的质检单（不 post_in）；MALL/ERP=客户退货经第 11 篇
-    CONSTRAINT ck_inb_rtn_src CHECK (order_type <> 'RETURN' OR source_system IN ('WMS_DELIVERY','STORE_RETURN','SCRAP_MISREPORT','MALL','ERP'))
+    CONSTRAINT ck_inb_rtn_src CHECK (order_type <> 'RETURN' OR source_system IN ('WMS_DELIVERY','STORE_RETURN','STORE_BLIND','SCRAP_MISREPORT','MALL','ERP'))
 );
 CREATE INDEX ix_inb_wh_status ON inbound_order(warehouse_id, status, work_date DESC);
 
@@ -981,7 +981,8 @@ CREATE TABLE exception_case (
     claimed_qty_milli  BIGINT       NOT NULL DEFAULT 0,   -- 对方声称（如司机拒收登记数）
     counted_qty_milli  BIGINT       NOT NULL DEFAULT 0,   -- 仓库实点数（以此为准）
     diff_qty_milli  BIGINT          NOT NULL DEFAULT 0,   -- counted − claimed，应用层写入
-    liability       VARCHAR(16)     NOT NULL DEFAULT 'UNKNOWN',
+    liable_party    VARCHAR(16)     NOT NULL DEFAULT 'UNKNOWN',   -- 责任方：WAREHOUSE/CARRIER/STORE/UNKNOWN（字典 exception_code.liability 只是建议值，落单时映射）
+    link_deadline_at TIMESTAMP,                    -- UTC；关联单据截止：盲收 = created_at + 48h，超时升级主管（escalated=1）；只能往后改
     status          VARCHAR(16)     NOT NULL DEFAULT 'OPEN',
     escalated       SMALLINT        NOT NULL DEFAULT 0,
     due_at          TIMESTAMP       NOT NULL,
@@ -1002,7 +1003,9 @@ CREATE TABLE exception_case (
     -- 小赵复评建议 1：处置结论取值；调整 / 报损必须带生成的单号
     CONSTRAINT ck_exc_resol  CHECK (resolution IS NULL OR resolution IN ('ACCEPT_COUNT','ADJUST','SCRAP','CLAIM_CARRIER','CLAIM_CUSTOMER','NO_ACTION')),
     CONSTRAINT ck_exc_resdoc CHECK (resolution IS NULL OR resolution NOT IN ('ADJUST','SCRAP') OR (resolution_doc IS NOT NULL AND length(resolution_doc) > 0)),
-    CONSTRAINT ck_exc_src_type CHECK (source_type IN ('DELIVERY_RETURN','STORE_RETURN','SCRAP_MISREPORT','RETURN_INBOUND','RR_HOLD_FAILED','FAILOVER_GAP','PICK','COUNT','MANUAL')),
+    CONSTRAINT ck_exc_liable CHECK (liable_party IN ('WAREHOUSE','CARRIER','STORE','UNKNOWN')),
+    CONSTRAINT ck_exc_blind  CHECK (source_type <> 'BLIND_RETURN' OR link_deadline_at IS NOT NULL),
+    CONSTRAINT ck_exc_src_type CHECK (source_type IN ('DELIVERY_RETURN','STORE_RETURN','BLIND_RETURN','SCRAP_MISREPORT','RETURN_INBOUND','RR_HOLD_FAILED','FAILOVER_GAP','PICK','COUNT','MANUAL')),
     CONSTRAINT ck_exc_hash   CHECK (length(source_hash) = 64 AND lower(source_hash) = source_hash AND replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(source_hash,'0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9',''),'a',''),'b',''),'c',''),'d',''),'e',''),'f','') = '')
 );
 CREATE INDEX ix_exc_wh_status ON exception_case(warehouse_id, status, due_at);
@@ -1029,9 +1032,12 @@ BEGIN   -- @pg-only
        OR (OLD.status = 'RESOLVED' AND (NEW.claimed_qty_milli IS DISTINCT FROM OLD.claimed_qty_milli   -- @pg-only
            OR NEW.counted_qty_milli IS DISTINCT FROM OLD.counted_qty_milli OR NEW.diff_qty_milli IS DISTINCT FROM OLD.diff_qty_milli   -- @pg-only
            OR NEW.resolution IS DISTINCT FROM OLD.resolution OR NEW.resolution_doc IS DISTINCT FROM OLD.resolution_doc   -- @pg-only
-           OR NEW.liability IS DISTINCT FROM OLD.liability OR NEW.closed_by IS DISTINCT FROM OLD.closed_by   -- @pg-only
+           OR NEW.liable_party IS DISTINCT FROM OLD.liable_party OR NEW.closed_by IS DISTINCT FROM OLD.closed_by   -- @pg-only
            OR (OLD.closed_at IS NOT NULL AND NEW.closed_at IS DISTINCT FROM OLD.closed_at))) THEN   -- @pg-only
         RAISE EXCEPTION 'exc_immutable' USING ERRCODE = '23514';   -- @pg-only
+    END IF;   -- @pg-only
+    IF OLD.link_deadline_at IS NOT NULL AND (NEW.link_deadline_at IS NULL OR NEW.link_deadline_at < OLD.link_deadline_at) THEN   -- @pg-only
+        RAISE EXCEPTION 'exc_deadline_backward' USING ERRCODE = '23514';   -- @pg-only
     END IF;   -- @pg-only
     RETURN NEW;   -- @pg-only
 END $$;   -- @pg-only
@@ -1056,14 +1062,14 @@ CREATE TRIGGER trg_exc_no_trunc  BEFORE TRUNCATE ON exception_case FOR EACH STAT
 -- @sqlite-only   OR NEW.source_key IS NOT OLD.source_key OR NEW.source_hash IS NOT OLD.source_hash OR NEW.sku_id IS NOT OLD.sku_id
 -- @sqlite-only   OR NEW.lot_id IS NOT OLD.lot_id OR NEW.claimed_qty_milli IS NOT OLD.claimed_qty_milli
 -- @sqlite-only   OR NEW.counted_qty_milli IS NOT OLD.counted_qty_milli OR NEW.diff_qty_milli IS NOT OLD.diff_qty_milli
--- @sqlite-only   OR NEW.liability IS NOT OLD.liability OR NEW.escalated IS NOT OLD.escalated
+-- @sqlite-only   OR NEW.liable_party IS NOT OLD.liable_party OR NEW.escalated IS NOT OLD.escalated
 -- @sqlite-only   OR NEW.due_at IS NOT OLD.due_at OR NEW.assignee_id IS NOT OLD.assignee_id OR NEW.resolution IS NOT OLD.resolution
 -- @sqlite-only   OR NEW.resolution_doc IS NOT OLD.resolution_doc OR NEW.reporter_id IS NOT OLD.reporter_id
 -- @sqlite-only   OR NEW.closed_by IS NOT OLD.closed_by OR NEW.closed_at IS NOT OLD.closed_at OR NEW.version IS NOT OLD.version
--- @sqlite-only   OR NEW.created_at IS NOT OLD.created_at))
+-- @sqlite-only   OR NEW.link_deadline_at IS NOT OLD.link_deadline_at OR NEW.created_at IS NOT OLD.created_at))
 -- @sqlite-only   OR (OLD.status = 'RESOLVED' AND (NEW.claimed_qty_milli IS NOT OLD.claimed_qty_milli OR NEW.counted_qty_milli IS NOT OLD.counted_qty_milli
 -- @sqlite-only       OR NEW.diff_qty_milli IS NOT OLD.diff_qty_milli OR NEW.resolution IS NOT OLD.resolution OR NEW.resolution_doc IS NOT OLD.resolution_doc
--- @sqlite-only       OR NEW.liability IS NOT OLD.liability OR NEW.closed_by IS NOT OLD.closed_by
+-- @sqlite-only       OR NEW.liable_party IS NOT OLD.liable_party OR NEW.closed_by IS NOT OLD.closed_by
 -- @sqlite-only       OR (OLD.closed_at IS NOT NULL AND NEW.closed_at IS NOT OLD.closed_at)))
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'exc_immutable'); END;
 -- @sqlite-only CREATE TRIGGER trg_exc_no_delete BEFORE DELETE ON exception_case BEGIN SELECT RAISE(ABORT, 'exc_no_delete'); END;
@@ -1073,8 +1079,163 @@ CREATE TRIGGER trg_exc_no_trunc  BEFORE TRUNCATE ON exception_case FOR EACH STAT
 -- @sqlite-only CREATE TRIGGER trg_exc_code_ins BEFORE INSERT ON exception_case
 -- @sqlite-only WHEN NOT EXISTS (SELECT 1 FROM exception_code c WHERE c.code = NEW.exception_code)
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'exc_code_unknown'); END;
+-- 盲收异常单：link_deadline_at 建单时必须 = created_at + 48h（截止只能往后改，见 trg_exc_forward / trg_exc_deadline）
+CREATE FUNCTION trg_exc_blind_ins() RETURNS trigger LANGUAGE plpgsql AS $$   -- @pg-only
+BEGIN   -- @pg-only
+    IF NEW.source_type = 'BLIND_RETURN' AND NEW.link_deadline_at IS NOT NULL AND NEW.link_deadline_at IS DISTINCT FROM NEW.created_at + INTERVAL '48 hours' THEN   -- @pg-only
+        RAISE EXCEPTION 'exc_blind_deadline' USING ERRCODE = '23514';   -- @pg-only
+    END IF;   -- @pg-only
+    RETURN NEW;   -- @pg-only
+END $$;   -- @pg-only
+CREATE TRIGGER trg_exc_blind_ins BEFORE INSERT ON exception_case FOR EACH ROW EXECUTE FUNCTION trg_exc_blind_ins();   -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_exc_blind_ins BEFORE INSERT ON exception_case
+-- @sqlite-only WHEN NEW.source_type = 'BLIND_RETURN' AND NEW.link_deadline_at IS NOT NULL AND NEW.link_deadline_at IS NOT datetime(NEW.created_at, '+48 hours')
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'exc_blind_deadline'); END;
+-- @sqlite-only CREATE TRIGGER trg_exc_deadline BEFORE UPDATE ON exception_case
+-- @sqlite-only WHEN OLD.link_deadline_at IS NOT NULL AND (NEW.link_deadline_at IS NULL OR NEW.link_deadline_at < OLD.link_deadline_at)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'exc_deadline_backward'); END;
 -- I4：授权。字典只读写不删；异常单不删（取消走状态）
 GRANT SELECT, INSERT, UPDATE ON exception_code, exception_case TO wms_app;                                   -- @pg-only
+
+-- -----------------------------------------------------------------------------
+-- 第 10 篇：门店退货「退货预约 + 盲收」（大肥鱼定案，对标盒马）
+--   原因码与容器码必填；没有容器码的货现场补贴新标签再收。
+-- -----------------------------------------------------------------------------
+-- 退货预约：门店建（return.reservation.create），仓库收货员收（return.reservation.receive），收货后库存挂 RETURN_QC。
+-- 状态：CREATED → RECEIVED / CANCELLED，只进不退；建单键不可改；终态整行只读；不许 DELETE / TRUNCATE；SQLite 另拦 REPLACE。
+CREATE TABLE return_reservation (
+    id                  BIGINT          PRIMARY KEY,
+    code                VARCHAR(32)     NOT NULL,      -- RSV-{yyyyMMdd}-{seq}
+    warehouse_id        BIGINT          NOT NULL,
+    store_code          VARCHAR(32)     NOT NULL,
+    outbound_order_id   BIGINT          NOT NULL,      -- 原出库单（门店只能退本店收过的单，服务端校验）
+    status              VARCHAR(16)     NOT NULL DEFAULT 'CREATED',
+    rtn_inbound_id      BIGINT,                        -- 收货生成的 RTN（inbound_order，source_system=STORE_RETURN）
+    created_by          BIGINT          NOT NULL,
+    received_by         BIGINT,
+    received_at         TIMESTAMP,
+    version             BIGINT          NOT NULL DEFAULT 0,
+    created_at          TIMESTAMP       NOT NULL DEFAULT now(),
+    CONSTRAINT uq_rrsv_code   UNIQUE (code),
+    CONSTRAINT ck_rrsv_status CHECK (status IN ('CREATED','RECEIVED','CANCELLED')),
+    CONSTRAINT ck_rrsv_store  CHECK (length(store_code) > 0),
+    CONSTRAINT ck_rrsv_recv   CHECK ((status = 'RECEIVED') = (rtn_inbound_id IS NOT NULL AND received_by IS NOT NULL AND received_at IS NOT NULL))
+);
+CREATE INDEX ix_rrsv_store ON return_reservation(warehouse_id, store_code, status);
+CREATE TABLE return_reservation_line (
+    id                  BIGINT          PRIMARY KEY,
+    reservation_id      BIGINT          NOT NULL REFERENCES return_reservation(id),
+    line_no             INTEGER         NOT NULL,
+    sku_id              BIGINT          NOT NULL,
+    qty_milli           BIGINT          NOT NULL,
+    reason_code         VARCHAR(24)     NOT NULL,
+    container_code      VARCHAR(64)     NOT NULL,
+    received_qty_milli  BIGINT,                        -- 收货时写一次（实点）
+    CONSTRAINT uq_rrsl_line   UNIQUE (reservation_id, line_no),
+    CONSTRAINT ck_rrsl_qty    CHECK (qty_milli > 0 AND qty_milli = CAST(qty_milli AS BIGINT)
+                                     AND (received_qty_milli IS NULL OR (received_qty_milli >= 0 AND received_qty_milli = CAST(received_qty_milli AS BIGINT)))),
+    CONSTRAINT ck_rrsl_ctn    CHECK (length(container_code) > 0),
+    CONSTRAINT ck_rrsl_reason CHECK (reason_code IN ('QUALITY','DAMAGED','EXPIRED','NEAR_EXPIRY','WRONG_ITEM','OVERSTOCK','TEMP_ABNORMAL','PACKAGING','OTHER'))
+);
+-- 盲收记录：不预约直接收（inbound.return.blind），只追加：整行不可改、不可删；同事务生成 RTN（source_system=STORE_BLIND）与异常单（source_type=BLIND_RETURN）。
+CREATE TABLE return_blind_receipt (
+    id                  BIGINT          PRIMARY KEY,
+    code                VARCHAR(32)     NOT NULL,      -- BRC-{yyyyMMdd}-{seq}，接口返回的收货记录号
+    warehouse_id        BIGINT          NOT NULL,
+    sku_id              BIGINT          NOT NULL,
+    qty_milli           BIGINT          NOT NULL,
+    store_code          VARCHAR(32),                   -- 可空：不知道哪家门店
+    container_code      VARCHAR(64)     NOT NULL,
+    reason_code         VARCHAR(24)     NOT NULL,
+    photo_ids           TEXT            NOT NULL DEFAULT '[]',   -- JSON 数组，第 12 篇文件服务 id
+    rtn_inbound_id      BIGINT          NOT NULL,
+    exception_case_id   BIGINT          NOT NULL,
+    op_key              VARCHAR(80)     NOT NULL,      -- Idempotency-Key
+    received_by         BIGINT          NOT NULL,
+    created_at          TIMESTAMP       NOT NULL DEFAULT now(),
+    CONSTRAINT uq_rbr_code    UNIQUE (code),
+    CONSTRAINT uq_rbr_op      UNIQUE (op_key),
+    CONSTRAINT ck_rbr_qty     CHECK (qty_milli > 0 AND qty_milli = CAST(qty_milli AS BIGINT)),
+    CONSTRAINT ck_rbr_ctn     CHECK (length(container_code) > 0 AND (store_code IS NULL OR length(store_code) > 0)),
+    CONSTRAINT ck_rbr_reason  CHECK (reason_code IN ('QUALITY','DAMAGED','EXPIRED','NEAR_EXPIRY','WRONG_ITEM','OVERSTOCK','TEMP_ABNORMAL','PACKAGING','OTHER'))
+);
+CREATE FUNCTION trg_rrsv_guard() RETURNS trigger LANGUAGE plpgsql AS $$   -- @pg-only
+BEGIN   -- @pg-only
+    IF NEW.status <> OLD.status AND NOT (OLD.status = 'CREATED' AND NEW.status IN ('RECEIVED','CANCELLED')) THEN   -- @pg-only
+        RAISE EXCEPTION 'rrsv_state_forward_only' USING ERRCODE = '23514';   -- @pg-only
+    END IF;   -- @pg-only
+    IF NEW.code IS DISTINCT FROM OLD.code OR NEW.warehouse_id IS DISTINCT FROM OLD.warehouse_id   -- @pg-only
+       OR NEW.store_code IS DISTINCT FROM OLD.store_code OR NEW.outbound_order_id IS DISTINCT FROM OLD.outbound_order_id   -- @pg-only
+       OR NEW.created_by IS DISTINCT FROM OLD.created_by OR NEW.created_at IS DISTINCT FROM OLD.created_at   -- @pg-only
+       OR (OLD.status <> 'CREATED' AND NEW.status = OLD.status AND ROW(NEW.*) IS DISTINCT FROM ROW(OLD.*)) THEN   -- @pg-only
+        RAISE EXCEPTION 'rrsv_immutable' USING ERRCODE = '23514';   -- @pg-only
+    END IF;   -- @pg-only
+    RETURN NEW;   -- @pg-only
+END $$;   -- @pg-only
+CREATE TRIGGER trg_rrsv_guard BEFORE UPDATE ON return_reservation FOR EACH ROW EXECUTE FUNCTION trg_rrsv_guard();   -- @pg-only
+CREATE FUNCTION trg_rrsl_guard() RETURNS trigger LANGUAGE plpgsql AS $$   -- @pg-only
+BEGIN   -- @pg-only
+    IF TG_OP = 'INSERT' THEN   -- @pg-only
+        IF NOT EXISTS (SELECT 1 FROM return_reservation r WHERE r.id = NEW.reservation_id AND r.status = 'CREATED') THEN   -- @pg-only
+            RAISE EXCEPTION 'rrsl_locked' USING ERRCODE = '23514';   -- @pg-only
+        END IF;   -- @pg-only
+        RETURN NEW;   -- @pg-only
+    END IF;   -- @pg-only
+    IF NEW.id IS DISTINCT FROM OLD.id OR NEW.reservation_id IS DISTINCT FROM OLD.reservation_id OR NEW.line_no IS DISTINCT FROM OLD.line_no   -- @pg-only
+       OR NEW.sku_id IS DISTINCT FROM OLD.sku_id OR NEW.qty_milli IS DISTINCT FROM OLD.qty_milli   -- @pg-only
+       OR NEW.reason_code IS DISTINCT FROM OLD.reason_code OR NEW.container_code IS DISTINCT FROM OLD.container_code   -- @pg-only
+       OR OLD.received_qty_milli IS NOT NULL   -- @pg-only
+       OR NOT EXISTS (SELECT 1 FROM return_reservation r WHERE r.id = OLD.reservation_id AND r.status = 'CREATED') THEN   -- @pg-only
+        RAISE EXCEPTION 'rrsl_locked' USING ERRCODE = '23514';   -- @pg-only
+    END IF;   -- @pg-only
+    RETURN NEW;   -- @pg-only
+END $$;   -- @pg-only
+CREATE TRIGGER trg_rrsl_guard BEFORE INSERT OR UPDATE ON return_reservation_line FOR EACH ROW EXECUTE FUNCTION trg_rrsl_guard();   -- @pg-only
+CREATE FUNCTION trg_rtn10_no_delete() RETURNS trigger LANGUAGE plpgsql AS $$   -- @pg-only
+BEGIN   -- @pg-only
+    RAISE EXCEPTION 'return_no_delete' USING ERRCODE = '23514';   -- @pg-only
+END $$;   -- @pg-only
+CREATE FUNCTION trg_rbr_immutable() RETURNS trigger LANGUAGE plpgsql AS $$   -- @pg-only
+BEGIN   -- @pg-only
+    RAISE EXCEPTION 'rbr_immutable' USING ERRCODE = '23514';   -- @pg-only
+END $$;   -- @pg-only
+CREATE TRIGGER trg_rrsv_no_delete BEFORE DELETE ON return_reservation FOR EACH ROW EXECUTE FUNCTION trg_rtn10_no_delete();   -- @pg-only
+CREATE TRIGGER trg_rrsv_no_trunc  BEFORE TRUNCATE ON return_reservation FOR EACH STATEMENT EXECUTE FUNCTION trg_rtn10_no_delete();   -- @pg-only
+CREATE TRIGGER trg_rrsl_no_delete BEFORE DELETE ON return_reservation_line FOR EACH ROW EXECUTE FUNCTION trg_rtn10_no_delete();   -- @pg-only
+CREATE TRIGGER trg_rrsl_no_trunc  BEFORE TRUNCATE ON return_reservation_line FOR EACH STATEMENT EXECUTE FUNCTION trg_rtn10_no_delete();   -- @pg-only
+CREATE TRIGGER trg_rbr_immutable  BEFORE UPDATE OR DELETE ON return_blind_receipt FOR EACH ROW EXECUTE FUNCTION trg_rbr_immutable();   -- @pg-only
+CREATE TRIGGER trg_rbr_no_trunc   BEFORE TRUNCATE ON return_blind_receipt FOR EACH STATEMENT EXECUTE FUNCTION trg_rbr_immutable();   -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_rrsv_forward BEFORE UPDATE ON return_reservation
+-- @sqlite-only WHEN NEW.status <> OLD.status AND NOT (OLD.status = 'CREATED' AND NEW.status IN ('RECEIVED','CANCELLED'))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'rrsv_state_forward_only'); END;
+-- @sqlite-only CREATE TRIGGER trg_rrsv_immutable BEFORE UPDATE ON return_reservation
+-- @sqlite-only WHEN NEW.code IS NOT OLD.code OR NEW.warehouse_id IS NOT OLD.warehouse_id OR NEW.store_code IS NOT OLD.store_code
+-- @sqlite-only   OR NEW.outbound_order_id IS NOT OLD.outbound_order_id OR NEW.created_by IS NOT OLD.created_by OR NEW.created_at IS NOT OLD.created_at
+-- @sqlite-only   OR (OLD.status <> 'CREATED' AND NEW.status = OLD.status AND (NEW.rtn_inbound_id IS NOT OLD.rtn_inbound_id
+-- @sqlite-only       OR NEW.received_by IS NOT OLD.received_by OR NEW.received_at IS NOT OLD.received_at OR NEW.version IS NOT OLD.version))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'rrsv_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_rrsv_no_delete BEFORE DELETE ON return_reservation BEGIN SELECT RAISE(ABORT, 'return_no_delete'); END;
+-- @sqlite-only CREATE TRIGGER trg_rrsv_no_replace BEFORE INSERT ON return_reservation
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM return_reservation r WHERE r.id = NEW.id OR r.code = NEW.code)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'rrsv_duplicate'); END;
+-- @sqlite-only CREATE TRIGGER trg_rrsl_ins BEFORE INSERT ON return_reservation_line
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM return_reservation_line l WHERE l.id = NEW.id OR (l.reservation_id = NEW.reservation_id AND l.line_no = NEW.line_no))
+-- @sqlite-only   OR NOT EXISTS (SELECT 1 FROM return_reservation r WHERE r.id = NEW.reservation_id AND r.status = 'CREATED')
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'rrsl_locked'); END;
+-- @sqlite-only CREATE TRIGGER trg_rrsl_upd BEFORE UPDATE ON return_reservation_line
+-- @sqlite-only WHEN NEW.id IS NOT OLD.id OR NEW.reservation_id IS NOT OLD.reservation_id OR NEW.line_no IS NOT OLD.line_no
+-- @sqlite-only   OR NEW.sku_id IS NOT OLD.sku_id OR NEW.qty_milli IS NOT OLD.qty_milli OR NEW.reason_code IS NOT OLD.reason_code
+-- @sqlite-only   OR NEW.container_code IS NOT OLD.container_code OR OLD.received_qty_milli IS NOT NULL
+-- @sqlite-only   OR NOT EXISTS (SELECT 1 FROM return_reservation r WHERE r.id = OLD.reservation_id AND r.status = 'CREATED')
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'rrsl_locked'); END;
+-- @sqlite-only CREATE TRIGGER trg_rrsl_no_delete BEFORE DELETE ON return_reservation_line BEGIN SELECT RAISE(ABORT, 'return_no_delete'); END;
+-- @sqlite-only CREATE TRIGGER trg_rbr_no_upd BEFORE UPDATE ON return_blind_receipt BEGIN SELECT RAISE(ABORT, 'rbr_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_rbr_no_del BEFORE DELETE ON return_blind_receipt BEGIN SELECT RAISE(ABORT, 'rbr_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_rbr_no_replace BEFORE INSERT ON return_blind_receipt
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM return_blind_receipt b WHERE b.id = NEW.id OR b.code = NEW.code OR b.op_key = NEW.op_key)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'rbr_immutable'); END;
+GRANT SELECT, INSERT, UPDATE ON return_reservation, return_reservation_line TO wms_app;   -- @pg-only
+GRANT SELECT, INSERT ON return_blind_receipt TO wms_app;   -- @pg-only
 
 -- -----------------------------------------------------------------------------
 -- 幂等 / 集成 / 审计

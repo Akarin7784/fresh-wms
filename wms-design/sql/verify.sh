@@ -18,8 +18,8 @@ SCHEMA=sql/schema_postgres.sql
 # stock_movement_key、stock_ledger_line → 42 表 / 114 索引（含 PK、UNIQUE 自动索引和分区父表上的分区索引；
 # 分区子表及其继承来的索引不计）/ 1 视图。二轮 C2 加 uq_mvk_mv（外键被引用键）→ 115；A3 加 stock_hold_release（PK、uq_hr_op、ix_hr_hold）→ 43 表 / 118。改 DDL 必须同步改这里。
 # 必须用新建的空库跑（DROP SCHEMA public 重建会丢 wms_app 的 USAGE；schema 里已 GRANT USAGE 兜底，小赵 C6）。
-EXPECT_TABLES=45
-EXPECT_INDEXES=123
+EXPECT_TABLES=48
+EXPECT_INDEXES=131
 EXPECT_VIEWS=1
 
 CTR=wms-pg-verify
@@ -68,7 +68,7 @@ echo "  → 表 $T 张 / 索引 $I 个 / 视图 $V 个"
 [ "$V" = "$EXPECT_VIEWS" ]   && ok "视图数 = $V" || bad "视图数 = $V，期望 $EXPECT_VIEWS"
 
 # 小赵 S4：按期望权限矩阵逐表核对 wms_app（表、分区父表、视图、物化视图；序列查 USAGE），多给、少给、漏表都失败
-EXPECT_PRIVS="adjust_line:SELECT,INSERT,UPDATE adjust_order:SELECT,INSERT,UPDATE api_credential:SELECT,INSERT,UPDATE audit_log:SELECT,INSERT count_line:SELECT,INSERT,UPDATE count_order:SELECT,INSERT,UPDATE exception_case:SELECT,INSERT,UPDATE exception_code:SELECT,INSERT,UPDATE idempotency_record:SELECT,INSERT,UPDATE inbound_line:SELECT,INSERT,UPDATE inbound_message:SELECT,INSERT,UPDATE inbound_order:SELECT,INSERT,UPDATE location:SELECT,INSERT,UPDATE lot:SELECT,INSERT,UPDATE numbering_segment:SELECT,INSERT,UPDATE outbound_line:SELECT,INSERT,UPDATE outbound_order:SELECT,INSERT,UPDATE outbox_event:SELECT,INSERT,UPDATE pack_box:SELECT,INSERT,UPDATE pack_box_line:SELECT,INSERT,UPDATE pick_task:SELECT,INSERT,UPDATE pick_task_line:SELECT,INSERT,UPDATE shipment:SELECT,INSERT,UPDATE shipment_order:SELECT,INSERT,UPDATE sku:SELECT,INSERT,UPDATE sku_barcode:SELECT,INSERT,UPDATE sku_unit:SELECT,INSERT,UPDATE stock:SELECT,INSERT,UPDATE stock_hold:SELECT,INSERT stock_hold_release:SELECT,INSERT stock_ledger_line:SELECT,INSERT stock_movement:SELECT,INSERT stock_movement_key:SELECT,INSERT stock_recon_alert:SELECT,INSERT,UPDATE stock_reservation:SELECT,INSERT,UPDATE stock_snapshot_daily:SELECT,INSERT sys_permission:SELECT,INSERT,UPDATE sys_role:SELECT,INSERT,UPDATE sys_role_perm:SELECT,INSERT,UPDATE sys_user:SELECT,INSERT,UPDATE sys_user_role:SELECT,INSERT,UPDATE sys_user_warehouse:SELECT,INSERT,UPDATE v_stock_available:SELECT warehouse:SELECT,INSERT,UPDATE wave:SELECT,INSERT,UPDATE zone:SELECT,INSERT,UPDATE"
+EXPECT_PRIVS="adjust_line:SELECT,INSERT,UPDATE adjust_order:SELECT,INSERT,UPDATE api_credential:SELECT,INSERT,UPDATE audit_log:SELECT,INSERT count_line:SELECT,INSERT,UPDATE count_order:SELECT,INSERT,UPDATE exception_case:SELECT,INSERT,UPDATE exception_code:SELECT,INSERT,UPDATE idempotency_record:SELECT,INSERT,UPDATE inbound_line:SELECT,INSERT,UPDATE inbound_message:SELECT,INSERT,UPDATE inbound_order:SELECT,INSERT,UPDATE location:SELECT,INSERT,UPDATE lot:SELECT,INSERT,UPDATE numbering_segment:SELECT,INSERT,UPDATE outbound_line:SELECT,INSERT,UPDATE outbound_order:SELECT,INSERT,UPDATE outbox_event:SELECT,INSERT,UPDATE pack_box:SELECT,INSERT,UPDATE pack_box_line:SELECT,INSERT,UPDATE pick_task:SELECT,INSERT,UPDATE pick_task_line:SELECT,INSERT,UPDATE return_blind_receipt:SELECT,INSERT return_reservation:SELECT,INSERT,UPDATE return_reservation_line:SELECT,INSERT,UPDATE shipment:SELECT,INSERT,UPDATE shipment_order:SELECT,INSERT,UPDATE sku:SELECT,INSERT,UPDATE sku_barcode:SELECT,INSERT,UPDATE sku_unit:SELECT,INSERT,UPDATE stock:SELECT,INSERT,UPDATE stock_hold:SELECT,INSERT stock_hold_release:SELECT,INSERT stock_ledger_line:SELECT,INSERT stock_movement:SELECT,INSERT stock_movement_key:SELECT,INSERT stock_recon_alert:SELECT,INSERT,UPDATE stock_reservation:SELECT,INSERT,UPDATE stock_snapshot_daily:SELECT,INSERT sys_permission:SELECT,INSERT,UPDATE sys_role:SELECT,INSERT,UPDATE sys_role_perm:SELECT,INSERT,UPDATE sys_user:SELECT,INSERT,UPDATE sys_user_role:SELECT,INSERT,UPDATE sys_user_warehouse:SELECT,INSERT,UPDATE v_stock_available:SELECT warehouse:SELECT,INSERT,UPDATE wave:SELECT,INSERT,UPDATE zone:SELECT,INSERT,UPDATE"
 ACT=$(psql -t -A -c "SELECT string_agg(x, ' ' ORDER BY x) FROM (SELECT c.relname || ':' || COALESCE(NULLIF(concat_ws(',', CASE WHEN c.relkind='S' THEN (CASE WHEN has_sequence_privilege('wms_app', c.oid, 'USAGE') THEN 'USAGE' END) ELSE (CASE WHEN has_table_privilege('wms_app', c.oid, 'SELECT') THEN 'SELECT' END) END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'INSERT') THEN 'INSERT' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'UPDATE') THEN 'UPDATE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'DELETE') THEN 'DELETE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'TRUNCATE') THEN 'TRUNCATE' END), ''), 'NONE') AS x FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','S') AND NOT c.relispartition) t")
 if [ "$ACT" = "$EXPECT_PRIVS" ]; then ok "S4 wms_app 权限矩阵与期望逐表一致（$(echo "$ACT" | wc -w) 个对象；列级 UPDATE 另测）"
 else bad "S4 wms_app 权限矩阵不符：$(diff <(echo "$EXPECT_PRIVS" | tr ' ' '\n') <(echo "$ACT" | tr ' ' '\n') | grep '^[<>]' | tr '\n' ' ')"; fi
@@ -520,11 +520,11 @@ expect_allow "10 L1 PROCESSING → RESOLVED（SCRAP，带单号）" "UPDATE exce
 expect_block "10 L1 RESOLVED → PROCESSING（已解决不能退回）" "UPDATE exception_case SET status='PROCESSING' WHERE id=140;" "exc_state_forward_only"
 expect_block "10 L1 RESOLVED 后改实点（借道重开改数被堵）" "UPDATE exception_case SET counted_qty_milli=5000, diff_qty_milli=0 WHERE id=140;" "exc_immutable"
 expect_block "10 L2 RESOLVED 后改处置结论" "UPDATE exception_case SET resolution='NO_ACTION', resolution_doc=NULL WHERE id=140;" "exc_immutable"
-expect_block "10 L2 RESOLVED 后改责任方" "UPDATE exception_case SET liability='CARRIER' WHERE id=140;" "exc_immutable"
+expect_block "10 L2 RESOLVED 后改责任方" "UPDATE exception_case SET liable_party='CARRIER' WHERE id=140;" "exc_immutable"
 expect_allow "10 L2 RESOLVED 下首次写 closed_at" "UPDATE exception_case SET closed_at='2026-10-15 13:00:00' WHERE id=140;"
 expect_block "10 L2 closed_at 只能写一次" "UPDATE exception_case SET closed_at='2026-10-16 13:00:00' WHERE id=140;" "exc_immutable"
 expect_block "10 L2 CLOSED 后改处置结论 / 清单号" "UPDATE exception_case SET resolution='NO_ACTION', resolution_doc=NULL WHERE id=100;" "exc_immutable"
-expect_block "10 L2 CLOSED 后改责任方" "UPDATE exception_case SET liability='CARRIER' WHERE id=100;" "exc_immutable"
+expect_block "10 L2 CLOSED 后改责任方" "UPDATE exception_case SET liable_party='CARRIER' WHERE id=100;" "exc_immutable"
 expect_block "10 L2 CLOSED 后改关闭人" "UPDATE exception_case SET closed_by=99 WHERE id=100;" "exc_immutable"
 expect_block "10 L2 CLOSED 后改仓库" "UPDATE exception_case SET warehouse_id=2 WHERE id=100;" "exc_immutable"
 expect_block "10 L2 CLOSED 后只改 version 也不行" "UPDATE exception_case SET version=version+1 WHERE id=100;" "exc_immutable"
@@ -546,6 +546,44 @@ expect_block "10 STORE_RETURN 不走 RETURN_PENDING（挂质检来源被拦）" 
 expect_block "10 STORE_RETURN 冻结不能是人工冻结（operator≠0）" "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (72,70,'RETURN_QC','RETURN_QC','QC',8002,'X72',1000,0,'HELD',7);" "ck_hold_retqc"
 expect_allow "10 STORE_RETURN 清点差异异常单（source_type=STORE_RETURN）" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (130,'EXC-130',1,'RETURN_COUNT_DIFF','STORE_RETURN','RTN-2:1','000000000000000000000000000000000000000000000000000000000000001e',2,3,3000,2000,-1000,'2026-10-15 12:00:00',7);"
 
+expect_allow "10 盲收 RTN 来源 STORE_BLIND" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8020,'RTN-20',1,'RETURN','STORE_BLIND','BRC-20261015-000001','CREATED','2026-10-15');"
+expect_block "10 RTN 来源拼错 STORE_BLINDX" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8021,'RTN-21',1,'RETURN','STORE_BLINDX','BRC-20261015-000009','CREATED','2026-10-15');" "ck_inb_rtn_src"
+expect_allow "10 盲收异常单（BLIND_RETURN，截止 = 建单 + 48h）" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id,created_at,link_deadline_at,liable_party) VALUES (150,'EXC-150',1,'RETURN_COUNT_DIFF','BLIND_RETURN','BRC:1','0000000000000000000000000000000000000000000000000000000000000000',1,0,0,3000,3000,'2026-10-17 10:00:00',7,'2026-10-15 10:00:00','2026-10-17 10:00:00','UNKNOWN');"
+expect_block "10 盲收异常单缺截止时间" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id,created_at,link_deadline_at,liable_party) VALUES (151,'EXC-151',1,'RETURN_COUNT_DIFF','BLIND_RETURN','BRC:2','0000000000000000000000000000000000000000000000000000000000000001',1,0,0,3000,3000,'2026-10-17 10:00:00',7,'2026-10-15 10:00:00',NULL,'UNKNOWN');" "ck_exc_blind"
+expect_block "10 盲收异常单截止 ≠ +48h" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id,created_at,link_deadline_at,liable_party) VALUES (151,'EXC-151',1,'RETURN_COUNT_DIFF','BLIND_RETURN','BRC:2','0000000000000000000000000000000000000000000000000000000000000001',1,0,0,3000,3000,'2026-10-17 10:00:00',7,'2026-10-15 10:00:00','2026-10-16 10:00:00','UNKNOWN');" "exc_blind_deadline"
+expect_block "10 liable_party 取值非法（SUPPLIER 不在四值内）" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id,created_at,link_deadline_at,liable_party) VALUES (151,'EXC-151',1,'RETURN_COUNT_DIFF','BLIND_RETURN','BRC:2','0000000000000000000000000000000000000000000000000000000000000001',1,0,0,3000,3000,'2026-10-17 10:00:00',7,'2026-10-15 10:00:00','2026-10-17 10:00:00','SUPPLIER');" "ck_exc_liable"
+R=$(psql -t -A -c "SELECT liable_party FROM exception_case WHERE id=100")
+[ "$R" = "UNKNOWN" ] && ok "10 liable_party 默认 UNKNOWN = $R" || bad "10 liable_party 默认 UNKNOWN = $R（期望 UNKNOWN）"
+expect_allow "10 liable_party 改为 STORE（处理中）" "UPDATE exception_case SET liable_party='STORE' WHERE id=150;"
+expect_allow "10 截止往后延（+24h，主管）" "UPDATE exception_case SET link_deadline_at='2026-10-18 10:00:00' WHERE id=150;"
+expect_block "10 截止往前改" "UPDATE exception_case SET link_deadline_at='2026-10-17 09:00:00' WHERE id=150;" "exc_deadline_backward"
+expect_block "10 截止清空" "UPDATE exception_case SET link_deadline_at=NULL WHERE id=150;" "exc_deadline_backward"
+expect_allow "10 盲收记录（容器码 + 原因码 + 照片）" "INSERT INTO return_blind_receipt (id,code,warehouse_id,sku_id,qty_milli,store_code,container_code,reason_code,photo_ids,rtn_inbound_id,exception_case_id,op_key,received_by) VALUES (1,'BRC-20261015-000001',1,1,3000,'ST001','CTN-001','DAMAGED','["F1","F2"]',8020,150,'IDEM-BLIND-1',7);"
+expect_block "10 盲收缺容器码" "INSERT INTO return_blind_receipt (id,code,warehouse_id,sku_id,qty_milli,store_code,reason_code,photo_ids,rtn_inbound_id,exception_case_id,op_key,received_by) VALUES (2,'BRC-20261015-000002',1,1,3000,'ST001','DAMAGED','[]',8020,150,'IDEM-BLIND-2',7);" "container_code"
+expect_block "10 盲收缺原因码" "INSERT INTO return_blind_receipt (id,code,warehouse_id,sku_id,qty_milli,store_code,container_code,photo_ids,rtn_inbound_id,exception_case_id,op_key,received_by) VALUES (2,'BRC-20261015-000002',1,1,3000,'ST001','CTN-002','[]',8020,150,'IDEM-BLIND-2',7);" "reason_code"
+expect_block "10 盲收容器码空串" "INSERT INTO return_blind_receipt (id,code,warehouse_id,sku_id,qty_milli,store_code,container_code,reason_code,photo_ids,rtn_inbound_id,exception_case_id,op_key,received_by) VALUES (2,'BRC-20261015-000002',1,1,3000,NULL,'','DAMAGED','[]',8020,150,'IDEM-BLIND-2',7);" "ck_rbr_ctn"
+expect_block "10 盲收原因码不在枚举" "INSERT INTO return_blind_receipt (id,code,warehouse_id,sku_id,qty_milli,store_code,container_code,reason_code,photo_ids,rtn_inbound_id,exception_case_id,op_key,received_by) VALUES (2,'BRC-20261015-000002',1,1,3000,NULL,'CTN-002','BROKEN','[]',8020,150,'IDEM-BLIND-2',7);" "ck_rbr_reason"
+expect_block "10 盲收同 op_key 重放" "INSERT INTO return_blind_receipt (id,code,warehouse_id,sku_id,qty_milli,store_code,container_code,reason_code,photo_ids,rtn_inbound_id,exception_case_id,op_key,received_by) VALUES (2,'BRC-20261015-000002',1,1,3000,NULL,'CTN-002','DAMAGED','[]',8020,150,'IDEM-BLIND-1',7);" "uq_rbr_op"
+expect_block "10 盲收记录不可改" "UPDATE return_blind_receipt SET qty_milli=1000 WHERE id=1;" "rbr_immutable"
+expect_block "10 盲收记录不可删" "DELETE FROM return_blind_receipt WHERE id=1;" "rbr_immutable"
+expect_allow "10 退货预约建单（门店 ST001）" "INSERT INTO return_reservation (id,code,warehouse_id,store_code,outbound_order_id,created_by) VALUES (1,'RSV-20261015-000001',1,'ST001',1,21);"
+expect_allow "10 预约行（原因码 + 容器码）" "INSERT INTO return_reservation_line (id,reservation_id,line_no,sku_id,qty_milli,reason_code,container_code) VALUES (1,1,1,1,2000,'QUALITY','CTN-101');"
+expect_block "10 预约行缺原因码" "INSERT INTO return_reservation_line (id,reservation_id,line_no,sku_id,qty_milli,container_code) VALUES (2,1,2,1,2000,'CTN-102');" "reason_code"
+expect_block "10 预约行缺容器码" "INSERT INTO return_reservation_line (id,reservation_id,line_no,sku_id,qty_milli,reason_code) VALUES (2,1,2,1,2000,'QUALITY');" "container_code"
+expect_block "10 预约行原因码非法" "INSERT INTO return_reservation_line (id,reservation_id,line_no,sku_id,qty_milli,reason_code,container_code) VALUES (2,1,2,1,2000,'NOPE','CTN-102');" "ck_rrsl_reason"
+expect_block "10 预约 RECEIVED 缺 RTN / 收货人" "UPDATE return_reservation SET status='RECEIVED' WHERE id=1;" "ck_rrsv_recv"
+expect_allow "10 收货写实点" "UPDATE return_reservation_line SET received_qty_milli=2000 WHERE id=1;"
+expect_block "10 实点只写一次" "UPDATE return_reservation_line SET received_qty_milli=1000 WHERE id=1;" "rrsl_locked"
+expect_block "10 预约门店不可改" "UPDATE return_reservation SET store_code='ST002' WHERE id=1;" "rrsv_immutable"
+expect_allow "10 预约收货 CREATED → RECEIVED（RTN 8010，随后挂 RETURN_QC）" "UPDATE return_reservation SET status='RECEIVED', rtn_inbound_id=8010, received_by=7, received_at='2026-10-15 11:00:00', version=version+1 WHERE id=1 AND status='CREATED';"
+expect_block "10 预约 RECEIVED → CANCELLED" "UPDATE return_reservation SET status='CANCELLED' WHERE id=1;" "rrsv_state_forward_only"
+expect_block "10 预约终态整行只读" "UPDATE return_reservation SET version=9 WHERE id=1;" "rrsv_immutable"
+expect_block "10 收货后再加预约行" "INSERT INTO return_reservation_line (id,reservation_id,line_no,sku_id,qty_milli,reason_code,container_code) VALUES (3,1,3,1,1000,'QUALITY','CTN-103');" "rrsl_locked"
+expect_block "10 收货后改预约行" "UPDATE return_reservation_line SET container_code='X' WHERE id=1;" "rrsl_locked"
+expect_block "10 预约不可删" "DELETE FROM return_reservation_line WHERE id=1;" "return_no_delete"
+expect_block "10 预约同号重复（SQLite 拦 REPLACE）" "INSERT INTO return_reservation (id,code,warehouse_id,store_code,outbound_order_id,created_by) VALUES (2,'RSV-20261015-000001',1,'ST001',1,21);" "uq_rrsv_code"
+R=$(psql -t -A -c "UPDATE return_reservation SET status='CANCELLED' WHERE id=1 AND status='CREATED'")
+[ "$R" = "UPDATE 0" ] && ok "10 预约 version 条件更新（旧状态 CREATED）0 行 rowcount=0" || bad "10 预约 version 条件更新（旧状态 CREATED）0 行：$R"
 echo "=== 3. §5.6 盘点差异生成列（实盘 − 基准账面 − 期间流水）==="
 seed "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000);"
 D=$(psql -t -A -c "SELECT diff_qty_milli FROM count_line WHERE id=1")
