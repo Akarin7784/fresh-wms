@@ -982,6 +982,47 @@ END $$;                                                                         
 CREATE TRIGGER trg_upl_append_only BEFORE UPDATE OR DELETE ON upstream_push_log FOR EACH ROW EXECUTE FUNCTION trg_upl_append_only();  -- @pg-only
 CREATE TRIGGER trg_upl_no_truncate BEFORE TRUNCATE ON upstream_push_log FOR EACH STATEMENT EXECUTE FUNCTION trg_append_only();  -- @pg-only
 GRANT SELECT, INSERT ON upstream_push_log TO wms_app;                                                         -- @pg-only
+
+-- 第 11 篇 Q1 定案：离线纸质单事后补录（00 §6.6.1 PAPER_BACKFILL，§6.6.2 backfill_deadline_at）。
+-- 一行 = 一张纸质单。补录产生的库存事件走 02 post_event，biz_key 与在线事件同一规则，由 uq_mvk_biz_line 去重；本表另按 (warehouse_id, biz_key) 防同单重复补录。
+CREATE TABLE offline_paper_record (
+    id                   BIGINT       PRIMARY KEY,
+    warehouse_id         BIGINT       NOT NULL,
+    device_id            VARCHAR(64)  NOT NULL,                 -- 离线的终端
+    action_type          VARCHAR(24)  NOT NULL,                 -- 拣货确认 / 收货登记 / 签收
+    biz_key              VARCHAR(128) NOT NULL,                 -- 与在线事件同一 biz_key 规则
+    occurred_at          TIMESTAMP    NOT NULL,                 -- UTC，纸面记录的作业时间
+    operator_id          BIGINT       NOT NULL,                 -- 纸面上的实际作业人
+    payload              TEXT         NOT NULL,
+    photo_ids            TEXT,
+    approval_type        VARCHAR(24)  NOT NULL DEFAULT 'PAPER_BACKFILL',
+    applicant_id         BIGINT       NOT NULL,                 -- 补录申请人（offline.paper.backfill）
+    approver_id          BIGINT,                                -- 主管（offline.paper.approve）
+    approved_at          TIMESTAMP,
+    status               VARCHAR(16)  NOT NULL DEFAULT 'PENDING',
+    offline_since        TIMESTAMP    NOT NULL,                 -- UTC，该设备本次离线起点
+    reconnected_at       TIMESTAMP    NOT NULL,                 -- UTC，恢复联网时间
+    backfill_deadline_at TIMESTAMP    NOT NULL,                 -- UTC，= reconnected_at + 24h（服务端下发值，00 §6.6.2）
+    submitted_at         TIMESTAMP    NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),
+    exception_case_id    BIGINT,                                -- 过期补录转的异常单（第 10 篇）
+    created_at           TIMESTAMP    NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),
+    CONSTRAINT uq_paper_bizkey   UNIQUE (warehouse_id, biz_key),
+    CONSTRAINT ck_paper_type     CHECK (approval_type = 'PAPER_BACKFILL'),
+    CONSTRAINT ck_paper_action   CHECK (action_type IN ('PICK_CONFIRM','RECEIVE_REGISTER','POD_SIGN')),
+    CONSTRAINT ck_paper_status   CHECK (status IN ('PENDING','APPROVED','REJECTED','EXPIRED')),
+    CONSTRAINT ck_paper_deadline CHECK (backfill_deadline_at = reconnected_at + interval '24 hours'),   -- @pg-only
+-- @sqlite-only     CONSTRAINT ck_paper_deadline CHECK (backfill_deadline_at = datetime(reconnected_at, '+24 hours')),
+    CONSTRAINT ck_paper_window   CHECK (reconnected_at > offline_since AND occurred_at >= offline_since
+                                        AND occurred_at <= reconnected_at AND submitted_at >= reconnected_at),
+    -- 过期：提交晚于 backfill_deadline_at 只能落 EXPIRED，且必须挂异常单；未过期不能是 EXPIRED
+    CONSTRAINT ck_paper_expired  CHECK ((status = 'EXPIRED' AND submitted_at > backfill_deadline_at AND exception_case_id IS NOT NULL)
+                                        OR (status <> 'EXPIRED' AND submitted_at <= backfill_deadline_at AND exception_case_id IS NULL)),
+    CONSTRAINT ck_paper_sod      CHECK (approver_id IS NULL OR approver_id <> applicant_id),   -- 申请人不能自批
+    CONSTRAINT ck_paper_approve  CHECK ((status IN ('APPROVED','REJECTED') AND approver_id IS NOT NULL AND approved_at IS NOT NULL)
+                                        OR (status IN ('PENDING','EXPIRED') AND approver_id IS NULL AND approved_at IS NULL))
+);
+CREATE INDEX ix_paper_pending ON offline_paper_record(warehouse_id, status, submitted_at);
+GRANT SELECT, INSERT, UPDATE ON offline_paper_record TO wms_app;                                               -- @pg-only
 REVOKE UPDATE, DELETE, TRUNCATE ON upstream_push_log FROM wms_app;                                            -- @pg-only
 -- SQLite（边缘节点）没有角色：UPDATE/DELETE 一律拦；到期清理同流水表，由维护脚本导出后 DROP 触发器→删 retain_until 已过的行→重建，全程审计
 -- @sqlite-only CREATE TRIGGER trg_upl_no_update BEFORE UPDATE ON upstream_push_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: upstream_push_log'); END;
