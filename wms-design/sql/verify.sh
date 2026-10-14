@@ -61,16 +61,43 @@ if [ -n "${PGHOST:-}" ]; then
   psql() { command psql -X -v ON_ERROR_STOP=1 "$@"; }
   cleanup() { :; }
   echo "=== 0. 直连 PG：$PGUSER@$PGHOST:$PGPORT/$PGDATABASE ==="
-  for _ in $(seq 1 30); do command psql -X -t -A -c "SELECT 1" >/dev/null 2>&1 && break; sleep 1; done
+  conn_err=$(mktemp)
+  ready=0
+  for _ in $(seq 1 30); do
+    if psql -t -A -c "SELECT 1" >/dev/null 2>"$conn_err"; then ready=1; break; fi
+    sleep 1
+  done
+  if [ "$ready" != 1 ]; then
+    echo "  ✗ 连不上 $PGUSER@$PGHOST:$PGPORT/$PGDATABASE（psql 退出码非 0）"
+    cat "$conn_err"
+    rm -f "$conn_err"
+    exit 1
+  fi
+  rm -f "$conn_err"
 else
   MODE=docker
   command -v docker >/dev/null 2>&1 || { echo "  ✗ 未设置 PGHOST，且本机没有 docker，无法验证 PG 侧"; exit 1; }
+  # 与直连分支一样：每次 psql 都开 ON_ERROR_STOP，就绪检查看退出码，不看文本。
   psql() { docker exec -i "$CTR" psql -X -v ON_ERROR_STOP=1 -U postgres -d postgres "$@"; }
   cleanup() { docker rm -f "$CTR" >/dev/null 2>&1; }
   echo "=== 0. 启动一次性 PG16 容器（回退模式）==="
   docker rm -f "$CTR" >/dev/null 2>&1
   docker run -d --name "$CTR" -e POSTGRES_PASSWORD=verify -p $PORT:5432 postgres:16-alpine >/dev/null
-  for _ in $(seq 1 60); do docker exec "$CTR" pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
+  ready=0
+  for _ in $(seq 1 60); do
+    if docker exec "$CTR" pg_isready -U postgres >/dev/null 2>&1; then ready=1; break; fi
+    sleep 1
+  done
+  if [ "$ready" != 1 ]; then
+    echo "  ✗ PG16 容器未就绪"
+    cleanup
+    exit 1
+  fi
+  if ! psql -t -A -c "SELECT 1" >/dev/null; then
+    echo "  ✗ docker 分支 psql SELECT 1 退出码非 0（ON_ERROR_STOP 已开）"
+    cleanup
+    exit 1
+  fi
 fi
 
 echo "=== 1. 建表（ON_ERROR_STOP，任何语法/方言错误直接失败）==="
@@ -86,13 +113,16 @@ fi
 rm -f "$SCHEMA_ERR"
 ok "sql/schema/*.sql 在 PG16 按序全量执行通过（退出码 0，stdout/stderr 都空）"
 
-# 把 stdout 和 stderr 拼在一起，只给“这条语句应该报错/不该报错”的断言用。
+# 把 stdout 和 stderr 拼在一起，并带回 psql 的退出码。
+# 调用方要自己接 $?：这里不能写 `|| true`，否则连不上库（退出码非 0）会被当成成功。
 psql_capture() {
-  local errf out
+  local errf out rc
   errf=$(mktemp)
-  out=$(psql -q -c "$1" 2>"$errf") || true
+  out=$(psql -q -c "$1" 2>"$errf")
+  rc=$?
   printf '%s\n%s' "$out" "$(cat "$errf")"
   rm -f "$errf"
+  return "$rc"
 }
 
 T=$(psql -t -A -c "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p') AND NOT c.relispartition")
@@ -144,8 +174,19 @@ expect_block() {  # $1 描述  $2 SQL  $3 期望命中的约束名（或错误�
   esac
 }
 expect_allow() {  # $1 描述  $2 SQL —— 参数顺序与 expect_block 保持一致
-  local out; out=$(psql_capture "$2")
-  case "$out" in *ERROR*) bad "$1 → 被误拦：$out";; *) ok "$1 → 通过";; esac
+  # 失败条件有两条，缺一不可：
+  #   1. psql 退出码非 0（ON_ERROR_STOP 下语句失败，以及连不上库，都走这里）
+  #   2. 输出里出现 error:，不区分大小写。连不上时是小写 "psql: error:"，
+  #      语句失败时是大写 "ERROR:"；只匹配大写会把连不上当成通过。
+  local out rc low
+  out=$(psql_capture "$2")
+  rc=$?
+  low=$(printf '%s' "$out" | tr '[:upper:]' '[:lower:]' | tr '\n' ' ')
+  if [ "$rc" != 0 ] || [ "${low#*error:}" != "$low" ]; then
+    bad "$1 → 被误拦（退出 $rc）：$out"
+  else
+    ok "$1 → 通过"
+  fi
 }
 
 expect_block "I2 超占（allocated>on_hand）" \
@@ -320,7 +361,7 @@ expect_allow "C4 正向：check_code='CHECK_BOX_MISMATCH'、'SHIP_EVENT_MISSING'
 expect_allow "convert_hold 准备：stock 40 被 RETURN_PENDING 冻满（available=0）" \
   "BEGIN; INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (40,1,2,1,3,'KG',5000,5000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (30,40,'RETURN_PENDING','RETURN_PENDING','RETURN_RECORD',601,'RRH:601',5000,0,'HELD',0); COMMIT;"
 expect_allow "convert_hold：available=0 时 RETURN_PENDING → SCRAP_PENDING/SCRAP（source_id = 报损单 9001）" \
-  "BEGIN; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 30 AND status = 'HELD' AND released_qty_milli = 0; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,from_hold_id) VALUES (31,40,'SCRAP_PENDING','SCRAP','SCRAP',9001,'CVT:30',5000,0,'HELD',0,30); COMMIT;"
+  "BEGIN; SELECT id FROM stock WHERE id = 40 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id = 30 ORDER BY id FOR UPDATE; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 30 AND status = 'HELD' AND released_qty_milli = 0; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,from_hold_id) VALUES (31,40,'SCRAP_PENDING','SCRAP','SCRAP',9001,'CVT:30',5000,0,'HELD',0,30); COMMIT;"
 expect_block "convert_hold 重试：CVT:30 已存在（幂等，由 uq_hold_op 兜底）" \
   "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (32,40,'SCRAP_PENDING','SCRAP','SCRAP',9001,'CVT:30',5000,0,'HELD',0); COMMIT;" \
   "uq_hold_op"
@@ -391,10 +432,10 @@ expect_allow "A3 release_qc_hold 释放 1000（去重行 + 明细 + stock 同事
 expect_block "A3 release_qc_hold 重放同一 op_key（不重复解冻）" "BEGIN; INSERT INTO stock_hold_release (id,hold_id,op_key,qty_milli) VALUES (2,50,'QCR:7001:1',1000); UPDATE stock_hold SET released_qty_milli = released_qty_milli + 1000, status = CASE WHEN released_qty_milli + 1000 = hold_qty_milli THEN 'RELEASED' ELSE 'HELD' END, version = version + 1 WHERE id = 50 AND hold_type = 'RETURN_QC' AND source_type = 'QC' AND source_id = 7001 AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 1000; UPDATE stock SET quality_hold_qty_milli = quality_hold_qty_milli - 1000, version = version + 1 WHERE id = 41 AND quality_hold_qty_milli >= 1000; COMMIT;" "uq_hr_op"
 R=$(psql -t -A -c "SELECT h.released_qty_milli||'/'||s.quality_hold_qty_milli FROM stock_hold h JOIN stock s ON s.id=h.stock_id WHERE h.id=50")
 [ "$R" = "1000/8000" ] && ok "A3 重放后 已释放/quality_hold = $R（只释放一次）" || bad "A3 重放后 = $R（期望 1000/8000）"
-expect_allow "A3 convert_hold QUALITY → SCRAP_PENDING（跨列：同事务 quality_hold −q、hold_qty +q）" "BEGIN; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 51 AND status = 'HELD' AND released_qty_milli = 0; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,from_hold_id) VALUES (52,41,'SCRAP_PENDING','SCRAP','SCRAP',9101,'CVT:51',3000,0,'HELD',0,51); UPDATE stock SET quality_hold_qty_milli = quality_hold_qty_milli - 3000, hold_qty_milli = hold_qty_milli + 3000, version = version + 1 WHERE id = 41 AND quality_hold_qty_milli >= 3000; COMMIT;"
+expect_allow "A3 convert_hold QUALITY → SCRAP_PENDING（跨列：同事务 quality_hold −q、hold_qty +q）" "BEGIN; SELECT id FROM stock WHERE id = 41 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id = 51 ORDER BY id FOR UPDATE; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 51 AND status = 'HELD' AND released_qty_milli = 0; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,from_hold_id) VALUES (52,41,'SCRAP_PENDING','SCRAP','SCRAP',9101,'CVT:51',3000,0,'HELD',0,51); UPDATE stock SET quality_hold_qty_milli = quality_hold_qty_milli - 3000, hold_qty_milli = hold_qty_milli + 3000, version = version + 1 WHERE id = 41 AND quality_hold_qty_milli >= 3000; COMMIT;"
 R=$(psql -t -A -c "SELECT quality_hold_qty_milli||'/'||hold_qty_milli||'/'||(on_hand_qty_milli-allocated_qty_milli-reserved_qty_milli-quality_hold_qty_milli-hold_qty_milli) FROM stock WHERE id=41")
 [ "$R" = "5000/3000/1000" ] && ok "A3 QUALITY 转后 quality/hold/available = $R（冻结总量 8000 与可用量不变）" || bad "A3 QUALITY 转后 = $R（期望 5000/3000/1000）"
-expect_allow "A3 convert_hold RETURN_QC 剩余 5000 → SCRAP_PENDING" "BEGIN; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 50 AND status = 'HELD' AND released_qty_milli = 1000; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,from_hold_id) VALUES (53,41,'SCRAP_PENDING','SCRAP','SCRAP',9102,'CVT:50',5000,0,'HELD',0,50); UPDATE stock SET quality_hold_qty_milli = quality_hold_qty_milli - 5000, hold_qty_milli = hold_qty_milli + 5000, version = version + 1 WHERE id = 41 AND quality_hold_qty_milli >= 5000; COMMIT;"
+expect_allow "A3 convert_hold RETURN_QC 剩余 5000 → SCRAP_PENDING" "BEGIN; SELECT id FROM stock WHERE id = 41 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id = 50 ORDER BY id FOR UPDATE; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 50 AND status = 'HELD' AND released_qty_milli = 1000; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,from_hold_id) VALUES (53,41,'SCRAP_PENDING','SCRAP','SCRAP',9102,'CVT:50',5000,0,'HELD',0,50); UPDATE stock SET quality_hold_qty_milli = quality_hold_qty_milli - 5000, hold_qty_milli = hold_qty_milli + 5000, version = version + 1 WHERE id = 41 AND quality_hold_qty_milli >= 5000; COMMIT;"
 R=$(psql -t -A -c "SELECT quality_hold_qty_milli||'/'||hold_qty_milli||'/'||(on_hand_qty_milli-allocated_qty_milli-reserved_qty_milli-quality_hold_qty_milli-hold_qty_milli) FROM stock WHERE id=41")
 [ "$R" = "0/8000/1000" ] && ok "A3 RETURN_QC 转后 quality/hold/available = $R（冻结总量 8000 与可用量不变）" || bad "A3 RETURN_QC 转后 = $R（期望 0/8000/1000）"
 expect_block "A3 stock_hold_release 只追加（UPDATE）" "BEGIN; UPDATE stock_hold_release SET qty_milli = 2000 WHERE op_key = 'QCR:7001:1'; COMMIT;" "hold_immutable"
@@ -477,7 +518,7 @@ R=$(psql -t -A -c "SELECT quality_hold_qty_milli||'/'||hold_qty_milli||'/'||(on_
 expect_block "误报回转缺审批单号（→ 应用层 40930，库层 ck_hold_approval 兜底）" "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no,is_reversal) VALUES (57,41,'RETURN_QC','RETURN_QC','QC',7011,'CVT:53',5000,0,'HELD',0,NULL,NULL,true); COMMIT;" "ck_hold_approval"
 expect_block "误报回转审批类型不是 SCRAP_MISREPORT" "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no,is_reversal) VALUES (59,41,'RETURN_QC','RETURN_QC','QC',7011,'CVT:53',5000,0,'HELD',0,'OTHER','APR-WHSH01-20261015-000002',true); COMMIT;" "ck_hold_approval"
 expect_block "非误报回转的明细不能挂审批（MANUAL + SCRAP_MISREPORT）" "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (60,41,'MANUAL','DAMAGE','MANUAL',0,'H60',1000,0,'HELD',7,'SCRAP_MISREPORT','APR-WHSH01-20261015-000003'); COMMIT;" "ck_hold_approval"
-expect_allow "误报回转：SCRAP_PENDING 52（3000）→ RETURN_QC 56，挂新质检单 7010 + 审批 APR-WHSH01-20261015-000001；hold −q、quality +q" "BEGIN; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 52 AND hold_type = 'SCRAP_PENDING' AND status = 'HELD' AND released_qty_milli = 0; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no,is_reversal,from_hold_id) VALUES (56,41,'RETURN_QC','RETURN_QC','QC',7010,'CVT:52',3000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH01-20261015-000001',true,52); UPDATE stock SET hold_qty_milli = hold_qty_milli - 3000, quality_hold_qty_milli = quality_hold_qty_milli + 3000, version = version + 1 WHERE id = 41 AND hold_qty_milli >= 3000; COMMIT;"
+expect_allow "误报回转：SCRAP_PENDING 52（3000）→ RETURN_QC 56，挂新质检单 7010 + 审批 APR-WHSH01-20261015-000001；hold −q、quality +q" "BEGIN; SELECT id FROM stock WHERE id = 41 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id = 52 ORDER BY id FOR UPDATE; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 52 AND hold_type = 'SCRAP_PENDING' AND status = 'HELD' AND released_qty_milli = 0; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no,is_reversal,from_hold_id) VALUES (56,41,'RETURN_QC','RETURN_QC','QC',7010,'CVT:52',3000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH01-20261015-000001',true,52); UPDATE stock SET hold_qty_milli = hold_qty_milli - 3000, quality_hold_qty_milli = quality_hold_qty_milli + 3000, version = version + 1 WHERE id = 41 AND hold_qty_milli >= 3000; COMMIT;"
 R=$(psql -t -A -c "SELECT quality_hold_qty_milli||'/'||hold_qty_milli||'/'||(on_hand_qty_milli-allocated_qty_milli-reserved_qty_milli-quality_hold_qty_milli-hold_qty_milli) FROM stock WHERE id=41")
 [ "$R" = "3000/5000/1000" ] && ok "误报回转后 quality/hold/available = $R（冻结总量 8000、可用量 1000 不变）" || bad "误报回转后 = $R（期望 3000/5000/1000）"
 expect_block "误报回转后审批单号不可改" "BEGIN; UPDATE stock_hold SET approval_no = 'APR-WHSH01-20261015-000099' WHERE id = 56; COMMIT;" "hold_immutable"
@@ -551,9 +592,9 @@ expect_block "回转 op_key 小写 cvt: 两库都拒（ck_hold_reversal_key）" 
 expect_allow "部分转换准备：stock 45 RETURN_QC 4000" \
   "BEGIN; INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,quality_hold_qty_milli) VALUES (45,1,1,1,3,'KG',4000,4000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (110,45,'RETURN_QC','RETURN_QC','QC',7201,'RQC:7201',4000,0,'HELD',0); COMMIT;"
 expect_allow "convert_hold 部分 2000，调用方键 CVT:110:1" \
-  "BEGIN; UPDATE stock_hold SET released_qty_milli = released_qty_milli + 2000, status = CASE WHEN released_qty_milli + 2000 = hold_qty_milli THEN 'RELEASED' ELSE 'HELD' END, version = version + 1 WHERE id = 110 AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 2000; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,from_hold_id) VALUES (111,45,'SCRAP_PENDING','SCRAP','SCRAP',9201,'CVT:110:1',2000,0,'HELD',0,110); UPDATE stock SET quality_hold_qty_milli = quality_hold_qty_milli - 2000, hold_qty_milli = hold_qty_milli + 2000, version = version + 1 WHERE id = 45 AND quality_hold_qty_milli >= 2000; COMMIT;"
+  "BEGIN; SELECT id FROM stock WHERE id = 45 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id = 110 ORDER BY id FOR UPDATE; UPDATE stock_hold SET released_qty_milli = released_qty_milli + 2000, status = CASE WHEN released_qty_milli + 2000 = hold_qty_milli THEN 'RELEASED' ELSE 'HELD' END, version = version + 1 WHERE id = 110 AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 2000; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,from_hold_id) VALUES (111,45,'SCRAP_PENDING','SCRAP','SCRAP',9201,'CVT:110:1',2000,0,'HELD',0,110); UPDATE stock SET quality_hold_qty_milli = quality_hold_qty_milli - 2000, hold_qty_milli = hold_qty_milli + 2000, version = version + 1 WHERE id = 45 AND quality_hold_qty_milli >= 2000; COMMIT;"
 expect_allow "convert_hold 再转 500，另一键 CVT:110:2" \
-  "BEGIN; UPDATE stock_hold SET released_qty_milli = released_qty_milli + 500, status = CASE WHEN released_qty_milli + 500 = hold_qty_milli THEN 'RELEASED' ELSE 'HELD' END, version = version + 1 WHERE id = 110 AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 500; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,from_hold_id) VALUES (112,45,'SCRAP_PENDING','SCRAP','SCRAP',9202,'CVT:110:2',500,0,'HELD',0,110); UPDATE stock SET quality_hold_qty_milli = quality_hold_qty_milli - 500, hold_qty_milli = hold_qty_milli + 500, version = version + 1 WHERE id = 45 AND quality_hold_qty_milli >= 500; COMMIT;"
+  "BEGIN; SELECT id FROM stock WHERE id = 45 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id = 110 ORDER BY id FOR UPDATE; UPDATE stock_hold SET released_qty_milli = released_qty_milli + 500, status = CASE WHEN released_qty_milli + 500 = hold_qty_milli THEN 'RELEASED' ELSE 'HELD' END, version = version + 1 WHERE id = 110 AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 500; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,from_hold_id) VALUES (112,45,'SCRAP_PENDING','SCRAP','SCRAP',9202,'CVT:110:2',500,0,'HELD',0,110); UPDATE stock SET quality_hold_qty_milli = quality_hold_qty_milli - 500, hold_qty_milli = hold_qty_milli + 500, version = version + 1 WHERE id = 45 AND quality_hold_qty_milli >= 500; COMMIT;"
 expect_block "同一调用方键 CVT:110:1 重放（uq_hold_op）" \
   "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,from_hold_id) VALUES (113,45,'SCRAP_PENDING','SCRAP','SCRAP',9201,'CVT:110:1',2000,0,'HELD',0,110); ROLLBACK;" \
   "uq_hold_op"
@@ -873,6 +914,77 @@ else
 fi
 R=$(psql -t -A -c "SELECT s.version||'/'||s.on_hand_qty_milli||'/'||s.hold_qty_milli||'/'||h.status||'/'||h.version||'/'||(SELECT count(*) FROM stock_hold_release WHERE op_key='LTH:7902:9002:171')||'/'||(SELECT qty_milli FROM stock_hold_release WHERE id=192) FROM stock s JOIN stock_hold h ON h.id=171 WHERE s.id=62")
 [ "$R" = "1/3000/0/RELEASED/1/1/3000" ] && ok "N-2 并发后 version/on_hand/hold_qty/状态/明细 version/释放行数/释放量 = $R（没有第二次释放）" || bad "N-2 并发后 = $R（期望 1/3000/0/RELEASED/1/1/3000）"
+rm -f "$REL_A" "$REL_B"
+
+echo "=== 5d. convert_hold 与 consume_live_hold 并发：先锁 stock、停在 pg_sleep、再锁 stock_hold，不死锁 ==="
+# 睡眠放在两把锁中间：转换会话只持有 stock 行锁时，消耗会话按 release/consume 的顺序去锁同一行。
+# 若转换改回先锁 stock_hold，消耗会话会先拿到 stock、再去等 stock_hold，两边交叉等待，这里应报 deadlock。
+expect_allow "convert 并发底数：stock 63（container 2）RETURN_PENDING 3000 + LIVE_HOLD 2000" \
+  "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,container_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (63,1,1,2,1,2,'KG',5000,5000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (180,63,'RETURN_PENDING','RETURN_PENDING','RETURN_RECORD',963,'RRH:963',3000,0,'HELD',0),(181,63,'LIVE_HOLD','LIVE_HOLD','LIVE_TANK_HOLD',9631,'LH:9631',2000,0,'HELD',0);"
+REL_A=$(mktemp)
+REL_B=$(mktemp)
+psql >"$REL_A" 2>&1 <<'SQL' &
+BEGIN;
+SELECT id FROM stock WHERE id = 63 ORDER BY id FOR UPDATE;
+SELECT pg_sleep(2);
+SELECT id FROM stock_hold WHERE id = 180 ORDER BY id FOR UPDATE;
+UPDATE stock_hold
+   SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1
+ WHERE id = 180 AND status = 'HELD' AND released_qty_milli = 0;
+INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,from_hold_id)
+VALUES (182,63,'SCRAP_PENDING','SCRAP','SCRAP',9301,'CVT:180',3000,0,'HELD',0,180);
+COMMIT;
+SQL
+APID=$!
+locked=0
+for _ in $(seq 1 50); do
+  n=$(psql -t -A -c "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND state = 'active' AND query LIKE '%pg_sleep%';")
+  n=$(printf '%s' "$n" | tr -d '[:space:]')
+  if [ -n "$n" ] && [ "$n" != "0" ]; then locked=1; break; fi
+  sleep 0.1
+done
+if [ "$locked" = "1" ]; then ok "convert 会话已锁库存行并停在 pg_sleep，消耗会话才开始"; else bad "没等到 convert 会话进入 pg_sleep"; echo "--- convert ---"; cat "$REL_A"; fi
+psql >"$REL_B" 2>&1 <<'SQL'
+DO $$
+DECLARE
+  n_stock int;
+  n_hold int;
+BEGIN
+  PERFORM id FROM stock WHERE id = 63 ORDER BY id FOR UPDATE;
+  PERFORM id FROM stock_hold WHERE id IN (180, 181) ORDER BY id FOR UPDATE;
+  UPDATE stock
+     SET hold_qty_milli = hold_qty_milli - 1000,
+         on_hand_qty_milli = on_hand_qty_milli - 1000,
+         ledger_seq = ledger_seq + 1,
+         version = version + 1
+   WHERE id = 63 AND hold_qty_milli >= 1000 AND on_hand_qty_milli >= 1000;
+  GET DIAGNOSTICS n_stock = ROW_COUNT;
+  UPDATE stock_hold
+     SET released_qty_milli = released_qty_milli + 1000, version = version + 1
+   WHERE id = 181 AND hold_type = 'LIVE_HOLD' AND status = 'HELD'
+     AND hold_qty_milli - released_qty_milli >= 1000;
+  GET DIAGNOSTICS n_hold = ROW_COUNT;
+  IF n_stock <> 1 OR n_hold <> 1 THEN
+    RAISE EXCEPTION 'consume_skipped stock=% hold=%', n_stock, n_hold;
+  END IF;
+END
+$$;
+SQL
+BSTAT=$?
+wait "$APID"
+ASTAT=$?
+if [ "$ASTAT" = "0" ] && ! grep -q deadlock "$REL_A"; then
+  ok "并发 convert 会话提交成功，无死锁"
+else
+  bad "并发 convert 会话退出 $ASTAT"; echo "--- convert ---"; cat "$REL_A"
+fi
+if [ "$BSTAT" = "0" ] && ! grep -q deadlock "$REL_B"; then
+  ok "并发消耗会话按同一锁序等到库存行后扣 1000，无死锁"
+else
+  bad "并发消耗会话退出 $BSTAT"; echo "--- consume ---"; cat "$REL_B"
+fi
+R=$(psql -t -A -c "SELECT s.version||'/'||s.on_hand_qty_milli||'/'||s.hold_qty_milli||'/'||s.ledger_seq||'/'||h180.status||'/'||h180.released_qty_milli||'/'||h182.status||'/'||h182.hold_qty_milli||'/'||h181.status||'/'||h181.released_qty_milli FROM stock s JOIN stock_hold h180 ON h180.id=180 JOIN stock_hold h182 ON h182.id=182 JOIN stock_hold h181 ON h181.id=181 WHERE s.id=63")
+[ "$R" = "1/4000/4000/1/RELEASED/3000/HELD/3000/HELD/1000" ] && ok "并发后 version/on_hand/hold_qty/ledger/待回库/已释放/报损状态/报损量/活鲜状态/活鲜已释放 = $R（同列转换没改库存数量，只被消耗扣了 1000）" || bad "并发后 = $R（期望 1/4000/4000/1/RELEASED/3000/HELD/3000/HELD/1000）"
 rm -f "$REL_A" "$REL_B"
 
 echo "=== 汇总 ==="

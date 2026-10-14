@@ -367,7 +367,12 @@ CREATE TRIGGER trg_sll_immutable BEFORE UPDATE ON stock_ledger_line FOR EACH ROW
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'ledger_line_immutable'); END;
 
 -- 冻结明细写入后不可改（小赵 N1）：只放行释放路径要写的 released_qty_milli / status / version / updated_at。
--- 类型转换只走 convert_hold（关旧建新），任何路径都不需要改 hold_type；否则先把 SCRAP_PENDING 改成 MANUAL 就能绕过 40933
+-- 类型转换只走 convert_hold（关旧建新），任何路径都不需要改 hold_type；否则先把 SCRAP_PENDING 改成 MANUAL 就能绕过 40933。
+-- convert_hold 加锁顺序（docs/02 §7.1.1、§8.2；PG 与 SQLite 同一条）：
+--   先锁 stock 行（SELECT … WHERE id = :stock_id ORDER BY id），再锁 stock_hold（ORDER BY id），
+--   然后才改 released/status、插入子明细；跨列时最后改 stock 数量。
+--   同列转换不改 stock 数量和 version，也要先锁 stock，避免和 release/consume 交叉等锁。
+--   PG 在这两条 SELECT 上加 FOR UPDATE；SQLite 没有行锁，语句顺序相同，写事务用 BEGIN IMMEDIATE。
 CREATE FUNCTION trg_hold_immutable() RETURNS trigger LANGUAGE plpgsql AS $$                                -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF NEW.id IS DISTINCT FROM OLD.id OR NEW.stock_id IS DISTINCT FROM OLD.stock_id                           -- @pg-only
