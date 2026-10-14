@@ -493,6 +493,7 @@ r = one("SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name='trg_o
 ok("种子路径结束后 trg_outbox_insert_pending 已重建") if r == 1 else bad("trg_outbox_insert_pending 未重建")
 expect_block_tx('R1 补洞：应用以 SENT 状态插入 outbox（sent_at 倒写 1 天前）', ["INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at) VALUES (8811,'t','k','{}','SENT',datetime('now','-1 day'))"], 'outbox_insert_not_pending')
 expect_block_tx('R1 补洞：应用以 PENDING 插入但带过去的 sent_at', ["INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at) VALUES (8812,'t','k','{}','PENDING',datetime('now','-8 days'))"], 'outbox_insert_not_pending')
+expect_block_tx('R1 补洞：应用以 FAILED 状态插入 outbox（SQLite 没有角色，非 PENDING 一律拒绝）', ["INSERT INTO outbox_event (id,topic,biz_key,payload,status) VALUES (8814,'t','k','{}','FAILED')"], 'outbox_insert_not_pending')
 expect_block_tx('P2 idem expires_at 改早', ["UPDATE idempotency_record SET expires_at = '2000-01-01 00:00:00' WHERE idem_key = 'live'"], 'expiry_backdate: idempotency_record')
 expect_block_tx('P2 idem created_at 被改', ["UPDATE idempotency_record SET created_at = '2000-01-01 00:00:00' WHERE idem_key = 'live'"], 'expiry_backdate: idempotency_record')
 expect_block_tx('P2 outbox sent_at 改早', ["UPDATE outbox_event SET sent_at = datetime('now','-30 days') WHERE id = 8803"], 'expiry_backdate: outbox_event')

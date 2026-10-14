@@ -337,7 +337,8 @@ CREATE TABLE stock_ledger_line (
 );
 
 -- 去重表与归属表绑定：写入 key 时，该单据行的归属必须已存在、来源一致，PDA 行还必须是当前持有设备（两库各一份触发器，语义相同）
-CREATE FUNCTION trg_mvk_line_kind() RETURNS trigger LANGUAGE plpgsql AS $$                                 -- @pg-only
+-- search_path 固定为 pg_catalog, public。函数体里的 stock_ledger_line 不写 schema，在这条路径下只解析到 public；调用方把自己的 schema 放在前面也看不见。
+CREATE FUNCTION trg_mvk_line_kind() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF NOT EXISTS (SELECT 1 FROM stock_ledger_line l                                                         -- @pg-only
                     WHERE l.biz_no = NEW.biz_no AND l.line_no = NEW.line_no AND l.src_kind = NEW.src_kind  -- @pg-only
@@ -353,7 +354,8 @@ CREATE TRIGGER trg_mvk_line_kind BEFORE INSERT ON stock_movement_key FOR EACH RO
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'ledger_line_owner_mismatch'); END;
 
 -- 归属行的来源不可改（小赵 C3）：src_kind / biz_no / line_no 写入后禁止 UPDATE，否则把 PDA 行改成 DOC 就能绕过互斥
-CREATE FUNCTION trg_sll_immutable() RETURNS trigger LANGUAGE plpgsql AS $$                                 -- @pg-only
+-- search_path 固定为 pg_catalog, public。函数体只比较 NEW/OLD，没有名字查找。
+CREATE FUNCTION trg_sll_immutable() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF NEW.src_kind IS DISTINCT FROM OLD.src_kind OR NEW.biz_no IS DISTINCT FROM OLD.biz_no                   -- @pg-only
        OR NEW.line_no IS DISTINCT FROM OLD.line_no THEN                                                       -- @pg-only
@@ -373,7 +375,8 @@ CREATE TRIGGER trg_sll_immutable BEFORE UPDATE ON stock_ledger_line FOR EACH ROW
 --   然后才改 released/status、插入子明细；跨列时最后改 stock 数量。
 --   同列转换不改 stock 数量和 version，也要先锁 stock，避免和 release/consume 交叉等锁。
 --   PG 在这两条 SELECT 上加 FOR UPDATE；SQLite 没有行锁，语句顺序相同，写事务用 BEGIN IMMEDIATE。
-CREATE FUNCTION trg_hold_immutable() RETURNS trigger LANGUAGE plpgsql AS $$                                -- @pg-only
+-- search_path 固定为 pg_catalog, public。函数体只比较 NEW/OLD，没有名字查找。
+CREATE FUNCTION trg_hold_immutable() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF NEW.id IS DISTINCT FROM OLD.id OR NEW.stock_id IS DISTINCT FROM OLD.stock_id                           -- @pg-only
        OR NEW.hold_type IS DISTINCT FROM OLD.hold_type OR NEW.reason_code IS DISTINCT FROM OLD.reason_code    -- @pg-only
@@ -391,7 +394,8 @@ BEGIN                                                                           
 END $$;                                                                                                       -- @pg-only
 CREATE TRIGGER trg_hold_immutable BEFORE UPDATE ON stock_hold FOR EACH ROW EXECUTE FUNCTION trg_hold_immutable();  -- @pg-only
 -- R2：冻结明细不可删除（wms_app 本就没有 DELETE/TRUNCATE 权限；这里兜底超级用户/迁移脚本，与流水表写法一致）
-CREATE FUNCTION trg_hold_no_delete() RETURNS trigger LANGUAGE plpgsql AS $$                                -- @pg-only
+-- search_path 固定为 pg_catalog, public。函数体只 RAISE，没有名字查找。
+CREATE FUNCTION trg_hold_no_delete() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     RAISE EXCEPTION 'hold_immutable' USING ERRCODE = '23514';                                                -- @pg-only
 END $$;                                                                                                       -- @pg-only
@@ -416,7 +420,8 @@ CREATE TRIGGER trg_hr_append_only BEFORE UPDATE OR DELETE ON stock_hold_release 
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'hold_duplicate'); END;
 
 -- 只追加：流水表与去重表禁止 UPDATE / DELETE。PG 侧收回应用角色权限 + 触发器（防超级用户/运维脚本误操作）；SQLite 侧触发器
-CREATE FUNCTION trg_append_only() RETURNS trigger LANGUAGE plpgsql AS $$                                   -- @pg-only
+-- search_path 固定为 pg_catalog, public。函数体只用 TG_TABLE_NAME。
+CREATE FUNCTION trg_append_only() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     RAISE EXCEPTION 'append_only_violation: %', TG_TABLE_NAME USING ERRCODE = '42501';                       -- @pg-only
 END $$;                                                                                                       -- @pg-only

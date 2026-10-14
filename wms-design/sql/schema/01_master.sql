@@ -140,7 +140,8 @@ CREATE INDEX ix_lot_expiry ON lot(sku_id, expiry_date) WHERE quality_status = 'Q
 CREATE INDEX ix_lot_aging  ON lot(remaining_life_days, sku_id);
 -- [SQLite] 两个部分索引均支持；ix_lot_aging 支撑效期预警列表
 -- sell_deadline 建档固定、不回溯：其余列仍可更新，只有这一列（含 NULL）写入后不可改
-CREATE FUNCTION trg_lot_sell_deadline() RETURNS trigger LANGUAGE plpgsql AS $$                          -- @pg-only
+-- search_path 固定为 pg_catalog, public。IS DISTINCT FROM 用的 =(date,date) 来自 pg_catalog，调用方 schema 里的同名运算符不生效。
+CREATE FUNCTION trg_lot_sell_deadline() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
 BEGIN                                                                                                     -- @pg-only
     IF NEW.sell_deadline IS DISTINCT FROM OLD.sell_deadline THEN                                          -- @pg-only
         RAISE EXCEPTION 'sell_deadline_immutable' USING ERRCODE = '23514';                               -- @pg-only

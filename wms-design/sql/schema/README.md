@@ -34,3 +34,9 @@
 | `ck_inb_rtn_src` | `inbound_order` | 第 10 篇 `10_returns.sql`（对 03 入库单 ALTER） | 限制退货入库来源。PostgreSQL 用 CHECK；SQLite 用触发器 | 待 #5 落库 |
 | `upstream_push_log` 的 SELECT、DELETE 给 `wms_purge_owner`；`purge_push_log()` 的 EXECUTE 给 `wms_cleaner` | `upstream_push_log` | `99_grants.sql`（目录检查，表或函数不存在则跳过） | 第 11 篇清理角色。本分支还没有这张表和这个函数，两笔 GRANT 当前都跳过 | 待 #11 落库（当前跳过） |
 | `ALTER FUNCTION purge_push_log() OWNER TO wms_purge_owner` | `purge_push_log()` | `99_grants.sql`（`to_regprocedure` 查目录，函数不存在则跳过） | 第 11 篇 `trg_upl_append_only` 只放行 `current_user = wms_purge_owner` 删除已过 `retain_until` 的行。函数是 SECURITY DEFINER，属主才是触发器看到的当前用户。角色在本文件开头创建，表上的 SELECT、DELETE 已按目录检查授予。函数体和触发器归第 11 篇，本文件不建 | 待 #11 落库（当前跳过） |
+
+## 触发器 search_path 与 outbox 插入
+
+本篇定义的 10 个函数都固定 `SET search_path = pg_catalog, public`。`purge_expired()` 原本就有。另外 9 个是触发器函数，不是 SECURITY DEFINER，按调用方身份执行：`trg_mvk_line_kind`、`trg_sll_immutable`、`trg_hold_immutable`、`trg_hold_no_delete`、`trg_append_only`（`02_inventory.sql`），`trg_lot_sell_deadline`（`01_master.sql`），`trg_purge_guard`、`trg_expiry_forward`、`trg_outbox_insert_pending`（`11_integration.sql`）。
+
+`trg_outbox_insert_pending` 不按 `current_user = 'wms_app'` 判断。`wms_app` 是 NOLOGIN，应用用继承它的登录角色。不是 `outbox_event` 表属主的角色，插入时 `status` 必须是 `PENDING` 且 `sent_at` 为空，否则拒绝（`outbox_insert_not_pending`），不把状态改写成 `PENDING`。表属主可以插入其他状态，供种子和迁移使用。SQLite 没有角色，也没有 search_path；同名触发器拒绝一切非 PENDING 或带 `sent_at` 的插入，包括 `FAILED`。

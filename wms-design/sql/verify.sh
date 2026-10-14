@@ -498,6 +498,44 @@ expect_allow "R1 补洞正向：wms_app 以 PENDING 插入（不带 sent_at）" 
 expect_block "R1 PENDING → SENT 时 sent_at 写成 1 小时前" "BEGIN; SET LOCAL ROLE wms_app; UPDATE outbox_event SET status='SENT', sent_at=(now() AT TIME ZONE 'UTC') - interval '1 hour' WHERE id=8801; ROLLBACK;" "sent_at_not_now"
 expect_block "R1 PENDING → SENT 时 sent_at 写成 1 小时后" "BEGIN; SET LOCAL ROLE wms_app; UPDATE outbox_event SET status='SENT', sent_at=(now() AT TIME ZONE 'UTC') + interval '1 hour' WHERE id=8801; ROLLBACK;" "sent_at_not_now"
 expect_allow "R1 正向：PENDING → SENT 写当前 UTC（容差内 +3 秒）" "BEGIN; SET LOCAL ROLE wms_app; UPDATE outbox_event SET status='SENT', sent_at=(now() AT TIME ZONE 'UTC') + interval '3 seconds' WHERE id=8801; ROLLBACK;"
+echo "=== 2f2c. search_path 钉死；登录角色劫持同名对象；非属主插入 FAILED ==="
+# #2 定义的 10 个函数。proconfig 要正好是 search_path=pg_catalog, public（与 purge_expired 已有断言同一写法）。
+R=$(psql -t -A -c "SELECT count(*)::text || '/' || (count(*) FILTER (WHERE p.proconfig = ARRAY['search_path=pg_catalog, public']::text[]))::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname IN ('purge_expired','trg_append_only','trg_expiry_forward','trg_hold_immutable','trg_hold_no_delete','trg_lot_sell_deadline','trg_mvk_line_kind','trg_outbox_insert_pending','trg_purge_guard','trg_sll_immutable')")
+[ "$R" = "10/10" ] && ok "#2 的 10 个函数 proconfig 都是 search_path=pg_catalog, public（$R）" || bad "search_path 目录：$R（期望 10/10）"
+# 角色是集群级的。CREATE ROLE 不能放进事务。已有就改属性，避免第二次跑 verify 撞“角色已存在”。
+if [ "$(psql -t -A -c "SELECT count(*) FROM pg_roles WHERE rolname = 'wms_login_test'" | tr -d '[:space:]')" != "1" ]; then
+  seed "CREATE ROLE wms_login_test LOGIN INHERIT"
+fi
+seed "ALTER ROLE wms_login_test LOGIN INHERIT"
+seed "GRANT wms_app TO wms_login_test"
+R=$(psql -t -A -c "SELECT r.rolname || '/' || r.rolcanlogin::text || '/' || pg_has_role('wms_login_test', 'wms_app', 'member')::text FROM pg_roles r WHERE r.rolname = 'wms_login_test'")
+[ "$R" = "wms_login_test/true/true" ] && ok "wms_login_test 是登录角色，且继承 wms_app（后面的语句只 SET ROLE 到它，不再 SET ROLE wms_app）" || bad "登录角色：$R"
+# 劫持对象放在 hijack，不进 public，避免改 S4 的表权限矩阵。要让同名对象赢，会话必须把 hijack 放在 pg_catalog 前面；函数自己的 search_path 会盖住这条会话设置。
+seed "DROP SCHEMA IF EXISTS hijack CASCADE"
+seed "$(cat <<'SQL'
+CREATE SCHEMA hijack AUTHORIZATION wms_login_test;
+CREATE TABLE hijack.stock_ledger_line (biz_no varchar(64), line_no int, src_kind varchar(8), owner_device_instance_id varchar(64));
+INSERT INTO hijack.stock_ledger_line (biz_no, line_no, src_kind, owner_device_instance_id) VALUES ('HIJACK', 1, 'DOC', NULL);
+CREATE FUNCTION hijack.now() RETURNS timestamptz LANGUAGE sql STABLE AS $$ SELECT '2000-01-01 00:00:00+00'::timestamptz $$;
+CREATE FUNCTION hijack.date_eq_always(date, date) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$ SELECT true $$;
+CREATE OPERATOR hijack.= (FUNCTION = hijack.date_eq_always, LEFTARG = date, RIGHTARG = date);
+SQL
+)"
+expect_block "劫持同名表打 trg_mvk_line_kind（登录角色把 hijack 放在 pg_catalog 前）" \
+  "SET ROLE wms_login_test; SET search_path = hijack, pg_catalog, public; INSERT INTO public.stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,stock_id,stock_seq,direction,occurred_at) VALUES (99001,'HIJ:1:D1:1','HIJACK',1,1,1,'DOC',11,99001,0,'2026-10-15 00:00:00');" \
+  "ledger_line_owner_mismatch"
+expect_block "劫持同名 now() 打 trg_expiry_forward（登录角色把 hijack 放在 pg_catalog 前）" \
+  "SET ROLE wms_login_test; SET search_path = hijack, pg_catalog, public; UPDATE public.outbox_event SET status='SENT', sent_at='2000-01-01' WHERE id=8801;" \
+  "sent_at_not_now"
+expect_block "劫持同名 =(date,date) 打 trg_lot_sell_deadline（登录角色把 hijack 放在 pg_catalog 前）" \
+  "SET ROLE wms_login_test; SET search_path = hijack, pg_catalog, public; UPDATE public.lot SET sell_deadline = '2026-12-15' WHERE id = 1;" \
+  "sell_deadline_immutable"
+# 应用连接的 current_user 是登录角色本身，不会再 SET ROLE wms_app。这里只 SET ROLE 到登录角色。
+expect_block "继承 wms_app 的登录角色不 SET ROLE wms_app，插入 status=FAILED" \
+  "SET ROLE wms_login_test; INSERT INTO outbox_event (id,topic,biz_key,payload,status) VALUES (8899,'t','k','{}','FAILED');" \
+  "outbox_insert_not_pending"
+expect_allow "同一登录角色插入 PENDING（不带 sent_at）" \
+  "BEGIN; SET LOCAL ROLE wms_login_test; INSERT INTO outbox_event (id,topic,biz_key,payload) VALUES (8898,'t','k','{}'); ROLLBACK;"
 seed "INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,created_at,expires_at) VALUES ('tz_live12h','h','{}',200,now() AT TIME ZONE 'UTC',(now() AT TIME ZONE 'UTC') + interval '12 hours'),('tz_dead','h','{}',200,now() AT TIME ZONE 'UTC',(now() AT TIME ZONE 'UTC') - interval '1 hour');"
 # POSIX 记号相反：Etc/GMT-8 = UTC+8，Etc/GMT+10 = UTC-10，Etc/GMT-14 = UTC+14（小赵 P1 的复现时区）
 TZR=""
