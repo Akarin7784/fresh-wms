@@ -5,10 +5,14 @@
 -- =============================================================================
 
 -- [跨篇 ALTER] audit_log（表主人：11_integration.sql）
-ALTER TABLE audit_log ADD COLUMN node_id INT NOT NULL DEFAULT 0;            -- 0 = 未登记节点，应用层必填真实 node_id
-ALTER TABLE audit_log ADD COLUMN node_seq BIGINT NOT NULL DEFAULT 0;
-ALTER TABLE audit_log ADD COLUMN device_instance_id VARCHAR(64);
-ALTER TABLE audit_log ADD COLUMN approval_id BIGINT;
+ALTER TABLE audit_log ADD COLUMN node_id INT NOT NULL DEFAULT 0;            -- 0 = 未登记节点，应用层必填真实 node_id   -- @pg-only
+-- @sqlite-only ALTER TABLE audit_log ADD COLUMN node_id INT NOT NULL DEFAULT 0;            -- 0 = 未登记节点，应用层必填真实 node_id
+ALTER TABLE audit_log ADD COLUMN node_seq BIGINT NOT NULL DEFAULT 0;   -- @pg-only
+-- @sqlite-only ALTER TABLE audit_log ADD COLUMN node_seq BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE audit_log ADD COLUMN device_instance_id VARCHAR(64);   -- @pg-only
+-- @sqlite-only ALTER TABLE audit_log ADD COLUMN device_instance_id VARCHAR(64);
+ALTER TABLE audit_log ADD COLUMN approval_id BIGINT;   -- @pg-only
+-- @sqlite-only ALTER TABLE audit_log ADD COLUMN approval_id BIGINT;
 CREATE UNIQUE INDEX uq_audit_node_seq ON audit_log(node_id, node_seq);
 CREATE INDEX ix_audit_wh ON audit_log(warehouse_id, occurred_at DESC);
 -- Doro 定：DEFAULT 0 只为兼容存量行；新写入 node_id/node_seq 必须 > 0（应用层映射 40001 PARAM_INVALID）
@@ -38,7 +42,8 @@ CREATE TRIGGER trg_audit_no_truncate BEFORE TRUNCATE ON audit_log FOR EACH STATE
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'append_only_violation: audit_log'); END;
 
 -- [本篇表，12_auth.sql 由 #2 拆分建立] sys_user 加 perm_version
-ALTER TABLE sys_user ADD COLUMN perm_version BIGINT NOT NULL DEFAULT 1 CONSTRAINT ck_user_perm_ver CHECK (perm_version > 0);
+ALTER TABLE sys_user ADD COLUMN perm_version BIGINT NOT NULL DEFAULT 1 CONSTRAINT ck_user_perm_ver CHECK (perm_version > 0);   -- @pg-only
+-- @sqlite-only ALTER TABLE sys_user ADD COLUMN perm_version BIGINT NOT NULL DEFAULT 1 CONSTRAINT ck_user_perm_ver CHECK (perm_version > 0);
 
 -- -----------------------------------------------------------------------------
 -- docs/12 权限与审计：设备绑定、离线令牌、主管审批
@@ -115,7 +120,7 @@ CREATE TABLE approval_request (
     created_at          TIMESTAMP    NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),   -- UTC；expires_at 等时间列一律存 UTC（对齐 02 ad8ec1b P1）
     CONSTRAINT uq_apr_code UNIQUE (code),
     CONSTRAINT ck_apr_type CHECK (approval_type IN ('POD_CORRECT','CANCEL_AFTER_PICK','UNPLANNED_FAILOVER','DEVICE_BIND','SCRAP_MISREPORT',
-        'PAPER_BACKFILL','BOX_VOID','PROCESS_YIELD_DEVIATION','LIVE_DEATH_OVER')),   -- 【ck_apr_type 变更】00 已登记的 4 类
+        'PAPER_BACKFILL','BOX_VOID','PROCESS_YIELD_DEVIATION','LIVE_DEATH_OVER','PROCESS_REWORK')),   -- 【ck_apr_type 变更】00 已登记的 4 类 + PROCESS_REWORK（Doro 06:16）
     -- 非计划切换 = 发起人 + 仓库主管 + 中心运维三人（00 §9.1），角色字符串固定；是否真持有该角色由 trg_apr_transition 查 sys_user_role
     CONSTRAINT ck_apr_failover_roles CHECK (approval_type <> 'UNPLANNED_FAILOVER'
         OR ((first_approver_id IS NULL OR first_approver_role = 'WH_SUPERVISOR')
@@ -211,7 +216,7 @@ BEGIN                                                                           
         RAISE EXCEPTION 'approval_role_not_held' USING ERRCODE = '23514';                                    -- @pg-only
     END IF;                                                                                                   -- @pg-only
     -- 小赵 T2：单人审批类型按角色权限表核对审批人持有对应审批权限点（审批时使用的角色 = first_approver_role，且在本仓）  -- @pg-only
-    IF NEW.approval_type IN ('DEVICE_BIND','POD_CORRECT','CANCEL_AFTER_PICK','PAPER_BACKFILL','BOX_VOID','PROCESS_YIELD_DEVIATION','LIVE_DEATH_OVER')                                -- @pg-only
+    IF NEW.approval_type IN ('DEVICE_BIND','POD_CORRECT','CANCEL_AFTER_PICK','PAPER_BACKFILL','BOX_VOID','PROCESS_YIELD_DEVIATION','LIVE_DEATH_OVER','PROCESS_REWORK')                                -- @pg-only
        AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL AND NEW.first_approver_role IS NOT NULL AND NOT EXISTS (  -- 角色缺失交给 ck_apr_pair  -- @pg-only
          SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id                                  -- @pg-only
            JOIN sys_role_perm rp ON rp.role_id = r.id JOIN sys_permission p ON p.id = rp.perm_id              -- @pg-only
@@ -224,6 +229,7 @@ BEGIN                                                                           
                                                 WHEN 'BOX_VOID' THEN 'pack.box.void.approve'   -- 【ck_apr_type 变更】 -- @pg-only
                                                 WHEN 'PROCESS_YIELD_DEVIATION' THEN 'process.yield.approve'   -- 【ck_apr_type 变更】 -- @pg-only
                                                 WHEN 'LIVE_DEATH_OVER' THEN 'live.death.approve'   -- 【ck_apr_type 变更】 -- @pg-only
+                                                WHEN 'PROCESS_REWORK' THEN 'process.rework.approve'   -- 【ck_apr_type 变更】 -- @pg-only
                                                 ELSE 'outbound.order.cancel_after_pick.approve' END) THEN             -- @pg-only
         RAISE EXCEPTION 'approval_perm_not_held' USING ERRCODE = '23514';                                    -- @pg-only
     END IF;                                                                                                   -- @pg-only
@@ -289,7 +295,7 @@ CREATE TRIGGER trg_apr_final BEFORE UPDATE ON approval_request FOR EACH ROW EXEC
 -- @sqlite-only         WHERE ur.user_id = NEW.second_approver_id AND r.code = 'CENTER_OPS')))
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'approval_role_not_held'); END;
 -- @sqlite-only CREATE TRIGGER trg_apr_perm BEFORE UPDATE ON approval_request
--- @sqlite-only WHEN NEW.approval_type IN ('DEVICE_BIND','POD_CORRECT','CANCEL_AFTER_PICK','PAPER_BACKFILL','BOX_VOID','PROCESS_YIELD_DEVIATION','LIVE_DEATH_OVER')
+-- @sqlite-only WHEN NEW.approval_type IN ('DEVICE_BIND','POD_CORRECT','CANCEL_AFTER_PICK','PAPER_BACKFILL','BOX_VOID','PROCESS_YIELD_DEVIATION','LIVE_DEATH_OVER','PROCESS_REWORK')
 -- @sqlite-only   AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL AND NEW.first_approver_role IS NOT NULL AND NOT EXISTS (
 -- @sqlite-only     SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
 -- @sqlite-only       JOIN sys_role_perm rp ON rp.role_id = r.id JOIN sys_permission p ON p.id = rp.perm_id
@@ -302,6 +308,7 @@ CREATE TRIGGER trg_apr_final BEFORE UPDATE ON approval_request FOR EACH ROW EXEC
 -- @sqlite-only                                            WHEN 'BOX_VOID' THEN 'pack.box.void.approve'
 -- @sqlite-only                                            WHEN 'PROCESS_YIELD_DEVIATION' THEN 'process.yield.approve'
 -- @sqlite-only                                            WHEN 'LIVE_DEATH_OVER' THEN 'live.death.approve'
+-- @sqlite-only                                            WHEN 'PROCESS_REWORK' THEN 'process.rework.approve'
 -- @sqlite-only                                            ELSE 'outbound.order.cancel_after_pick.approve' END)
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'approval_perm_not_held'); END;
 -- @sqlite-only CREATE TRIGGER trg_apr_scrap_role BEFORE UPDATE ON approval_request
@@ -404,6 +411,17 @@ CREATE TRIGGER trg_user_perm_ver BEFORE UPDATE ON sys_user FOR EACH ROW EXECUTE 
 -- @sqlite-only CREATE TRIGGER trg_user_no_replace BEFORE INSERT ON sys_user
 -- @sqlite-only WHEN EXISTS (SELECT 1 FROM sys_user u WHERE u.id = NEW.id OR u.username = NEW.username)
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'sys_user_duplicate'); END;
+
+
+-- [跨篇 ALTER] stock_hold.approval_no → approval_request.code（表主人：02_inventory.sql；00 第 278 行）
+-- PG 外键引用 uq_apr_code。SQLite 不能 ALTER 加外键，用 AFTER 触发器：CHECK 先于 AFTER，格式错误仍报 ck_hold_approval_no。
+ALTER TABLE stock_hold ADD CONSTRAINT fk_hold_approval_no FOREIGN KEY (approval_no) REFERENCES approval_request (code);  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_hold_approval_fk AFTER INSERT ON stock_hold
+-- @sqlite-only WHEN NEW.approval_no IS NOT NULL AND NOT EXISTS (SELECT 1 FROM approval_request a WHERE a.code = NEW.approval_no)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'fk_hold_approval_no'); END;
+-- @sqlite-only CREATE TRIGGER trg_hold_approval_fk_upd AFTER UPDATE OF approval_no ON stock_hold
+-- @sqlite-only WHEN NEW.approval_no IS NOT NULL AND NOT EXISTS (SELECT 1 FROM approval_request a WHERE a.code = NEW.approval_no)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'fk_hold_approval_no'); END;
 
 -- 授权（PG）
 -- docs/12 新表 wms_app 最小授权：不给 DELETE/TRUNCATE；离线令牌只能写吊销时间；审批只能改决策相关列

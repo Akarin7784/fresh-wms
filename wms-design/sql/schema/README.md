@@ -18,7 +18,7 @@
 | `08_count.sql` | 盘点、调整 |
 | `11_integration.sql` | 幂等、入站消息、outbox、审计、取号 |
 | `12_auth.sql` | 用户、角色、权限、API 凭证 |
-| `12b_auth_audit.sql` | 设备绑定、离线令牌、审批单；`audit_log` / `sys_user` 跨篇加列 |
+| `12b_auth_audit.sql` | 设备绑定、离线令牌、审批单；audit_log 节点列与只追加；sys_user.perm_version |
 | `90_available_view.sql` | `v_stock_available`，然后 `COMMIT` |
 | `99_grants.sql` | 事务外执行：`wms_purge_owner` / `wms_cleaner` / `purge_expired()` |
 
@@ -31,5 +31,5 @@
 | 列 | 表 | 由哪一篇的文件 ALTER | 原因 | 状态 |
 |---|---|---|---|---|
 | `received_qty_milli`、`qc_passed_qty_milli`、`qc_failed_qty_milli` | `inbound_line` | 第 10 篇 `10_returns.sql`（尚未加入加载列表） | 02 §7.1.3 `release_qc_hold` 按这些 milli 列累加质检合格量。`03_inbound.sql` 里现有的 `received_qty` 仍是 `NUMERIC(14,3)`，本篇不改 03 | 待 #5 落库 |
-| `node_id`、`node_seq`、`device_instance_id`、`approval_id`；`uq_audit_node_seq`、`ix_audit_wh`；只追加触发器 | `audit_log` | 第 12 篇 `12b_auth_audit.sql` | 边缘回传去重、审批关联（12 §6）。表主人 `11_integration.sql` | 已落库 |
-| `perm_version`（`ck_user_perm_ver`、`trg_user_perm_ver`） | `sys_user` | 第 12 篇 `12b_auth_audit.sql` | 权限版本（12 §3.1）。表主人 `12_auth.sql` | 已落库 |
+| `node_id`、`node_seq`、`device_instance_id`、`approval_id` | `audit_log` | 第 12 篇 `12b_auth_audit.sql` | 边缘回传按 (node_id,node_seq) 去重、审批关联（12 §6）；DEFAULT 0 只兼容存量，新插入 ≤0 由 trg_audit_node_required 拦（40001） | 已落库 |
+| `approval_no` → `approval_request.code` | `stock_hold` | 第 12 篇 `12b_auth_audit.sql` | 00 审批单号关联真实审批单。PG 外键 `fk_hold_approval_no`；SQLite 用 AFTER INSERT/UPDATE 触发器（不能 ALTER 加外键） | 已落库 |
