@@ -950,7 +950,7 @@ CREATE TABLE scrap_order (
     id              BIGINT          PRIMARY KEY,
     code            VARCHAR(64)     NOT NULL,   -- SCR-{仓}-{节点}-{作业日}-{序号}
     warehouse_id    BIGINT          NOT NULL,
-    source_type     VARCHAR(24)     NOT NULL,   -- 取值见 ck_scr_src_type；RETURN_HANDOVER：04 交接，source_id=待回库记录 id；RETURN_QC：10 质检不合格，source_id=inbound_line.id
+    source_type     VARCHAR(24)     NOT NULL,   -- 取值见 ck_scr_src_type；SELL_DAYS_EXPIRED：可售天数到期扫描（source_id=扫描批次 id）；RETURN_HANDOVER：04 交接，source_id=待回库记录 id；RETURN_QC：10 质检不合格，source_id=inbound_line.id
     source_id       BIGINT          NOT NULL DEFAULT 0,
     reason_code     VARCHAR(24)     NOT NULL,   -- 取值见 ck_scr_reason
     status          VARCHAR(16)     NOT NULL DEFAULT 'DRAFT',
@@ -973,8 +973,8 @@ CREATE TABLE scrap_order (
     -- 小赵复评 S1：审批 / 过账后的人员与时间必须齐
     CONSTRAINT ck_scr_appr   CHECK (status NOT IN ('APPROVED','POSTED') OR (approver_id IS NOT NULL AND approved_at IS NOT NULL)),
     CONSTRAINT ck_scr_posted CHECK (status <> 'POSTED' OR posted_at IS NOT NULL),
-    CONSTRAINT ck_scr_src_type CHECK (source_type IN ('EXPIRY_SCAN','MANUAL','RETURN_QC','RETURN_HANDOVER','COUNT','EXCEPTION')),
-    CONSTRAINT ck_scr_reason CHECK (reason_code IN ('EXPIRED','NEAR_EXPIRY','DAMAGED','QC_REJECT','NATURAL_LOSS','OTHER'))
+    CONSTRAINT ck_scr_src_type CHECK (source_type IN ('EXPIRY_SCAN','SELL_DAYS_EXPIRED','MANUAL','RETURN_QC','RETURN_HANDOVER','COUNT','EXCEPTION')),
+    CONSTRAINT ck_scr_reason CHECK (reason_code IN ('EXPIRED','NEAR_EXPIRY','SELL_DAYS_EXPIRED','DAMAGED','QC_REJECT','NATURAL_LOSS','OTHER'))
 );
 CREATE INDEX ix_scr_wh_status ON scrap_order(warehouse_id, status, work_date);
 CREATE UNIQUE INDEX uq_scr_source ON scrap_order(source_type, source_id) WHERE source_id <> 0 AND status NOT IN ('REJECTED','CANCELLED');

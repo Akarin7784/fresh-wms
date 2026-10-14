@@ -541,6 +541,12 @@ expect_block "09 K2 DELETE 报损单" "DELETE FROM scrap_order WHERE id=102;" "s
 expect_block "09 K2 DELETE POSTED 单的行" "DELETE FROM scrap_line WHERE id=100;" "scrap_no_delete"
 expect_block "09 K2 PG TRUNCATE 报损行（超级用户 / 迁移脚本）" "TRUNCATE scrap_line;" "scrap_no_delete"
 expect_block "09 K2 PG TRUNCATE 报损单" "TRUNCATE scrap_order CASCADE;" "scrap_no_delete"
+expect_allow "09 sell_days 到期自动报损单（SELL_DAYS_EXPIRED，扫描批次 601，系统建单）" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (130,'SCR-30',1,'SELL_DAYS_EXPIRED',601,'SELL_DAYS_EXPIRED','2026-10-15',0);"
+expect_block "09 sell_days 同一扫描批次重复建单" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (131,'SCR-31',1,'SELL_DAYS_EXPIRED',601,'SELL_DAYS_EXPIRED','2026-10-15',0);" "uq_scr_source"
+expect_block "09 sell_days 来源拼错" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (131,'SCR-31',1,'SELL_DAY_EXPIRED',602,'SELL_DAYS_EXPIRED','2026-10-15',0);" "ck_scr_src_type"
+expect_block "09 sell_days 原因码拼错" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (131,'SCR-31',1,'SELL_DAYS_EXPIRED',602,'SELL_DAYS','2026-10-15',0);" "ck_scr_reason"
+expect_allow "09 sell_days 系统提交（DRAFT → PENDING_APPROVAL，S1 同事务冻结 SCRAP_PENDING 即下架）" "UPDATE scrap_order SET status='PENDING_APPROVAL' WHERE id=130 AND status='DRAFT';"
+expect_block "09 sell_days 系统单也要人审（审批人 = 申请人 0）" "UPDATE scrap_order SET approver_id=0, approved_at='2026-10-15 10:00:00', status='APPROVED' WHERE id=130;" "ck_scr_sod"
 expect_block "09 Q8 VOIDED 是终态（→ POSTED）" "UPDATE scrap_order SET status='POSTED' WHERE id=102;" "scrap_state_forward_only"
 R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 82 AND status = 'HELD' AND hold_type IN ('QUALITY','MANUAL')")
 [ "$R" = "UPDATE 0" ] && ok "09 Q8 回转后的 RETURN_QC 不能人工解冻（→ 40933，只能 release_qc_hold） rowcount=0" || bad "09 Q8 回转后的 RETURN_QC 不能人工解冻（→ 40933，只能 release_qc_hold）：$R"
