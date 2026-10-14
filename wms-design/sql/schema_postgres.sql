@@ -257,6 +257,8 @@ CREATE TABLE stock_hold (
     released_qty_milli  BIGINT          NOT NULL DEFAULT 0,
     status              VARCHAR(16)     NOT NULL DEFAULT 'HELD',      -- HELD/RELEASED，由余量决定
     operator_id         BIGINT          NOT NULL,   -- 系统冻结填 0
+    approval_type       VARCHAR(24),                -- 需要审批的转换才填：SCRAP_MISREPORT（SCRAP_PENDING → RETURN_QC 误报回转）
+    approval_no         VARCHAR(64),                -- 审批单号
     version             BIGINT          NOT NULL DEFAULT 0,
     created_at          TIMESTAMP       NOT NULL DEFAULT now(),
     updated_at          TIMESTAMP       NOT NULL DEFAULT now(),
@@ -281,6 +283,12 @@ CREATE TABLE stock_hold (
     CONSTRAINT ck_hold_retqc CHECK (
         hold_type <> 'RETURN_QC'
         OR (source_type = 'QC' AND source_id > 0 AND operator_id = 0)
+    ),
+    -- 误报回转（SCRAP_PENDING → RETURN_QC，convert_hold 生成 op_key=CVT:{原 hold_id}）必须带 SCRAP_MISREPORT 审批单号；其余明细不带审批
+    CONSTRAINT ck_hold_approval CHECK (
+        (NOT (hold_type = 'RETURN_QC' AND op_key LIKE 'CVT:%') AND approval_type IS NULL AND approval_no IS NULL)
+        OR (hold_type = 'RETURN_QC' AND op_key LIKE 'CVT:%'
+            AND approval_type = 'SCRAP_MISREPORT' AND approval_no IS NOT NULL AND length(approval_no) > 0)
     ),
     CONSTRAINT ck_hold_scrap CHECK (
         hold_type <> 'SCRAP_PENDING'
@@ -474,6 +482,7 @@ BEGIN                                                                           
        OR NEW.source_type IS DISTINCT FROM OLD.source_type OR NEW.source_id IS DISTINCT FROM OLD.source_id    -- @pg-only
        OR NEW.op_key IS DISTINCT FROM OLD.op_key OR NEW.hold_qty_milli IS DISTINCT FROM OLD.hold_qty_milli   -- @pg-only
        OR NEW.operator_id IS DISTINCT FROM OLD.operator_id OR NEW.created_at IS DISTINCT FROM OLD.created_at  -- @pg-only
+       OR NEW.approval_type IS DISTINCT FROM OLD.approval_type OR NEW.approval_no IS DISTINCT FROM OLD.approval_no  -- @pg-only
        OR NEW.released_qty_milli < OLD.released_qty_milli  -- R1 释放量只增不减 -- @pg-only
        OR (OLD.status = 'RELEASED' AND NEW.status <> 'RELEASED') THEN  -- R1 RELEASED 不能回 HELD -- @pg-only
         RAISE EXCEPTION 'hold_immutable' USING ERRCODE = '23514';                                            -- @pg-only
@@ -495,6 +504,7 @@ CREATE TRIGGER trg_hr_append_only BEFORE UPDATE OR DELETE ON stock_hold_release 
 -- @sqlite-only WHEN NEW.id IS NOT OLD.id OR NEW.stock_id IS NOT OLD.stock_id OR NEW.hold_type IS NOT OLD.hold_type OR NEW.reason_code IS NOT OLD.reason_code
 -- @sqlite-only   OR NEW.source_type IS NOT OLD.source_type OR NEW.source_id IS NOT OLD.source_id OR NEW.op_key IS NOT OLD.op_key
 -- @sqlite-only   OR NEW.hold_qty_milli IS NOT OLD.hold_qty_milli OR NEW.operator_id IS NOT OLD.operator_id OR NEW.created_at IS NOT OLD.created_at
+-- @sqlite-only   OR NEW.approval_type IS NOT OLD.approval_type OR NEW.approval_no IS NOT OLD.approval_no
 -- @sqlite-only   OR NEW.released_qty_milli < OLD.released_qty_milli OR (OLD.status = 'RELEASED' AND NEW.status <> 'RELEASED')
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'hold_immutable'); END;
 -- R2（SQLite）：拒删除；REPLACE 冲突时删旧行在 recursive_triggers=OFF（默认，且是连接级开关）下不触发 DELETE 触发器，
@@ -1033,6 +1043,10 @@ CREATE TRIGGER trg_audit_append_only BEFORE UPDATE OR DELETE ON audit_log FOR EA
 CREATE TRIGGER trg_audit_no_truncate BEFORE TRUNCATE ON audit_log FOR EACH STATEMENT EXECUTE FUNCTION trg_audit_append_only();  -- @pg-only
 -- @sqlite-only CREATE TRIGGER trg_audit_no_update BEFORE UPDATE ON audit_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: audit_log'); END;
 -- @sqlite-only CREATE TRIGGER trg_audit_no_delete BEFORE DELETE ON audit_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: audit_log'); END;
+-- 小赵 B1：SQLite REPLACE 删旧行不触发 DELETE 触发器（recursive_triggers=OFF），id 或 (node_id,node_seq) 已存在就直接 ABORT
+-- @sqlite-only CREATE TRIGGER trg_audit_no_replace BEFORE INSERT ON audit_log
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM audit_log a WHERE a.id = NEW.id OR (a.node_id = NEW.node_id AND a.node_seq = NEW.node_seq))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'append_only_violation: audit_log'); END;
 
 CREATE TABLE numbering_segment (
     biz_prefix   VARCHAR(16)  NOT NULL,
@@ -1105,7 +1119,7 @@ CREATE TABLE api_credential (
 -- docs/12 权限与审计：设备绑定、离线令牌、主管审批
 -- -----------------------------------------------------------------------------
 
--- 设备实例绑定：device_instance_id（App 安装实例）↔ 账号 + 仓。一个实例同时只有一条 ACTIVE 绑定
+-- 设备实例绑定：device_instance_id（App 安装实例）↔ 账号 + 仓。一个实例同时最多一条 PENDING/ACTIVE 绑定
 CREATE TABLE user_device_binding (
     id                  BIGINT       PRIMARY KEY,
     device_instance_id  VARCHAR(64)  NOT NULL,
@@ -1113,7 +1127,7 @@ CREATE TABLE user_device_binding (
     client_type         VARCHAR(16)  NOT NULL,       -- PDA / DRIVER_APP
     user_id             BIGINT       NOT NULL,
     warehouse_id        BIGINT       NOT NULL,
-    status              VARCHAR(16)  NOT NULL DEFAULT 'PENDING',   -- PENDING（待主管确认）/ ACTIVE / REVOKED
+    status              VARCHAR(16)  NOT NULL DEFAULT 'PENDING',   -- PENDING（待主管确认）/ ACTIVE / REVOKED（终态）
     approval_id         BIGINT,                      -- DEVICE_BIND 审批单
     bound_at            TIMESTAMP    NOT NULL DEFAULT now(),
     activated_at        TIMESTAMP,
@@ -1142,14 +1156,18 @@ CREATE TABLE offline_token (
     expires_at          TIMESTAMP    NOT NULL,
     revoked_at          TIMESTAMP,
     CONSTRAINT uq_offline_jti UNIQUE (jti),
-    CONSTRAINT ck_offline_ttl CHECK (expires_at > issued_at)
+    CONSTRAINT ck_offline_ttl CHECK (expires_at > issued_at),
+    -- 有效期上限 12 小时（docs/12 §3.3，小赵 I4）
+    CONSTRAINT ck_offline_max_ttl CHECK (expires_at <= issued_at + interval '12 hours')  -- @pg-only
+-- @sqlite-only     CONSTRAINT ck_offline_max_ttl CHECK (datetime(expires_at) <= datetime(issued_at, '+12 hours'))
 );
 CREATE INDEX ix_offline_binding ON offline_token(binding_id) WHERE revoked_at IS NULL;
 
--- 主管审批（docs/12 §5）：申请人 ≠ 审批人；双人确认类第二审批人与前两人都不同
+-- 主管审批（docs/12 §5）
 CREATE TABLE approval_request (
     id                  BIGINT       PRIMARY KEY,
-    approval_type       VARCHAR(32)  NOT NULL,       -- POD_CORRECT / CANCEL_AFTER_PICK / UNPLANNED_FAILOVER / DEVICE_BIND
+    code                VARCHAR(64)  NOT NULL,       -- 审批单号；02 stock_hold.approval_no 引用本列
+    approval_type       VARCHAR(32)  NOT NULL,       -- POD_CORRECT / CANCEL_AFTER_PICK / UNPLANNED_FAILOVER / DEVICE_BIND / SCRAP_MISREPORT
     warehouse_id        BIGINT       NOT NULL,
     target_type         VARCHAR(32)  NOT NULL,
     target_id           VARCHAR(64)  NOT NULL,
@@ -1159,9 +1177,9 @@ CREATE TABLE approval_request (
     requested_by        BIGINT       NOT NULL,
     status              VARCHAR(16)  NOT NULL DEFAULT 'PENDING',
     first_approver_id   BIGINT,
-    first_approver_role VARCHAR(32),                 -- 审批时实际使用的角色（服务端写入）
+    first_approver_role VARCHAR(32),                 -- 审批时实际使用的角色（服务端写入，FAILOVER 由触发器核对）
     first_approved_at   TIMESTAMP,
-    second_approver_id  BIGINT,                      -- 仅双人确认类
+    second_approver_id  BIGINT,                      -- 仅 UNPLANNED_FAILOVER
     second_approver_role VARCHAR(32),
     second_approved_at  TIMESTAMP,
     result_ref          VARCHAR(64),                 -- 执行结果引用：如 POD 更正的新 pod_id + correct_seq（服务端执行时分配）
@@ -1170,8 +1188,9 @@ CREATE TABLE approval_request (
     expires_at          TIMESTAMP    NOT NULL,
     version             INT          NOT NULL DEFAULT 0,
     created_at          TIMESTAMP    NOT NULL DEFAULT now(),
-    CONSTRAINT ck_apr_type CHECK (approval_type IN ('POD_CORRECT','CANCEL_AFTER_PICK','UNPLANNED_FAILOVER','DEVICE_BIND')),
-    -- 非计划切换 = 发起人 + 仓库主管 + 中心运维三人（00 §9.1），角色固定
+    CONSTRAINT uq_apr_code UNIQUE (code),
+    CONSTRAINT ck_apr_type CHECK (approval_type IN ('POD_CORRECT','CANCEL_AFTER_PICK','UNPLANNED_FAILOVER','DEVICE_BIND','SCRAP_MISREPORT')),
+    -- 非计划切换 = 发起人 + 仓库主管 + 中心运维三人（00 §9.1），角色字符串固定；是否真持有该角色由 trg_apr_transition 查 sys_user_role
     CONSTRAINT ck_apr_failover_roles CHECK (approval_type <> 'UNPLANNED_FAILOVER'
         OR ((first_approver_id IS NULL OR first_approver_role = 'WH_SUPERVISOR')
             AND (second_approver_id IS NULL OR second_approver_role = 'CENTER_OPS'))),
@@ -1181,26 +1200,188 @@ CREATE TABLE approval_request (
         OR (approval_type = 'UNPLANNED_FAILOVER' AND second_approver_id <> requested_by AND second_approver_id <> first_approver_id)),
     CONSTRAINT ck_apr_done CHECK (status <> 'APPROVED' OR (first_approver_id IS NOT NULL
         AND (approval_type <> 'UNPLANNED_FAILOVER' OR second_approver_id IS NOT NULL))),
-    CONSTRAINT ck_apr_hash CHECK (length(payload_hash) = 64)
+    CONSTRAINT ck_apr_hash CHECK (length(payload_hash) = 64),
+    -- 小赵 I2：审批人三列成组；PARTIAL 只用于 FAILOVER 且只有第一人；APPROVED/REJECTED 必有 decided_at，未决不能有
+    CONSTRAINT ck_apr_pair CHECK (
+        ((first_approver_id IS NULL AND first_approver_role IS NULL AND first_approved_at IS NULL)
+          OR (first_approver_id IS NOT NULL AND first_approver_role IS NOT NULL AND first_approved_at IS NOT NULL))
+        AND ((second_approver_id IS NULL AND second_approver_role IS NULL AND second_approved_at IS NULL)
+          OR (second_approver_id IS NOT NULL AND second_approver_role IS NOT NULL AND second_approved_at IS NOT NULL))),
+    CONSTRAINT ck_apr_partial CHECK (status <> 'PARTIAL'
+        OR (approval_type = 'UNPLANNED_FAILOVER' AND first_approver_id IS NOT NULL AND second_approver_id IS NULL)),
+    CONSTRAINT ck_apr_decided CHECK ((status IN ('APPROVED','REJECTED') AND decided_at IS NOT NULL)
+        OR (status IN ('PENDING','PARTIAL') AND decided_at IS NULL)
+        OR status IN ('EXPIRED','WITHDRAWN'))
 );
 CREATE UNIQUE INDEX uq_apr_open ON approval_request(approval_type, target_type, target_id) WHERE status IN ('PENDING','PARTIAL');
 CREATE INDEX ix_apr_wh ON approval_request(warehouse_id, status, created_at);
 CREATE INDEX ix_apr_requester ON approval_request(requested_by, status, created_at);   -- GET /approvals?mine=true
--- 审批终态不可再改（APPROVED/REJECTED/EXPIRED/WITHDRAWN），PENDING/PARTIAL 只能前进
+
+-- ===== 小赵 I1/I2/I5：审批只能 INSERT 成 PENDING；迁移单向；审批人写入后不可改；过期不能再审；FAILOVER 确认人必须真持有角色 =====
+CREATE FUNCTION trg_apr_insert() RETURNS trigger LANGUAGE plpgsql AS $$                                     -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    IF NEW.status <> 'PENDING' OR NEW.first_approver_id IS NOT NULL OR NEW.second_approver_id IS NOT NULL      -- @pg-only
+       OR NEW.decided_at IS NOT NULL OR NEW.result_ref IS NOT NULL THEN                                      -- @pg-only
+        RAISE EXCEPTION 'approval_insert_not_pending' USING ERRCODE = '23514';                               -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    RETURN NEW;                                                                                               -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_apr_insert BEFORE INSERT ON approval_request FOR EACH ROW EXECUTE FUNCTION trg_apr_insert();  -- @pg-only
 CREATE FUNCTION trg_apr_final() RETURNS trigger LANGUAGE plpgsql AS $$                                      -- @pg-only
 BEGIN                                                                                                         -- @pg-only
-    IF OLD.status IN ('APPROVED','REJECTED','EXPIRED','WITHDRAWN') OR NEW.payload_hash IS DISTINCT FROM OLD.payload_hash  -- @pg-only
-       OR NEW.requested_by IS DISTINCT FROM OLD.requested_by OR NEW.approval_type IS DISTINCT FROM OLD.approval_type THEN  -- @pg-only
+    IF OLD.status IN ('APPROVED','REJECTED','EXPIRED','WITHDRAWN')                                            -- @pg-only
+       OR NEW.payload_hash IS DISTINCT FROM OLD.payload_hash OR NEW.payload_json IS DISTINCT FROM OLD.payload_json  -- @pg-only
+       OR NEW.requested_by IS DISTINCT FROM OLD.requested_by OR NEW.approval_type IS DISTINCT FROM OLD.approval_type  -- @pg-only
+       OR NEW.code IS DISTINCT FROM OLD.code OR NEW.warehouse_id IS DISTINCT FROM OLD.warehouse_id               -- @pg-only
+       OR NEW.target_type IS DISTINCT FROM OLD.target_type OR NEW.target_id IS DISTINCT FROM OLD.target_id       -- @pg-only
+       OR NEW.expires_at IS DISTINCT FROM OLD.expires_at OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN  -- @pg-only
         RAISE EXCEPTION 'approval_final' USING ERRCODE = '23514';                                            -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    IF NOT ((OLD.status = NEW.status AND NEW.status IN ('PENDING','PARTIAL'))                                 -- @pg-only
+         OR (OLD.status = 'PENDING' AND NEW.status IN ('PARTIAL','APPROVED','REJECTED','EXPIRED','WITHDRAWN'))   -- @pg-only
+         OR (OLD.status = 'PARTIAL' AND NEW.status IN ('APPROVED','REJECTED','EXPIRED','WITHDRAWN'))) THEN       -- @pg-only
+        RAISE EXCEPTION 'approval_transition_invalid' USING ERRCODE = '23514';                               -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    IF (OLD.first_approver_id IS NOT NULL AND (NEW.first_approver_id IS DISTINCT FROM OLD.first_approver_id   -- @pg-only
+          OR NEW.first_approver_role IS DISTINCT FROM OLD.first_approver_role OR NEW.first_approved_at IS DISTINCT FROM OLD.first_approved_at))  -- @pg-only
+       OR (OLD.second_approver_id IS NOT NULL AND NEW.second_approver_id IS DISTINCT FROM OLD.second_approver_id) THEN  -- @pg-only
+        RAISE EXCEPTION 'approval_approver_immutable' USING ERRCODE = '23514';                               -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    IF NEW.status IN ('PARTIAL','APPROVED') AND NEW.status <> OLD.status AND OLD.expires_at <= now() THEN      -- @pg-only
+        RAISE EXCEPTION 'approval_expired' USING ERRCODE = '23514';                                          -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    IF NEW.approval_type = 'UNPLANNED_FAILOVER' AND (                                                         -- @pg-only
+         (NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL AND NOT EXISTS (                 -- @pg-only
+            SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id                               -- @pg-only
+             JOIN sys_user_warehouse uw ON uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id      -- @pg-only
+             WHERE ur.user_id = NEW.first_approver_id AND r.code = 'WH_SUPERVISOR'))                          -- @pg-only
+      OR (NEW.second_approver_id IS NOT NULL AND OLD.second_approver_id IS NULL AND NOT EXISTS (              -- @pg-only
+            SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id                               -- @pg-only
+             WHERE ur.user_id = NEW.second_approver_id AND r.code = 'CENTER_OPS'))) THEN                      -- @pg-only
+        RAISE EXCEPTION 'approval_role_not_held' USING ERRCODE = '23514';                                    -- @pg-only
     END IF;                                                                                                   -- @pg-only
     RETURN NEW;                                                                                               -- @pg-only
 END $$;                                                                                                       -- @pg-only
 CREATE TRIGGER trg_apr_final BEFORE UPDATE ON approval_request FOR EACH ROW EXECUTE FUNCTION trg_apr_final();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_apr_no_replace BEFORE INSERT ON approval_request
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM approval_request a WHERE a.id = NEW.id OR a.code = NEW.code
+-- @sqlite-only   OR (a.status IN ('PENDING','PARTIAL') AND a.approval_type = NEW.approval_type AND a.target_type = NEW.target_type AND a.target_id = NEW.target_id))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'approval_duplicate'); END;
+-- @sqlite-only CREATE TRIGGER trg_apr_insert BEFORE INSERT ON approval_request
+-- @sqlite-only WHEN NEW.status <> 'PENDING' OR NEW.first_approver_id IS NOT NULL OR NEW.second_approver_id IS NOT NULL
+-- @sqlite-only   OR NEW.decided_at IS NOT NULL OR NEW.result_ref IS NOT NULL
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'approval_insert_not_pending'); END;
 -- @sqlite-only CREATE TRIGGER trg_apr_final BEFORE UPDATE ON approval_request
--- @sqlite-only WHEN OLD.status IN ('APPROVED','REJECTED','EXPIRED','WITHDRAWN') OR NEW.payload_hash IS NOT OLD.payload_hash
+-- @sqlite-only WHEN OLD.status IN ('APPROVED','REJECTED','EXPIRED','WITHDRAWN')
+-- @sqlite-only   OR NEW.payload_hash IS NOT OLD.payload_hash OR NEW.payload_json IS NOT OLD.payload_json
 -- @sqlite-only   OR NEW.requested_by IS NOT OLD.requested_by OR NEW.approval_type IS NOT OLD.approval_type
+-- @sqlite-only   OR NEW.code IS NOT OLD.code OR NEW.warehouse_id IS NOT OLD.warehouse_id
+-- @sqlite-only   OR NEW.target_type IS NOT OLD.target_type OR NEW.target_id IS NOT OLD.target_id
+-- @sqlite-only   OR NEW.expires_at IS NOT OLD.expires_at OR NEW.created_at IS NOT OLD.created_at
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'approval_final'); END;
--- sys_user.perm_version 只升不降（撤权必须让旧令牌失效）
+-- @sqlite-only CREATE TRIGGER trg_apr_transition BEFORE UPDATE ON approval_request
+-- @sqlite-only WHEN OLD.status IN ('PENDING','PARTIAL') AND NOT ((OLD.status = NEW.status AND NEW.status IN ('PENDING','PARTIAL'))
+-- @sqlite-only   OR (OLD.status = 'PENDING' AND NEW.status IN ('PARTIAL','APPROVED','REJECTED','EXPIRED','WITHDRAWN'))
+-- @sqlite-only   OR (OLD.status = 'PARTIAL' AND NEW.status IN ('APPROVED','REJECTED','EXPIRED','WITHDRAWN')))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'approval_transition_invalid'); END;
+-- @sqlite-only CREATE TRIGGER trg_apr_approver_immutable BEFORE UPDATE ON approval_request
+-- @sqlite-only WHEN (OLD.first_approver_id IS NOT NULL AND (NEW.first_approver_id IS NOT OLD.first_approver_id
+-- @sqlite-only     OR NEW.first_approver_role IS NOT OLD.first_approver_role OR NEW.first_approved_at IS NOT OLD.first_approved_at))
+-- @sqlite-only   OR (OLD.second_approver_id IS NOT NULL AND NEW.second_approver_id IS NOT OLD.second_approver_id)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'approval_approver_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_apr_expired BEFORE UPDATE ON approval_request
+-- @sqlite-only WHEN NEW.status IN ('PARTIAL','APPROVED') AND NEW.status <> OLD.status AND datetime(OLD.expires_at) <= datetime('now', 'localtime')
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'approval_expired'); END;
+-- @sqlite-only CREATE TRIGGER trg_apr_role BEFORE UPDATE ON approval_request
+-- @sqlite-only WHEN NEW.approval_type = 'UNPLANNED_FAILOVER' AND (
+-- @sqlite-only     (NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL AND NOT EXISTS (
+-- @sqlite-only        SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
+-- @sqlite-only         JOIN sys_user_warehouse uw ON uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id
+-- @sqlite-only         WHERE ur.user_id = NEW.first_approver_id AND r.code = 'WH_SUPERVISOR'))
+-- @sqlite-only  OR (NEW.second_approver_id IS NOT NULL AND OLD.second_approver_id IS NULL AND NOT EXISTS (
+-- @sqlite-only        SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
+-- @sqlite-only         WHERE ur.user_id = NEW.second_approver_id AND r.code = 'CENTER_OPS')))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'approval_role_not_held'); END;
+
+-- ===== 小赵 I3 + S1：设备绑定 INSERT 只能 PENDING；REVOKED 终态；身份列不可改；激活必须有本绑定的已通过 DEVICE_BIND 审批，审批人 ≠ 使用人 =====
+CREATE FUNCTION trg_udb_guard() RETURNS trigger LANGUAGE plpgsql AS $$                                      -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    IF TG_OP = 'INSERT' THEN                                                                                  -- @pg-only
+        IF NEW.status <> 'PENDING' OR NEW.approval_id IS NOT NULL THEN                                        -- @pg-only
+            RAISE EXCEPTION 'binding_insert_not_pending' USING ERRCODE = '23514';                            -- @pg-only
+        END IF;                                                                                               -- @pg-only
+        RETURN NEW;                                                                                           -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    IF OLD.status = 'REVOKED' OR (OLD.status = 'ACTIVE' AND NEW.status = 'PENDING')                          -- @pg-only
+       OR NEW.device_instance_id IS DISTINCT FROM OLD.device_instance_id OR NEW.user_id IS DISTINCT FROM OLD.user_id  -- @pg-only
+       OR NEW.warehouse_id IS DISTINCT FROM OLD.warehouse_id OR NEW.client_type IS DISTINCT FROM OLD.client_type  -- @pg-only
+       OR NEW.device_id IS DISTINCT FROM OLD.device_id OR NEW.bound_at IS DISTINCT FROM OLD.bound_at            -- @pg-only
+       OR (OLD.approval_id IS NOT NULL AND NEW.approval_id IS DISTINCT FROM OLD.approval_id) THEN             -- @pg-only
+        RAISE EXCEPTION 'binding_immutable' USING ERRCODE = '23514';                                         -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    IF NEW.status = 'ACTIVE' AND OLD.status = 'PENDING' AND NOT EXISTS (                                      -- @pg-only
+        SELECT 1 FROM approval_request a WHERE a.id = NEW.approval_id AND a.approval_type = 'DEVICE_BIND'     -- @pg-only
+           AND a.status = 'APPROVED' AND a.target_type = 'DEVICE_BINDING' AND a.target_id = NEW.id::text      -- @pg-only
+           AND a.first_approver_id <> NEW.user_id) THEN                                                       -- @pg-only
+        RAISE EXCEPTION 'binding_approval_invalid' USING ERRCODE = '23514';                                  -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    RETURN NEW;                                                                                               -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_udb_guard BEFORE INSERT OR UPDATE ON user_device_binding FOR EACH ROW EXECUTE FUNCTION trg_udb_guard();  -- @pg-only
+CREATE FUNCTION trg_no_delete_12() RETURNS trigger LANGUAGE plpgsql AS $$                                   -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    RAISE EXCEPTION 'append_only_violation: %', TG_TABLE_NAME USING ERRCODE = '42501';                       -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_udb_no_delete BEFORE DELETE ON user_device_binding FOR EACH ROW EXECUTE FUNCTION trg_no_delete_12();  -- @pg-only
+CREATE TRIGGER trg_apr_no_delete BEFORE DELETE ON approval_request FOR EACH ROW EXECUTE FUNCTION trg_no_delete_12();  -- @pg-only
+CREATE TRIGGER trg_udb_no_truncate BEFORE TRUNCATE ON user_device_binding FOR EACH STATEMENT EXECUTE FUNCTION trg_no_delete_12();  -- @pg-only
+CREATE TRIGGER trg_apr_no_truncate BEFORE TRUNCATE ON approval_request FOR EACH STATEMENT EXECUTE FUNCTION trg_no_delete_12();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_udb_no_replace BEFORE INSERT ON user_device_binding
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM user_device_binding b WHERE b.id = NEW.id
+-- @sqlite-only   OR (b.device_instance_id = NEW.device_instance_id AND b.status IN ('PENDING','ACTIVE')))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'binding_duplicate'); END;
+-- @sqlite-only CREATE TRIGGER trg_udb_insert BEFORE INSERT ON user_device_binding WHEN NEW.status <> 'PENDING' OR NEW.approval_id IS NOT NULL
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'binding_insert_not_pending'); END;
+-- @sqlite-only CREATE TRIGGER trg_udb_immutable BEFORE UPDATE ON user_device_binding
+-- @sqlite-only WHEN OLD.status = 'REVOKED' OR (OLD.status = 'ACTIVE' AND NEW.status = 'PENDING')
+-- @sqlite-only   OR NEW.device_instance_id IS NOT OLD.device_instance_id OR NEW.user_id IS NOT OLD.user_id
+-- @sqlite-only   OR NEW.warehouse_id IS NOT OLD.warehouse_id OR NEW.client_type IS NOT OLD.client_type
+-- @sqlite-only   OR NEW.device_id IS NOT OLD.device_id OR NEW.bound_at IS NOT OLD.bound_at
+-- @sqlite-only   OR (OLD.approval_id IS NOT NULL AND NEW.approval_id IS NOT OLD.approval_id)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'binding_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_udb_activate BEFORE UPDATE ON user_device_binding
+-- @sqlite-only WHEN NEW.status = 'ACTIVE' AND OLD.status = 'PENDING' AND NOT EXISTS (
+-- @sqlite-only   SELECT 1 FROM approval_request a WHERE a.id = NEW.approval_id AND a.approval_type = 'DEVICE_BIND'
+-- @sqlite-only     AND a.status = 'APPROVED' AND a.target_type = 'DEVICE_BINDING' AND a.target_id = CAST(NEW.id AS TEXT)
+-- @sqlite-only     AND a.first_approver_id <> NEW.user_id)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'binding_approval_invalid'); END;
+-- @sqlite-only CREATE TRIGGER trg_udb_no_delete BEFORE DELETE ON user_device_binding BEGIN SELECT RAISE(ABORT, 'append_only_violation: user_device_binding'); END;
+-- @sqlite-only CREATE TRIGGER trg_apr_no_delete BEFORE DELETE ON approval_request BEGIN SELECT RAISE(ABORT, 'append_only_violation: approval_request'); END;
+
+-- ===== 小赵 I4：离线令牌只能写一次 revoked_at；其余列不可改；SQLite 防 REPLACE =====
+CREATE FUNCTION trg_offline_guard() RETURNS trigger LANGUAGE plpgsql AS $$                                  -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    IF OLD.revoked_at IS NOT NULL OR NEW.jti IS DISTINCT FROM OLD.jti OR NEW.binding_id IS DISTINCT FROM OLD.binding_id  -- @pg-only
+       OR NEW.user_id IS DISTINCT FROM OLD.user_id OR NEW.device_instance_id IS DISTINCT FROM OLD.device_instance_id  -- @pg-only
+       OR NEW.warehouse_id IS DISTINCT FROM OLD.warehouse_id OR NEW.perm_version IS DISTINCT FROM OLD.perm_version  -- @pg-only
+       OR NEW.issued_at IS DISTINCT FROM OLD.issued_at OR NEW.expires_at IS DISTINCT FROM OLD.expires_at THEN  -- @pg-only
+        RAISE EXCEPTION 'offline_token_immutable' USING ERRCODE = '23514';                                   -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    RETURN NEW;                                                                                               -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_offline_guard BEFORE UPDATE ON offline_token FOR EACH ROW EXECUTE FUNCTION trg_offline_guard();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_offline_guard BEFORE UPDATE ON offline_token
+-- @sqlite-only WHEN OLD.revoked_at IS NOT NULL OR NEW.jti IS NOT OLD.jti OR NEW.binding_id IS NOT OLD.binding_id
+-- @sqlite-only   OR NEW.user_id IS NOT OLD.user_id OR NEW.device_instance_id IS NOT OLD.device_instance_id
+-- @sqlite-only   OR NEW.warehouse_id IS NOT OLD.warehouse_id OR NEW.perm_version IS NOT OLD.perm_version
+-- @sqlite-only   OR NEW.issued_at IS NOT OLD.issued_at OR NEW.expires_at IS NOT OLD.expires_at
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'offline_token_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_offline_no_replace BEFORE INSERT ON offline_token
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM offline_token t WHERE t.id = NEW.id OR t.jti = NEW.jti)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'offline_token_duplicate'); END;
+
+-- sys_user.perm_version 只升不降（撤权必须让旧令牌失效）；SQLite 防 REPLACE 把版本打回 1（小赵 I7）。
+-- 下发应用 USER_PERM 一律"UPDATE，0 行再 INSERT"，不用 REPLACE / UPSERT（docs/12 §4.3）
 CREATE FUNCTION trg_user_perm_ver() RETURNS trigger LANGUAGE plpgsql AS $$                                  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF NEW.perm_version < OLD.perm_version THEN                                                               -- @pg-only
@@ -1211,6 +1392,9 @@ END $$;                                                                         
 CREATE TRIGGER trg_user_perm_ver BEFORE UPDATE ON sys_user FOR EACH ROW EXECUTE FUNCTION trg_user_perm_ver();  -- @pg-only
 -- @sqlite-only CREATE TRIGGER trg_user_perm_ver BEFORE UPDATE ON sys_user WHEN NEW.perm_version < OLD.perm_version
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'perm_version_rewind'); END;
+-- @sqlite-only CREATE TRIGGER trg_user_no_replace BEFORE INSERT ON sys_user
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM sys_user u WHERE u.id = NEW.id OR u.username = NEW.username)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'sys_user_duplicate'); END;
 
 -- -----------------------------------------------------------------------------
 -- 视图：可用量（避免每个查询手写减法，也避免算错）
@@ -1279,7 +1463,8 @@ GRANT EXECUTE ON FUNCTION public.purge_expired() TO wms_cleaner;                
 GRANT SELECT, INSERT ON audit_log, stock_snapshot_daily TO wms_app;                    -- 只追加 -- @pg-only
 GRANT SELECT ON v_stock_available TO wms_app;                                          -- @pg-only
 -- docs/12 新表 wms_app 最小授权：不给 DELETE/TRUNCATE；离线令牌只能写吊销时间；审批只能改决策相关列
-GRANT SELECT, INSERT, UPDATE ON user_device_binding TO wms_app;                                               -- @pg-only
+GRANT SELECT, INSERT ON user_device_binding TO wms_app;                                                       -- @pg-only
+GRANT UPDATE (status, approval_id, activated_at, revoked_at, revoked_by, revoke_reason) ON user_device_binding TO wms_app;  -- @pg-only
 GRANT SELECT, INSERT ON offline_token TO wms_app;                                                             -- @pg-only
 GRANT UPDATE (revoked_at) ON offline_token TO wms_app;                                                        -- @pg-only
 GRANT SELECT, INSERT ON approval_request TO wms_app;                                                          -- @pg-only

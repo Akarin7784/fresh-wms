@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 44 处 DEFAULT now() → DEFAULT (datetime('now'))（表达式默认值需括号）
---   3. 方言专属行：删除 131 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 43 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 213 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 116 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -264,6 +264,8 @@ CREATE TABLE stock_hold (
     released_qty_milli  BIGINT          NOT NULL DEFAULT 0,
     status              VARCHAR(16)     NOT NULL DEFAULT 'HELD',      -- HELD/RELEASED，由余量决定
     operator_id         BIGINT          NOT NULL,   -- 系统冻结填 0
+    approval_type       VARCHAR(24),                -- 需要审批的转换才填：SCRAP_MISREPORT（SCRAP_PENDING → RETURN_QC 误报回转）
+    approval_no         VARCHAR(64),                -- 审批单号
     version             BIGINT          NOT NULL DEFAULT 0,
     created_at          TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     updated_at          TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
@@ -288,6 +290,12 @@ CREATE TABLE stock_hold (
     CONSTRAINT ck_hold_retqc CHECK (
         hold_type <> 'RETURN_QC'
         OR (source_type = 'QC' AND source_id > 0 AND operator_id = 0)
+    ),
+    -- 误报回转（SCRAP_PENDING → RETURN_QC，convert_hold 生成 op_key=CVT:{原 hold_id}）必须带 SCRAP_MISREPORT 审批单号；其余明细不带审批
+    CONSTRAINT ck_hold_approval CHECK (
+        (NOT (hold_type = 'RETURN_QC' AND op_key LIKE 'CVT:%') AND approval_type IS NULL AND approval_no IS NULL)
+        OR (hold_type = 'RETURN_QC' AND op_key LIKE 'CVT:%'
+            AND approval_type = 'SCRAP_MISREPORT' AND approval_no IS NOT NULL AND length(approval_no) > 0)
     ),
     CONSTRAINT ck_hold_scrap CHECK (
         hold_type <> 'SCRAP_PENDING'
@@ -457,6 +465,7 @@ CREATE TRIGGER trg_hold_immutable BEFORE UPDATE ON stock_hold
 WHEN NEW.id IS NOT OLD.id OR NEW.stock_id IS NOT OLD.stock_id OR NEW.hold_type IS NOT OLD.hold_type OR NEW.reason_code IS NOT OLD.reason_code
   OR NEW.source_type IS NOT OLD.source_type OR NEW.source_id IS NOT OLD.source_id OR NEW.op_key IS NOT OLD.op_key
   OR NEW.hold_qty_milli IS NOT OLD.hold_qty_milli OR NEW.operator_id IS NOT OLD.operator_id OR NEW.created_at IS NOT OLD.created_at
+  OR NEW.approval_type IS NOT OLD.approval_type OR NEW.approval_no IS NOT OLD.approval_no
   OR NEW.released_qty_milli < OLD.released_qty_milli OR (OLD.status = 'RELEASED' AND NEW.status <> 'RELEASED')
 BEGIN SELECT RAISE(ABORT, 'hold_immutable'); END;
 -- R2（SQLite）：拒删除；REPLACE 冲突时删旧行在 recursive_triggers=OFF（默认，且是连接级开关）下不触发 DELETE 触发器，
@@ -955,6 +964,10 @@ CREATE INDEX ix_audit_wh     ON audit_log(warehouse_id, occurred_at DESC);
 -- audit_log 只追加（docs/12 §6.4）：行级 UPDATE/DELETE 与 TRUNCATE 都拦；归档走按月导出 + 维护窗口内专用角色
 CREATE TRIGGER trg_audit_no_update BEFORE UPDATE ON audit_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: audit_log'); END;
 CREATE TRIGGER trg_audit_no_delete BEFORE DELETE ON audit_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: audit_log'); END;
+-- 小赵 B1：SQLite REPLACE 删旧行不触发 DELETE 触发器（recursive_triggers=OFF），id 或 (node_id,node_seq) 已存在就直接 ABORT
+CREATE TRIGGER trg_audit_no_replace BEFORE INSERT ON audit_log
+WHEN EXISTS (SELECT 1 FROM audit_log a WHERE a.id = NEW.id OR (a.node_id = NEW.node_id AND a.node_seq = NEW.node_seq))
+BEGIN SELECT RAISE(ABORT, 'append_only_violation: audit_log'); END;
 
 CREATE TABLE numbering_segment (
     biz_prefix   VARCHAR(16)  NOT NULL,
@@ -1027,7 +1040,7 @@ CREATE TABLE api_credential (
 -- docs/12 权限与审计：设备绑定、离线令牌、主管审批
 -- -----------------------------------------------------------------------------
 
--- 设备实例绑定：device_instance_id（App 安装实例）↔ 账号 + 仓。一个实例同时只有一条 ACTIVE 绑定
+-- 设备实例绑定：device_instance_id（App 安装实例）↔ 账号 + 仓。一个实例同时最多一条 PENDING/ACTIVE 绑定
 CREATE TABLE user_device_binding (
     id                  BIGINT       PRIMARY KEY,
     device_instance_id  VARCHAR(64)  NOT NULL,
@@ -1035,7 +1048,7 @@ CREATE TABLE user_device_binding (
     client_type         VARCHAR(16)  NOT NULL,       -- PDA / DRIVER_APP
     user_id             BIGINT       NOT NULL,
     warehouse_id        BIGINT       NOT NULL,
-    status              VARCHAR(16)  NOT NULL DEFAULT 'PENDING',   -- PENDING（待主管确认）/ ACTIVE / REVOKED
+    status              VARCHAR(16)  NOT NULL DEFAULT 'PENDING',   -- PENDING（待主管确认）/ ACTIVE / REVOKED（终态）
     approval_id         BIGINT,                      -- DEVICE_BIND 审批单
     bound_at            TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     activated_at        TIMESTAMP,
@@ -1064,14 +1077,17 @@ CREATE TABLE offline_token (
     expires_at          TIMESTAMP    NOT NULL,
     revoked_at          TIMESTAMP,
     CONSTRAINT uq_offline_jti UNIQUE (jti),
-    CONSTRAINT ck_offline_ttl CHECK (expires_at > issued_at)
+    CONSTRAINT ck_offline_ttl CHECK (expires_at > issued_at),
+    -- 有效期上限 12 小时（docs/12 §3.3，小赵 I4）
+    CONSTRAINT ck_offline_max_ttl CHECK (datetime(expires_at) <= datetime(issued_at, '+12 hours'))
 );
 CREATE INDEX ix_offline_binding ON offline_token(binding_id) WHERE revoked_at IS NULL;
 
--- 主管审批（docs/12 §5）：申请人 ≠ 审批人；双人确认类第二审批人与前两人都不同
+-- 主管审批（docs/12 §5）
 CREATE TABLE approval_request (
     id                  BIGINT       PRIMARY KEY,
-    approval_type       VARCHAR(32)  NOT NULL,       -- POD_CORRECT / CANCEL_AFTER_PICK / UNPLANNED_FAILOVER / DEVICE_BIND
+    code                VARCHAR(64)  NOT NULL,       -- 审批单号；02 stock_hold.approval_no 引用本列
+    approval_type       VARCHAR(32)  NOT NULL,       -- POD_CORRECT / CANCEL_AFTER_PICK / UNPLANNED_FAILOVER / DEVICE_BIND / SCRAP_MISREPORT
     warehouse_id        BIGINT       NOT NULL,
     target_type         VARCHAR(32)  NOT NULL,
     target_id           VARCHAR(64)  NOT NULL,
@@ -1081,9 +1097,9 @@ CREATE TABLE approval_request (
     requested_by        BIGINT       NOT NULL,
     status              VARCHAR(16)  NOT NULL DEFAULT 'PENDING',
     first_approver_id   BIGINT,
-    first_approver_role VARCHAR(32),                 -- 审批时实际使用的角色（服务端写入）
+    first_approver_role VARCHAR(32),                 -- 审批时实际使用的角色（服务端写入，FAILOVER 由触发器核对）
     first_approved_at   TIMESTAMP,
-    second_approver_id  BIGINT,                      -- 仅双人确认类
+    second_approver_id  BIGINT,                      -- 仅 UNPLANNED_FAILOVER
     second_approver_role VARCHAR(32),
     second_approved_at  TIMESTAMP,
     result_ref          VARCHAR(64),                 -- 执行结果引用：如 POD 更正的新 pod_id + correct_seq（服务端执行时分配）
@@ -1092,8 +1108,9 @@ CREATE TABLE approval_request (
     expires_at          TIMESTAMP    NOT NULL,
     version             INT          NOT NULL DEFAULT 0,
     created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
-    CONSTRAINT ck_apr_type CHECK (approval_type IN ('POD_CORRECT','CANCEL_AFTER_PICK','UNPLANNED_FAILOVER','DEVICE_BIND')),
-    -- 非计划切换 = 发起人 + 仓库主管 + 中心运维三人（00 §9.1），角色固定
+    CONSTRAINT uq_apr_code UNIQUE (code),
+    CONSTRAINT ck_apr_type CHECK (approval_type IN ('POD_CORRECT','CANCEL_AFTER_PICK','UNPLANNED_FAILOVER','DEVICE_BIND','SCRAP_MISREPORT')),
+    -- 非计划切换 = 发起人 + 仓库主管 + 中心运维三人（00 §9.1），角色字符串固定；是否真持有该角色由 trg_apr_transition 查 sys_user_role
     CONSTRAINT ck_apr_failover_roles CHECK (approval_type <> 'UNPLANNED_FAILOVER'
         OR ((first_approver_id IS NULL OR first_approver_role = 'WH_SUPERVISOR')
             AND (second_approver_id IS NULL OR second_approver_role = 'CENTER_OPS'))),
@@ -1103,19 +1120,105 @@ CREATE TABLE approval_request (
         OR (approval_type = 'UNPLANNED_FAILOVER' AND second_approver_id <> requested_by AND second_approver_id <> first_approver_id)),
     CONSTRAINT ck_apr_done CHECK (status <> 'APPROVED' OR (first_approver_id IS NOT NULL
         AND (approval_type <> 'UNPLANNED_FAILOVER' OR second_approver_id IS NOT NULL))),
-    CONSTRAINT ck_apr_hash CHECK (length(payload_hash) = 64)
+    CONSTRAINT ck_apr_hash CHECK (length(payload_hash) = 64),
+    -- 小赵 I2：审批人三列成组；PARTIAL 只用于 FAILOVER 且只有第一人；APPROVED/REJECTED 必有 decided_at，未决不能有
+    CONSTRAINT ck_apr_pair CHECK (
+        ((first_approver_id IS NULL AND first_approver_role IS NULL AND first_approved_at IS NULL)
+          OR (first_approver_id IS NOT NULL AND first_approver_role IS NOT NULL AND first_approved_at IS NOT NULL))
+        AND ((second_approver_id IS NULL AND second_approver_role IS NULL AND second_approved_at IS NULL)
+          OR (second_approver_id IS NOT NULL AND second_approver_role IS NOT NULL AND second_approved_at IS NOT NULL))),
+    CONSTRAINT ck_apr_partial CHECK (status <> 'PARTIAL'
+        OR (approval_type = 'UNPLANNED_FAILOVER' AND first_approver_id IS NOT NULL AND second_approver_id IS NULL)),
+    CONSTRAINT ck_apr_decided CHECK ((status IN ('APPROVED','REJECTED') AND decided_at IS NOT NULL)
+        OR (status IN ('PENDING','PARTIAL') AND decided_at IS NULL)
+        OR status IN ('EXPIRED','WITHDRAWN'))
 );
 CREATE UNIQUE INDEX uq_apr_open ON approval_request(approval_type, target_type, target_id) WHERE status IN ('PENDING','PARTIAL');
 CREATE INDEX ix_apr_wh ON approval_request(warehouse_id, status, created_at);
 CREATE INDEX ix_apr_requester ON approval_request(requested_by, status, created_at);   -- GET /approvals?mine=true
--- 审批终态不可再改（APPROVED/REJECTED/EXPIRED/WITHDRAWN），PENDING/PARTIAL 只能前进
+
+-- ===== 小赵 I1/I2/I5：审批只能 INSERT 成 PENDING；迁移单向；审批人写入后不可改；过期不能再审；FAILOVER 确认人必须真持有角色 =====
+CREATE TRIGGER trg_apr_no_replace BEFORE INSERT ON approval_request
+WHEN EXISTS (SELECT 1 FROM approval_request a WHERE a.id = NEW.id OR a.code = NEW.code
+  OR (a.status IN ('PENDING','PARTIAL') AND a.approval_type = NEW.approval_type AND a.target_type = NEW.target_type AND a.target_id = NEW.target_id))
+BEGIN SELECT RAISE(ABORT, 'approval_duplicate'); END;
+CREATE TRIGGER trg_apr_insert BEFORE INSERT ON approval_request
+WHEN NEW.status <> 'PENDING' OR NEW.first_approver_id IS NOT NULL OR NEW.second_approver_id IS NOT NULL
+  OR NEW.decided_at IS NOT NULL OR NEW.result_ref IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'approval_insert_not_pending'); END;
 CREATE TRIGGER trg_apr_final BEFORE UPDATE ON approval_request
-WHEN OLD.status IN ('APPROVED','REJECTED','EXPIRED','WITHDRAWN') OR NEW.payload_hash IS NOT OLD.payload_hash
+WHEN OLD.status IN ('APPROVED','REJECTED','EXPIRED','WITHDRAWN')
+  OR NEW.payload_hash IS NOT OLD.payload_hash OR NEW.payload_json IS NOT OLD.payload_json
   OR NEW.requested_by IS NOT OLD.requested_by OR NEW.approval_type IS NOT OLD.approval_type
+  OR NEW.code IS NOT OLD.code OR NEW.warehouse_id IS NOT OLD.warehouse_id
+  OR NEW.target_type IS NOT OLD.target_type OR NEW.target_id IS NOT OLD.target_id
+  OR NEW.expires_at IS NOT OLD.expires_at OR NEW.created_at IS NOT OLD.created_at
 BEGIN SELECT RAISE(ABORT, 'approval_final'); END;
--- sys_user.perm_version 只升不降（撤权必须让旧令牌失效）
+CREATE TRIGGER trg_apr_transition BEFORE UPDATE ON approval_request
+WHEN OLD.status IN ('PENDING','PARTIAL') AND NOT ((OLD.status = NEW.status AND NEW.status IN ('PENDING','PARTIAL'))
+  OR (OLD.status = 'PENDING' AND NEW.status IN ('PARTIAL','APPROVED','REJECTED','EXPIRED','WITHDRAWN'))
+  OR (OLD.status = 'PARTIAL' AND NEW.status IN ('APPROVED','REJECTED','EXPIRED','WITHDRAWN')))
+BEGIN SELECT RAISE(ABORT, 'approval_transition_invalid'); END;
+CREATE TRIGGER trg_apr_approver_immutable BEFORE UPDATE ON approval_request
+WHEN (OLD.first_approver_id IS NOT NULL AND (NEW.first_approver_id IS NOT OLD.first_approver_id
+    OR NEW.first_approver_role IS NOT OLD.first_approver_role OR NEW.first_approved_at IS NOT OLD.first_approved_at))
+  OR (OLD.second_approver_id IS NOT NULL AND NEW.second_approver_id IS NOT OLD.second_approver_id)
+BEGIN SELECT RAISE(ABORT, 'approval_approver_immutable'); END;
+CREATE TRIGGER trg_apr_expired BEFORE UPDATE ON approval_request
+WHEN NEW.status IN ('PARTIAL','APPROVED') AND NEW.status <> OLD.status AND datetime(OLD.expires_at) <= datetime('now', 'localtime')
+BEGIN SELECT RAISE(ABORT, 'approval_expired'); END;
+CREATE TRIGGER trg_apr_role BEFORE UPDATE ON approval_request
+WHEN NEW.approval_type = 'UNPLANNED_FAILOVER' AND (
+    (NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL AND NOT EXISTS (
+       SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
+        JOIN sys_user_warehouse uw ON uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id
+        WHERE ur.user_id = NEW.first_approver_id AND r.code = 'WH_SUPERVISOR'))
+ OR (NEW.second_approver_id IS NOT NULL AND OLD.second_approver_id IS NULL AND NOT EXISTS (
+       SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
+        WHERE ur.user_id = NEW.second_approver_id AND r.code = 'CENTER_OPS')))
+BEGIN SELECT RAISE(ABORT, 'approval_role_not_held'); END;
+
+-- ===== 小赵 I3 + S1：设备绑定 INSERT 只能 PENDING；REVOKED 终态；身份列不可改；激活必须有本绑定的已通过 DEVICE_BIND 审批，审批人 ≠ 使用人 =====
+CREATE TRIGGER trg_udb_no_replace BEFORE INSERT ON user_device_binding
+WHEN EXISTS (SELECT 1 FROM user_device_binding b WHERE b.id = NEW.id
+  OR (b.device_instance_id = NEW.device_instance_id AND b.status IN ('PENDING','ACTIVE')))
+BEGIN SELECT RAISE(ABORT, 'binding_duplicate'); END;
+CREATE TRIGGER trg_udb_insert BEFORE INSERT ON user_device_binding WHEN NEW.status <> 'PENDING' OR NEW.approval_id IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'binding_insert_not_pending'); END;
+CREATE TRIGGER trg_udb_immutable BEFORE UPDATE ON user_device_binding
+WHEN OLD.status = 'REVOKED' OR (OLD.status = 'ACTIVE' AND NEW.status = 'PENDING')
+  OR NEW.device_instance_id IS NOT OLD.device_instance_id OR NEW.user_id IS NOT OLD.user_id
+  OR NEW.warehouse_id IS NOT OLD.warehouse_id OR NEW.client_type IS NOT OLD.client_type
+  OR NEW.device_id IS NOT OLD.device_id OR NEW.bound_at IS NOT OLD.bound_at
+  OR (OLD.approval_id IS NOT NULL AND NEW.approval_id IS NOT OLD.approval_id)
+BEGIN SELECT RAISE(ABORT, 'binding_immutable'); END;
+CREATE TRIGGER trg_udb_activate BEFORE UPDATE ON user_device_binding
+WHEN NEW.status = 'ACTIVE' AND OLD.status = 'PENDING' AND NOT EXISTS (
+  SELECT 1 FROM approval_request a WHERE a.id = NEW.approval_id AND a.approval_type = 'DEVICE_BIND'
+    AND a.status = 'APPROVED' AND a.target_type = 'DEVICE_BINDING' AND a.target_id = CAST(NEW.id AS TEXT)
+    AND a.first_approver_id <> NEW.user_id)
+BEGIN SELECT RAISE(ABORT, 'binding_approval_invalid'); END;
+CREATE TRIGGER trg_udb_no_delete BEFORE DELETE ON user_device_binding BEGIN SELECT RAISE(ABORT, 'append_only_violation: user_device_binding'); END;
+CREATE TRIGGER trg_apr_no_delete BEFORE DELETE ON approval_request BEGIN SELECT RAISE(ABORT, 'append_only_violation: approval_request'); END;
+
+-- ===== 小赵 I4：离线令牌只能写一次 revoked_at；其余列不可改；SQLite 防 REPLACE =====
+CREATE TRIGGER trg_offline_guard BEFORE UPDATE ON offline_token
+WHEN OLD.revoked_at IS NOT NULL OR NEW.jti IS NOT OLD.jti OR NEW.binding_id IS NOT OLD.binding_id
+  OR NEW.user_id IS NOT OLD.user_id OR NEW.device_instance_id IS NOT OLD.device_instance_id
+  OR NEW.warehouse_id IS NOT OLD.warehouse_id OR NEW.perm_version IS NOT OLD.perm_version
+  OR NEW.issued_at IS NOT OLD.issued_at OR NEW.expires_at IS NOT OLD.expires_at
+BEGIN SELECT RAISE(ABORT, 'offline_token_immutable'); END;
+CREATE TRIGGER trg_offline_no_replace BEFORE INSERT ON offline_token
+WHEN EXISTS (SELECT 1 FROM offline_token t WHERE t.id = NEW.id OR t.jti = NEW.jti)
+BEGIN SELECT RAISE(ABORT, 'offline_token_duplicate'); END;
+
+-- sys_user.perm_version 只升不降（撤权必须让旧令牌失效）；SQLite 防 REPLACE 把版本打回 1（小赵 I7）。
+-- 下发应用 USER_PERM 一律"UPDATE，0 行再 INSERT"，不用 REPLACE / UPSERT（docs/12 §4.3）
 CREATE TRIGGER trg_user_perm_ver BEFORE UPDATE ON sys_user WHEN NEW.perm_version < OLD.perm_version
 BEGIN SELECT RAISE(ABORT, 'perm_version_rewind'); END;
+CREATE TRIGGER trg_user_no_replace BEFORE INSERT ON sys_user
+WHEN EXISTS (SELECT 1 FROM sys_user u WHERE u.id = NEW.id OR u.username = NEW.username)
+BEGIN SELECT RAISE(ABORT, 'sys_user_duplicate'); END;
 
 -- -----------------------------------------------------------------------------
 -- 视图：可用量（避免每个查询手写减法，也避免算错）
