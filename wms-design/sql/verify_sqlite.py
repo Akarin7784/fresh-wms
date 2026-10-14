@@ -201,7 +201,10 @@ seed = [
     "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (1,'OBT1',1,'SALE','MALL','M-2026-001','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'CREATED','2026-10-16')",
 ]
 for s in seed:
-    conn.execute(s)
+    try:
+        conn.execute(s)
+    except sqlite3.Error as e:  # 小赵 U2：种子失败直接非 0 退出
+        print(f"  ✗ 种子失败，中止：{s}\n    {e}"); sys.exit(1)
 conn.commit()
 ok("种子数据写入（含 TIME/DATE/TIMESTAMP/BOOLEAN/NUMERIC 列，未做任何列型改写）")
 
