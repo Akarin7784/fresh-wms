@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 43 处 DEFAULT now()、3 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
---   3. 方言专属行：删除 125 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 46 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 129 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 48 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -515,7 +515,7 @@ CREATE INDEX ix_snap_sku ON stock_snapshot_daily(work_date, warehouse_id, sku_id
 
 CREATE TABLE stock_recon_alert (
     id                      BIGINT          PRIMARY KEY,
-    check_code              VARCHAR(16)     NOT NULL,   -- I3a/I3b/I3c/I3d/I4/I5/SNAP
+    check_code              VARCHAR(24)     NOT NULL,   -- 码表见 ck_recon_code；CHECK_BOX_MISMATCH 18 位，16 放不下
     warehouse_id            BIGINT          NOT NULL,
     stock_id                BIGINT          NOT NULL DEFAULT 0,   -- 0 = 仓级汇总差异（R11）
     expected_qty_milli      BIGINT          NOT NULL,
@@ -528,7 +528,7 @@ CREATE TABLE stock_recon_alert (
     detected_at             TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     last_seen_at            TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT ck_recon_status CHECK (status IN ('OPEN','ACKED','RESOLVED')),
-    CONSTRAINT ck_recon_code CHECK (check_code IN ('I3a','I3b','I3c','I3d','I3e','I4','I5','SNAP','RR_HOLD_FAILED','RR_HOLD_MISMATCH'))   -- 码表见 docs/02 §4.6；新增走迁移（小赵 C4）
+    CONSTRAINT ck_recon_code CHECK (check_code IN ('I3a','I3b','I3c','I3d','I3e','I4','I5','SNAP','RR_HOLD_FAILED','RR_HOLD_MISMATCH','CHECK_BOX_MISMATCH','SHIP_EVENT_MISSING'))   -- 码表见 docs/02 §4.6；新增走迁移（小赵 C4）
 );
 CREATE INDEX ix_recon_open ON stock_recon_alert(warehouse_id, status, detected_at DESC);
 CREATE UNIQUE INDEX uq_recon_open ON stock_recon_alert(check_code, warehouse_id, stock_id) WHERE status <> 'RESOLVED';
@@ -1112,6 +1112,8 @@ CREATE TRIGGER trg_idem_expiry_fwd BEFORE UPDATE ON idempotency_record WHEN NEW.
 BEGIN SELECT RAISE(ABORT, 'expiry_backdate: idempotency_record'); END;
 CREATE TRIGGER trg_outbox_expiry_fwd BEFORE UPDATE ON outbox_event WHEN NEW.created_at IS NOT OLD.created_at OR (OLD.sent_at IS NOT NULL AND (NEW.sent_at IS NULL OR NEW.sent_at < OLD.sent_at)) OR (OLD.sent_at IS NULL AND NEW.sent_at < OLD.created_at) OR (OLD.status = 'SENT' AND NEW.status <> 'SENT')
 BEGIN SELECT RAISE(ABORT, 'expiry_backdate: outbox_event'); END;
+CREATE TRIGGER trg_outbox_sent_now BEFORE UPDATE ON outbox_event WHEN NEW.status = 'SENT' AND OLD.status <> 'SENT' AND abs(julianday(NEW.sent_at) - julianday('now')) * 86400 > 5
+BEGIN SELECT RAISE(ABORT, 'sent_at_not_now'); END;
 -- SQLite REPLACE 冲突删旧行不触发 DELETE 触发器 → BEFORE INSERT 主键已存在就中止（应用把 idem_duplicate 当作"键已存在"处理，与 PG 23505 同分支）
 CREATE TRIGGER trg_idem_no_replace BEFORE INSERT ON idempotency_record WHEN EXISTS (SELECT 1 FROM idempotency_record r WHERE r.idem_key = NEW.idem_key)
 BEGIN SELECT RAISE(ABORT, 'idem_duplicate'); END;

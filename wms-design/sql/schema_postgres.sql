@@ -572,7 +572,7 @@ CREATE INDEX ix_snap_sku ON stock_snapshot_daily(work_date, warehouse_id, sku_id
 
 CREATE TABLE stock_recon_alert (
     id                      BIGINT          PRIMARY KEY,
-    check_code              VARCHAR(16)     NOT NULL,   -- I3a/I3b/I3c/I3d/I4/I5/SNAP
+    check_code              VARCHAR(24)     NOT NULL,   -- 码表见 ck_recon_code；CHECK_BOX_MISMATCH 18 位，16 放不下
     warehouse_id            BIGINT          NOT NULL,
     stock_id                BIGINT          NOT NULL DEFAULT 0,   -- 0 = 仓级汇总差异（R11）
     expected_qty_milli      BIGINT          NOT NULL,
@@ -585,7 +585,7 @@ CREATE TABLE stock_recon_alert (
     detected_at             TIMESTAMP       NOT NULL DEFAULT now(),
     last_seen_at            TIMESTAMP       NOT NULL DEFAULT now(),
     CONSTRAINT ck_recon_status CHECK (status IN ('OPEN','ACKED','RESOLVED')),
-    CONSTRAINT ck_recon_code CHECK (check_code IN ('I3a','I3b','I3c','I3d','I3e','I4','I5','SNAP','RR_HOLD_FAILED','RR_HOLD_MISMATCH'))   -- 码表见 docs/02 §4.6；新增走迁移（小赵 C4）
+    CONSTRAINT ck_recon_code CHECK (check_code IN ('I3a','I3b','I3c','I3d','I3e','I4','I5','SNAP','RR_HOLD_FAILED','RR_HOLD_MISMATCH','CHECK_BOX_MISMATCH','SHIP_EVENT_MISSING'))   -- 码表见 docs/02 §4.6；新增走迁移（小赵 C4）
 );
 CREATE INDEX ix_recon_open ON stock_recon_alert(warehouse_id, status, detected_at DESC);
 CREATE UNIQUE INDEX uq_recon_open ON stock_recon_alert(check_code, warehouse_id, stock_id) WHERE status <> 'RESOLVED';
@@ -1193,6 +1193,10 @@ BEGIN                                                                           
         IF NEW.expires_at < OLD.expires_at THEN                                                               -- @pg-only
             RAISE EXCEPTION 'expiry_backdate: expires_at' USING ERRCODE = '42501'; END IF;                    -- @pg-only
     ELSE                                                                                                      -- @pg-only
+        -- R1：变成 SENT 的那次写入，sent_at 必须是当前 UTC 时间（容差 5 秒）                                    -- @pg-only
+        IF NEW.status = 'SENT' AND OLD.status <> 'SENT'                                                       -- @pg-only
+           AND abs(extract(epoch FROM NEW.sent_at - (now() AT TIME ZONE 'UTC'))) > 5 THEN                     -- @pg-only
+            RAISE EXCEPTION 'sent_at_not_now' USING ERRCODE = '42501'; END IF;                                -- @pg-only
         IF OLD.sent_at IS NOT NULL AND (NEW.sent_at IS NULL OR NEW.sent_at < OLD.sent_at) THEN                -- @pg-only
             RAISE EXCEPTION 'expiry_backdate: sent_at' USING ERRCODE = '42501'; END IF;                       -- @pg-only
         IF OLD.sent_at IS NULL AND NEW.sent_at < OLD.created_at THEN                                          -- @pg-only
@@ -1208,6 +1212,8 @@ CREATE TRIGGER trg_outbox_expiry_fwd BEFORE UPDATE ON outbox_event       FOR EAC
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'expiry_backdate: idempotency_record'); END;
 -- @sqlite-only CREATE TRIGGER trg_outbox_expiry_fwd BEFORE UPDATE ON outbox_event WHEN NEW.created_at IS NOT OLD.created_at OR (OLD.sent_at IS NOT NULL AND (NEW.sent_at IS NULL OR NEW.sent_at < OLD.sent_at)) OR (OLD.sent_at IS NULL AND NEW.sent_at < OLD.created_at) OR (OLD.status = 'SENT' AND NEW.status <> 'SENT')
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'expiry_backdate: outbox_event'); END;
+-- @sqlite-only CREATE TRIGGER trg_outbox_sent_now BEFORE UPDATE ON outbox_event WHEN NEW.status = 'SENT' AND OLD.status <> 'SENT' AND abs(julianday(NEW.sent_at) - julianday('now')) * 86400 > 5
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'sent_at_not_now'); END;
 -- SQLite REPLACE 冲突删旧行不触发 DELETE 触发器 → BEFORE INSERT 主键已存在就中止（应用把 idem_duplicate 当作"键已存在"处理，与 PG 23505 同分支）
 -- @sqlite-only CREATE TRIGGER trg_idem_no_replace BEFORE INSERT ON idempotency_record WHEN EXISTS (SELECT 1 FROM idempotency_record r WHERE r.idem_key = NEW.idem_key)
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'idem_duplicate'); END;
