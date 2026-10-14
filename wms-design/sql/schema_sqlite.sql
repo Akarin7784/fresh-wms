@@ -297,9 +297,9 @@ CREATE TABLE stock_hold (
         OR (hold_type = 'RETURN_QC' AND op_key LIKE 'CVT:%'
             AND approval_type = 'SCRAP_MISREPORT' AND approval_no IS NOT NULL AND length(approval_no) > 0)
     ),
-    -- 审批单号格式 APR-{仓库编码}-{yyyyMMdd}-{6 位数字}；仓库编码字符集 [A-Z0-9]{1,32}（01 §2 warehouse.code，VARCHAR(32)，单号仓前缀不含 '-'）
+    -- 审批单号格式 APR-{仓库编码}-{yyyyMMdd}-{6 位数字}；仓库编码字符集 [A-Z0-9]{2,16}（以第 1 篇 #8 为准）
     CONSTRAINT ck_hold_approval_no CHECK (approval_no IS NULL OR (
-        length(approval_no) BETWEEN 21 AND 52 AND substr(approval_no, 1, 4) = 'APR-'
+        length(approval_no) BETWEEN 22 AND 36 AND substr(approval_no, 1, 4) = 'APR-'
         AND substr(approval_no, 5, length(approval_no) - 20) NOT GLOB '*[^A-Z0-9]*'
         AND substr(approval_no, -16) GLOB '-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]'
         AND (substr(approval_no, -11, 2) GLOB '0[1-9]' OR substr(approval_no, -11, 2) GLOB '1[0-2]')
@@ -528,7 +528,7 @@ CREATE TABLE stock_recon_alert (
     detected_at             TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     last_seen_at            TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT ck_recon_status CHECK (status IN ('OPEN','ACKED','RESOLVED')),
-    CONSTRAINT ck_recon_code CHECK (check_code IN ('I3a','I3b','I3c','I3d','I3e','I4','I5','SNAP'))   -- 码表见 docs/02 §4.6；新增走迁移（小赵 C4）
+    CONSTRAINT ck_recon_code CHECK (check_code IN ('I3a','I3b','I3c','I3d','I3e','I4','I5','SNAP','RR_HOLD_FAILED','RR_HOLD_MISMATCH'))   -- 码表见 docs/02 §4.6；新增走迁移（小赵 C4）
 );
 CREATE INDEX ix_recon_open ON stock_recon_alert(warehouse_id, status, detected_at DESC);
 CREATE UNIQUE INDEX uq_recon_open ON stock_recon_alert(check_code, warehouse_id, stock_id) WHERE status <> 'RESOLVED';
