@@ -17,8 +17,9 @@ SCHEMA=sql/schema_postgres.sql
 # stock_movement_key、stock_ledger_line → 42 表 / 114 索引（含 PK、UNIQUE 自动索引和分区父表上的分区索引；
 # 分区子表及其继承来的索引不计）/ 1 视图。二轮 C2 加 uq_mvk_mv（外键被引用键）→ 115。改 DDL 必须同步改这里。
 # 必须用新建的空库跑（DROP SCHEMA public 重建会丢 wms_app 的 USAGE；schema 里已 GRANT USAGE 兜底，小赵 C6）。
-EXPECT_TABLES=42
-EXPECT_INDEXES=115
+# docs/16 +8 表 / +25 索引（8 PK + 9 UNIQUE + uq_podc_pending/uq_podc_seq + 6 普通）
+EXPECT_TABLES=50
+EXPECT_INDEXES=140
 EXPECT_VIEWS=1
 
 CTR=wms-pg-verify
@@ -334,6 +335,95 @@ echo "=== 2d. Q7：PG 写入 bigint 的取整行为（QA 在 PG16.14 实测，�
 Q7=$(psql -q -t -A -c "CREATE TEMP TABLE q7 (v BIGINT); INSERT INTO q7 VALUES (3.5), (2.5), (2.5::float8); SELECT string_agg(v::text, ',' ORDER BY ctid) FROM q7;")
 [ "$Q7" = "4,3,2" ] && ok "numeric 3.5→4、2.5→3（四舍五入），float8 2.5→2（银行家舍入）→ 应用层只绑定整数" \
                   || bad "Q7 取整结果 = $Q7（期望 4,3,2）"
+
+echo "=== 2g. docs/16 配送与签收：POD_OP 业务键、缓存范围、更正栅栏、回仓差异 ==="
+expect_allow "16 运单建单" \
+  "INSERT INTO waybill (id,code,warehouse_id,shipment_id,driver_id,work_date) VALUES (1600,'WB-1',1,1600,9,'2026-10-15');"
+expect_block "16 运单非法状态" \
+  "UPDATE waybill SET status='SIGNED' WHERE id=1600;" \
+  "ck_wb_status"
+expect_allow "16 站点出库单 SHIPPED（无生效签收）" \
+  "INSERT INTO delivery_order (id,waybill_id,stop_no,outbound_id) VALUES (1601,1600,1,9101);"
+expect_block "16 DELIVERED 但没有 valid_pod_id" \
+  "UPDATE delivery_order SET status='DELIVERED' WHERE id=1601;" \
+  "ck_dord_pod"
+expect_block "16 出库单签收状态取值（站点级 SIGNED 不允许）" \
+  "UPDATE delivery_order SET status='SIGNED', valid_pod_id=1, root_pod_id=1 WHERE id=1601;" \
+  "ck_dord_status"
+expect_allow "16 POD_SIGN 2xx 落业务键" \
+  "INSERT INTO pod_op (id,warehouse_id,waybill_no,stop_no,device_instance_id,op_seq,op_type,user_id,req_hash,http_status,biz_code,response) VALUES (1610,1,'WB-1',1,'dev-A',1,'POD_SIGN',9,'0000000000000000000000000000000000000000000000000000000000000000',200,'0','{}');"
+expect_block "16 同一 POD_OP 四字段业务键重复" \
+  "INSERT INTO pod_op (id,warehouse_id,waybill_no,stop_no,device_instance_id,op_seq,op_type,user_id,req_hash,http_status,biz_code,response) VALUES (1611,1,'WB-1',1,'dev-A',1,'POD_SIGN',9,'0000000000000000000000000000000000000000000000000000000000000000',200,'0','{}');" \
+  "uq_pod_op_key"
+expect_allow "16 409 业务冲突（40950）可缓存" \
+  "INSERT INTO pod_op (id,warehouse_id,waybill_no,stop_no,device_instance_id,op_seq,op_type,user_id,req_hash,http_status,biz_code,response) VALUES (1612,1,'WB-1',1,'dev-A',2,'POD_SIGN',9,'0000000000000000000000000000000000000000000000000000000000000000',409,'40950','{}');"
+expect_block "16 422 不缓存" \
+  "INSERT INTO pod_op (id,warehouse_id,waybill_no,stop_no,device_instance_id,op_seq,op_type,user_id,req_hash,http_status,biz_code,response) VALUES (1613,1,'WB-1',1,'dev-A',3,'POD_SIGN',9,'0000000000000000000000000000000000000000000000000000000000000000',422,'42210','{}');" \
+  "ck_pod_op_cache"
+expect_block "16 50303 不缓存" \
+  "INSERT INTO pod_op (id,warehouse_id,waybill_no,stop_no,device_instance_id,op_seq,op_type,user_id,req_hash,http_status,biz_code,response) VALUES (1614,1,'WB-1',1,'dev-A',4,'POD_SIGN',9,'0000000000000000000000000000000000000000000000000000000000000000',503,'50303','{}');" \
+  "ck_pod_op_cache"
+expect_block "16 HTTP 409 配非 409xx 码" \
+  "INSERT INTO pod_op (id,warehouse_id,waybill_no,stop_no,device_instance_id,op_seq,op_type,user_id,req_hash,http_status,biz_code,response) VALUES (1615,1,'WB-1',1,'dev-A',5,'POD_SIGN',9,'0000000000000000000000000000000000000000000000000000000000000000',409,'42214','{}');" \
+  "ck_pod_op_cache"
+expect_block "16 POD_CORRECT 不带 corrected_pod_id" \
+  "INSERT INTO pod_op (id,warehouse_id,waybill_no,stop_no,device_instance_id,op_seq,op_type,user_id,req_hash,http_status,biz_code,response) VALUES (1616,1,'WB-1',1,'dev-A',6,'POD_CORRECT',9,'0000000000000000000000000000000000000000000000000000000000000000',200,'0','{}');" \
+  "ck_pod_op_corr"
+expect_allow "16 POD_CORRECT 带 corrected_pod_id" \
+  "INSERT INTO pod_op (id,warehouse_id,waybill_no,stop_no,device_instance_id,op_seq,op_type,user_id,req_hash,http_status,biz_code,response,corrected_pod_id) VALUES (1617,1,'WB-1',1,'dev-A',7,'POD_CORRECT',9,'0000000000000000000000000000000000000000000000000000000000000000',200,'0','{}',1610);"
+expect_block "16 签收行拒收量 > 实发量" \
+  "INSERT INTO pod_line (id,pod_id,outbound_id,outbound_line_id,sku_id,lot_id,shipped_qty_milli,rejected_qty_milli,reject_reason) VALUES (1620,1610,9101,1,1,1,5000,5001,'DAMAGED');" \
+  "ck_podl_qty"
+expect_block "16 有拒收量但无原因" \
+  "INSERT INTO pod_line (id,pod_id,outbound_id,outbound_line_id,sku_id,lot_id,shipped_qty_milli,rejected_qty_milli) VALUES (1621,1610,9101,1,1,1,5000,1000);" \
+  "ck_podl_rsn"
+expect_allow "16 签收行部分拒收" \
+  "INSERT INTO pod_line (id,pod_id,outbound_id,outbound_line_id,sku_id,lot_id,shipped_qty_milli,rejected_qty_milli,reject_reason) VALUES (1622,1610,9101,1,1,1,5000,1000,'DAMAGED');"
+expect_allow "16 签收更正申请 PENDING" \
+  "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,outbound_id,requested_by,reason) VALUES (1630,1617,1610,9101,9,'误点全收');"
+expect_block "16 同一生效签收第二条待审批更正" \
+  "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,outbound_id,requested_by,reason) VALUES (1631,1618,1610,9101,9,'再改');" \
+  "uq_podc_pending"
+expect_block "16 更正审批 SoD（审批人=申请人）" \
+  "UPDATE pod_correction SET status='APPLIED', approver_id=9, decided_at='2026-10-15 10:00:00', correct_seq=1 WHERE id=1630;" \
+  "ck_podc_sod"
+expect_block "16 更正审批缺审批人" \
+  "UPDATE pod_correction SET status='APPLIED' WHERE id=1630;" \
+  "ck_podc_decide"
+expect_block "16 APPLIED 更正缺 correct_seq" \
+  "UPDATE pod_correction SET status='APPLIED', approver_id=8, decided_at='2026-10-15 10:00:00' WHERE id=1630;" \
+  "ck_podc_seq"
+expect_allow "16 更正 APPLIED（correct_seq=1）" \
+  "UPDATE pod_correction SET status='APPLIED', approver_id=8, decided_at='2026-10-15 10:00:00', correct_seq=1 WHERE id=1630;"
+expect_block "16 同一出库单两条更正同一 correct_seq" \
+  "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,outbound_id,requested_by,reason,status,approver_id,decided_at,correct_seq) VALUES (1632,1619,1617,9101,9,'x','APPLIED',8,'2026-10-15 11:00:00',1);" \
+  "uq_podc_seq"
+expect_block "16 未签收却有 correct_seq" \
+  "INSERT INTO delivery_order (id,waybill_id,stop_no,outbound_id,correct_seq) VALUES (1602,1600,2,9102,1);" \
+  "ck_dord_cseq"
+expect_allow "16 拒收回仓交接" \
+  "INSERT INTO delivery_return (id,warehouse_id,waybill_id,stop_no) VALUES (1640,1,1600,1);"
+expect_block "16 交接 COUNTED 但未生成 RTN" \
+  "UPDATE delivery_return SET status='COUNTED', counted_by=8 WHERE id=1640;" \
+  "ck_dret_cnt"
+expect_block "16 实点≠司机登记数却没有异常单" \
+  "INSERT INTO delivery_return_line (id,return_id,pod_line_id,sku_id,lot_id,reported_qty_milli,counted_qty_milli) VALUES (1641,1640,1622,1,1,1000,800);" \
+  "ck_dretl_exc"
+expect_allow "16 实点≠登记数且已挂第 10 篇异常单" \
+  "INSERT INTO delivery_return_line (id,return_id,pod_line_id,sku_id,lot_id,reported_qty_milli,counted_qty_milli,exception_case_id) VALUES (1642,1640,1622,1,1,1000,800,7001);"
+F16=""
+F16="$F16$(psql -t -A -c "UPDATE delivery_order SET status='DELIVERED', valid_pod_id=1610, root_pod_id=1610, version=version+1 WHERE id=1601 AND status='SHIPPED'" | sed -n 's/^UPDATE //p'),"
+F16="$F16$(psql -t -A -c "UPDATE delivery_order SET status='DELIVERED', valid_pod_id=1610, root_pod_id=1610, version=version+1 WHERE id=1601 AND status='SHIPPED'" | sed -n 's/^UPDATE //p'),"
+F16="$F16$(psql -t -A -c "UPDATE delivery_order SET status='PARTIALLY_REJECTED', valid_pod_id=1617, correct_seq=correct_seq+1, version=version+1 WHERE id=1601 AND status='DELIVERED' AND valid_pod_id=1610" | sed -n 's/^UPDATE //p'),"
+F16="$F16$(psql -t -A -c "UPDATE delivery_order SET status='DELIVERED', valid_pod_id=1699, version=version+1 WHERE id=1601 AND status='DELIVERED' AND valid_pod_id=1610" | sed -n 's/^UPDATE //p'),"
+F16="${F16%,}"
+[ "$F16" = "1,0,1,0" ] && ok "16 签收只认 SHIPPED、POD_CORRECT 只认 DELIVERED+valid_pod_id：rowcount $F16" || bad "16 条件更新 rowcount = $F16，期望 1,0,1,0"
+OUT=$(psql -q -c "SET ROLE wms_app; UPDATE pod_op SET response='{}' WHERE id=1610;")
+case "$OUT" in *"permission denied for table pod_op"*) ok "16 wms_app 对 pod_op 无 UPDATE（回放缓存只追加）";; *) bad "wms_app 改 pod_op 未被拒：$OUT";; esac
+OUT=$(psql -q -c "SET ROLE wms_app; UPDATE delivery_order SET version=version WHERE id=1601;")
+[ "$OUT" = "" ] && ok "16 wms_app 可条件更新 delivery_order" || bad "wms_app 更新 delivery_order 被拒：$OUT"
+H16=$(psql -t -A -c "SELECT stop_no||':'||max(op_seq) FROM pod_op WHERE device_instance_id='dev-A' AND waybill_no='WB-1' GROUP BY stop_no")
+[ "$H16" = "1:7" ] && ok "16 op-seq-hwm 查询 = $H16" || bad "16 op-seq-hwm = $H16，期望 1:7"
 
 echo "=== 3. §5.6 盘点差异生成列（实盘 − 基准账面 − 期间流水）==="
 seed "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000);"
