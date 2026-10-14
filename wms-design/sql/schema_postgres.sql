@@ -816,15 +816,52 @@ CREATE TABLE pack_box (
     code            VARCHAR(64)  NOT NULL,          -- 箱码，司机端逐箱扫
     warehouse_id    BIGINT       NOT NULL,
     outbound_id     BIGINT       NOT NULL,
+    check_id        BIGINT,                         -- docs/06：装箱必须挂在一张 PASSED 复核单上（应用层校验）
     shipment_id     BIGINT,
     stage_location_id BIGINT,                       -- 集货位
     box_type        VARCHAR(24)  NOT NULL DEFAULT 'CARTON',  -- CARTON/TURNBOX（周转筐）
-    weight_g        NUMERIC(10,2),
-    sealed          BOOLEAN      NOT NULL DEFAULT false,
+    weight_g        NUMERIC(10,2),                  -- docs/06 Q6：拟改 weight_mg BIGINT（R2），待 PM
+    status          VARCHAR(16)  NOT NULL DEFAULT 'OPEN',    -- docs/06 §5.2：OPEN/SEALED/STAGED/SHIPPED/CANCELLED；装车扫箱归 docs/16
+    sealed          BOOLEAN      NOT NULL DEFAULT false,     -- 兼容旧字段，= status<>'OPEN' 且 <>'CANCELLED'
     checker_id      BIGINT,
-    packed_at       TIMESTAMP,
-    CONSTRAINT uq_box_code UNIQUE (code)
+    packed_at       TIMESTAMP,                      -- 封箱时间（UTC）
+    shipped_at      TIMESTAMP,                      -- 发货出库时间（UTC）
+    version         INT          NOT NULL DEFAULT 0,
+    created_at      TIMESTAMP    NOT NULL DEFAULT now(),
+    CONSTRAINT uq_box_code UNIQUE (code),
+    CONSTRAINT ck_box_status CHECK (status IN ('OPEN','SEALED','STAGED','SHIPPED','CANCELLED')),
+    CONSTRAINT ck_box_sealed CHECK ((status IN ('OPEN','CANCELLED') AND sealed = false)
+                                 OR (status IN ('SEALED','STAGED','SHIPPED') AND sealed = true AND packed_at IS NOT NULL AND checker_id IS NOT NULL)),
+    CONSTRAINT ck_box_staged CHECK (status NOT IN ('STAGED','SHIPPED') OR stage_location_id IS NOT NULL),
+    CONSTRAINT ck_box_shipped CHECK (status <> 'SHIPPED' OR (shipment_id IS NOT NULL AND shipped_at IS NOT NULL))
 );
+CREATE INDEX ix_box_outbound ON pack_box(outbound_id, status);
+CREATE INDEX ix_box_shipment ON pack_box(shipment_id);
+-- docs/06 §5.2：箱状态只能前进；SHIPPED / CANCELLED 终态；箱身份列（code/outbound_id/warehouse_id）不可改；不可删
+CREATE FUNCTION trg_box_guard() RETURNS trigger LANGUAGE plpgsql AS $$                                    -- @pg-only
+BEGIN                                                                                                      -- @pg-only
+    IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'box_immutable'; END IF;                                      -- @pg-only
+    IF NEW.code <> OLD.code OR NEW.outbound_id <> OLD.outbound_id OR NEW.warehouse_id <> OLD.warehouse_id  -- @pg-only
+    THEN RAISE EXCEPTION 'box_immutable'; END IF;                                                          -- @pg-only
+    IF NEW.status <> OLD.status AND NOT (                                                                  -- @pg-only
+        (OLD.status = 'OPEN'   AND NEW.status IN ('SEALED','CANCELLED')) OR                                -- @pg-only
+        (OLD.status = 'SEALED' AND NEW.status IN ('STAGED','OPEN')) OR                                     -- @pg-only
+        (OLD.status = 'STAGED' AND NEW.status IN ('SHIPPED','SEALED')))                                                 -- @pg-only
+    THEN RAISE EXCEPTION 'box_state'; END IF;                                                              -- @pg-only
+    RETURN NEW;                                                                                            -- @pg-only
+END $$;                                                                                                    -- @pg-only
+CREATE TRIGGER trg_box_guard BEFORE UPDATE OR DELETE ON pack_box FOR EACH ROW EXECUTE FUNCTION trg_box_guard();  -- @pg-only
+CREATE TRIGGER trg_box_no_truncate BEFORE TRUNCATE ON pack_box FOR EACH STATEMENT EXECUTE FUNCTION trg_append_only();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_box_upd BEFORE UPDATE ON pack_box
+-- @sqlite-only WHEN NEW.code <> OLD.code OR NEW.outbound_id <> OLD.outbound_id OR NEW.warehouse_id <> OLD.warehouse_id
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'box_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_box_state BEFORE UPDATE OF status ON pack_box
+-- @sqlite-only WHEN NEW.status <> OLD.status AND NOT ((OLD.status = 'OPEN' AND NEW.status IN ('SEALED','CANCELLED')) OR (OLD.status = 'SEALED' AND NEW.status IN ('STAGED','OPEN')) OR (OLD.status = 'STAGED' AND NEW.status IN ('SHIPPED','SEALED')))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'box_state'); END;
+-- @sqlite-only CREATE TRIGGER trg_box_del BEFORE DELETE ON pack_box BEGIN SELECT RAISE(ABORT, 'box_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_box_dup BEFORE INSERT ON pack_box
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM pack_box b WHERE b.id = NEW.id OR b.code = NEW.code)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'box_duplicate'); END;
 
 CREATE TABLE pack_box_line (
     id          BIGINT          PRIMARY KEY,
@@ -836,6 +873,26 @@ CREATE TABLE pack_box_line (
     CONSTRAINT ck_box_line_qty CHECK (qty_milli > 0 AND qty_milli = CAST(qty_milli AS BIGINT)),
     CONSTRAINT uq_box_line UNIQUE (box_id, sku_id, lot_id)
 );
+-- docs/06 §5.2：箱明细只在箱 OPEN 时可增改删；封箱后冻结（解封回 OPEN 才能改，需 pack.unseal 权限 + audit_log）
+CREATE FUNCTION trg_box_line_guard() RETURNS trigger LANGUAGE plpgsql AS $$                               -- @pg-only
+DECLARE st VARCHAR(16);                                                                                    -- @pg-only
+BEGIN                                                                                                      -- @pg-only
+    SELECT status INTO st FROM pack_box WHERE id = CASE WHEN TG_OP = 'DELETE' THEN OLD.box_id ELSE NEW.box_id END;  -- @pg-only
+    IF st IS DISTINCT FROM 'OPEN' THEN RAISE EXCEPTION 'box_sealed'; END IF;                               -- @pg-only
+    IF TG_OP = 'UPDATE' AND NEW.box_id <> OLD.box_id THEN RAISE EXCEPTION 'box_sealed'; END IF;            -- @pg-only
+    IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;                                                           -- @pg-only
+    RETURN NEW;                                                                                            -- @pg-only
+END $$;                                                                                                    -- @pg-only
+CREATE TRIGGER trg_box_line_guard BEFORE INSERT OR UPDATE OR DELETE ON pack_box_line FOR EACH ROW EXECUTE FUNCTION trg_box_line_guard();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_box_line_ins BEFORE INSERT ON pack_box_line
+-- @sqlite-only WHEN COALESCE((SELECT status FROM pack_box WHERE id = NEW.box_id), '') <> 'OPEN'
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'box_sealed'); END;
+-- @sqlite-only CREATE TRIGGER trg_box_line_upd BEFORE UPDATE ON pack_box_line
+-- @sqlite-only WHEN NEW.box_id <> OLD.box_id OR COALESCE((SELECT status FROM pack_box WHERE id = OLD.box_id), '') <> 'OPEN'
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'box_sealed'); END;
+-- @sqlite-only CREATE TRIGGER trg_box_line_del BEFORE DELETE ON pack_box_line
+-- @sqlite-only WHEN COALESCE((SELECT status FROM pack_box WHERE id = OLD.box_id), '') <> 'OPEN'
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'box_sealed'); END;
 
 CREATE TABLE shipment (
     id              BIGINT       PRIMARY KEY,
@@ -846,16 +903,183 @@ CREATE TABLE shipment (
     driver_id       BIGINT,
     driver_name     VARCHAR(64),
     driver_phone    VARCHAR(32),
-    status          VARCHAR(16)  NOT NULL DEFAULT 'CREATED', -- CREATED/LOADING/DEPARTED/DELIVERING/SIGNED/CLOSED
+    status          VARCHAR(16)  NOT NULL DEFAULT 'CREATED', -- docs/06 §5.3：CREATED/HANDED_OVER/CANCELLED；HANDED_OVER 后装车、发车、在途、签收归 docs/16（waybill 1:1）
     planned_depart_at TIMESTAMP,
     departed_at     TIMESTAMP,
     signed_at       TIMESTAMP,
     temp_log_ref    VARCHAR(128),                   -- 温控记录对象存储 key
+    dock_location_id BIGINT,                        -- 月台
+    box_count       INT          NOT NULL DEFAULT 0,       -- 交接时冻结：SHIPPED 箱数
+    handed_over_at  TIMESTAMP,                      -- 发货出库交接时间（UTC）
+    handed_over_by  BIGINT,
+    version         INT          NOT NULL DEFAULT 0,
     created_at      TIMESTAMP    NOT NULL DEFAULT now(),
     updated_at      TIMESTAMP    NOT NULL DEFAULT now(),
-    CONSTRAINT uq_shp_code UNIQUE (code)
+    CONSTRAINT uq_shp_code UNIQUE (code),
+    CONSTRAINT ck_shp_status CHECK (status IN ('CREATED','HANDED_OVER','CANCELLED')),
+    CONSTRAINT ck_shp_handover CHECK (status <> 'HANDED_OVER' OR (handed_over_at IS NOT NULL AND handed_over_by IS NOT NULL AND vehicle_no IS NOT NULL AND box_count > 0)),
+    CONSTRAINT ck_shp_box_count CHECK (box_count >= 0)
 );
+-- docs/06 §5.3：HANDED_OVER / CANCELLED 终态（之后的 departed_at/signed_at 等由 docs/16 回写，不在本触发器冻结列内）；不可删
+CREATE FUNCTION trg_shp_guard() RETURNS trigger LANGUAGE plpgsql AS $$                                    -- @pg-only
+BEGIN                                                                                                      -- @pg-only
+    IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'shipment_immutable'; END IF;                                 -- @pg-only
+    IF OLD.status IN ('HANDED_OVER','CANCELLED') AND (NEW.status <> OLD.status OR NEW.box_count <> OLD.box_count  -- @pg-only
+       OR NEW.vehicle_no IS DISTINCT FROM OLD.vehicle_no OR NEW.handed_over_at IS DISTINCT FROM OLD.handed_over_at)  -- @pg-only
+    THEN RAISE EXCEPTION 'shipment_closed'; END IF;                                                        -- @pg-only
+    IF NEW.status <> OLD.status AND NOT (                                                                  -- @pg-only
+        (OLD.status = 'CREATED' AND NEW.status IN ('HANDED_OVER','CANCELLED')))                          -- @pg-only
+    THEN RAISE EXCEPTION 'shipment_state'; END IF;                                                         -- @pg-only
+    RETURN NEW;                                                                                            -- @pg-only
+END $$;                                                                                                    -- @pg-only
+CREATE TRIGGER trg_shp_guard BEFORE UPDATE OR DELETE ON shipment FOR EACH ROW EXECUTE FUNCTION trg_shp_guard();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_shp_closed BEFORE UPDATE ON shipment
+-- @sqlite-only WHEN OLD.status IN ('HANDED_OVER','CANCELLED') AND (NEW.status <> OLD.status OR NEW.box_count <> OLD.box_count OR NEW.vehicle_no IS NOT OLD.vehicle_no OR NEW.handed_over_at IS NOT OLD.handed_over_at)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'shipment_closed'); END;
+-- @sqlite-only CREATE TRIGGER trg_shp_state BEFORE UPDATE OF status ON shipment
+-- @sqlite-only WHEN OLD.status NOT IN ('HANDED_OVER','CANCELLED') AND NEW.status <> OLD.status AND NOT (OLD.status = 'CREATED' AND NEW.status IN ('HANDED_OVER','CANCELLED'))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'shipment_state'); END;
+-- @sqlite-only CREATE TRIGGER trg_shp_del BEFORE DELETE ON shipment BEGIN SELECT RAISE(ABORT, 'shipment_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_shp_dup BEFORE INSERT ON shipment
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM shipment x WHERE x.id = NEW.id OR x.code = NEW.code)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'shipment_duplicate'); END;
 CREATE INDEX ix_shp_driver ON shipment(driver_id, status, planned_depart_at);
+
+-- ============================================================
+-- docs/06 复核、装箱、发货
+-- ============================================================
+-- 复核单：一张出库单同一时刻至多一张 OPEN 复核；复核人 ≠ 拣货人（SoD，与 outbound_order.ck_ob_sod 同口径）
+CREATE TABLE check_record (
+    id                  BIGINT       PRIMARY KEY,
+    code                VARCHAR(64)  NOT NULL,
+    warehouse_id        BIGINT       NOT NULL,
+    outbound_id         BIGINT       NOT NULL,
+    picker_id           BIGINT,                      -- 开单时从 outbound_order.picker_id 冻结
+    checker_id          BIGINT       NOT NULL,
+    device_instance_id  VARCHAR(64),
+    status              VARCHAR(16)  NOT NULL DEFAULT 'OPEN',  -- OPEN/PASSED/FAILED/CANCELLED
+    mismatch_count      INT          NOT NULL DEFAULT 0,
+    closed_by           BIGINT,
+    closed_at           TIMESTAMP,
+    version             INT          NOT NULL DEFAULT 0,
+    created_at          TIMESTAMP    NOT NULL DEFAULT now(),
+    CONSTRAINT uq_chk_code UNIQUE (code),
+    CONSTRAINT ck_chk_status CHECK (status IN ('OPEN','PASSED','FAILED','CANCELLED')),
+    CONSTRAINT ck_chk_sod CHECK (picker_id IS NULL OR picker_id <> checker_id),
+    CONSTRAINT ck_chk_closed CHECK ((status = 'OPEN' AND closed_at IS NULL AND closed_by IS NULL)
+                                 OR (status <> 'OPEN' AND closed_at IS NOT NULL AND closed_by IS NOT NULL)),
+    CONSTRAINT ck_chk_pass CHECK (status <> 'PASSED' OR mismatch_count = 0),
+    CONSTRAINT ck_chk_mismatch CHECK (mismatch_count >= 0)
+);
+CREATE UNIQUE INDEX uq_chk_open ON check_record(outbound_id) WHERE status = 'OPEN';
+-- 关单后终态；身份列不可改；不可删
+CREATE FUNCTION trg_chk_guard() RETURNS trigger LANGUAGE plpgsql AS $$                                    -- @pg-only
+BEGIN                                                                                                      -- @pg-only
+    IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'check_immutable'; END IF;                                    -- @pg-only
+    IF NEW.outbound_id <> OLD.outbound_id OR NEW.checker_id <> OLD.checker_id                              -- @pg-only
+       OR NEW.picker_id IS DISTINCT FROM OLD.picker_id OR NEW.code <> OLD.code                             -- @pg-only
+    THEN RAISE EXCEPTION 'check_immutable'; END IF;                                                        -- @pg-only
+    IF OLD.status <> 'OPEN' THEN RAISE EXCEPTION 'check_closed'; END IF;                                   -- @pg-only
+    RETURN NEW;                                                                                            -- @pg-only
+END $$;                                                                                                    -- @pg-only
+CREATE TRIGGER trg_chk_guard BEFORE UPDATE OR DELETE ON check_record FOR EACH ROW EXECUTE FUNCTION trg_chk_guard();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_chk_upd BEFORE UPDATE ON check_record
+-- @sqlite-only WHEN NEW.outbound_id <> OLD.outbound_id OR NEW.checker_id <> OLD.checker_id OR NEW.picker_id IS NOT OLD.picker_id OR NEW.code <> OLD.code
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'check_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_chk_closed BEFORE UPDATE ON check_record WHEN OLD.status <> 'OPEN'
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'check_closed'); END;
+-- @sqlite-only CREATE TRIGGER trg_chk_del BEFORE DELETE ON check_record BEGIN SELECT RAISE(ABORT, 'check_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_chk_dup BEFORE INSERT ON check_record
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM check_record c WHERE c.id = NEW.id OR c.code = NEW.code OR (c.outbound_id = NEW.outbound_id AND c.status = 'OPEN' AND NEW.status = 'OPEN'))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'check_duplicate'); END;
+
+-- 复核行：按出库行汇总；checked ≤ expected（多扫 → 42214 OVER_QTY，detail.reason=OVER_CHECK）
+CREATE TABLE check_line (
+    id                  BIGINT       PRIMARY KEY,
+    check_id            BIGINT       NOT NULL,
+    line_no             INT          NOT NULL,       -- = outbound_line.line_no
+    outbound_line_id    BIGINT       NOT NULL,
+    sku_id              BIGINT       NOT NULL,
+    expected_qty_milli  BIGINT       NOT NULL,       -- = 该出库行已拣 picked_qty_milli（开单冻结）
+    checked_qty_milli   BIGINT       NOT NULL DEFAULT 0,
+    version             INT          NOT NULL DEFAULT 0,
+    CONSTRAINT uq_chkl_line UNIQUE (check_id, line_no),
+    CONSTRAINT uq_chkl_obl UNIQUE (check_id, outbound_line_id),
+    CONSTRAINT ck_chkl_qty CHECK (expected_qty_milli >= 0 AND checked_qty_milli >= 0 AND checked_qty_milli <= expected_qty_milli
+                                  AND expected_qty_milli = CAST(expected_qty_milli AS BIGINT) AND checked_qty_milli = CAST(checked_qty_milli AS BIGINT))
+);
+-- 复核行只在复核单 OPEN 时可写；不可删；身份列不可改
+CREATE FUNCTION trg_chkl_guard() RETURNS trigger LANGUAGE plpgsql AS $$                                   -- @pg-only
+BEGIN                                                                                                      -- @pg-only
+    IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'check_immutable'; END IF;                                    -- @pg-only
+    IF TG_OP = 'UPDATE' AND (NEW.check_id <> OLD.check_id OR NEW.line_no <> OLD.line_no                    -- @pg-only
+       OR NEW.outbound_line_id <> OLD.outbound_line_id OR NEW.sku_id <> OLD.sku_id                         -- @pg-only
+       OR NEW.expected_qty_milli <> OLD.expected_qty_milli) THEN RAISE EXCEPTION 'check_immutable'; END IF; -- @pg-only
+    IF (SELECT status FROM check_record WHERE id = NEW.check_id) IS DISTINCT FROM 'OPEN'                   -- @pg-only
+    THEN RAISE EXCEPTION 'check_closed'; END IF;                                                           -- @pg-only
+    RETURN NEW;                                                                                            -- @pg-only
+END $$;                                                                                                    -- @pg-only
+CREATE TRIGGER trg_chkl_guard BEFORE INSERT OR UPDATE OR DELETE ON check_line FOR EACH ROW EXECUTE FUNCTION trg_chkl_guard();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_chkl_upd BEFORE UPDATE ON check_line
+-- @sqlite-only WHEN NEW.check_id <> OLD.check_id OR NEW.line_no <> OLD.line_no OR NEW.outbound_line_id <> OLD.outbound_line_id OR NEW.sku_id <> OLD.sku_id OR NEW.expected_qty_milli <> OLD.expected_qty_milli
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'check_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_chkl_closed_u BEFORE UPDATE ON check_line
+-- @sqlite-only WHEN COALESCE((SELECT status FROM check_record WHERE id = OLD.check_id), '') <> 'OPEN'
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'check_closed'); END;
+-- @sqlite-only CREATE TRIGGER trg_chkl_closed_i BEFORE INSERT ON check_line
+-- @sqlite-only WHEN COALESCE((SELECT status FROM check_record WHERE id = NEW.check_id), '') <> 'OPEN'
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'check_closed'); END;
+-- @sqlite-only CREATE TRIGGER trg_chkl_del BEFORE DELETE ON check_line BEGIN SELECT RAISE(ABORT, 'check_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_chkl_dup BEFORE INSERT ON check_line
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM check_line l WHERE l.id = NEW.id OR (l.check_id = NEW.check_id AND (l.line_no = NEW.line_no OR l.outbound_line_id = NEW.outbound_line_id)))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'check_duplicate'); END;
+
+-- 复核扫描操作：PDA 四元键 (check_id, line_no, device_instance_id, op_seq) 去重，与 docs/05 pick_op 同构
+-- 同键不同 (op_type, qty_milli, barcode) → 40910 key_type=PDA_OP；不入账（复核不动库存）
+CREATE TABLE check_op (
+    id                  BIGINT       PRIMARY KEY,
+    check_id            BIGINT       NOT NULL,
+    line_no             INT          NOT NULL,
+    device_instance_id  VARCHAR(64)  NOT NULL,
+    op_seq              BIGINT       NOT NULL,
+    op_type             VARCHAR(16)  NOT NULL,       -- SCAN/UNDO
+    barcode             VARCHAR(64)  NOT NULL,
+    qty_milli           BIGINT       NOT NULL,
+    scan_event_id       VARCHAR(64),                 -- 逐件模式
+    result_code         CHAR(5),                     -- NULL=成功；失败为 5 位错误码（42210/42214/…）
+    finished_at         TIMESTAMP,                   -- UTC；与 result_code 一起只写一次
+    created_at          TIMESTAMP    NOT NULL DEFAULT now(),
+    CONSTRAINT uq_check_op UNIQUE (check_id, line_no, device_instance_id, op_seq),
+    CONSTRAINT ck_check_op_type CHECK (op_type IN ('SCAN','UNDO')),
+    CONSTRAINT ck_check_op_qty CHECK (qty_milli > 0 AND qty_milli = CAST(qty_milli AS BIGINT)),
+    CONSTRAINT ck_check_op_result CHECK (result_code IS NULL OR (length(result_code) = 5 AND result_code BETWEEN '10000' AND '59999')),
+    CONSTRAINT ck_check_op_finish CHECK (finished_at IS NOT NULL OR result_code IS NULL)
+);
+CREATE UNIQUE INDEX uq_check_op_scan ON check_op(check_id, scan_event_id) WHERE scan_event_id IS NOT NULL;
+CREATE FUNCTION trg_check_op_guard() RETURNS trigger LANGUAGE plpgsql AS $$                               -- @pg-only
+BEGIN                                                                                                      -- @pg-only
+    IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'check_op_immutable'; END IF;                                 -- @pg-only
+    IF OLD.finished_at IS NOT NULL                                                                         -- @pg-only
+       OR NEW.check_id <> OLD.check_id OR NEW.line_no <> OLD.line_no OR NEW.device_instance_id <> OLD.device_instance_id  -- @pg-only
+       OR NEW.op_seq <> OLD.op_seq OR NEW.op_type <> OLD.op_type OR NEW.barcode <> OLD.barcode            -- @pg-only
+       OR NEW.qty_milli <> OLD.qty_milli OR NEW.scan_event_id IS DISTINCT FROM OLD.scan_event_id           -- @pg-only
+       OR NEW.created_at <> OLD.created_at                                                                 -- @pg-only
+    THEN RAISE EXCEPTION 'check_op_immutable'; END IF;                                                     -- @pg-only
+    RETURN NEW;                                                                                            -- @pg-only
+END $$;                                                                                                    -- @pg-only
+CREATE TRIGGER trg_check_op_guard BEFORE UPDATE OR DELETE ON check_op FOR EACH ROW EXECUTE FUNCTION trg_check_op_guard();  -- @pg-only
+CREATE TRIGGER trg_check_op_no_truncate BEFORE TRUNCATE ON check_op FOR EACH STATEMENT EXECUTE FUNCTION trg_append_only();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_check_op_upd BEFORE UPDATE ON check_op
+-- @sqlite-only WHEN OLD.finished_at IS NOT NULL OR NEW.check_id <> OLD.check_id OR NEW.line_no <> OLD.line_no OR NEW.device_instance_id <> OLD.device_instance_id OR NEW.op_seq <> OLD.op_seq OR NEW.op_type <> OLD.op_type OR NEW.barcode <> OLD.barcode OR NEW.qty_milli <> OLD.qty_milli OR NEW.scan_event_id IS NOT OLD.scan_event_id OR NEW.created_at <> OLD.created_at
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'check_op_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_check_op_del BEFORE DELETE ON check_op BEGIN SELECT RAISE(ABORT, 'check_op_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_check_op_dup BEFORE INSERT ON check_op
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM check_op o WHERE o.id = NEW.id OR (o.check_id = NEW.check_id AND o.line_no = NEW.line_no AND o.device_instance_id = NEW.device_instance_id AND o.op_seq = NEW.op_seq) OR (NEW.scan_event_id IS NOT NULL AND o.check_id = NEW.check_id AND o.scan_event_id = NEW.scan_event_id))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'check_op_duplicate'); END;
+
+GRANT SELECT, INSERT, UPDATE ON check_record, check_line TO wms_app;                     -- @pg-only
+GRANT SELECT, INSERT ON check_op TO wms_app;                         -- @pg-only
+GRANT UPDATE (result_code, finished_at) ON check_op TO wms_app;                          -- @pg-only
 
 CREATE TABLE shipment_order (
     shipment_id BIGINT NOT NULL,
