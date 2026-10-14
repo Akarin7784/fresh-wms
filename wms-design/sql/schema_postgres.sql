@@ -1212,3 +1212,303 @@ REVOKE ALL ON FUNCTION public.purge_expired() FROM PUBLIC;                      
 GRANT EXECUTE ON FUNCTION public.purge_expired() TO wms_cleaner;                       -- @pg-only
 GRANT SELECT, INSERT ON audit_log, stock_snapshot_daily TO wms_app;                    -- 只追加 -- @pg-only
 GRANT SELECT ON v_stock_available TO wms_app;                                          -- @pg-only
+
+-- ============================================================
+-- docs/18 活鲜暂存（双数量：重量 *_qty_milli 走第 2 篇账；尾数 *_count 走本篇 live_count_ledger）
+-- 温度一律 *_c10（0.1 ℃ 整数，与 PR #8 温区口径一致）；时间存 UTC
+-- ============================================================
+-- SKU 活鲜参数（按 SKU）：称重容差、日死亡率阈值、日失重容差，单位 bp（万分之一）
+CREATE TABLE sku_live_param (
+    sku_id                  BIGINT   PRIMARY KEY,
+    weigh_tolerance_bp      INT      NOT NULL DEFAULT 300,   -- PM 2：默认 3%
+    death_rate_threshold_bp INT      NOT NULL DEFAULT 500,   -- PM 3：默认 5%（池日死亡率）
+    shrink_tolerance_bp     INT      NOT NULL DEFAULT 100,   -- PM 7：每日失重容差；默认值待定（§12）
+    version                 INT      NOT NULL DEFAULT 0,
+    updated_by              BIGINT,
+    updated_at              TIMESTAMP NOT NULL DEFAULT now(),
+    CONSTRAINT ck_slp_bp CHECK (weigh_tolerance_bp BETWEEN 0 AND 10000 AND death_rate_threshold_bp BETWEEN 0 AND 10000 AND shrink_tolerance_bp BETWEEN 0 AND 10000)
+);
+CREATE FUNCTION trg_slp_guard() RETURNS trigger LANGUAGE plpgsql AS $$  -- @pg-only
+BEGIN                                                                                     -- @pg-only
+    IF TG_OP = 'DELETE' OR (NEW.sku_id <> OLD.sku_id) THEN RAISE EXCEPTION 'slp_immutable'; END IF;  -- @pg-only
+    RETURN NEW;                                                                           -- @pg-only
+END $$;                                                                                   -- @pg-only
+CREATE TRIGGER trg_slp_guard BEFORE UPDATE OR DELETE ON sku_live_param FOR EACH ROW EXECUTE FUNCTION trg_slp_guard();  -- @pg-only
+CREATE TRIGGER trg_slp_no_truncate BEFORE TRUNCATE ON sku_live_param FOR EACH STATEMENT EXECUTE FUNCTION trg_append_only();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_slp_upd BEFORE UPDATE ON sku_live_param WHEN NEW.sku_id <> OLD.sku_id BEGIN SELECT RAISE(ABORT, 'slp_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_slp_del BEFORE DELETE ON sku_live_param BEGIN SELECT RAISE(ABORT, 'slp_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_slp_dup BEFORE INSERT ON sku_live_param
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM sku_live_param x WHERE x.sku_id = NEW.sku_id)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'slp_duplicate'); END;
+
+-- 暂养池扩展（PM 5）：库位 location_type='LIVE_TANK' 的 1:1 扩展；一池一 SKU，可多批次
+CREATE TABLE live_tank (
+    location_id             BIGINT   PRIMARY KEY,           -- = location.id（location_type='LIVE_TANK'，应用层校验）
+    warehouse_id            BIGINT   NOT NULL,
+    sku_id                  BIGINT   NOT NULL,              -- 一池一 SKU
+    water_volume_l          BIGINT   NOT NULL,              -- 水体积（升）
+    temp_controlled         BOOLEAN  NOT NULL DEFAULT true,
+    temp_min_c10            INT      NOT NULL,              -- 告警下限（0.1 ℃）
+    temp_max_c10            INT      NOT NULL,              -- 告警上限
+    temp_severe_min_c10     INT      NOT NULL,              -- 严重下限：一次即锁池
+    temp_severe_max_c10     INT      NOT NULL,              -- 严重上限
+    do_min_x100             INT      NOT NULL,              -- 溶解氧告警下限（mg/L ×100）
+    do_severe_min_x100      INT      NOT NULL,
+    ph_min_x100             INT      NOT NULL,
+    ph_max_x100             INT      NOT NULL,
+    inspect_interval_min    INT      NOT NULL DEFAULT 120,  -- 巡检频率（分钟）
+    status                  VARCHAR(16) NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE/DISABLED（锁池走 live_tank_hold，不在这里）
+    version                 INT      NOT NULL DEFAULT 0,
+    updated_at              TIMESTAMP NOT NULL DEFAULT now(),
+    CONSTRAINT ck_lt_status CHECK (status IN ('ACTIVE','DISABLED')),
+    CONSTRAINT ck_lt_volume CHECK (water_volume_l > 0),
+    CONSTRAINT ck_lt_temp CHECK (temp_severe_min_c10 <= temp_min_c10 AND temp_min_c10 < temp_max_c10 AND temp_max_c10 <= temp_severe_max_c10),
+    CONSTRAINT ck_lt_do CHECK (do_severe_min_x100 >= 0 AND do_severe_min_x100 <= do_min_x100),
+    CONSTRAINT ck_lt_ph CHECK (ph_min_x100 >= 0 AND ph_min_x100 < ph_max_x100 AND ph_max_x100 <= 1400),
+    CONSTRAINT ck_lt_interval CHECK (inspect_interval_min BETWEEN 10 AND 1440)
+);
+CREATE FUNCTION trg_lt_guard() RETURNS trigger LANGUAGE plpgsql AS $$  -- @pg-only
+BEGIN                                                                                     -- @pg-only
+    IF TG_OP = 'DELETE' OR (NEW.location_id <> OLD.location_id OR NEW.warehouse_id <> OLD.warehouse_id OR NEW.sku_id <> OLD.sku_id) THEN RAISE EXCEPTION 'lt_immutable'; END IF;  -- @pg-only
+    RETURN NEW;                                                                           -- @pg-only
+END $$;                                                                                   -- @pg-only
+CREATE TRIGGER trg_lt_guard BEFORE UPDATE OR DELETE ON live_tank FOR EACH ROW EXECUTE FUNCTION trg_lt_guard();  -- @pg-only
+CREATE TRIGGER trg_lt_no_truncate BEFORE TRUNCATE ON live_tank FOR EACH STATEMENT EXECUTE FUNCTION trg_append_only();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_lt_upd BEFORE UPDATE ON live_tank WHEN NEW.location_id <> OLD.location_id OR NEW.warehouse_id <> OLD.warehouse_id OR NEW.sku_id <> OLD.sku_id BEGIN SELECT RAISE(ABORT, 'lt_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_lt_del BEFORE DELETE ON live_tank BEGIN SELECT RAISE(ABORT, 'lt_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_lt_dup BEFORE INSERT ON live_tank
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM live_tank x WHERE x.location_id = NEW.location_id)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'lt_duplicate'); END;
+
+-- 尾数余额（PM 1）：与 stock 行 1:1；重量仍在 stock.on_hand_qty_milli（第 2 篇），这里只存只数
+-- count > 0 ⇒ 对应 stock 重量 > 0（触发器；第 2 篇改重量时由巡检 LIVE_COUNT_WEIGHT 兜底）
+CREATE TABLE live_stock_count (
+    stock_id        BIGINT   PRIMARY KEY,
+    location_id     BIGINT   NOT NULL,
+    lot_id          BIGINT   NOT NULL,
+    on_hand_count   BIGINT   NOT NULL DEFAULT 0,
+    version         INT      NOT NULL DEFAULT 0,
+    updated_at      TIMESTAMP NOT NULL DEFAULT now(),
+    CONSTRAINT ck_lsc_count CHECK (on_hand_count >= 0)
+);
+CREATE FUNCTION trg_lsc_guard() RETURNS trigger LANGUAGE plpgsql AS $$                     -- @pg-only
+BEGIN                                                                                       -- @pg-only
+    IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'lsc_immutable'; END IF;                       -- @pg-only
+    IF TG_OP = 'UPDATE' AND (NEW.stock_id <> OLD.stock_id OR NEW.location_id <> OLD.location_id OR NEW.lot_id <> OLD.lot_id)  -- @pg-only
+    THEN RAISE EXCEPTION 'lsc_immutable'; END IF;                                           -- @pg-only
+    IF NEW.on_hand_count > 0 AND COALESCE((SELECT on_hand_qty_milli FROM stock WHERE id = NEW.stock_id), 0) <= 0  -- @pg-only
+    THEN RAISE EXCEPTION 'live_count_without_weight'; END IF;                               -- @pg-only
+    RETURN NEW;                                                                             -- @pg-only
+END $$;                                                                                     -- @pg-only
+CREATE TRIGGER trg_lsc_guard BEFORE INSERT OR UPDATE OR DELETE ON live_stock_count FOR EACH ROW EXECUTE FUNCTION trg_lsc_guard();  -- @pg-only
+CREATE TRIGGER trg_lsc_no_truncate BEFORE TRUNCATE ON live_stock_count FOR EACH STATEMENT EXECUTE FUNCTION trg_append_only();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_lsc_upd BEFORE UPDATE ON live_stock_count WHEN NEW.stock_id <> OLD.stock_id OR NEW.location_id <> OLD.location_id OR NEW.lot_id <> OLD.lot_id BEGIN SELECT RAISE(ABORT, 'lsc_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_lsc_del BEFORE DELETE ON live_stock_count BEGIN SELECT RAISE(ABORT, 'lsc_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_lsc_dup BEFORE INSERT ON live_stock_count WHEN EXISTS (SELECT 1 FROM live_stock_count x WHERE x.stock_id = NEW.stock_id) BEGIN SELECT RAISE(ABORT, 'lsc_duplicate'); END;
+-- @sqlite-only CREATE TRIGGER trg_lsc_w_ins BEFORE INSERT ON live_stock_count WHEN NEW.on_hand_count > 0 AND COALESCE((SELECT on_hand_qty_milli FROM stock WHERE id = NEW.stock_id), 0) <= 0 BEGIN SELECT RAISE(ABORT, 'live_count_without_weight'); END;
+-- @sqlite-only CREATE TRIGGER trg_lsc_w_upd BEFORE UPDATE ON live_stock_count WHEN NEW.on_hand_count > 0 AND COALESCE((SELECT on_hand_qty_milli FROM stock WHERE id = NEW.stock_id), 0) <= 0 BEGIN SELECT RAISE(ABORT, 'live_count_without_weight'); END;
+
+-- 尾数流水（只追加）：每笔只数变动一行，与第 2 篇重量流水 stock_movement 同事务、同 biz 键
+CREATE TABLE live_count_ledger (
+    id              BIGINT       PRIMARY KEY,
+    stock_id        BIGINT       NOT NULL,
+    biz_type        VARCHAR(16)  NOT NULL,   -- RECEIVE/WEIGH_OUT/DEATH/COUNT_ADJ/MOVE_IN/MOVE_OUT/PROCESS_OUT
+    biz_no          VARCHAR(64)  NOT NULL,
+    line_no         INT          NOT NULL DEFAULT 1,
+    delta_count     BIGINT       NOT NULL,
+    count_before    BIGINT       NOT NULL,
+    count_after     BIGINT       NOT NULL,
+    movement_id     BIGINT,                  -- 对应重量流水（第 2 篇 stock_movement）；纯只数盘点调整可空
+    created_at      TIMESTAMP    NOT NULL DEFAULT now(),
+    CONSTRAINT uq_lcl_biz UNIQUE (biz_type, biz_no, line_no, stock_id),
+    CONSTRAINT ck_lcl_type CHECK (biz_type IN ('RECEIVE','WEIGH_OUT','DEATH','COUNT_ADJ','MOVE_IN','MOVE_OUT','PROCESS_OUT')),
+    CONSTRAINT ck_lcl_math CHECK (delta_count <> 0 AND count_before >= 0 AND count_after >= 0 AND count_after = count_before + delta_count)
+);
+CREATE TRIGGER trg_lcl_append_only BEFORE UPDATE OR DELETE ON live_count_ledger FOR EACH ROW EXECUTE FUNCTION trg_append_only();  -- @pg-only
+CREATE TRIGGER trg_lcl_no_truncate BEFORE TRUNCATE ON live_count_ledger FOR EACH STATEMENT EXECUTE FUNCTION trg_append_only();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_lcl_upd BEFORE UPDATE ON live_count_ledger BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+-- @sqlite-only CREATE TRIGGER trg_lcl_del BEFORE DELETE ON live_count_ledger BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+-- @sqlite-only CREATE TRIGGER trg_lcl_dup BEFORE INSERT ON live_count_ledger
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM live_count_ledger x WHERE x.id = NEW.id OR (x.biz_type = NEW.biz_type AND x.biz_no = NEW.biz_no AND x.line_no = NEW.line_no AND x.stock_id = NEW.stock_id))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'lcl_duplicate'); END;
+
+-- 巡检记录（PM 4，只追加）：PDA 离线可录，键 (device_instance_id, client_op_id)
+CREATE TABLE live_inspection (
+    id                  BIGINT       PRIMARY KEY,
+    warehouse_id        BIGINT       NOT NULL,
+    location_id         BIGINT       NOT NULL,
+    device_instance_id  VARCHAR(64)  NOT NULL,
+    client_op_id        VARCHAR(64)  NOT NULL,
+    inspector_id        BIGINT       NOT NULL,
+    inspected_at        TIMESTAMP    NOT NULL,    -- 现场时间（UTC）
+    temp_c10            INT          NOT NULL,
+    do_x100             INT          NOT NULL,
+    ph_x100             INT          NOT NULL,
+    result              VARCHAR(8)   NOT NULL,    -- NORMAL/ALARM/SEVERE（服务端按 live_tank 阈值判定，不信客户端）
+    consecutive_breach  INT          NOT NULL DEFAULT 0,  -- 含本次的连续超标次数（NORMAL 为 0）
+    is_recheck          BOOLEAN      NOT NULL DEFAULT false,  -- 锁池后的复检
+    created_at          TIMESTAMP    NOT NULL DEFAULT now(),
+    CONSTRAINT uq_li_op UNIQUE (device_instance_id, client_op_id),
+    CONSTRAINT ck_li_result CHECK (result IN ('NORMAL','ALARM','SEVERE')),
+    CONSTRAINT ck_li_breach CHECK ((result = 'NORMAL' AND consecutive_breach = 0) OR (result <> 'NORMAL' AND consecutive_breach >= 1)),
+    CONSTRAINT ck_li_range CHECK (do_x100 >= 0 AND ph_x100 BETWEEN 0 AND 1400)
+);
+CREATE INDEX ix_li_tank ON live_inspection(location_id, inspected_at);
+CREATE TRIGGER trg_li_append_only BEFORE UPDATE OR DELETE ON live_inspection FOR EACH ROW EXECUTE FUNCTION trg_append_only();  -- @pg-only
+CREATE TRIGGER trg_li_no_truncate BEFORE TRUNCATE ON live_inspection FOR EACH STATEMENT EXECUTE FUNCTION trg_append_only();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_li_upd BEFORE UPDATE ON live_inspection BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+-- @sqlite-only CREATE TRIGGER trg_li_del BEFORE DELETE ON live_inspection BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+-- @sqlite-only CREATE TRIGGER trg_li_dup BEFORE INSERT ON live_inspection
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM live_inspection x WHERE x.id = NEW.id OR (x.device_instance_id = NEW.device_instance_id AND x.client_op_id = NEW.client_op_id))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'li_duplicate'); END;
+
+-- 池级锁（PM 4）：2 次连续超标或 1 次严重 → ACTIVE；复检合格 → RELEASED（系统释放）。
+-- 同一池同时至多一条 ACTIVE；状态单向；对应每个 stock 行的第 2 篇 stock_hold(hold_type=LIVE_HOLD, source_type=LIVE_TANK_HOLD, source_id=本表 id)
+CREATE TABLE live_tank_hold (
+    id                      BIGINT       PRIMARY KEY,
+    warehouse_id            BIGINT       NOT NULL,
+    location_id             BIGINT       NOT NULL,
+    reason                  VARCHAR(24)  NOT NULL,    -- CONSECUTIVE_BREACH/SEVERE
+    trigger_inspection_id   BIGINT       NOT NULL,
+    status                  VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE/RELEASED
+    release_inspection_id   BIGINT,
+    released_at             TIMESTAMP,
+    created_at              TIMESTAMP    NOT NULL DEFAULT now(),
+    CONSTRAINT ck_lth_reason CHECK (reason IN ('CONSECUTIVE_BREACH','SEVERE')),
+    CONSTRAINT ck_lth_status CHECK (status IN ('ACTIVE','RELEASED')),
+    CONSTRAINT ck_lth_release CHECK ((status = 'ACTIVE' AND release_inspection_id IS NULL AND released_at IS NULL)
+                                  OR (status = 'RELEASED' AND release_inspection_id IS NOT NULL AND released_at IS NOT NULL))
+);
+CREATE UNIQUE INDEX uq_lth_active ON live_tank_hold(location_id) WHERE status = 'ACTIVE';
+CREATE FUNCTION trg_lth_guard() RETURNS trigger LANGUAGE plpgsql AS $$                     -- @pg-only
+BEGIN                                                                                       -- @pg-only
+    IF TG_OP = 'INSERT' THEN                                                                -- @pg-only
+        IF NEW.status <> 'ACTIVE' THEN RAISE EXCEPTION 'lth_state'; END IF; RETURN NEW;    -- @pg-only
+    END IF;                                                                                 -- @pg-only
+    IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'lth_immutable'; END IF;                       -- @pg-only
+    IF OLD.status <> 'ACTIVE' THEN RAISE EXCEPTION 'lth_closed'; END IF;                    -- @pg-only
+    IF NEW.location_id <> OLD.location_id OR NEW.reason <> OLD.reason OR NEW.trigger_inspection_id <> OLD.trigger_inspection_id  -- @pg-only
+       OR NEW.warehouse_id <> OLD.warehouse_id OR NEW.created_at <> OLD.created_at THEN RAISE EXCEPTION 'lth_immutable'; END IF;  -- @pg-only
+    IF NEW.status = 'RELEASED' AND NOT EXISTS (SELECT 1 FROM live_inspection i WHERE i.id = NEW.release_inspection_id  -- @pg-only
+       AND i.location_id = NEW.location_id AND i.is_recheck AND i.result = 'NORMAL') THEN RAISE EXCEPTION 'lth_recheck_required'; END IF;  -- @pg-only
+    RETURN NEW;                                                                             -- @pg-only
+END $$;                                                                                     -- @pg-only
+CREATE TRIGGER trg_lth_guard BEFORE INSERT OR UPDATE OR DELETE ON live_tank_hold FOR EACH ROW EXECUTE FUNCTION trg_lth_guard();  -- @pg-only
+CREATE TRIGGER trg_lth_no_truncate BEFORE TRUNCATE ON live_tank_hold FOR EACH STATEMENT EXECUTE FUNCTION trg_append_only();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_lth_ins BEFORE INSERT ON live_tank_hold WHEN NEW.status <> 'ACTIVE' BEGIN SELECT RAISE(ABORT, 'lth_state'); END;
+-- @sqlite-only CREATE TRIGGER trg_lth_closed BEFORE UPDATE ON live_tank_hold WHEN OLD.status <> 'ACTIVE' BEGIN SELECT RAISE(ABORT, 'lth_closed'); END;
+-- @sqlite-only CREATE TRIGGER trg_lth_upd BEFORE UPDATE ON live_tank_hold WHEN OLD.status = 'ACTIVE' AND (NEW.location_id <> OLD.location_id OR NEW.reason <> OLD.reason OR NEW.trigger_inspection_id <> OLD.trigger_inspection_id OR NEW.warehouse_id <> OLD.warehouse_id OR NEW.created_at <> OLD.created_at) BEGIN SELECT RAISE(ABORT, 'lth_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_lth_rel BEFORE UPDATE OF status ON live_tank_hold WHEN OLD.status = 'ACTIVE' AND NEW.status = 'RELEASED' AND NOT EXISTS (SELECT 1 FROM live_inspection i WHERE i.id = NEW.release_inspection_id AND i.location_id = NEW.location_id AND i.is_recheck AND i.result = 'NORMAL') BEGIN SELECT RAISE(ABORT, 'lth_recheck_required'); END;
+-- @sqlite-only CREATE TRIGGER trg_lth_del BEFORE DELETE ON live_tank_hold BEGIN SELECT RAISE(ABORT, 'lth_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_lth_dup BEFORE INSERT ON live_tank_hold WHEN EXISTS (SELECT 1 FROM live_tank_hold x WHERE x.id = NEW.id OR (x.location_id = NEW.location_id AND x.status = 'ACTIVE')) BEGIN SELECT RAISE(ABORT, 'lth_duplicate'); END;
+
+-- 出池称重（PM 1/2，只追加）：键 (task_id, weigh_client_id)（§12 待定）；存毛重、皮重、净重；净重 = 毛 − 皮
+-- 超容差 → result=REJECTED, result_code='42217'，不入账；ACCEPTED 才扣重量（实际净重）和只数（实际只数）
+CREATE TABLE live_weigh (
+    id                  BIGINT       PRIMARY KEY,
+    warehouse_id        BIGINT       NOT NULL,
+    task_id             BIGINT       NOT NULL,       -- 第 5 篇 pick_task.id
+    line_no             INT          NOT NULL,
+    weigh_client_id     VARCHAR(64)  NOT NULL,       -- 客户端每次称重生成（UUID）
+    device_instance_id  VARCHAR(64)  NOT NULL,
+    scale_id            VARCHAR(64),                 -- 蓝牙秤/台秤编号；手输为空
+    reading_source      VARCHAR(8)   NOT NULL,       -- SCALE/MANUAL
+    location_id         BIGINT       NOT NULL,
+    stock_id            BIGINT       NOT NULL,
+    sku_id              BIGINT       NOT NULL,
+    lot_id              BIGINT       NOT NULL,
+    gross_qty_milli     BIGINT       NOT NULL,
+    tare_qty_milli      BIGINT       NOT NULL,
+    net_qty_milli       BIGINT       NOT NULL,
+    qty_count           BIGINT       NOT NULL,
+    planned_qty_milli   BIGINT       NOT NULL,
+    deviation_bp        INT          NOT NULL,       -- |net − planned| / planned × 10000（向上取整）
+    result              VARCHAR(8)   NOT NULL,       -- ACCEPTED/REJECTED
+    result_code         CHAR(5),
+    movement_id         BIGINT,                      -- ACCEPTED 的重量流水
+    weighed_by          BIGINT       NOT NULL,
+    weighed_at          TIMESTAMP    NOT NULL,       -- UTC
+    created_at          TIMESTAMP    NOT NULL DEFAULT now(),
+    CONSTRAINT uq_lw_key UNIQUE (task_id, weigh_client_id),
+    CONSTRAINT ck_lw_src CHECK (reading_source IN ('SCALE','MANUAL') AND (reading_source = 'MANUAL' OR scale_id IS NOT NULL)),
+    CONSTRAINT ck_lw_qty CHECK (gross_qty_milli >= 0 AND tare_qty_milli >= 0 AND net_qty_milli >= 0 AND qty_count >= 0
+                                AND net_qty_milli = gross_qty_milli - tare_qty_milli AND planned_qty_milli > 0 AND deviation_bp >= 0),
+    CONSTRAINT ck_lw_dual CHECK (qty_count = 0 OR net_qty_milli > 0),
+    CONSTRAINT ck_lw_result CHECK ((result = 'ACCEPTED' AND result_code IS NULL AND movement_id IS NOT NULL)
+                                OR (result = 'REJECTED' AND result_code IS NOT NULL AND movement_id IS NULL))
+);
+CREATE TRIGGER trg_lw_append_only BEFORE UPDATE OR DELETE ON live_weigh FOR EACH ROW EXECUTE FUNCTION trg_append_only();  -- @pg-only
+CREATE TRIGGER trg_lw_no_truncate BEFORE TRUNCATE ON live_weigh FOR EACH STATEMENT EXECUTE FUNCTION trg_append_only();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_lw_upd BEFORE UPDATE ON live_weigh BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+-- @sqlite-only CREATE TRIGGER trg_lw_del BEFORE DELETE ON live_weigh BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+-- @sqlite-only CREATE TRIGGER trg_lw_dup BEFORE INSERT ON live_weigh
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM live_weigh x WHERE x.id = NEW.id OR (x.task_id = NEW.task_id AND x.weigh_client_id = NEW.weigh_client_id))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'lw_duplicate'); END;
+
+-- 死亡登记（PM 3，只追加）：同时扣重量和只数；生成第 9 篇报损单 source_type=LIVE_DEATH（uq_scr_source 去重）
+-- 当日该池死亡率超 SKU 阈值时必须带 LIVE_DEATH_OVER 审批单号（应用层判定，库层只校验格式）；LIVE_HOLD 期间允许
+CREATE TABLE live_death (
+    id                  BIGINT       PRIMARY KEY,
+    warehouse_id        BIGINT       NOT NULL,
+    location_id         BIGINT       NOT NULL,
+    stock_id            BIGINT       NOT NULL,
+    lot_id              BIGINT       NOT NULL,
+    work_date           DATE         NOT NULL,
+    device_instance_id  VARCHAR(64)  NOT NULL,
+    client_op_id        VARCHAR(64)  NOT NULL,
+    death_count         BIGINT       NOT NULL,
+    death_qty_milli     BIGINT       NOT NULL,
+    day_rate_bp         INT          NOT NULL,       -- 含本次的池当日死亡率（只数口径）
+    approval_no         VARCHAR(64),                 -- 超阈值时必填，APR-{仓库编码}-{yyyyMMdd}-{6 位}
+    scrap_order_id      BIGINT,
+    reported_by         BIGINT       NOT NULL,
+    reported_at         TIMESTAMP    NOT NULL,
+    created_at          TIMESTAMP    NOT NULL DEFAULT now(),
+    CONSTRAINT uq_ld_op UNIQUE (device_instance_id, client_op_id),
+    CONSTRAINT ck_ld_qty CHECK (death_count > 0 AND death_qty_milli > 0 AND day_rate_bp BETWEEN 0 AND 10000),
+    CONSTRAINT ck_ld_apr CHECK (approval_no IS NULL OR (approval_no LIKE 'APR-%' AND length(approval_no) BETWEEN 22 AND 36))
+);
+CREATE TRIGGER trg_ld_append_only BEFORE UPDATE OR DELETE ON live_death FOR EACH ROW EXECUTE FUNCTION trg_append_only();  -- @pg-only
+CREATE TRIGGER trg_ld_no_truncate BEFORE TRUNCATE ON live_death FOR EACH STATEMENT EXECUTE FUNCTION trg_append_only();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_ld_upd BEFORE UPDATE ON live_death BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+-- @sqlite-only CREATE TRIGGER trg_ld_del BEFORE DELETE ON live_death BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+-- @sqlite-only CREATE TRIGGER trg_ld_dup BEFORE INSERT ON live_death
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM live_death x WHERE x.id = NEW.id OR (x.device_instance_id = NEW.device_instance_id AND x.client_op_id = NEW.client_op_id))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'ld_duplicate'); END;
+
+-- 日失重结算（PM 7，只追加，权威库上的日终作业，§12 待定）：键 (location_id, lot_id, work_date)
+-- 容差内 → 第 9 篇 LIVE_SHRINK 损耗单（uq_scr_source 3 列去重，source_id=本表 id，source_date=work_date）；超容差 → 第 8 篇盘点差异
+CREATE TABLE live_shrink_settlement (
+    id                  BIGINT       PRIMARY KEY,
+    warehouse_id        BIGINT       NOT NULL,
+    location_id         BIGINT       NOT NULL,
+    lot_id              BIGINT       NOT NULL,
+    stock_id            BIGINT       NOT NULL,
+    work_date           DATE         NOT NULL,
+    book_qty_milli      BIGINT       NOT NULL,       -- 结算前账面重量
+    measured_qty_milli  BIGINT       NOT NULL,       -- 抽称推算重量
+    shrink_qty_milli    BIGINT       NOT NULL,       -- = book − measured（只计重量，不动只数）
+    shrink_bp           INT          NOT NULL,
+    tolerance_bp        INT          NOT NULL,       -- 结算时的 SKU shrink_tolerance_bp 快照
+    outcome             VARCHAR(16)  NOT NULL,       -- LOSS/VARIANCE/NONE
+    scrap_order_id      BIGINT,
+    count_order_id      BIGINT,
+    created_at          TIMESTAMP    NOT NULL DEFAULT now(),
+    CONSTRAINT uq_lss_day UNIQUE (location_id, lot_id, work_date),
+    CONSTRAINT ck_lss_qty CHECK (book_qty_milli >= 0 AND measured_qty_milli >= 0 AND shrink_qty_milli = book_qty_milli - measured_qty_milli AND shrink_bp >= 0 AND tolerance_bp BETWEEN 0 AND 10000),
+    CONSTRAINT ck_lss_outcome CHECK ((outcome = 'NONE' AND shrink_qty_milli <= 0 AND scrap_order_id IS NULL AND count_order_id IS NULL)
+                                  OR (outcome = 'LOSS' AND shrink_qty_milli > 0 AND shrink_bp <= tolerance_bp AND scrap_order_id IS NOT NULL AND count_order_id IS NULL)
+                                  OR (outcome = 'VARIANCE' AND shrink_qty_milli > 0 AND shrink_bp > tolerance_bp AND count_order_id IS NOT NULL AND scrap_order_id IS NULL))
+);
+CREATE TRIGGER trg_lss_append_only BEFORE UPDATE OR DELETE ON live_shrink_settlement FOR EACH ROW EXECUTE FUNCTION trg_append_only();  -- @pg-only
+CREATE TRIGGER trg_lss_no_truncate BEFORE TRUNCATE ON live_shrink_settlement FOR EACH STATEMENT EXECUTE FUNCTION trg_append_only();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_lss_upd BEFORE UPDATE ON live_shrink_settlement BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+-- @sqlite-only CREATE TRIGGER trg_lss_del BEFORE DELETE ON live_shrink_settlement BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+-- @sqlite-only CREATE TRIGGER trg_lss_dup BEFORE INSERT ON live_shrink_settlement
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM live_shrink_settlement x WHERE x.id = NEW.id OR (x.location_id = NEW.location_id AND x.lot_id = NEW.lot_id AND x.work_date = NEW.work_date))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'lss_duplicate'); END;
+
+GRANT SELECT, INSERT, UPDATE ON sku_live_param, live_tank, live_stock_count TO wms_app;             -- @pg-only
+GRANT SELECT, INSERT ON live_count_ledger, live_inspection, live_weigh, live_death, live_shrink_settlement TO wms_app;  -- 只追加 -- @pg-only
+GRANT SELECT, INSERT ON live_tank_hold TO wms_app;                                                  -- @pg-only
+GRANT UPDATE (status, release_inspection_id, released_at) ON live_tank_hold TO wms_app;            -- 只允许系统释放 -- @pg-only
