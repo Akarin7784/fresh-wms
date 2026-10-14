@@ -298,8 +298,8 @@ stateDiagram-v2
 - **每个写请求带 `X-Write-Epoch`**（缓存的 epoch）。
 - **旧写节点拒写（`STALE_WRITE_NODE`）**：暂停 outbox → 重新取 write-endpoint → 按 `local_seq` 顺序**原样**重提交（原 `Idempotency-Key`、`device_instance_id`、`op_seq` 不变）；条目保持 `pending`，**不标红**，顶栏提示「系统切换中」。
   - 码值：**`50303 STALE_WRITE_NODE`**（总体设计 §6.4）。
-  - `50302 ID_CLOCK_BACKWARD`（发号时钟回拨）**不触发**重取地址：按普通 503 处理，条目保持 `pending` 退避重试，不标红。注意 00 @8a66782 的码表把 `50302` 同时登记为 `STALE_STOCK_PAUSED` 与 `ID_CLOCK_BACKWARD`（冲突，见 Q34）；在 00 修正前前端按 `detail.action` 区分：带 `detail.action`（`paused_actions` 枚举值）→ 暂停（§9.10），不带 → 时钟回拨。
-- 收到 `50301 DEPENDENCY_UNAVAILABLE`（00 §6.4 @8a66782：**只表示写库不可用**）或发现 `epoch` 变化时，重取 `write-endpoint` 后按原幂等键重提交。暂停不再使用 `50301`，见 §9.10。
+  - `50302 ID_CLOCK_BACKWARD`（发号时钟回拨）**不触发**重取地址：按普通 503 处理，条目保持 `pending` 退避重试，不标红。注意 00 @6420d3e 的码表把 `50302` 同时登记为 `STALE_STOCK_PAUSED` 与 `ID_CLOCK_BACKWARD`（冲突，见 Q34）；在 00 修正前前端按 `detail.action` 区分：带 `detail.action`（`paused_actions` 枚举值）→ 暂停（§9.10），不带 → 时钟回拨。
+- 收到 `50301 DEPENDENCY_UNAVAILABLE`（00 §6.4 @6420d3e：**只表示写库不可用**）或发现 `epoch` 变化时，重取 `write-endpoint` 后按原幂等键重提交。暂停不再使用 `50301`，见 §9.10。
 - **继承**：幂等记录、四元组唯一键约束、待回库记录随权威库迁移，新写节点直接继承；切换完成前旧节点只读。切换前已成功的操作重提交得到重放结果，不重复扣减。
 - **非计划切换（边缘硬件故障）**：从备份恢复到备用机，RPO 窗口内的写入可能丢失；PDA 只需重取地址，然后 outbox 按原业务键重提交补数，幂等保证不重复入账。恢复后的节点可能使用**新的节点号**，对 PDA 无影响（除重取地址外）。对账（动碰盘点）完成前若服务端暂不开放作业，写请求按 503 处理，条目保持 `pending`。
 - 任务包里的任务版本以新库为准；版本变化按 §9.4 处理。
@@ -322,7 +322,7 @@ stateDiagram-v2
 - 监听 `online`/`offline` + 每 15s 轻量探测（事件在 PDA 上不可靠）。
 - 重连后先刷新 token 与任务版本，再上传 outbox；任务版本变化按 §9.4 处理。
 - 离线超过 2 小时：提示「任务可能已被回收」，仍补交，由服务端裁决。
-- **对齐第 11 篇 §6.7（#6 @5472b9c）与 00 §6.6.2**：离线超过 12 小时后，服务端在 `paused_actions` 中下发 `PICK_CONFIRM / CHECK / SHIP / RECEIVE / POD`，并在补交时拒绝这些操作；**PDA 不设本地 12h 计时禁用**，置灰只看最近一次收到的 `paused_actions`。设备全程断网收不到更新时，仍照常记录进 outbox（不丢现场数据），联网补交后被拒的条目转红条交主管，不静默丢弃（若 00 后续要求本地停止记录，改为按 `paused_actions` 判断，见 Q35）。被暂停的操作返回 `503` `50302 STALE_STOCK_PAUSED`（§9.10）。重连顺序：先**重放** outbox，再由服务端**对账**，冲突进入异常队列，PDA 红条显示异常单号（若响应提供）。
+- **对齐第 11 篇 §6.7（#6 @5472b9c）与 00 §6.6.2**：离线超过 12 小时后，服务端在 `paused_actions` 中下发 `PICK_CONFIRM / CHECK / SHIP / RECEIVE / POD`，并在补交时拒绝这些操作；**PDA 不设本地 12h 计时禁用**，置灰只看最近一次收到的 `paused_actions`。设备全程断网收不到更新时，仍照常记录进 outbox（不丢现场数据），联网补交后被拒的条目转红条交主管，不静默丢弃（00 @6420d3e 未要求本地停止记录）。被暂停的操作返回 `503` `50302 STALE_STOCK_PAUSED`（§9.10）。重连顺序：先**重放** outbox，再由服务端**对账**，冲突进入异常队列，PDA 红条显示异常单号（若响应提供）。
 
 ### 9.9 复核与装箱（第 6 篇 #11 @820d4e8 + 大肥鱼裁定）
 - 开复核单、提交、装箱、封箱只能在线（需取冻结期望数）；复核扫码 / 撤销一扫可离线入 outbox（四元键去重）。
@@ -345,7 +345,7 @@ stateDiagram-v2
 ### 9.10 断网可用清单与剩余离线时间（Yuri 裁定）
 - 断网状态由 `GET /api/v1/me` 与 PDA 心跳返回：`{stale_policy: PAUSE|DEGRADE, paused, offline_since, offline_deadline_at, paused_actions: [ALLOCATE|TRANSFER|WAVE_RELEASE], backfill_deadline_at}`（00 §6.6.2；`offline_deadline_at` = `offline_since` + 12h）（`stale_policy` 默认 `PAUSE`）。**首页宫格与按钮按 `paused_actions[]` 置灰**，不在前端写死清单；离线期间沿用最后一次收到的值。下表仅为示例（按 Yuri 裁定的默认口径），以服务端返回为准：
 
-**`paused_actions` 枚举 → PDA 按钮**（00 §6.6.2 @8a66782，新增值须先登记到 00）：
+**`paused_actions` 枚举 → PDA 按钮**（00 §6.6.2 @6420d3e，新增值须先登记到 00）：
 
 | 枚举值 | 含义 | PDA 置灰 |
 |---|---|---|
@@ -358,7 +358,7 @@ stateDiagram-v2
 | `RECEIVE` | 收货 | 收货登记、盲收、预约收货 |
 | `POD` | 签收 | PDA 无此入口（司机端，第 15 篇） |
 
-未知枚举值：不映射任何按钮，记录日志上报。`PICK_CONFIRM / CHECK / SHIP / RECEIVE / POD` 按团队裁定写入，00 @8a66782 码表尚只登记前三个值，见 Q35。
+未知枚举值：不映射任何按钮，记录日志上报。八个值均已登记于 00 §6.6.2 @6420d3e：前三个在 PAUSE 期间下发，后五个在离线超过 12 小时后由服务端加入。
 
 | 功能 | 断网时 |
 |---|---|
@@ -371,7 +371,7 @@ stateDiagram-v2
 | 待回库确认 | 置灰（需在线校验状态） |
 
 - 置灰项点击提示「断网期间不可用，联网后操作」。
-- 被暂停的操作若仍提交，服务端返回 `503` `50302 STALE_STOCK_PAUSED`，`detail.action` ∈ `paused_actions`：提示「该仓暂停跨网点分配/移动」，**不自动重试、不重取写地址**；立即重拉 `GET /api/v1/me`，等 `/me` 或心跳返回 `paused=false`（或 `paused_actions` 不再含该动作）后按钮恢复，由用户重新操作（00 §6.4 @8a66782）。
+- 被暂停的操作若仍提交，服务端返回 `503` `50302 STALE_STOCK_PAUSED`，`detail.action` ∈ `paused_actions`：提示「该仓暂停跨网点分配/移动」，**不自动重试、不重取写地址**；立即重拉 `GET /api/v1/me`，等 `/me` 或心跳返回 `paused=false`（或 `paused_actions` 不再含该动作）后按钮恢复，由用户重新操作（00 §6.4 @6420d3e）。
 - **剩余离线时间**：顶栏倒计时，取 `offline_deadline_at`（UTC，按本地显示；= `offline_since` + 12h），前端不自行用 `offline_since` 推算；剩余 < 1 小时变红提醒。**倒计时只做显示，不自行禁用任何按钮**：置灰只由 `paused_actions` 驱动（见上表）。
 - 重连后按 §9.8 对账补交；补交冲突进入服务端异常队列，PDA 对应条目显示红条与异常单号（若响应提供）。
 
@@ -398,7 +398,7 @@ stateDiagram-v2
 - **库存状态**：`PROCESSING`、`LIVE_HOLD` 是系统锁定，不计可用量，PDA 无释放入口（00 PR #2 @9946e33）。
 - **双数量**：活鲜同时录入/显示重量 `qty_milli`（3 位小数字符串，入账与出库依据）与尾数 `qty_count`（整数）。死亡登记两者都扣；称重出库按实际重量与实际尾数扣。
 - **称重**：电子秤取重或手录；皮重由秤或 PDA「去皮」按钮录入；提交净重，毛重与皮重随请求留痕。超出 SKU `weigh_tolerance_bp`（默认 300 = 3%）返回 `422` `42217 WEIGH_OUT_OF_TOLERANCE` → 长鸣红条，不自动重试，提示复称。
-- **称重出库幂等（`LIVE_WEIGH`，00 §6.4 @8a66782）**：每次称重生成一次 `weigh_client_id`（UUID），与称重结果一起持久化到 outbox；超时、重连、重启后的重试都复用同一个，只有重新称一次才生成新值。业务键 `(task_id, weigh_client_id)`；同键不同重量返回 `409` `40910`，`detail.key_type=LIVE_WEIGH` → 红条「这次称重和之前提交的内容不一致」，不自动重试、不生成新键，交主管。
+- **称重出库幂等（`LIVE_WEIGH`，00 §6.4 @6420d3e）**：每次称重生成一次 `weigh_client_id`（UUID），与称重结果一起持久化到 outbox；超时、重连、重启后的重试都复用同一个，只有重新称一次才生成新值。业务键 `(task_id, weigh_client_id)`；同键不同重量返回 `409` `40910`，`detail.key_type=LIVE_WEIGH` → 红条「这次称重和之前提交的内容不一致」，不自动重试、不生成新键，交主管。
 - **死亡登记**：走第 9 篇报损（来源 `LIVE_DEATH`）；池位被 `LIVE_HOLD` 锁定时仍可登记。单池单日超阈值时服务端转 `LIVE_DEATH_OVER` 审批，PDA 显示「待审批」。
 - **巡检**：超限即告警长鸣；连续 2 次超限或严重超限后整池锁定 `LIVE_HOLD`，PDA 显示锁定且无解锁按钮，复检合格后自动解除；该池已分配未称重的出库会被重新分配，PDA 上对应称重任务消失或改派（按服务端返回）。
 - **加工**：领料按净量；成品入库后服务端校验 原料 = 成品 + 副产品 + 损耗；得率超界不拦截（转 `PROCESS_YIELD_DEVIATION` 审批），PDA 只提示。冲销超过已领净量 `42214 OVER_QTY` `reason=OVER_REVERSE`（按 §9.4 现有红条口径）；已发货成品不显示冲销。屠宰/分割属加工，原料可从池位领用（扫池位）。
@@ -453,5 +453,5 @@ stateDiagram-v2
 | Q31 | ~~双单位与称重~~ **已定**（00 @9946e33）：`qty_milli` + `qty_count`，`weigh_tolerance_bp` 默认 300、超差 `42217`，净重入账、毛重/皮重留痕；剩余：电子秤接入见 Q5 | 已关闭 |
 | Q32 | 巡检频率（是否 PDA 定时提醒）、指标字段与正常/严重阈值下发方式 | 第 18 篇 |
 | Q33 | ~~得率容差在 PDA~~ **已定**：不拦截，转 `PROCESS_YIELD_DEVIATION` 审批，PDA 只提示 | 已关闭 |
-| Q34 | 00 §6.4 @8a66782 把 `50302` 同时登记为 `STALE_STOCK_PAUSED` 与 `ID_CLOCK_BACKWARD`；需大肥鱼改一个码值。前端暂按 `detail.action` 区分 | 大肥鱼 / 00 |
-| Q35 | `paused_actions` 新值 `PICK_CONFIRM / CHECK / SHIP / RECEIVE / POD` 登记到 00 §6.6.2（@8a66782 仅三值）；全程断网的设备收不到 `paused_actions`，00 是否要求本地超过 12h 停止记录 outbox | 大肥鱼 / 00 |
+| Q34 | 00 §6.4 @6420d3e 把 `50302` 同时登记为 `STALE_STOCK_PAUSED` 与 `ID_CLOCK_BACKWARD`；需大肥鱼改一个码值。前端暂按 `detail.action` 区分 | 大肥鱼 / 00 |
+| Q35 | ~~`paused_actions` 新值~~ **已定**（00 §6.6.2 @6420d3e）：八值 `ALLOCATE / TRANSFER / WAVE_RELEASE / PICK_CONFIRM / CHECK / SHIP / RECEIVE / POD`；00 未要求本地停止记录 outbox，前端置灰只看 `paused_actions` | 已关闭 |
