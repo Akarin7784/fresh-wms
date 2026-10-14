@@ -377,7 +377,7 @@ R=$(psql -t -A -c "SELECT p.prosecdef::text || '/' || array_to_string(p.proconfi
 role_matrix() {  # $1 角色名（public 用小写）：列出有任一权限的对象，无则输出 NONE
   psql -t -A -c "SELECT COALESCE(string_agg(x, ' ' ORDER BY x), 'NONE') FROM (SELECT c.relname || ':' || concat_ws(',', CASE WHEN has_table_privilege('$1', c.oid, 'SELECT') THEN 'SELECT' END, CASE WHEN has_table_privilege('$1', c.oid, 'INSERT') THEN 'INSERT' END, CASE WHEN has_table_privilege('$1', c.oid, 'UPDATE') THEN 'UPDATE' END, CASE WHEN has_table_privilege('$1', c.oid, 'DELETE') THEN 'DELETE' END, CASE WHEN has_table_privilege('$1', c.oid, 'TRUNCATE') THEN 'TRUNCATE' END, CASE WHEN has_table_privilege('$1', c.oid, 'REFERENCES') THEN 'REFERENCES' END, CASE WHEN has_table_privilege('$1', c.oid, 'TRIGGER') THEN 'TRIGGER' END) AS x FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m') AND NOT c.relispartition) t WHERE x NOT LIKE '%:'"
 }
-for spec in "wms_cleaner|NONE" "wms_purge_owner|idempotency_record:SELECT,DELETE outbox_event:SELECT,DELETE" "public|NONE"; do
+for spec in "wms_cleaner|NONE" "wms_purge_owner|idempotency_record:SELECT,DELETE outbox_event:SELECT,DELETE upstream_push_log:SELECT,DELETE" "public|NONE"; do
   RL=${spec%%|*}; EXP=${spec#*|}; GOT=$(role_matrix "$RL")
   [ "$GOT" = "$EXP" ] && ok "S2 $RL 表权限矩阵 = $EXP" || bad "S2 $RL 表权限矩阵：期望 $EXP，实际 $GOT"
 done
