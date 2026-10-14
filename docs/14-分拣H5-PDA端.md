@@ -268,7 +268,7 @@ stateDiagram-v2
 - **取地址**：`GET /api/v1/warehouses/{warehouse_code}/write-endpoint` 返回 `{endpoint, epoch}`，**中心和边缘节点本地都提供**。PDA 缓存上次的 `endpoint` + `epoch`；取不到（断网、中心不可达）时**用缓存继续作业**，不阻塞。
 - **每个写请求带 `X-Write-Epoch`**（缓存的 epoch）。
 - **旧写节点拒写（`STALE_WRITE_NODE`）**：暂停 outbox → 重新取 write-endpoint → 按 `local_seq` 顺序**原样**重提交（原 `Idempotency-Key`、`device_instance_id`、`op_seq` 不变）；条目保持 `pending`，**不标红**，顶栏提示「系统切换中」。
-  - 码值：#2 §6.4 当前把 `50302` 同时给了 `STALE_WRITE_NODE` 和 `ID_CLOCK_BACKWARD`，冲突未解；本篇按小吴提议写 **`50303 STALE_WRITE_NODE`**，待 #2 定稿（Q16）。
+  - 码值：**`50303 STALE_WRITE_NODE`**（总体设计 §6.4）。
   - `50302 ID_CLOCK_BACKWARD`（发号时钟回拨）**不触发**重取地址：按普通 503 处理，条目保持 `pending` 退避重试，不标红。
 - 收到 `50301` 或发现 `epoch` 变化时，同样重取地址后按上述规则重提交。
 - **继承**：幂等记录、四元组唯一键约束、待回库记录随权威库迁移，新写节点直接继承；切换完成前旧节点只读。切换前已成功的操作重提交得到重放结果，不重复扣减。
@@ -310,4 +310,4 @@ stateDiagram-v2
 | Q13 | 键盘楔入去抖阈值的配置来源 | 第 1 篇字典 |
 | Q14 | ~~报损交接完成依据~~ **已定**：GET 详情 `handover_confirmed_at`/`_by` 非空，见 §9.4.2 | 已关闭 |
 | Q15 | ~~切换后继承与地址获取~~ **已定**：随库迁移继承；`write-endpoint` + `epoch`，见 §9.5 | 已关闭 |
-| Q16 | `STALE_WRITE_NODE` 码值：#2 §6.4 与 `ID_CLOCK_BACKWARD` 同为 `50302`，本篇暂用 `50303`（小吴提议） | #2 总体设计 §6.4 |
+| Q16 | ~~`STALE_WRITE_NODE` 码值~~ **已定**：`50303`，`50302` 仍为 `ID_CLOCK_BACKWARD`（00 §6.4 @8314830） | 已关闭 |
