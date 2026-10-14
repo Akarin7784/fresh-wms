@@ -298,7 +298,7 @@ stateDiagram-v2
 - **每个写请求带 `X-Write-Epoch`**（缓存的 epoch）。
 - **旧写节点拒写（`STALE_WRITE_NODE`）**：暂停 outbox → 重新取 write-endpoint → 按 `local_seq` 顺序**原样**重提交（原 `Idempotency-Key`、`device_instance_id`、`op_seq` 不变）；条目保持 `pending`，**不标红**，顶栏提示「系统切换中」。
   - 码值：**`50303 STALE_WRITE_NODE`**（总体设计 §6.4）。
-  - `50302 ID_CLOCK_BACKWARD`（发号时钟回拨）**不触发**重取地址：按普通 503 处理，条目保持 `pending` 退避重试，不标红。注意 00 @6420d3e 的码表把 `50302` 同时登记为 `STALE_STOCK_PAUSED` 与 `ID_CLOCK_BACKWARD`（冲突，见 Q34）；在 00 修正前前端按 `detail.action` 区分：带 `detail.action`（`paused_actions` 枚举值）→ 暂停（§9.10），不带 → 时钟回拨。
+  - `50302 ID_CLOCK_BACKWARD`（发号时钟回拨）**不触发**重取地址：按普通 503 处理，条目保持 `pending` 退避重试，不标红。（00 §6.4 @7dbd566：`50302` 只表示时钟回拨。）
 - 收到 `50301 DEPENDENCY_UNAVAILABLE`（00 §6.4 @6420d3e：**只表示写库不可用**）或发现 `epoch` 变化时，重取 `write-endpoint` 后按原幂等键重提交。暂停不再使用 `50301`，见 §9.10。
 - **继承**：幂等记录、四元组唯一键约束、待回库记录随权威库迁移，新写节点直接继承；切换完成前旧节点只读。切换前已成功的操作重提交得到重放结果，不重复扣减。
 - **非计划切换（边缘硬件故障）**：从备份恢复到备用机，RPO 窗口内的写入可能丢失；PDA 只需重取地址，然后 outbox 按原业务键重提交补数，幂等保证不重复入账。恢复后的节点可能使用**新的节点号**，对 PDA 无影响（除重取地址外）。对账（动碰盘点）完成前若服务端暂不开放作业，写请求按 503 处理，条目保持 `pending`。
@@ -322,7 +322,7 @@ stateDiagram-v2
 - 监听 `online`/`offline` + 每 15s 轻量探测（事件在 PDA 上不可靠）。
 - 重连后先刷新 token 与任务版本，再上传 outbox；任务版本变化按 §9.4 处理。
 - 离线超过 2 小时：提示「任务可能已被回收」，仍补交，由服务端裁决。
-- **对齐第 11 篇 §6.7（#6 @5472b9c）与 00 §6.6.2**：离线超过 12 小时后，服务端在 `paused_actions` 中下发 `PICK_CONFIRM / CHECK / SHIP / RECEIVE / POD`，并在补交时拒绝这些操作；**PDA 不设本地 12h 计时禁用**，置灰只看最近一次收到的 `paused_actions`。设备全程断网收不到更新时，仍照常记录进 outbox（不丢现场数据），联网补交后被拒的条目转红条交主管，不静默丢弃（00 @6420d3e 未要求本地停止记录）。被暂停的操作返回 `503` `50302 STALE_STOCK_PAUSED`（§9.10）。重连顺序：先**重放** outbox，再由服务端**对账**，冲突进入异常队列，PDA 红条显示异常单号（若响应提供）。
+- **对齐第 11 篇 §6.7（#6 @5472b9c）与 00 §6.6.2**：离线超过 12 小时后，服务端在 `paused_actions` 中下发 `PICK_CONFIRM / CHECK / SHIP / RECEIVE / POD`，并在补交时拒绝这些操作；**PDA 不设本地 12h 计时禁用**，置灰只看最近一次收到的 `paused_actions`。设备全程断网收不到更新时，仍照常记录进 outbox（不丢现场数据），联网补交后被拒的条目转红条交主管，不静默丢弃（00 @6420d3e 未要求本地停止记录）。被暂停的操作返回 `503` `50304 STALE_STOCK_PAUSED`（§9.10）。重连顺序：先**重放** outbox，再由服务端**对账**，冲突进入异常队列，PDA 红条显示异常单号（若响应提供）。
 
 ### 9.9 复核与装箱（第 6 篇 #11 @820d4e8 + 大肥鱼裁定）
 - 开复核单、提交、装箱、封箱只能在线（需取冻结期望数）；复核扫码 / 撤销一扫可离线入 outbox（四元键去重）。
@@ -340,7 +340,7 @@ stateDiagram-v2
 - 称重品显示与录入重量为整数克 `weight_g`，不带小数。
 - **箱状态**（第 6 篇 @f41be86）：`OPEN / SEALED / STAGED / SHIPPED / CANCELLED / VOIDED`；封箱后改明细、重量、封箱人 → `40937`；`SHIPPED / CANCELLED / VOIDED` 整行只读（服务端 `40930`）。
 - **车次与交接**：车次有箱或有单时不能取消；交接时服务端核对箱数 = 已集货（STAGED）箱数，不符拒绝；交接后装错车不可撤回，PDA 不提供撤回入口。
-- **箱作废**：封箱后丢失/损坏走 `box_void_request`（`POST /api/v1/pack/boxes/{box_id}/void-request`，只对 SEALED 箱，`reason_code: LOST|DAMAGED`），审批通过箱变 `VOIDED`；审批人 = 申请人返回 `40312`，`detail.reason=BOX_VOID_SELF_APPROVE`。PDA 复核员可发起（`pack.box.void.request`），审批在管理后台（第 13 篇）。
+- **箱作废**：封箱后丢失/损坏走 `box_void_request`（`POST /api/v1/pack/boxes/{box_id}/void-request`，只对 SEALED 箱，`reason_code: LOST|DAMAGED`），审批通过箱变 `VOIDED`；审批人 = 申请人返回 `40312`，`detail.reason=BOX_VOID_SELF_APPROVE`。PDA 复核员可发起（`pack.box.void.request`），审批在管理后台箱详情（第 13 篇），不进审批中心（00 §6.6.1 @7dbd566 已对齐第 6 篇）。箱详情响应将携带当前 `box_void_request`，PDA 箱详情据此显示「作废审批中」并隐藏重复申请；字段待第 6 篇。
 
 ### 9.10 断网可用清单与剩余离线时间（Yuri 裁定）
 - 断网状态由 `GET /api/v1/me` 与 PDA 心跳返回：`{stale_policy: PAUSE|DEGRADE, paused, offline_since, offline_deadline_at, paused_actions: [ALLOCATE|TRANSFER|WAVE_RELEASE], backfill_deadline_at}`（00 §6.6.2；`offline_deadline_at` = `offline_since` + 12h）（`stale_policy` 默认 `PAUSE`）。**首页宫格与按钮按 `paused_actions[]` 置灰**，不在前端写死清单；离线期间沿用最后一次收到的值。下表仅为示例（按 Yuri 裁定的默认口径），以服务端返回为准：
@@ -371,7 +371,7 @@ stateDiagram-v2
 | 待回库确认 | 置灰（需在线校验状态） |
 
 - 置灰项点击提示「断网期间不可用，联网后操作」。
-- 被暂停的操作若仍提交，服务端返回 `503` `50302 STALE_STOCK_PAUSED`，`detail.action` ∈ `paused_actions`：提示「该仓暂停跨网点分配/移动」，**不自动重试、不重取写地址**；立即重拉 `GET /api/v1/me`，等 `/me` 或心跳返回 `paused=false`（或 `paused_actions` 不再含该动作）后按钮恢复，由用户重新操作（00 §6.4 @6420d3e）。
+- 被暂停的操作若仍提交，服务端返回 `503` `50304 STALE_STOCK_PAUSED`（00 §6.4 @7dbd566），`detail.action` ∈ `paused_actions`：提示「该仓暂停跨网点分配/移动」，**不自动重试、不重取写地址**；立即重拉 `GET /api/v1/me`，等 `/me` 或心跳返回 `paused=false`（或 `paused_actions` 不再含该动作）后按钮恢复，由用户重新操作（00 §6.4 @6420d3e）。
 - **剩余离线时间**：顶栏倒计时，取 `offline_deadline_at`（UTC，按本地显示；= `offline_since` + 12h），前端不自行用 `offline_since` 推算；剩余 < 1 小时变红提醒。**倒计时只做显示，不自行禁用任何按钮**：置灰只由 `paused_actions` 驱动（见上表）。
 - 重连后按 §9.8 对账补交；补交冲突进入服务端异常队列，PDA 对应条目显示红条与异常单号（若响应提供）。
 
@@ -411,7 +411,7 @@ stateDiagram-v2
 | 单元 | Vitest + fake-indexeddb | outbox 写入原子性；Key 与 `op_seq` 在失败/重启/退避后不变；`local_seq` 排序（时钟回拨后顺序不变）；串行与失败暂停只影响本账号同任务；`failed` 不被 24h 清理、只在服务端回执后删除；撤销在确认被拒后置 `superseded`；重扫生成新条目并关联；`format_version` 迁移（含迁移失败标红）；数量字符串计算 |
 | 组件 | Vitest + @vue/test-utils | 三步扫码不可跳步、缺货跳行、30 秒撤销、BigButton ≥56dp、离线确认即时反馈；计件模式 1 秒扫 5 件得 5（不被去抖）；非计件模式壳重复广播被丢弃；outbox 非空不能登出、可交主管；首页显示其他账号待补交数 |
 | 模拟弱网 | MSW | `40110 DEVICE_UNBOUND` 清令牌回登录且 outbox 保留；`40111 NOT_BOUND` 重新登录再发起绑定；`WAREHOUSE_MISMATCH` 提示主管；等待页按 approval_id 查询状态；离线令牌剩余时间取响应 `exp`；`40111 BINDING_PENDING` 显示等待页且 outbox 无写入、刷新后审批通过进入首页；`40920` 带 `new_holder_device_id` 时红条显示持有设备、排队操作转待回库队列、无重试请求；`40111` 暂停队列且不清 outbox；`40112` 四种 reason 分别提示、均不清 outbox；`40312` 红条显示 rule；离线令牌剩余 <1h 提醒、过期仍记录 outbox；离线用任务行 `expected_barcodes[]` 预校验（不匹配长鸣不入队）、本地通过但服务端 `42210` 时红条重扫（服务端胜出）；在线扫码调用 barcodes 解析；IndexedDB 无条码全表；`40110` 三种 reason：TOKEN_EXPIRED 刷新后同 Key 续传、PERM_VERSION_CHANGED 重拉 /me 后按权限继续或转红条、DEVICE_UNBOUND 进入重新绑定且 outbox 保留；`42214 OVER_QTY` 按 `detail.reason` 分支：`OVER_PICK` 超拣红条、`OVER_REVERSE` 红条按 `detail{outbound_line_id, picked_qty, reversed_qty, requested_qty}` 渲染且数量经 `formatQty` 显示（不做浮点运算）、缺失/未知红条交人工，三种情况均不自动重试（断言无二次请求）；超时后重试同 Key；响应丢失；**Key 过期（服务端无 Key 记录）后补交按四元组重放，不重复扣减**；`40932` detail 五字段齐全：非 `NEARBY_PUTBACK` 时 `target_location` 有值也被忽略（不提示去目标库位）、`NEARBY_PUTBACK` 且 `target_location` 为空按契约异常保留红条；`40932` 按 `resolution` 分支：`CONFIRMED`/`RETURNED_TO_ORIGINAL` 立即删除、`NEARBY_PUTBACK` 红条保留直到 `putback-ack` 成功（扫错 `42212` 重扫、ack 不写流水）、`SCRAP_HANDOVER` 红条保留直到 GET 详情 `handover_confirmed_at` 非空（为空保留）、缺失/未知保留；`40910` 的 `POD_OP`/`POD_CORRECT`/`SOURCE_ORDER` 按契约异常处理；断网时用缓存的 endpoint + epoch 继续作业且写请求带 `X-Write-Epoch`；`50303 STALE_WRITE_NODE` → 暂停 outbox、重取 write-endpoint、按 `local_seq` 原 Key 重放，不标红；`50302 ID_CLOCK_BACKWARD` 不触发重取地址、不与 STALE 混淆（只退避重试）；非计划切换后按原业务键重提交补数且新节点号无影响；`50301` 或 `epoch` 变化 → 重取 write-endpoint 后按 `local_seq` 用原 Key/`op_seq` 重提交，切换前已成功的操作得到重放不重复扣减；切换期间不标红；40920/40921/40922 返回 `confirmedLines` + `returnRecordId`，重复被拒返回同一 id（按四元组）；confirm 扫错库位 `42212` 红条保留并提示重扫原库位；confirm 成功后删除 failed 条目；confirm 与主管 resolve 并发：**`40930` 不删除、红条保留**；`40910` 按 `detail.key_type` 分支（`PDA_OP` 交主管、`IDEMPOTENCY_KEY` 上报；缺失/未知时红条、不自动重试、不生成新 Key）；`50000` 退避同 Key 重试；`50010` 不自动重试、红条；`42214 OVER_QTY`（`OVER_PICK`）超拣红条且不自动重试；`42212` 后修正重扫用同 Key 被重新执行（422 不缓存）；5xx/429 后同 Key 重试被重新执行且由业务键兜底不重复扣减；confirm 网络失败同 Key 重试；401 中途失效 |
-| 复核/装箱/离线清单 | Vitest + MSW | `40312` + `detail.reason=CHECK_SOD` 红条「换人复核」不重试，`40312` 其他 reason 走通用；`42214 OVER_CHECK` 长鸣红条不重试，文案区别于 OVER_PICK/OVER_REVERSE；未扫齐时提交置灰并提示先撤销拣货；SEALED 箱明细只读，`40937` 刷新不重试；扫到他单商品拒绝入箱；多人拣同一单时复核人与任一拣货人相同、或无拣货人记录均被 `40312 CHECK_SOD` 拒绝；零扫描「通过」置灰；复核未 PASSED 不显示封箱，封箱人规则拒绝走通用处理；SHIPPED 箱无编辑入口；`42215` 红条重扫集货位；重量只接受整数克；断网时领取新任务、新分配、调拨、波次下发、开复核/封箱置灰，已下发任务执行、复核扫码、收货与盲收登记可用并入 outbox；顶栏倒计时取离线令牌 `exp`（≤12h），<1h 变红、到期停止新记录；复核 `42214 SELL_EXPIRED` 红条「批次已过可售期」并提示拣后取消、不重试；离线超过 12h 的补交被服务端拒绝时转红条不删除，重连先重放后对账；盲收未选 `reason_code` 或未扫 `container_code` 时提交置灰、离线也不入队，服务端 `400` 按字段提示；纸单补录需 `offline.paper.backfill`、照片必传、在线提交生成 `PAPER_BACKFILL` 审批，恢复联网后 24h 倒计时只取 `backfill_deadline_at`（改设备时间不影响）、<1h 标红、每次恢复联网后都有值、窗口内入口一直显示（无待补纸单也显示），为 `null`（窗口已过 / 从未断网）时隐藏入口与倒计时但已提交补录记录仍可查看；`50302 STALE_STOCK_PAUSED` 提示暂停、不重试、重拉 /me、不重取写节点，`50301` 走写节点重取；盲收提交成功显示收货记录号 + 异常单号与 48h 提示、离线时入队补交后显示；预约收货调用 receive 后显示待质检；置灰完全由 `paused_actions[]` 驱动（返回空数组时不置灰、返回新动作时置灰）；倒计时取 `offline_deadline_at` 而非本地推算；非复核人看不到封箱按钮，`40930 SEALER_NOT_CHECKER` 提示不重试；`40312 CHECK_SOD` 显示 `picker_ids`；PASSED 需≥1 行、无不符、有拣货人；非复核人无封箱按钮、主管也无；装箱超复核量 `42211` 标 SKU；`42215` 显示两个温区；VOIDED/SHIPPED 箱只读；有箱/有单的车次无取消；`BOX_VOID_SELF_APPROVE` 提示不能自批；`50302` 带 `detail.action` → 暂停提示、不重试、不重取写地址、重拉 /me，`paused=false` 后恢复；`50302` 不带 `detail.action` → 时钟回拨退避；`50301` → 重取写地址按原键重提；`paused_actions` 八个值各自置灰对应按钮，未知值不映射；`offline_deadline_at` 到期但 `paused_actions` 未含对应值时按钮不置灰（无本地 12h 禁用）、断网期间到期仍可记录进 outbox |
+| 复核/装箱/离线清单 | Vitest + MSW | `40312` + `detail.reason=CHECK_SOD` 红条「换人复核」不重试，`40312` 其他 reason 走通用；`42214 OVER_CHECK` 长鸣红条不重试，文案区别于 OVER_PICK/OVER_REVERSE；未扫齐时提交置灰并提示先撤销拣货；SEALED 箱明细只读，`40937` 刷新不重试；扫到他单商品拒绝入箱；多人拣同一单时复核人与任一拣货人相同、或无拣货人记录均被 `40312 CHECK_SOD` 拒绝；零扫描「通过」置灰；复核未 PASSED 不显示封箱，封箱人规则拒绝走通用处理；SHIPPED 箱无编辑入口；`42215` 红条重扫集货位；重量只接受整数克；断网时领取新任务、新分配、调拨、波次下发、开复核/封箱置灰，已下发任务执行、复核扫码、收货与盲收登记可用并入 outbox；顶栏倒计时取离线令牌 `exp`（≤12h），<1h 变红、到期停止新记录；复核 `42214 SELL_EXPIRED` 红条「批次已过可售期」并提示拣后取消、不重试；离线超过 12h 的补交被服务端拒绝时转红条不删除，重连先重放后对账；盲收未选 `reason_code` 或未扫 `container_code` 时提交置灰、离线也不入队，服务端 `400` 按字段提示；纸单补录需 `offline.paper.backfill`、照片必传、在线提交生成 `PAPER_BACKFILL` 审批，恢复联网后 24h 倒计时只取 `backfill_deadline_at`（改设备时间不影响）、<1h 标红、每次恢复联网后都有值、窗口内入口一直显示（无待补纸单也显示），为 `null`（窗口已过 / 从未断网）时隐藏入口与倒计时但已提交补录记录仍可查看；`50304 STALE_STOCK_PAUSED` 提示暂停、不重试、重拉 /me、不重取写节点，`50301` 走写节点重取；盲收提交成功显示收货记录号 + 异常单号与 48h 提示、离线时入队补交后显示；预约收货调用 receive 后显示待质检；置灰完全由 `paused_actions[]` 驱动（返回空数组时不置灰、返回新动作时置灰）；倒计时取 `offline_deadline_at` 而非本地推算；非复核人看不到封箱按钮，`40930 SEALER_NOT_CHECKER` 提示不重试；`40312 CHECK_SOD` 显示 `picker_ids`；PASSED 需≥1 行、无不符、有拣货人；非复核人无封箱按钮、主管也无；装箱超复核量 `42211` 标 SKU；`42215` 显示两个温区；VOIDED/SHIPPED 箱只读；有箱/有单的车次无取消；`BOX_VOID_SELF_APPROVE` 提示不能自批；`50304` → 暂停提示、不重试、不重取写地址、重拉 /me，`paused=false` 后恢复；`50302` → 时钟回拨退避重试、不重取地址；`50303` → 重取写地址按原键重放不标红；`50301` → 重取写地址按原键重提；`paused_actions` 八个值各自置灰对应按钮，未知值不映射；`offline_deadline_at` 到期但 `paused_actions` 未含对应值时按钮不置灰（无本地 12h 禁用）、断网期间到期仍可记录进 outbox |
 | 加工 / 活鲜 | Vitest | `PROCESSING`/`LIVE_HOLD` 无释放入口；活鲜重量（3 位小数）+ 尾数（整数）同时录入，缺一不能提交；去皮后提交净重并带毛重/皮重；`42217` 长鸣红条不重试；锁池时死亡登记仍可用、巡检无解锁按钮；死亡超阈值显示待审批；冲销超量 `42214 OVER_REVERSE` 红条；已发货成品无冲销；得率超界只提示不拦截；称重 `weigh_client_id` 重试/重启复用、重称才换新值；`40910 key_type=LIVE_WEIGH` 红条不重试不换键 |
 | 真机 | 手工清单 | 冷库断网 30 分钟及跨夜（>24h）后补交；拔电池/杀 WebView 后恢复；手动改系统时间后上传顺序；换班换账号；outbox 非空时强制更新 |
 
@@ -440,7 +440,7 @@ stateDiagram-v2
 | Q17 | ~~`OVER_REVERSE` detail 字段~~ **已定**：`{outbound_line_id, picked_qty, reversed_qty, requested_qty}`，数量为 3 位小数字符串（00 §6.4 @5e44905） | 已关闭 |
 | Q18 | ~~离线条码预校验~~ **已定**：任务行 `expected_barcodes[]` 快照，仅预校验，服务端判定为准，见 §9.6 | 已关闭 |
 | Q19 | ~~me 与首次绑定确认~~ **已定**：`GET /api/v1/me`；首次绑定 PENDING + `DEVICE_BIND` 审批，审批前 `40111 BINDING_PENDING`，见 §9.7 | 已关闭 |
-| Q20 | ~~复核/装箱码登记~~ **已定**（00 §6.4 @124b164）：`40937 BOX_SEALED_IMMUTABLE`、`42215 STAGING_TEMP_ZONE_MISMATCH`、`40312` `detail.reason=CHECK_SOD`、`40930` `SEALER_NOT_CHECKER`（无权限例外）、`50301` `STALE_STOCK_PAUSED` | 已关闭 |
+| Q20 | ~~复核/装箱码登记~~ **已定**（00 §6.4 @124b164）：`40937 BOX_SEALED_IMMUTABLE`、`42215 STAGING_TEMP_ZONE_MISMATCH`、`40312` `detail.reason=CHECK_SOD`、`40930` `SEALER_NOT_CHECKER`（无权限例外）、`50304` `STALE_STOCK_PAUSED`（00 §6.4 @7dbd566） | 已关闭 |
 | Q21 | ~~断网状态下发~~ **已定**：`GET /api/v1/me` 与心跳返回 `{stale_policy, paused, offline_since, offline_deadline_at, paused_actions[]}`，见 §9.10 | 已关闭 |
 | Q22 | ~~盲收接口~~ **已定**：`POST /api/v1/inbound/returns/blind`（`inbound.return.blind`），返回收货记录号 + 异常单号，见 §9.11 | 已关闭 |
 | Q24 | ~~封箱人规则~~ **已定**：封箱人必须是复核人，否则 `40930` `detail.reason=SEALER_NOT_CHECKER`，见 §9.9 | 已关闭 |
@@ -453,5 +453,5 @@ stateDiagram-v2
 | Q31 | ~~双单位与称重~~ **已定**（00 @9946e33）：`qty_milli` + `qty_count`，`weigh_tolerance_bp` 默认 300、超差 `42217`，净重入账、毛重/皮重留痕；剩余：电子秤接入见 Q5 | 已关闭 |
 | Q32 | 巡检频率（是否 PDA 定时提醒）、指标字段与正常/严重阈值下发方式 | 第 18 篇 |
 | Q33 | ~~得率容差在 PDA~~ **已定**：不拦截，转 `PROCESS_YIELD_DEVIATION` 审批，PDA 只提示 | 已关闭 |
-| Q34 | 00 §6.4 @6420d3e 把 `50302` 同时登记为 `STALE_STOCK_PAUSED` 与 `ID_CLOCK_BACKWARD`；需大肥鱼改一个码值。前端暂按 `detail.action` 区分 | 大肥鱼 / 00 |
+| Q34 | ~~`50302` 重复登记~~ **已定**（00 §6.4 @7dbd566）：暂停 `50304`，`50302` 仅 `ID_CLOCK_BACKWARD`；不再按 `detail.action` 区分 | 已关闭 |
 | Q35 | ~~`paused_actions` 新值~~ **已定**（00 §6.6.2 @6420d3e）：八值 `ALLOCATE / TRANSFER / WAVE_RELEASE / PICK_CONFIRM / CHECK / SHIP / RECEIVE / POD`；00 未要求本地停止记录 outbox，前端置灰只看 `paused_actions` | 已关闭 |
