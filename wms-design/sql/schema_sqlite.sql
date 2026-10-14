@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 39 处 DEFAULT now()、5 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
---   3. 方言专属行：删除 259 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 156 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 266 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 163 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -1170,6 +1170,12 @@ CREATE TRIGGER trg_apr_insert BEFORE INSERT ON approval_request
 WHEN NEW.status <> 'PENDING' OR NEW.first_approver_id IS NOT NULL OR NEW.second_approver_id IS NOT NULL
   OR NEW.decided_at IS NOT NULL OR NEW.result_ref IS NOT NULL
 BEGIN SELECT RAISE(ABORT, 'approval_insert_not_pending'); END;
+CREATE TRIGGER trg_apr_code_wh BEFORE INSERT ON approval_request
+WHEN length(NEW.code) BETWEEN 22 AND 36 AND substr(NEW.code, 1, 4) = 'APR-'
+  AND substr(NEW.code, 5, length(NEW.code) - 20) NOT GLOB '*[^A-Z0-9]*'
+  AND substr(NEW.code, -16) GLOB '-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]'
+  AND NOT EXISTS (SELECT 1 FROM warehouse w WHERE w.id = NEW.warehouse_id AND w.code = substr(NEW.code, 5, length(NEW.code) - 20))
+BEGIN SELECT RAISE(ABORT, 'approval_code_warehouse_mismatch'); END;
 CREATE TRIGGER trg_apr_insert_role BEFORE INSERT ON approval_request
 WHEN NEW.approval_type = 'SCRAP_MISREPORT' AND NOT EXISTS (
     SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
@@ -1212,11 +1218,12 @@ WHEN NEW.approval_type IN ('DEVICE_BIND','POD_CORRECT','CANCEL_AFTER_PICK')
   AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL AND NEW.first_approver_role IS NOT NULL AND NOT EXISTS (
     SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
       JOIN sys_role_perm rp ON rp.role_id = r.id JOIN sys_permission p ON p.id = rp.perm_id
-      JOIN sys_user_warehouse uw ON uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id
      WHERE ur.user_id = NEW.first_approver_id AND r.code = NEW.first_approver_role
+       AND (r.code = 'CENTER_OPS' OR EXISTS (SELECT 1 FROM sys_user_warehouse uw
+            WHERE uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id))
        AND p.code = CASE NEW.approval_type WHEN 'DEVICE_BIND' THEN 'device.binding.approve'
                                            WHEN 'POD_CORRECT' THEN 'delivery.pod.correct.approve'
-                                           ELSE 'outbound.order.cancel_after_pick' END)
+                                           ELSE 'outbound.order.cancel_after_pick.approve' END)
 BEGIN SELECT RAISE(ABORT, 'approval_perm_not_held'); END;
 CREATE TRIGGER trg_apr_scrap_role BEFORE UPDATE ON approval_request
 WHEN NEW.approval_type = 'SCRAP_MISREPORT' AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL
