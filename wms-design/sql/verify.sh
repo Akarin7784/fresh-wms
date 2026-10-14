@@ -505,7 +505,7 @@ expect_allow "01 M1 边缘：同一事务先删旧绑定再建新绑定" \
 R=$(psql -t -A -c "SELECT count(*) || ':' || max(sku_id) FROM sku_barcode WHERE barcode = '6901234500017';")
 [ "$R" = "1:51" ] && ok "01 M1 验收：换绑后条码解析到新 SKU 51，且只有一行" || bad "01 M1 验收：换绑后条码解析到新 SKU 51，且只有一行 → $R（期望 1:51）"
 seed "UPDATE sku SET status='PENDING_DISABLE', md_version=4 WHERE id=52;"
-seed "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by) VALUES (11,'SKU',52,1,4,'DISABLE',100);"
+seed "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by,prior_status) VALUES (11,'SKU',52,1,4,'DISABLE',100,NULL);"
 expect_block "01 M2 APPLIED 不带版本" \
   "BEGIN; UPDATE md_pending_disable SET status='APPLIED' WHERE id=11; COMMIT;" "ck_mdpd_applied"
 expect_block "01 M2 APPLIED 带的版本与发起版本不符" \
@@ -527,8 +527,8 @@ R=$(psql -t -A -c "WITH u AS (UPDATE sku SET status='DISABLED', md_version=md_ve
 R=$(psql -t -A -c "WITH u AS (UPDATE sku SET status='DISABLED', md_version=md_version+1 WHERE id=52 AND status='PENDING_DISABLE' AND md_version=4 RETURNING 1) SELECT count(*) FROM u;")
 [ "$R" = "1" ] && ok "01 M2 正向：版本 v4 → 1 行 → rowcount=1" || bad "01 M2 正向：版本 v4 → 1 行 → rowcount=$R（期望 1）"
 seed "UPDATE sku SET status='PENDING_DELETE', md_version=2 WHERE id=53;"
-seed "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by) VALUES (21,'SKU',53,1,2,'DELETE',100);"
-seed "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by) VALUES (22,'SKU',53,2,2,'DELETE',100);"
+seed "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by,prior_status) VALUES (21,'SKU',53,1,2,'DELETE',100,'ACTIVE');"
+seed "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by,prior_status) VALUES (22,'SKU',53,2,2,'DELETE',100,'ACTIVE');"
 expect_block "01 M3 两仓都未确认就软删" \
   "BEGIN; UPDATE sku SET status='DELETED', deleted_at='2026-10-15 04:00' WHERE id=53; COMMIT;" "md_delete_not_confirmed"
 seed "UPDATE md_pending_disable SET status='APPLIED', applied_version=2 WHERE id=21 AND status='WAITING' AND requested_version=2;"
@@ -545,25 +545,50 @@ expect_block "01 M3 ACTIVE 直接软删（跳过 PENDING_DELETE）" \
   "BEGIN; UPDATE sku SET status='DELETED', deleted_at='2026-10-15 04:00' WHERE id=54; COMMIT;" "md_delete_not_confirmed"
 expect_block "01 M3 ACTIVE 却写 deleted_at（旧的一段式软删）" \
   "BEGIN; UPDATE sku SET deleted_at='2026-10-15 04:00' WHERE id=54; COMMIT;" "ck_sku_deleted"
-seed "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by) VALUES (23,'SKU',55,1,2,'DELETE',100);"
+seed "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by,prior_status) VALUES (23,'SKU',55,1,2,'DELETE',100,'ACTIVE');"
 seed "UPDATE md_pending_disable SET status='APPLIED', applied_version=2 WHERE id=23;"
 seed "UPDATE sku SET status='PENDING_DELETE', md_version=3 WHERE id=55;"
 expect_block "01 M3 确认的是旧版本 v2，当前 v3" \
   "BEGIN; UPDATE sku SET status='DELETED', deleted_at='2026-10-15 04:00' WHERE id=55; COMMIT;" "md_delete_not_confirmed"
-seed "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by) VALUES (24,'SKU',54,1,1,'DISABLE',100);"
+seed "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by,prior_status) VALUES (24,'SKU',54,1,1,'DISABLE',100,NULL);"
 seed "UPDATE md_pending_disable SET status='APPLIED', applied_version=1 WHERE id=24;"
 seed "UPDATE sku SET status='PENDING_DELETE' WHERE id=54;"
 expect_block "01 M3 只有停用确认（action=DISABLE）不算删除确认" \
   "BEGIN; UPDATE sku SET status='DELETED', deleted_at='2026-10-15 04:00' WHERE id=54; COMMIT;" "md_delete_not_confirmed"
 seed "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence,md_status) VALUES (60,1,2,'B09-01-01','PALLET',8,'B900','PENDING_DELETE'),(61,1,2,'B09-01-02','PALLET',8,'B901','PENDING_DELETE');"
-seed "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by) VALUES (31,'LOCATION',60,1,1,'DELETE',100);"
+seed "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by,prior_status) VALUES (31,'LOCATION',60,1,1,'DELETE',100,'ACTIVE');"
 seed "UPDATE md_pending_disable SET status='APPLIED', applied_version=1 WHERE id=31;"
 expect_block "01 M3 库位未确认就软删" \
   "BEGIN; UPDATE location SET md_status='DELETED', deleted_at='2026-10-15 04:00' WHERE id=61; COMMIT;" "md_delete_not_confirmed"
 expect_allow "01 M3 库位正向：权威库确认后软删" \
   "BEGIN; UPDATE location SET md_status='DELETED', deleted_at='2026-10-15 04:00' WHERE id=60; COMMIT;"
 expect_block "01 M3 删除确认 action 码表" \
-  "BEGIN; INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by) VALUES (32,'SKU',51,1,1,'PURGE',100); COMMIT;" "ck_mdpd_action"
+  "BEGIN; INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by,prior_status) VALUES (32,'SKU',51,1,1,'PURGE',100,'ACTIVE'); COMMIT;" "ck_mdpd_action"
+expect_block "01 删除申请 prior_status 缺失" \
+  "BEGIN; INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by,prior_status) VALUES (41,'SKU',51,1,2,'DELETE',100,NULL); COMMIT;" "ck_mdpd_prior"
+expect_block "01 删除申请 prior_status 非 ACTIVE/DISABLED" \
+  "BEGIN; INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by,prior_status) VALUES (42,'SKU',51,1,2,'DELETE',100,'PENDING_DISABLE'); COMMIT;" "ck_mdpd_prior"
+expect_block "01 停用确认行带 prior_status" \
+  "BEGIN; INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by,prior_status) VALUES (43,'SKU',51,1,2,'DISABLE',100,'ACTIVE'); COMMIT;" "ck_mdpd_prior"
+expect_block "01 PENDING_DISABLE 期间申请删除" \
+  "BEGIN; UPDATE sku SET status='PENDING_DISABLE' WHERE id=51; UPDATE sku SET status='PENDING_DELETE' WHERE id=51; COMMIT;" "md_delete_request_invalid"
+expect_allow "01 delete-request 正向：DISABLED → PENDING_DELETE（v2，记 prior_status=DISABLED）" \
+  "BEGIN; UPDATE sku SET status='DISABLED' WHERE id=51; UPDATE sku SET status='PENDING_DELETE', md_version=2 WHERE id=51 AND md_version=1; INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by,prior_status) VALUES (44,'SKU',51,1,2,'DELETE',100,'DISABLED'); INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by,prior_status) VALUES (45,'SKU',51,2,2,'DELETE',100,'DISABLED'); COMMIT;"
+R=$(psql -t -A -c "WITH u AS (UPDATE sku SET status='PENDING_DELETE', md_version=md_version+1 WHERE id=51 AND md_version=1 RETURNING 1) SELECT count(*) FROM u;")
+[ "$R" = "0" ] && ok "01 delete-request 版本不一致（带 v1，当前 v2）→ 0 行 → 40930 → rowcount=0" || bad "01 delete-request 版本不一致（带 v1，当前 v2）→ 0 行 → 40930 → rowcount=$R（期望 0）"
+expect_block "01 有引用退回却回到 ACTIVE（申请前是 DISABLED）" \
+  "BEGIN; UPDATE sku SET status='ACTIVE', md_version=3 WHERE id=51; COMMIT;" "md_delete_restore_mismatch"
+expect_block "01 改 prior_status" \
+  "BEGIN; UPDATE md_pending_disable SET prior_status='ACTIVE' WHERE id=45; COMMIT;" "md_pending_immutable"
+expect_allow "01 有引用退回正向：仓 2 回报引用 → 剩余 WAITING 置 CANCELLED、实体回到 DISABLED（40960）" \
+  "BEGIN; UPDATE md_pending_disable SET status='CANCELLED', blocker_json='[{\"type\":\"STOCK\",\"id\":\"40\",\"count\":1}]' WHERE id IN (44,45) AND status='WAITING'; UPDATE sku SET status='DISABLED', md_version=3 WHERE id=51 AND status='PENDING_DELETE' AND md_version=2; COMMIT;"
+seed "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life) VALUES (56,'SKU-DATE','椰枣','KG','CHILLED',30,10);"
+seed "UPDATE sku SET status='PENDING_DELETE', md_version=5 WHERE id=56;"
+seed "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by,prior_status) VALUES (46,'SKU',56,1,5,'DELETE',100,'ACTIVE');"
+expect_block "01 cancel 却回到 DISABLED（申请前是 ACTIVE）" \
+  "BEGIN; UPDATE sku SET status='DISABLED', md_version=6 WHERE id=56; COMMIT;" "md_delete_restore_mismatch"
+expect_allow "01 cancel 正向：PENDING_DELETE → ACTIVE（申请前状态），WAITING 置 CANCELLED" \
+  "BEGIN; UPDATE md_pending_disable SET status='CANCELLED' WHERE id=46 AND status='WAITING'; UPDATE sku SET status='ACTIVE', md_version=6 WHERE id=56 AND status='PENDING_DELETE' AND md_version=5; COMMIT;"
 OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM sku WHERE id=51;" 2>&1)
 case "$OUT" in *"permission denied for table sku"*) ok "01 M1 wms_app 只能删条码/单位行，不能删 sku";; *) bad "01 M1 wms_app 删 sku 未被拒：$OUT";; esac
 

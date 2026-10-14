@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 57 处 DEFAULT now() → DEFAULT (datetime('now'))（表达式默认值需括号）
---   3. 方言专属行：删除 199 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 106 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 210 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 131 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -320,6 +320,7 @@ CREATE TABLE md_pending_disable (
     warehouse_id    BIGINT       NOT NULL,              -- 在哪个仓的权威库里判定引用
     requested_version BIGINT     NOT NULL,              -- 发起时（进入 PENDING_DISABLE / PENDING_DELETE 后）的 md_version
     action          VARCHAR(16)  NOT NULL DEFAULT 'DISABLE',  -- DISABLE 停用 / DELETE 软删（小吴 M3，复用同一确认机制）
+    prior_status    VARCHAR(16),                        -- action=DELETE：申请前的状态（ACTIVE/DISABLED），撤销或有引用时据此恢复；DISABLE 行为空
     applied_version BIGINT,                             -- 权威库回传 APPLIED 时带的 md_version（小吴 M2）；中心条件更新 requested_version = 回传版本，0 行忽略
     status          VARCHAR(16)  NOT NULL DEFAULT 'WAITING',  -- WAITING/APPLIED/CANCELLED
     blocker_json    TEXT,                               -- 最近一次检查到的引用摘要
@@ -328,6 +329,8 @@ CREATE TABLE md_pending_disable (
     updated_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT ck_mdpd_status CHECK (status IN ('WAITING','APPLIED','CANCELLED')),
     CONSTRAINT ck_mdpd_action CHECK (action IN ('DISABLE','DELETE')),
+    CONSTRAINT ck_mdpd_prior CHECK ((action = 'DELETE' AND prior_status IS NOT NULL AND prior_status IN ('ACTIVE','DISABLED'))
+        OR (action = 'DISABLE' AND prior_status IS NULL)),
     CONSTRAINT ck_mdpd_applied CHECK ((status = 'APPLIED' AND applied_version IS NOT NULL AND applied_version = requested_version)
         OR (status <> 'APPLIED' AND applied_version IS NULL)),
     CONSTRAINT ck_mdpd_entity CHECK (entity_type IN ('LOCATION','SKU','SUPPLIER','CUSTOMER','VEHICLE','DRIVER'))
@@ -382,35 +385,60 @@ BEGIN SELECT RAISE(ABORT, 'node_id_never_reused'); END;
 CREATE TRIGGER trg_mdpd_guard BEFORE UPDATE ON md_pending_disable
 WHEN OLD.status IN ('APPLIED','CANCELLED') OR NEW.entity_type IS NOT OLD.entity_type OR NEW.entity_id IS NOT OLD.entity_id
   OR NEW.warehouse_id IS NOT OLD.warehouse_id OR NEW.requested_version IS NOT OLD.requested_version OR NEW.action IS NOT OLD.action
+  OR NEW.prior_status IS NOT OLD.prior_status
 BEGIN SELECT RAISE(ABORT, 'md_pending_immutable'); END;
 
 -- ===== 小吴 M3：软删两段式。DELETED 只能从 PENDING_DELETE 进入，且各权威库对当前版本的 DELETE 确认都已 APPLIED、没有 WAITING；DELETED 是终态 =====
 CREATE TRIGGER trg_mddel_final_location BEFORE UPDATE ON location WHEN OLD.md_status = 'DELETED' BEGIN SELECT RAISE(ABORT, 'md_deleted_final'); END;
+CREATE TRIGGER trg_mddel_req_location BEFORE UPDATE ON location WHEN NEW.md_status = 'PENDING_DELETE' AND OLD.md_status NOT IN ('PENDING_DELETE','ACTIVE','DISABLED') BEGIN SELECT RAISE(ABORT, 'md_delete_request_invalid'); END;
+CREATE TRIGGER trg_mddel_restore_location BEFORE UPDATE ON location WHEN OLD.md_status = 'PENDING_DELETE' AND NEW.md_status NOT IN ('PENDING_DELETE','DELETED') AND NOT EXISTS (
+  SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'LOCATION' AND p.entity_id = OLD.id AND p.action = 'DELETE' AND p.requested_version = OLD.md_version AND p.prior_status = NEW.md_status)
+BEGIN SELECT RAISE(ABORT, 'md_delete_restore_mismatch'); END;
 CREATE TRIGGER trg_mddel_location BEFORE UPDATE ON location WHEN NEW.md_status = 'DELETED' AND OLD.md_status <> 'DELETED' AND (OLD.md_status <> 'PENDING_DELETE'
   OR NOT EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'LOCATION' AND p.entity_id = OLD.id AND p.action = 'DELETE' AND p.status = 'APPLIED' AND p.requested_version = OLD.md_version)
   OR EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'LOCATION' AND p.entity_id = OLD.id AND p.status = 'WAITING'))
 BEGIN SELECT RAISE(ABORT, 'md_delete_not_confirmed'); END;
 CREATE TRIGGER trg_mddel_final_sku BEFORE UPDATE ON sku WHEN OLD.status = 'DELETED' BEGIN SELECT RAISE(ABORT, 'md_deleted_final'); END;
+CREATE TRIGGER trg_mddel_req_sku BEFORE UPDATE ON sku WHEN NEW.status = 'PENDING_DELETE' AND OLD.status NOT IN ('PENDING_DELETE','ACTIVE','DISABLED') BEGIN SELECT RAISE(ABORT, 'md_delete_request_invalid'); END;
+CREATE TRIGGER trg_mddel_restore_sku BEFORE UPDATE ON sku WHEN OLD.status = 'PENDING_DELETE' AND NEW.status NOT IN ('PENDING_DELETE','DELETED') AND NOT EXISTS (
+  SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'SKU' AND p.entity_id = OLD.id AND p.action = 'DELETE' AND p.requested_version = OLD.md_version AND p.prior_status = NEW.status)
+BEGIN SELECT RAISE(ABORT, 'md_delete_restore_mismatch'); END;
 CREATE TRIGGER trg_mddel_sku BEFORE UPDATE ON sku WHEN NEW.status = 'DELETED' AND OLD.status <> 'DELETED' AND (OLD.status <> 'PENDING_DELETE'
   OR NOT EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'SKU' AND p.entity_id = OLD.id AND p.action = 'DELETE' AND p.status = 'APPLIED' AND p.requested_version = OLD.md_version)
   OR EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'SKU' AND p.entity_id = OLD.id AND p.status = 'WAITING'))
 BEGIN SELECT RAISE(ABORT, 'md_delete_not_confirmed'); END;
 CREATE TRIGGER trg_mddel_final_supplier BEFORE UPDATE ON supplier WHEN OLD.status = 'DELETED' BEGIN SELECT RAISE(ABORT, 'md_deleted_final'); END;
+CREATE TRIGGER trg_mddel_req_supplier BEFORE UPDATE ON supplier WHEN NEW.status = 'PENDING_DELETE' AND OLD.status NOT IN ('PENDING_DELETE','ACTIVE','DISABLED') BEGIN SELECT RAISE(ABORT, 'md_delete_request_invalid'); END;
+CREATE TRIGGER trg_mddel_restore_supplier BEFORE UPDATE ON supplier WHEN OLD.status = 'PENDING_DELETE' AND NEW.status NOT IN ('PENDING_DELETE','DELETED') AND NOT EXISTS (
+  SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'SUPPLIER' AND p.entity_id = OLD.id AND p.action = 'DELETE' AND p.requested_version = OLD.md_version AND p.prior_status = NEW.status)
+BEGIN SELECT RAISE(ABORT, 'md_delete_restore_mismatch'); END;
 CREATE TRIGGER trg_mddel_supplier BEFORE UPDATE ON supplier WHEN NEW.status = 'DELETED' AND OLD.status <> 'DELETED' AND (OLD.status <> 'PENDING_DELETE'
   OR NOT EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'SUPPLIER' AND p.entity_id = OLD.id AND p.action = 'DELETE' AND p.status = 'APPLIED' AND p.requested_version = OLD.md_version)
   OR EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'SUPPLIER' AND p.entity_id = OLD.id AND p.status = 'WAITING'))
 BEGIN SELECT RAISE(ABORT, 'md_delete_not_confirmed'); END;
 CREATE TRIGGER trg_mddel_final_customer BEFORE UPDATE ON customer WHEN OLD.status = 'DELETED' BEGIN SELECT RAISE(ABORT, 'md_deleted_final'); END;
+CREATE TRIGGER trg_mddel_req_customer BEFORE UPDATE ON customer WHEN NEW.status = 'PENDING_DELETE' AND OLD.status NOT IN ('PENDING_DELETE','ACTIVE','DISABLED') BEGIN SELECT RAISE(ABORT, 'md_delete_request_invalid'); END;
+CREATE TRIGGER trg_mddel_restore_customer BEFORE UPDATE ON customer WHEN OLD.status = 'PENDING_DELETE' AND NEW.status NOT IN ('PENDING_DELETE','DELETED') AND NOT EXISTS (
+  SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'CUSTOMER' AND p.entity_id = OLD.id AND p.action = 'DELETE' AND p.requested_version = OLD.md_version AND p.prior_status = NEW.status)
+BEGIN SELECT RAISE(ABORT, 'md_delete_restore_mismatch'); END;
 CREATE TRIGGER trg_mddel_customer BEFORE UPDATE ON customer WHEN NEW.status = 'DELETED' AND OLD.status <> 'DELETED' AND (OLD.status <> 'PENDING_DELETE'
   OR NOT EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'CUSTOMER' AND p.entity_id = OLD.id AND p.action = 'DELETE' AND p.status = 'APPLIED' AND p.requested_version = OLD.md_version)
   OR EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'CUSTOMER' AND p.entity_id = OLD.id AND p.status = 'WAITING'))
 BEGIN SELECT RAISE(ABORT, 'md_delete_not_confirmed'); END;
 CREATE TRIGGER trg_mddel_final_vehicle BEFORE UPDATE ON vehicle WHEN OLD.status = 'DELETED' BEGIN SELECT RAISE(ABORT, 'md_deleted_final'); END;
+CREATE TRIGGER trg_mddel_req_vehicle BEFORE UPDATE ON vehicle WHEN NEW.status = 'PENDING_DELETE' AND OLD.status NOT IN ('PENDING_DELETE','ACTIVE','DISABLED') BEGIN SELECT RAISE(ABORT, 'md_delete_request_invalid'); END;
+CREATE TRIGGER trg_mddel_restore_vehicle BEFORE UPDATE ON vehicle WHEN OLD.status = 'PENDING_DELETE' AND NEW.status NOT IN ('PENDING_DELETE','DELETED') AND NOT EXISTS (
+  SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'VEHICLE' AND p.entity_id = OLD.id AND p.action = 'DELETE' AND p.requested_version = OLD.md_version AND p.prior_status = NEW.status)
+BEGIN SELECT RAISE(ABORT, 'md_delete_restore_mismatch'); END;
 CREATE TRIGGER trg_mddel_vehicle BEFORE UPDATE ON vehicle WHEN NEW.status = 'DELETED' AND OLD.status <> 'DELETED' AND (OLD.status <> 'PENDING_DELETE'
   OR NOT EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'VEHICLE' AND p.entity_id = OLD.id AND p.action = 'DELETE' AND p.status = 'APPLIED' AND p.requested_version = OLD.md_version)
   OR EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'VEHICLE' AND p.entity_id = OLD.id AND p.status = 'WAITING'))
 BEGIN SELECT RAISE(ABORT, 'md_delete_not_confirmed'); END;
 CREATE TRIGGER trg_mddel_final_driver BEFORE UPDATE ON driver WHEN OLD.status = 'DELETED' BEGIN SELECT RAISE(ABORT, 'md_deleted_final'); END;
+CREATE TRIGGER trg_mddel_req_driver BEFORE UPDATE ON driver WHEN NEW.status = 'PENDING_DELETE' AND OLD.status NOT IN ('PENDING_DELETE','ACTIVE','DISABLED') BEGIN SELECT RAISE(ABORT, 'md_delete_request_invalid'); END;
+CREATE TRIGGER trg_mddel_restore_driver BEFORE UPDATE ON driver WHEN OLD.status = 'PENDING_DELETE' AND NEW.status NOT IN ('PENDING_DELETE','DELETED') AND NOT EXISTS (
+  SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'DRIVER' AND p.entity_id = OLD.id AND p.action = 'DELETE' AND p.requested_version = OLD.md_version AND p.prior_status = NEW.status)
+BEGIN SELECT RAISE(ABORT, 'md_delete_restore_mismatch'); END;
 CREATE TRIGGER trg_mddel_driver BEFORE UPDATE ON driver WHEN NEW.status = 'DELETED' AND OLD.status <> 'DELETED' AND (OLD.status <> 'PENDING_DELETE'
   OR NOT EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'DRIVER' AND p.entity_id = OLD.id AND p.action = 'DELETE' AND p.status = 'APPLIED' AND p.requested_version = OLD.md_version)
   OR EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'DRIVER' AND p.entity_id = OLD.id AND p.status = 'WAITING'))
