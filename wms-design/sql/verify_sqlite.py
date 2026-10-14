@@ -275,6 +275,37 @@ conn.execute("UPDATE stock SET reserved_qty_milli = 0 WHERE id = 11")
 conn.execute("DELETE FROM stock WHERE id = 33")
 conn.commit()
 
+print("=== 2c. docs/02 待回库 RETURN_PENDING 冻结 ===")
+# 用 stock 14（LOT-1008 @B02-01-05，80000）：冻结 5000 后 available 应为 75000，结束时释放，保证 FEFO 断言不受影响
+c = conn.execute("UPDATE stock SET frozen_qty_milli = frozen_qty_milli + 5000 WHERE id = 14 AND on_hand_qty_milli - allocated_qty_milli - reserved_qty_milli - quality_hold_qty_milli - frozen_qty_milli >= 5000").rowcount
+conn.execute("INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,operator_id) VALUES (10,14,'MANUAL','RETURN_PENDING','RETURN_RECORD',501,'RTP:501',5000,7)")
+conn.commit()
+AV14 = one("SELECT available_qty_milli FROM v_stock_available WHERE stock_id=14")[0]
+ok(f"02 RETURN_PENDING 冻结后 available = {AV14}（期望 75000，FEFO 不可分配）") if c == 1 and AV14 == 75000 else bad(f"冻结后 rowcount={c} available={AV14}")
+expect_block(
+    "02 同一待回库记录重复冻结",
+    "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,operator_id) VALUES (11,14,'MANUAL','RETURN_PENDING','RETURN_RECORD',501,'RTP:501:dup',5000,7)",
+    'stock_hold.source_id',
+)
+expect_block(
+    "02 RETURN_PENDING 必须挂待回库记录且计入 frozen",
+    "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,operator_id) VALUES (12,14,'QUALITY','RETURN_PENDING','MANUAL',0,'RTP:x',1000,7)",
+    'ck_hold_return',
+)
+expect_block(
+    "02 冻结原因不在码表",
+    "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,operator_id) VALUES (13,14,'MANUAL','WHATEVER','MANUAL',0,'H:13',1000,7)",
+    'ck_hold_reason',
+)
+# 确认回库：同一事务内释放冻结，不写流水
+mv0 = one("SELECT count(*) FROM stock_movement")[0]
+conn.execute("UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED' WHERE id = 10 AND status = 'HELD'")
+conn.execute("UPDATE stock SET frozen_qty_milli = frozen_qty_milli - 5000 WHERE id = 14 AND frozen_qty_milli >= 5000")
+conn.commit()
+AV14 = one("SELECT available_qty_milli FROM v_stock_available WHERE stock_id=14")[0]
+mv1 = one("SELECT count(*) FROM stock_movement")[0]
+ok("02 确认回库：释放冻结后 available 回到 80000，且无新增流水") if AV14 == 80000 and mv1 == mv0 else bad(f"确认后 available={AV14} 流水 {mv0}→{mv1}")
+
 D = one("SELECT diff_qty_milli FROM count_line WHERE id=1")[0]
 ok(f"§5.6 差异生成列 diff_qty_milli = {D}（预期 -2000）") if D == -2000 else bad(f"差异列 = {D}")
 
