@@ -912,12 +912,36 @@ CREATE TABLE upstream_push_log (
     result_code     VARCHAR(8)   NOT NULL DEFAULT '0',
     wms_doc_no      VARCHAR(64),
     inbound_message_id BIGINT    NOT NULL DEFAULT 0,
-    retain_until    TIMESTAMP    NOT NULL,   -- ≥ received_at + max(配置保留天数, 全量备份周期)
+    retain_until    TIMESTAMP    NOT NULL,   -- ≥ received_at + 90 天（= 长期 requestNo 去重 TTL；且 ≥ 全量备份周期 + 1 天，由启动自检保证）
     CONSTRAINT ck_upl_result CHECK (result_status IN ('ACCEPTED','DUPLICATE','CONFLICT','REJECTED','FAILED')),
-    CONSTRAINT ck_upl_retain CHECK (retain_until > received_at)
+    -- 小赵 I1 / 项目经理决定：保留期下限 90 天库层落地。PG 用 interval；SQLite 时间列是 TEXT，用 julianday 做等价比较
+    -- （同时接受 'YYYY-MM-DD HH:MM:SS' 与 ISO 'T' 写法），并要求两列都能被解析，防止乱写的字符串让比较结果为 NULL 而放行
+    CONSTRAINT ck_upl_retain CHECK (retain_until >= received_at + INTERVAL '90 days'),   -- @pg-only
+-- @sqlite-only     CONSTRAINT ck_upl_retain CHECK (julianday(received_at) IS NOT NULL AND julianday(retain_until) IS NOT NULL AND julianday(retain_until) - julianday(received_at) >= 90),
+    -- D6 口径：规范化报文 SHA-256，64 位小写十六进制（与 ck_obo_hash 同写法，两库通用）
+    CONSTRAINT ck_upl_sha CHECK (length(payload_sha) = 64 AND lower(payload_sha) = payload_sha AND replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(payload_sha,'0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9',''),'a',''),'b',''),'c',''),'d',''),'e',''),'f','') = '')
 );
 CREATE INDEX ix_upl_time ON upstream_push_log(warehouse_id, received_at);
 CREATE INDEX ix_upl_src  ON upstream_push_log(source_system, source_order_no, received_at);
+-- 小赵 B1：只追加在库层落地（写法同 stock_movement）。wms_app 只有 SELECT/INSERT；
+-- 唯一能删的是专用归档角色 wms_archiver，且只能删 retain_until 已过（按 UTC）的行；UPDATE、TRUNCATE 对任何角色都拦。
+CREATE FUNCTION trg_upl_append_only() RETURNS trigger LANGUAGE plpgsql AS $$                               -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    IF TG_OP = 'DELETE' AND current_user = 'wms_archiver' AND OLD.retain_until < (now() AT TIME ZONE 'UTC') THEN  -- @pg-only
+        RETURN OLD;                                                                                           -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    RAISE EXCEPTION 'append_only_violation: %', TG_TABLE_NAME USING ERRCODE = '42501';                       -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_upl_append_only BEFORE UPDATE OR DELETE ON upstream_push_log FOR EACH ROW EXECUTE FUNCTION trg_upl_append_only();  -- @pg-only
+CREATE TRIGGER trg_upl_no_truncate BEFORE TRUNCATE ON upstream_push_log FOR EACH STATEMENT EXECUTE FUNCTION trg_append_only();  -- @pg-only
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'wms_archiver') THEN CREATE ROLE wms_archiver NOLOGIN; END IF; END $$;  -- @pg-only
+GRANT SELECT, INSERT ON upstream_push_log TO wms_app;                                                         -- @pg-only
+REVOKE UPDATE, DELETE, TRUNCATE ON upstream_push_log FROM wms_app;                                            -- @pg-only
+GRANT USAGE ON SCHEMA public TO wms_archiver;                                                                 -- @pg-only
+GRANT SELECT, DELETE ON upstream_push_log TO wms_archiver;                                                    -- @pg-only
+-- SQLite（边缘节点）没有角色：UPDATE/DELETE 一律拦；到期清理同流水表，由维护脚本导出后 DROP 触发器→删 retain_until 已过的行→重建，全程审计
+-- @sqlite-only CREATE TRIGGER trg_upl_no_update BEFORE UPDATE ON upstream_push_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: upstream_push_log'); END;
+-- @sqlite-only CREATE TRIGGER trg_upl_no_delete BEFORE DELETE ON upstream_push_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: upstream_push_log'); END;
 
 -- -----------------------------------------------------------------------------
 -- 幂等 / 集成 / 审计

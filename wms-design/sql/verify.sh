@@ -366,14 +366,66 @@ expect_block "11 入站报文非法状态" \
   "UPDATE inbound_message SET status='OK' WHERE id=100;" \
   "ck_in_msg_status"
 
-expect_allow "11 推送日志：同单号重推各记一行（只追加，不唯一）" \
-  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,warehouse_id,payload_sha,payload,received_at,result_status,retain_until) VALUES (1,'ERP','SALES_ORDER','SO-1',1,'h1','{}','2026-10-15 01:00:00','ACCEPTED','2026-10-22 01:00:00'),(2,'ERP','SALES_ORDER','SO-1',1,'h1','{}','2026-10-15 01:05:00','DUPLICATE','2026-10-22 01:05:00');"
+expect_allow "11 推送日志：同单号重推各记一行（只追加，不唯一；保留 90 天）" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,warehouse_id,payload_sha,payload,received_at,result_status,retain_until) VALUES (1,'ERP','SALES_ORDER','SO-1',1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2027-01-13 01:00:00'),(2,'ERP','SALES_ORDER','SO-1',1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:05:00','DUPLICATE','2027-01-13 01:05:00');"
 expect_block "11 推送日志结果取值" \
-  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (3,'ERP','SALES_ORDER','SO-2','h','{}','2026-10-15 01:00:00','OK','2026-10-22 01:00:00');" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (3,'ERP','SALES_ORDER','SO-3','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','OK','2027-01-13 01:00:00');" \
   "ck_upl_result"
-expect_block "11 推送日志保留期必须晚于接收时间" \
-  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (4,'ERP','SALES_ORDER','SO-3','h','{}','2026-10-15 01:00:00','ACCEPTED','2026-10-15 01:00:00');" \
+expect_block "11 I1 保留期等于接收时间" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (4,'ERP','SALES_ORDER','SO-4','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2026-10-15 01:00:00');" \
   "ck_upl_retain"
+expect_block "11 I1 保留期只有 1 秒" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (5,'ERP','SALES_ORDER','SO-5','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2026-10-15 01:00:01');" \
+  "ck_upl_retain"
+expect_block "11 I1 保留期 7 天（旧口径，现低于 90 天下限）" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (6,'ERP','SALES_ORDER','SO-6','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2026-10-22 01:00:00');" \
+  "ck_upl_retain"
+expect_block "11 I1 保留期 90 天差 1 秒" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (7,'ERP','SALES_ORDER','SO-7','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2027-01-13 00:59:59');" \
+  "ck_upl_retain"
+expect_allow "11 I1 保留期恰好 90 天（边界放行）" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (8,'ERP','SALES_ORDER','SO-8','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2027-01-13 01:00:00');"
+expect_block "11 payload_sha 大写 hex" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (9,'ERP','SALES_ORDER','SO-9','AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA','{}','2026-10-15 01:00:00','ACCEPTED','2027-01-13 01:00:00');" \
+  "ck_upl_sha"
+expect_block "11 payload_sha 长度 63" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (10,'ERP','SALES_ORDER','SO-10','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2027-01-13 01:00:00');" \
+  "ck_upl_sha"
+expect_block "11 payload_sha 非 hex（z）" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (11,'ERP','SALES_ORDER','SO-11','zaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2027-01-13 01:00:00');" \
+  "ck_upl_sha"
+expect_block "11 B1 只追加：UPDATE 推送日志（改结果+原文）" \
+  "UPDATE upstream_push_log SET result_status='REJECTED', payload='x' WHERE id=1;" \
+  "append_only_violation: upstream_push_log"
+expect_block "11 B1 只追加：DELETE 推送日志" \
+  "DELETE FROM upstream_push_log WHERE id=1;" \
+  "append_only_violation: upstream_push_log"
+expect_allow "11 写一条已过保留期的旧日志（归档用例）" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (20,'ERP','SALES_ORDER','SO-OLD','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','{}','2020-01-01 00:00:00','ACCEPTED','2020-04-01 00:00:00');"
+expect_block "11 B1 超级用户 DELETE 已过期行（非归档角色也拦）" \
+  "DELETE FROM upstream_push_log WHERE id=20;" \
+  "append_only_violation: upstream_push_log"
+expect_block "11 B1 TRUNCATE 推送日志" \
+  "TRUNCATE upstream_push_log;" \
+  "append_only_violation: upstream_push_log"
+OUT=$(psql -q -c "SET ROLE wms_app; INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (21,'ERP','SALES_ORDER','SO-21','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','{}','2026-10-15 02:00:00','ACCEPTED','2027-01-13 02:00:00');")
+case "$OUT" in *ERROR*) bad "I2 wms_app INSERT 推送日志被拒：$OUT";; *) ok "I2 wms_app 可 INSERT 推送日志";; esac
+OUT=$(psql -q -t -A -c "SET ROLE wms_app; SELECT count(*) FROM upstream_push_log;")
+case "$OUT" in *ERROR*) bad "I2 wms_app SELECT 推送日志被拒：$OUT";; *) ok "I2 wms_app 可 SELECT 推送日志";; esac
+OUT=$(psql -q -c "SET ROLE wms_app; UPDATE upstream_push_log SET result_status='REJECTED' WHERE id=1;")
+case "$OUT" in *"permission denied for table upstream_push_log"*) ok "B1 wms_app UPDATE 推送日志 → permission denied";; *) bad "wms_app UPDATE 未被拒：$OUT";; esac
+OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM upstream_push_log WHERE id=20;")
+case "$OUT" in *"permission denied for table upstream_push_log"*) ok "B1 wms_app DELETE（即使已过期）→ permission denied";; *) bad "wms_app DELETE 未被拒：$OUT";; esac
+OUT=$(psql -q -c "SET ROLE wms_app; TRUNCATE upstream_push_log;")
+case "$OUT" in *"permission denied for table upstream_push_log"*) ok "B1 wms_app TRUNCATE → permission denied";; *) bad "wms_app TRUNCATE 未被拒：$OUT";; esac
+OUT=$(psql -q -c "SET ROLE wms_archiver; DELETE FROM upstream_push_log WHERE id=1;")
+case "$OUT" in *"append_only_violation: upstream_push_log"*) ok "B1 归档角色删未到期行 → 触发器拦";; *) bad "归档角色删未到期行未被拦：$OUT";; esac
+OUT=$(psql -q -c "SET ROLE wms_archiver; UPDATE upstream_push_log SET payload='x' WHERE id=20;")
+case "$OUT" in *"permission denied"*|*"append_only_violation"*) ok "B1 归档角色 UPDATE → 拒";; *) bad "归档角色 UPDATE 未被拒：$OUT";; esac
+OUT=$(psql -q -t -A -c "SET ROLE wms_archiver; WITH d AS (DELETE FROM upstream_push_log WHERE id=20 RETURNING id) SELECT count(*) FROM d;")
+[ "$OUT" = "1" ] && ok "B1 归档角色删已过 retain_until 的行 → 放行（1 行）" || bad "归档角色到期清理失败：$OUT"
+N=$(psql -t -A -c "SELECT count(*) FROM upstream_push_log WHERE id IN (1,2,8,21)")
+[ "$N" = "4" ] && ok "B1 各种绕过后未到期日志仍在（4 行）" || bad "未到期日志被动过：$N"
 
 echo "=== 3. §5.6 盘点差异生成列（实盘 − 基准账面 − 期间流水）==="
 seed "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000);"

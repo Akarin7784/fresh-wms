@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 41 处 DEFAULT now() → DEFAULT (datetime('now'))（表达式默认值需括号）
---   3. 方言专属行：删除 61 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 22 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 76 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 25 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -858,12 +858,21 @@ CREATE TABLE upstream_push_log (
     result_code     VARCHAR(8)   NOT NULL DEFAULT '0',
     wms_doc_no      VARCHAR(64),
     inbound_message_id BIGINT    NOT NULL DEFAULT 0,
-    retain_until    TIMESTAMP    NOT NULL,   -- ≥ received_at + max(配置保留天数, 全量备份周期)
+    retain_until    TIMESTAMP    NOT NULL,   -- ≥ received_at + 90 天（= 长期 requestNo 去重 TTL；且 ≥ 全量备份周期 + 1 天，由启动自检保证）
     CONSTRAINT ck_upl_result CHECK (result_status IN ('ACCEPTED','DUPLICATE','CONFLICT','REJECTED','FAILED')),
-    CONSTRAINT ck_upl_retain CHECK (retain_until > received_at)
+    -- 小赵 I1 / 项目经理决定：保留期下限 90 天库层落地。PG 用 interval；SQLite 时间列是 TEXT，用 julianday 做等价比较
+    -- （同时接受 'YYYY-MM-DD HH:MM:SS' 与 ISO 'T' 写法），并要求两列都能被解析，防止乱写的字符串让比较结果为 NULL 而放行
+    CONSTRAINT ck_upl_retain CHECK (julianday(received_at) IS NOT NULL AND julianday(retain_until) IS NOT NULL AND julianday(retain_until) - julianday(received_at) >= 90),
+    -- D6 口径：规范化报文 SHA-256，64 位小写十六进制（与 ck_obo_hash 同写法，两库通用）
+    CONSTRAINT ck_upl_sha CHECK (length(payload_sha) = 64 AND lower(payload_sha) = payload_sha AND replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(payload_sha,'0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9',''),'a',''),'b',''),'c',''),'d',''),'e',''),'f','') = '')
 );
 CREATE INDEX ix_upl_time ON upstream_push_log(warehouse_id, received_at);
 CREATE INDEX ix_upl_src  ON upstream_push_log(source_system, source_order_no, received_at);
+-- 小赵 B1：只追加在库层落地（写法同 stock_movement）。wms_app 只有 SELECT/INSERT；
+-- 唯一能删的是专用归档角色 wms_archiver，且只能删 retain_until 已过（按 UTC）的行；UPDATE、TRUNCATE 对任何角色都拦。
+-- SQLite（边缘节点）没有角色：UPDATE/DELETE 一律拦；到期清理同流水表，由维护脚本导出后 DROP 触发器→删 retain_until 已过的行→重建，全程审计
+CREATE TRIGGER trg_upl_no_update BEFORE UPDATE ON upstream_push_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: upstream_push_log'); END;
+CREATE TRIGGER trg_upl_no_delete BEFORE DELETE ON upstream_push_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: upstream_push_log'); END;
 
 -- -----------------------------------------------------------------------------
 -- 幂等 / 集成 / 审计
