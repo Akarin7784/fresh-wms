@@ -119,7 +119,7 @@ NI = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='index' AND sql
 NV = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='view'").fetchone()[0]
 print(f"  → 表 {NT} 张 / 手工建索引 {NI} 个 / 视图 {NV} 个")
 # 期望值：main 8ed5f0c 为 38 表；docs/02 新增 stock_hold、stock_recon_alert、stock_movement_key、stock_ledger_line → 42 表（PG 分区子表不计）。改表数必须同步改这里和 verify.sh
-EXPECT_TABLES, EXPECT_VIEWS = 52, 1  # docs/01 +9
+EXPECT_TABLES, EXPECT_VIEWS = 53, 1  # docs/01 +10（含 md_disable_action_policy）
 ok(f"表数 = {NT}（期望 {EXPECT_TABLES}）") if NT == EXPECT_TABLES else bad(f"表数 = {NT}，期望 {EXPECT_TABLES}")
 ok(f"视图数 = {NV}") if NV == EXPECT_VIEWS else bad(f"视图数 = {NV}，期望 {EXPECT_VIEWS}")
 
@@ -434,7 +434,7 @@ D = one("SELECT diff_qty_milli FROM count_line WHERE id=1")[0]
 ok(f"§5.6 差异生成列 diff_qty_milli = {D}（预期 -2000）") if D == -2000 else bad(f"差异列 = {D}")
 
 print("=== 2f. docs/01 主数据：milli 换算、损耗 ppm、往来方、节点号、下发日志 ===")
-expect_block("01 损耗容差超过 100%", "UPDATE sku SET natural_loss_tolerance_ppm = 1000001 WHERE id = 1", "ck_sku_loss_ppm")
+expect_block("01 损耗容差超过 5%", "UPDATE sku SET natural_loss_tolerance_ppm = 50001 WHERE id = 1", "ck_sku_loss_ppm")
 expect_block("01 出库禁发期大于保质期", "UPDATE sku SET ship_min_shelf_life = 31 WHERE id = 1", "ck_sku_shelf_life")
 expect_block("01 单位换算为 0", "INSERT INTO sku_unit (id,sku_id,uom,base_qty_milli) VALUES (901,1,'BOX',0)", "ck_unit_ratio")
 expect_allow("01 单位换算 1 箱 = 12500 milli", "INSERT INTO sku_unit (id,sku_id,uom,base_qty_milli) VALUES (902,1,'BOX',12500)")
@@ -447,14 +447,45 @@ expect_block("01 节点号超出 0–1023", "INSERT INTO node_registry (node_id,
 expect_block("01 边缘节点不挂仓", "INSERT INTO node_registry (node_id,form,role,host_label) VALUES (5,'B','EDGE','edge-x')", "ck_node_form")
 conn.execute("INSERT INTO node_registry (node_id,warehouse_id,form,role,host_label) VALUES (7,1,'B','EDGE','qp-edge-01')")
 conn.execute("UPDATE node_registry SET status='RETIRED', retired_at=datetime('now'), retire_reason='HW_REPLACE' WHERE node_id = 7")
-expect_block("01 退役节点号重新分配", "INSERT INTO node_registry (node_id,warehouse_id,form,role,host_label) VALUES (7,1,'B','EDGE','qp-edge-02')", "node_registry.node_id")
+expect_block_tx("01 退役节点号重新分配", ["INSERT INTO node_registry (node_id,warehouse_id,form,role,host_label) VALUES (7,1,'B','EDGE','qp-edge-02')"], "node_id_never_reused")
 expect_block_tx("01 退役节点号复活", ["UPDATE node_registry SET status='ACTIVE', retired_at=NULL WHERE node_id = 7"], "node_id_never_reused")
 expect_block_tx("01 删除节点登记", ["DELETE FROM node_registry WHERE node_id = 7"], "node_id_never_reused")
 conn.execute("INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,payload_json,operator_id) VALUES (1,'SKU',1,2,'UPSERT','{}',100)")
-expect_block("01 同一实体同一版本两条下发日志", "INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,payload_json,operator_id) VALUES (2,'SKU',1,2,'UPSERT','{}',100)", "md_change_log.entity_type, md_change_log.entity_id, md_change_log.md_version")
+expect_block_tx("01 同一实体同一版本两条下发日志", ["INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,payload_json,operator_id) VALUES (2,'SKU',1,2,'UPSERT','{}',100)"], "append_only_violation: md_change_log")
 expect_block_tx("01 下发日志只追加（UPDATE）", ["UPDATE md_change_log SET payload_json='{}' WHERE seq = 1"], "append_only_violation: md_change_log")
 conn.execute("INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,requested_by) VALUES (1,'SKU',1,1,3,100)")
 expect_block("01 同一实体同仓两条等待中的延迟停用", "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,requested_by) VALUES (2,'SKU',1,1,4,100)", "md_pending_disable.entity_type, md_pending_disable.entity_id, md_pending_disable.warehouse_id")
+
+print("=== 2f2. docs/01 小钱副审 B1–B4 / I1–I4 / 建议 ===")
+expect_allow("01 I4 损耗容差 = 5%", "UPDATE sku SET natural_loss_tolerance_ppm = 50000 WHERE id = 1")
+expect_block("01 I3 SQLite ppm 存小数", "UPDATE sku SET natural_loss_tolerance_ppm = '5000.5' WHERE id = 1", "ck_sku_int")
+expect_block("01 I3 SQLite 换算存小数", "INSERT INTO sku_unit (id,sku_id,uom,base_qty_milli) VALUES (905,1,'BAG',12500.7)", "ck_unit_int")
+expect_block("01 I3 SQLite 补货水位存小数", "UPDATE location SET min_level_milli = 0.5, max_level_milli = 10 WHERE id = 1", "ck_loc_int")
+expect_block_tx("01 I3 基本单位行换算 ≠ 1000", ["INSERT INTO sku_unit (id,sku_id,uom,base_qty_milli) VALUES (903,1,'KG',999)"], "base_unit_ratio_must_be_1000")
+expect_allow("01 I3 基本单位行换算 = 1000", "INSERT INTO sku_unit (id,sku_id,uom,base_qty_milli) VALUES (904,1,'KG',1000)")
+expect_allow("01 I1 库位 md_status = PENDING_DISABLE", "UPDATE location SET md_status='PENDING_DISABLE' WHERE id = 3")
+expect_block("01 I1 作业状态不再承载 DISABLED", "UPDATE location SET status='DISABLED' WHERE id = 3", "ck_loc_status")
+conn.execute("UPDATE sku SET md_version = 5 WHERE id = 1")
+expect_block_tx("01 I2 md_version 回退", ["UPDATE sku SET md_version = 2 WHERE id = 1"], "md_version_rewind")
+conn.execute("INSERT INTO md_sync_state (node_id,applied_seq) VALUES (7,100)")
+expect_block_tx("01 I2 应用水位回退", ["UPDATE md_sync_state SET applied_seq = 5 WHERE node_id = 7"], "applied_seq_rewind")
+pol = dict(conn.execute("SELECT action_code, allowed_when_pending FROM md_disable_action_policy").fetchall())
+want = {"SCRAP_CREATE":1,"MOVE_OUT":1,"COUNT_ADJUST":1,"RETURN_TO_SUPPLIER":1,"CUSTOMER_RETURN_IN":1,"RELEASE_HOLD":1,"CONVERT_HOLD":1,
+        "INBOUND_CREATE":0,"ALLOCATE":0,"PUTAWAY_TO_LOCATION":0,"OUTBOUND_CREATE":0,"MOVE_IN":0}
+ok("01 B1 停用白名单正反向全部符合") if all(pol.get(k) == v for k, v in want.items()) else bad(f"01 B1 白名单不符：{pol}")
+expect_block("01 B1 把增加引用的动作改成放行", "UPDATE md_disable_action_policy SET allowed_when_pending = 1 WHERE action_code = 'INBOUND_CREATE'", "ck_mdap_add_never")
+expect_block("01 B1 新增一个放行的 ADD 动作", "INSERT INTO md_disable_action_policy VALUES ('NEW_PO','ADD',1,'03')", "ck_mdap_add_never")
+expect_block_tx("01 B2 INSERT OR REPLACE 复活退役节点号", ["INSERT OR REPLACE INTO node_registry (node_id,warehouse_id,form,role,host_label) VALUES (7,2,'B','EDGE','e2')"], "node_id_never_reused")
+conn.execute("INSERT INTO node_registry (node_id,warehouse_id,form,role,host_label) VALUES (8,1,'B','EDGE','e8')")
+expect_block_tx("01 B2 ACTIVE 节点改仓", ["UPDATE node_registry SET warehouse_id = 9 WHERE node_id = 8"], "node_id_never_reused")
+expect_block_tx("01 B2 已退役节点改 retire_reason", ["UPDATE node_registry SET retire_reason = 'x' WHERE node_id = 7"], "node_id_never_reused")
+expect_allow_tx("01 B2 ACTIVE 节点正常退役", ["UPDATE node_registry SET status='RETIRED', retired_at=datetime('now'), retire_reason='HW' WHERE node_id = 8"])
+expect_block_tx("01 B3 REPLACE 篡改下发日志", ["REPLACE INTO md_change_log (seq,entity_type,entity_id,md_version,op,payload_json,operator_id) VALUES (1,'SKU',1,2,'UPSERT','{\"tampered\":1}',100)"], "append_only_violation: md_change_log")
+expect_block_tx("01 B3 DELETE 下发日志", ["DELETE FROM md_change_log WHERE seq = 1"], "append_only_violation: md_change_log")
+expect_block_tx("01 门店挂在不存在的客户下", ["INSERT INTO customer (id,code,name,customer_type,parent_id) VALUES (904,'ST-904','x','STORE',777)"], "customer_parent_invalid")
+expect_block_tx("01 门店挂在门店下", ["INSERT INTO customer (id,code,name,customer_type,parent_id) VALUES (905,'ST-905','x','STORE',2)"], "customer_parent_invalid")
+expect_block("01 entity_type 不在码表", "INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,payload_json,operator_id) VALUES (9,'BANANA',1,1,'UPSERT','{}',1)", "ck_mdlog_entity")
+expect_block("01 待停用 entity_type 不在码表", "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,requested_by) VALUES (9,'WHATEVER',1,1,1,1)", "ck_mdpd_entity")
 
 print("=== 3. §4.4 FEFO 候选池排序（视图 + 排序键）===")
 rows = conn.execute(

@@ -30,6 +30,7 @@ CREATE TABLE warehouse (
     created_at          TIMESTAMP    NOT NULL DEFAULT now(),
     updated_at          TIMESTAMP    NOT NULL DEFAULT now(),
     deleted_at          TIMESTAMP,
+    md_version          BIGINT       NOT NULL DEFAULT 1,  -- docs/01 §4
     CONSTRAINT uq_warehouse_code UNIQUE (code)
 );
 COMMENT ON COLUMN warehouse.work_date_offset IS '凌晨作业归属哪一天：-1 表示今日凌晨拣昨日截单的货';
@@ -48,6 +49,7 @@ CREATE TABLE zone (
     created_at      TIMESTAMP    NOT NULL DEFAULT now(),
     updated_at      TIMESTAMP    NOT NULL DEFAULT now(),
     deleted_at      TIMESTAMP,
+    md_version      BIGINT       NOT NULL DEFAULT 1,  -- docs/01 §4
     CONSTRAINT uq_zone_code UNIQUE (warehouse_id, code)
 );
 CREATE INDEX ix_zone_wh_type ON zone(warehouse_id, zone_type, temp_zone);
@@ -67,7 +69,8 @@ CREATE TABLE location (
     mix_sku             BOOLEAN       NOT NULL DEFAULT false,
     pickable            BOOLEAN       NOT NULL DEFAULT true,
     abc_class           VARCHAR(2),
-    status              VARCHAR(16)   NOT NULL DEFAULT 'AVAILABLE', -- AVAILABLE/LOCKED/DISABLED
+    status              VARCHAR(16)   NOT NULL DEFAULT 'AVAILABLE', -- 作业状态 AVAILABLE/LOCKED（盘点冻结）
+    md_status           VARCHAR(16)   NOT NULL DEFAULT 'ACTIVE',    -- 主数据状态 ACTIVE/PENDING_DISABLE/DISABLED（docs/01 §5.1，与 status 正交）
     lock_reason         VARCHAR(64),
     min_level_milli     BIGINT        NOT NULL DEFAULT 0,  -- 拣货位补货水位，milli（docs/01 §4.3，替代 NUMERIC min_level）
     max_level_milli     BIGINT        NOT NULL DEFAULT 0,
@@ -78,10 +81,12 @@ CREATE TABLE location (
     md_version          BIGINT        NOT NULL DEFAULT 1,  -- 主数据版本（docs/01 §6），中心每次修改 +1
     CONSTRAINT uq_location_code UNIQUE (warehouse_id, code),
     CONSTRAINT ck_loc_level CHECK (min_level_milli >= 0 AND max_level_milli >= min_level_milli),
-    CONSTRAINT ck_loc_status CHECK (status IN ('AVAILABLE','LOCKED','DISABLED'))
+    CONSTRAINT ck_loc_status CHECK (status IN ('AVAILABLE','LOCKED')),
+    CONSTRAINT ck_loc_md_status CHECK (md_status IN ('ACTIVE','PENDING_DISABLE','DISABLED')),
+    CONSTRAINT ck_loc_int CHECK (min_level_milli = CAST(min_level_milli AS BIGINT) AND max_level_milli = CAST(max_level_milli AS BIGINT))
 );
 -- 待补货扫描：available < min_level_milli 且 pickable
-CREATE INDEX ix_loc_replen ON location(zone_id, pick_sequence) WHERE pickable = true AND status = 'AVAILABLE';
+CREATE INDEX ix_loc_replen ON location(zone_id, pick_sequence) WHERE pickable = true AND status = 'AVAILABLE' AND md_status = 'ACTIVE';
 -- [SQLite] 部分索引需 3.8+，语义一致；BOOLEAN 在 SQLite 存为 INTEGER 0/1
 
 CREATE TABLE sku (
@@ -111,7 +116,8 @@ CREATE TABLE sku (
     updated_at                  TIMESTAMP    NOT NULL DEFAULT now(),
     deleted_at                  TIMESTAMP,
     CONSTRAINT uq_sku_code UNIQUE (code),
-    CONSTRAINT ck_sku_loss_ppm CHECK (natural_loss_tolerance_ppm BETWEEN 0 AND 1000000),
+    CONSTRAINT ck_sku_loss_ppm CHECK (natural_loss_tolerance_ppm BETWEEN 0 AND 50000),   -- ≤ 5%，超出 422 42222（docs/01 §4.3）
+    CONSTRAINT ck_sku_int CHECK (natural_loss_tolerance_ppm = CAST(natural_loss_tolerance_ppm AS BIGINT)),
     CONSTRAINT ck_sku_shelf_life CHECK (shelf_life_days >= 0 AND receive_min_shelf_life >= 0 AND ship_min_shelf_life >= 0
         AND (shelf_life_days = 0 OR (receive_min_shelf_life <= shelf_life_days AND ship_min_shelf_life <= shelf_life_days))),
     CONSTRAINT ck_sku_status CHECK (status IN ('ACTIVE','PENDING_DISABLE','DISABLED'))
@@ -137,7 +143,8 @@ CREATE TABLE sku_unit (
     is_receive_uom  BOOLEAN       NOT NULL DEFAULT false,
     barcode_level   SMALLINT      NOT NULL DEFAULT 1,
     CONSTRAINT uq_sku_uom UNIQUE (sku_id, uom),
-    CONSTRAINT ck_unit_ratio CHECK (base_qty_milli > 0)
+    CONSTRAINT ck_unit_ratio CHECK (base_qty_milli > 0),
+    CONSTRAINT ck_unit_int CHECK (base_qty_milli = CAST(base_qty_milli AS BIGINT))
 );
 
 CREATE TABLE lot (
@@ -207,7 +214,7 @@ CREATE TABLE vehicle (
     created_at      TIMESTAMP    NOT NULL DEFAULT now(),
     updated_at      TIMESTAMP    NOT NULL DEFAULT now(),
     CONSTRAINT uq_vehicle_plate UNIQUE (plate_no),
-    CONSTRAINT ck_vehicle_cap CHECK (capacity_weight_milli >= 0),
+    CONSTRAINT ck_vehicle_cap CHECK (capacity_weight_milli >= 0 AND capacity_weight_milli = CAST(capacity_weight_milli AS BIGINT)),
     CONSTRAINT ck_vehicle_status CHECK (status IN ('ACTIVE','PENDING_DISABLE','DISABLED'))
 );
 CREATE INDEX ix_vehicle_wh ON vehicle(warehouse_id, status);
@@ -276,7 +283,8 @@ CREATE TABLE md_change_log (
     created_at      TIMESTAMP    NOT NULL DEFAULT now(),
     CONSTRAINT uq_mdlog_ver UNIQUE (entity_type, entity_id, md_version),
     CONSTRAINT ck_mdlog_op CHECK (op IN ('UPSERT','DISABLE')),
-    CONSTRAINT ck_mdlog_ver CHECK (md_version > 0)
+    CONSTRAINT ck_mdlog_ver CHECK (md_version > 0),
+    CONSTRAINT ck_mdlog_entity CHECK (entity_type IN ('WAREHOUSE','ZONE','LOCATION','SKU','SKU_UNIT','SKU_BARCODE','SUPPLIER','CUSTOMER','VEHICLE','DRIVER','DEVICE','USER_PERM'))
 );
 CREATE INDEX ix_mdlog_scope ON md_change_log(scope_warehouse_id, seq);
 
@@ -299,31 +307,142 @@ CREATE TABLE md_pending_disable (
     requested_by    BIGINT       NOT NULL,
     created_at      TIMESTAMP    NOT NULL DEFAULT now(),
     updated_at      TIMESTAMP    NOT NULL DEFAULT now(),
-    CONSTRAINT ck_mdpd_status CHECK (status IN ('WAITING','APPLIED','CANCELLED'))
+    CONSTRAINT ck_mdpd_status CHECK (status IN ('WAITING','APPLIED','CANCELLED')),
+    CONSTRAINT ck_mdpd_entity CHECK (entity_type IN ('LOCATION','SKU','SUPPLIER','CUSTOMER','VEHICLE','DRIVER'))
 );
 CREATE UNIQUE INDEX uq_mdpd_waiting ON md_pending_disable(entity_type, entity_id, warehouse_id) WHERE status = 'WAITING';
 
--- md_change_log 只追加
+-- 停用期间动作白名单（docs/01 §5.2，小钱 B1）：PENDING_DISABLE/DISABLED 的主数据，只放行"减少引用"的动作。
+-- 服务层按 action_code 查本表，查不到或 allowed_when_pending=false → 42221。库层保证"增加引用"的动作永远不能被放行
+CREATE TABLE md_disable_action_policy (
+    action_code          VARCHAR(32)  PRIMARY KEY,
+    ref_effect           VARCHAR(8)   NOT NULL,   -- ADD 增加引用 / REDUCE 减少引用
+    allowed_when_pending BOOLEAN      NOT NULL,
+    doc_ref              VARCHAR(16)  NOT NULL,   -- 归属篇
+    CONSTRAINT ck_mdap_effect CHECK (ref_effect IN ('ADD','REDUCE')),
+    CONSTRAINT ck_mdap_add_never CHECK (ref_effect = 'REDUCE' OR allowed_when_pending = false)
+);
+INSERT INTO md_disable_action_policy (action_code, ref_effect, allowed_when_pending, doc_ref) VALUES
+    ('INBOUND_CREATE',      'ADD',    false, '03'),   -- 新入库单/采购收货
+    ('PUTAWAY_TO_LOCATION', 'ADD',    false, '03'),   -- 上架到该库位
+    ('OUTBOUND_CREATE',     'ADD',    false, '04'),   -- 新出库单行
+    ('ALLOCATE',            'ADD',    false, '04'),   -- 新分配/预占
+    ('MOVE_IN',             'ADD',    false, '02'),   -- 移入该库位
+    ('NEARBY_PUTBACK_TO',   'ADD',    false, '04'),   -- 待回库就近放回到该库位（放回原位 RETURNED_TO_ORIGINAL 不算新增）
+    ('SCRAP_CREATE',        'REDUCE', true,  '09'),   -- 报损单（含 SCRAP_HANDOVER 同事务建单）
+    ('MOVE_OUT',            'REDUCE', true,  '02'),   -- 从该库位移出
+    ('COUNT_ADJUST',        'REDUCE', true,  '08'),   -- 盘点差异调整（盘盈盘亏都放行：账实一致才能清零）
+    ('RETURN_TO_SUPPLIER',  'REDUCE', true,  '10'),   -- 退供出库
+    ('CUSTOMER_RETURN_IN',  'REDUCE', true,  '10'),   -- 门店退货回仓：入库同事务冻结为 RETURN_PENDING，只能走报损或退供，不能转可售
+    ('RETURN_RECORD_CLOSE', 'REDUCE', true,  '04'),   -- 待回库 confirm / resolve（RETURNED_TO_ORIGINAL / SCRAP_HANDOVER）
+    ('PICK_EXISTING_TASK',  'REDUCE', true,  '05'),   -- 停用前已生成任务的拣货、复核、发货
+    ('RELEASE_HOLD',        'REDUCE', true,  '02'),   -- release_return_hold / release_scrap_hold / release_qc_hold 等 release_*_hold
+    ('CONVERT_HOLD',        'REDUCE', true,  '02');   -- convert_hold（如 RETURN_PENDING → SCRAP_PENDING）
+
+-- md_change_log 只追加（小钱 B3）：行级 UPDATE/DELETE + 语句级 TRUNCATE；SQLite 另拦 REPLACE
 CREATE FUNCTION trg_mdlog_append_only() RETURNS trigger LANGUAGE plpgsql AS $$                             -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     RAISE EXCEPTION 'append_only_violation: md_change_log' USING ERRCODE = '42501';                         -- @pg-only
 END $$;                                                                                                       -- @pg-only
 CREATE TRIGGER trg_mdlog_append_only BEFORE UPDATE OR DELETE ON md_change_log FOR EACH ROW EXECUTE FUNCTION trg_mdlog_append_only();  -- @pg-only
+CREATE TRIGGER trg_mdlog_no_truncate BEFORE TRUNCATE ON md_change_log FOR EACH STATEMENT EXECUTE FUNCTION trg_mdlog_append_only();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_mdlog_no_replace BEFORE INSERT ON md_change_log
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM md_change_log m WHERE m.seq = NEW.seq
+-- @sqlite-only   OR (m.entity_type = NEW.entity_type AND m.entity_id = NEW.entity_id AND m.md_version = NEW.md_version))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'append_only_violation: md_change_log'); END;
 -- @sqlite-only CREATE TRIGGER trg_mdlog_no_update BEFORE UPDATE ON md_change_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: md_change_log'); END;
 -- @sqlite-only CREATE TRIGGER trg_mdlog_no_delete BEFORE DELETE ON md_change_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: md_change_log'); END;
--- 节点号永不复用：node_registry 禁止 DELETE，node_id 不可改
+-- 节点号永不复用（小钱 B2）：禁 DELETE / TRUNCATE；退役行完全冻结；ACTIVE 行只能改 status/retired_at/retire_reason 走退役
 CREATE FUNCTION trg_node_no_reuse() RETURNS trigger LANGUAGE plpgsql AS $$                                 -- @pg-only
 BEGIN                                                                                                         -- @pg-only
-    IF TG_OP = 'DELETE' OR NEW.node_id IS DISTINCT FROM OLD.node_id OR (OLD.status = 'RETIRED' AND NEW.status <> 'RETIRED') THEN  -- @pg-only
+    IF TG_OP IN ('DELETE','TRUNCATE') OR OLD.status = 'RETIRED'                                              -- @pg-only
+       OR NEW.node_id IS DISTINCT FROM OLD.node_id OR NEW.warehouse_id IS DISTINCT FROM OLD.warehouse_id     -- @pg-only
+       OR NEW.form IS DISTINCT FROM OLD.form OR NEW.role IS DISTINCT FROM OLD.role                           -- @pg-only
+       OR NEW.host_label IS DISTINCT FROM OLD.host_label OR NEW.assigned_at IS DISTINCT FROM OLD.assigned_at THEN  -- @pg-only
         RAISE EXCEPTION 'node_id_never_reused' USING ERRCODE = '23514';                                      -- @pg-only
     END IF;                                                                                                   -- @pg-only
     RETURN NEW;                                                                                               -- @pg-only
 END $$;                                                                                                       -- @pg-only
 CREATE TRIGGER trg_node_no_reuse BEFORE UPDATE OR DELETE ON node_registry FOR EACH ROW EXECUTE FUNCTION trg_node_no_reuse();  -- @pg-only
+CREATE TRIGGER trg_node_no_truncate BEFORE TRUNCATE ON node_registry FOR EACH STATEMENT EXECUTE FUNCTION trg_node_no_reuse();  -- @pg-only
 -- @sqlite-only CREATE TRIGGER trg_node_no_delete BEFORE DELETE ON node_registry BEGIN SELECT RAISE(ABORT, 'node_id_never_reused'); END;
--- @sqlite-only CREATE TRIGGER trg_node_no_revive BEFORE UPDATE ON node_registry
--- @sqlite-only WHEN NEW.node_id IS NOT OLD.node_id OR (OLD.status = 'RETIRED' AND NEW.status <> 'RETIRED')
+-- @sqlite-only CREATE TRIGGER trg_node_no_replace BEFORE INSERT ON node_registry
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM node_registry n WHERE n.node_id = NEW.node_id)
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'node_id_never_reused'); END;
+-- @sqlite-only CREATE TRIGGER trg_node_no_revive BEFORE UPDATE ON node_registry
+-- @sqlite-only WHEN OLD.status = 'RETIRED' OR NEW.node_id IS NOT OLD.node_id OR NEW.warehouse_id IS NOT OLD.warehouse_id
+-- @sqlite-only   OR NEW.form IS NOT OLD.form OR NEW.role IS NOT OLD.role OR NEW.host_label IS NOT OLD.host_label OR NEW.assigned_at IS NOT OLD.assigned_at
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'node_id_never_reused'); END;
+
+-- 版本只升不降（小钱 I2）：主数据 md_version、边缘应用水位 applied_seq
+CREATE FUNCTION trg_md_version_monotonic() RETURNS trigger LANGUAGE plpgsql AS $$                          -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    IF NEW.md_version < OLD.md_version THEN                                                                   -- @pg-only
+        RAISE EXCEPTION 'md_version_rewind' USING ERRCODE = '23514';                                         -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    RETURN NEW;                                                                                               -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_mdv_warehouse BEFORE UPDATE ON warehouse FOR EACH ROW EXECUTE FUNCTION trg_md_version_monotonic();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_mdv_warehouse BEFORE UPDATE ON warehouse WHEN NEW.md_version < OLD.md_version BEGIN SELECT RAISE(ABORT, 'md_version_rewind'); END;
+CREATE TRIGGER trg_mdv_zone BEFORE UPDATE ON zone FOR EACH ROW EXECUTE FUNCTION trg_md_version_monotonic();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_mdv_zone BEFORE UPDATE ON zone WHEN NEW.md_version < OLD.md_version BEGIN SELECT RAISE(ABORT, 'md_version_rewind'); END;
+CREATE TRIGGER trg_mdv_location BEFORE UPDATE ON location FOR EACH ROW EXECUTE FUNCTION trg_md_version_monotonic();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_mdv_location BEFORE UPDATE ON location WHEN NEW.md_version < OLD.md_version BEGIN SELECT RAISE(ABORT, 'md_version_rewind'); END;
+CREATE TRIGGER trg_mdv_sku BEFORE UPDATE ON sku FOR EACH ROW EXECUTE FUNCTION trg_md_version_monotonic();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_mdv_sku BEFORE UPDATE ON sku WHEN NEW.md_version < OLD.md_version BEGIN SELECT RAISE(ABORT, 'md_version_rewind'); END;
+CREATE TRIGGER trg_mdv_supplier BEFORE UPDATE ON supplier FOR EACH ROW EXECUTE FUNCTION trg_md_version_monotonic();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_mdv_supplier BEFORE UPDATE ON supplier WHEN NEW.md_version < OLD.md_version BEGIN SELECT RAISE(ABORT, 'md_version_rewind'); END;
+CREATE TRIGGER trg_mdv_customer BEFORE UPDATE ON customer FOR EACH ROW EXECUTE FUNCTION trg_md_version_monotonic();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_mdv_customer BEFORE UPDATE ON customer WHEN NEW.md_version < OLD.md_version BEGIN SELECT RAISE(ABORT, 'md_version_rewind'); END;
+CREATE TRIGGER trg_mdv_vehicle BEFORE UPDATE ON vehicle FOR EACH ROW EXECUTE FUNCTION trg_md_version_monotonic();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_mdv_vehicle BEFORE UPDATE ON vehicle WHEN NEW.md_version < OLD.md_version BEGIN SELECT RAISE(ABORT, 'md_version_rewind'); END;
+CREATE TRIGGER trg_mdv_driver BEFORE UPDATE ON driver FOR EACH ROW EXECUTE FUNCTION trg_md_version_monotonic();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_mdv_driver BEFORE UPDATE ON driver WHEN NEW.md_version < OLD.md_version BEGIN SELECT RAISE(ABORT, 'md_version_rewind'); END;
+CREATE TRIGGER trg_mdv_device BEFORE UPDATE ON device FOR EACH ROW EXECUTE FUNCTION trg_md_version_monotonic();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_mdv_device BEFORE UPDATE ON device WHEN NEW.md_version < OLD.md_version BEGIN SELECT RAISE(ABORT, 'md_version_rewind'); END;
+CREATE FUNCTION trg_mdss_monotonic() RETURNS trigger LANGUAGE plpgsql AS $$                                 -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    IF NEW.applied_seq < OLD.applied_seq OR NEW.node_id IS DISTINCT FROM OLD.node_id THEN                    -- @pg-only
+        RAISE EXCEPTION 'applied_seq_rewind' USING ERRCODE = '23514';                                        -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    RETURN NEW;                                                                                               -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_mdss_monotonic BEFORE UPDATE ON md_sync_state FOR EACH ROW EXECUTE FUNCTION trg_mdss_monotonic();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_mdss_monotonic BEFORE UPDATE ON md_sync_state WHEN NEW.applied_seq < OLD.applied_seq OR NEW.node_id IS NOT OLD.node_id
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'applied_seq_rewind'); END;
+
+-- 基本单位行的换算必须是 1000（小钱 I3）
+CREATE FUNCTION trg_unit_base() RETURNS trigger LANGUAGE plpgsql AS $$                                      -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    IF NEW.base_qty_milli <> 1000 AND EXISTS (SELECT 1 FROM sku k WHERE k.id = NEW.sku_id AND k.base_uom = NEW.uom) THEN  -- @pg-only
+        RAISE EXCEPTION 'base_unit_ratio_must_be_1000' USING ERRCODE = '23514';                              -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    RETURN NEW;                                                                                               -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_unit_base BEFORE INSERT OR UPDATE ON sku_unit FOR EACH ROW EXECUTE FUNCTION trg_unit_base();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_unit_base_ins BEFORE INSERT ON sku_unit
+-- @sqlite-only WHEN NEW.base_qty_milli <> 1000 AND EXISTS (SELECT 1 FROM sku k WHERE k.id = NEW.sku_id AND k.base_uom = NEW.uom)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'base_unit_ratio_must_be_1000'); END;
+-- @sqlite-only CREATE TRIGGER trg_unit_base_upd BEFORE UPDATE ON sku_unit
+-- @sqlite-only WHEN NEW.base_qty_milli <> 1000 AND EXISTS (SELECT 1 FROM sku k WHERE k.id = NEW.sku_id AND k.base_uom = NEW.uom)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'base_unit_ratio_must_be_1000'); END;
+
+-- 门店必须挂在已存在的 CUSTOMER 下（小钱建议）
+CREATE FUNCTION trg_customer_parent() RETURNS trigger LANGUAGE plpgsql AS $$                                -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    IF NEW.parent_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM customer c WHERE c.id = NEW.parent_id AND c.customer_type = 'CUSTOMER') THEN  -- @pg-only
+        RAISE EXCEPTION 'customer_parent_invalid' USING ERRCODE = '23514';                                   -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    RETURN NEW;                                                                                               -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_customer_parent BEFORE INSERT OR UPDATE ON customer FOR EACH ROW EXECUTE FUNCTION trg_customer_parent();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_customer_parent_ins BEFORE INSERT ON customer
+-- @sqlite-only WHEN NEW.parent_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM customer c WHERE c.id = NEW.parent_id AND c.customer_type = 'CUSTOMER')
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'customer_parent_invalid'); END;
+-- @sqlite-only CREATE TRIGGER trg_customer_parent_upd BEFORE UPDATE ON customer
+-- @sqlite-only WHEN NEW.parent_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM customer c WHERE c.id = NEW.parent_id AND c.customer_type = 'CUSTOMER')
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'customer_parent_invalid'); END;
+
 CREATE INDEX ix_lot_aging  ON lot(remaining_life_days, sku_id);
 -- [SQLite] 两个部分索引均支持；ix_lot_aging 支撑效期预警列表
 
@@ -1276,3 +1395,9 @@ GRANT SELECT, INSERT, UPDATE ON warehouse, zone, location, sku, sku_unit, sku_ba
 GRANT SELECT, INSERT, UPDATE, DELETE ON idempotency_record, outbox_event TO wms_app;   -- 过期清理/已投递清理由应用定时任务做 -- @pg-only
 GRANT SELECT, INSERT ON audit_log, stock_snapshot_daily TO wms_app;                    -- 只追加 -- @pg-only
 GRANT SELECT ON v_stock_available TO wms_app;                                          -- @pg-only
+-- docs/01 新表 wms_app 最小授权（小钱 B4）：md_change_log 只追加；node_registry 只能改退役相关列；不给 DELETE/TRUNCATE
+GRANT SELECT, INSERT, UPDATE ON supplier, customer, vehicle, driver, device, md_sync_state, md_pending_disable TO wms_app;  -- @pg-only
+GRANT SELECT, INSERT ON md_change_log TO wms_app;                                                             -- @pg-only
+GRANT SELECT, INSERT ON node_registry TO wms_app;                                                             -- @pg-only
+GRANT UPDATE (status, retired_at, retire_reason) ON node_registry TO wms_app;                                 -- @pg-only
+GRANT SELECT ON md_disable_action_policy TO wms_app;                                                          -- 白名单只读，改动走迁移 -- @pg-only
