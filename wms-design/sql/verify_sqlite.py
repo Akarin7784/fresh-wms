@@ -194,7 +194,7 @@ seed = [
     "INSERT INTO warehouse (id,code,name,cutoff_time,work_date_offset) VALUES (1,'WHSH01','上海青浦仓','20:00',-1)",
     "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (1,1,'Z-C1','冷藏拣货区','CHILLED','PICK'),(2,1,'Z-C2','冷藏存储区','CHILLED','STORAGE')",
     "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (1,1,1,'A01-02-03','BIN',2,'A010'),(2,1,1,'A01-03-01','BIN',2,'A020'),(3,1,2,'B02-01-05','PALLET',8,'B010')",
-    "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life) VALUES (1,'SKU-APPLE','山东红富士 80#','KG','CHILLED',30,10)",
+    "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life,sell_days) VALUES (1,'SKU-APPLE','山东红富士 80#','KG','CHILLED',30,10,7)",
     "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date,quality_status,remaining_life_days) VALUES (1,1,'LOT-1008','2026-10-25','2026-10-08','QUALIFIED',10),(2,1,'LOT-1012','2026-10-29','2026-10-12','QUALIFIED',14),(3,1,'LOT-1014','2026-10-31','2026-10-14','QUALIFIED',16)",
     "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,allocated_qty_milli) VALUES (11,1,1,1,2,'KG',50000,0),(12,1,2,1,1,'KG',30000,10000),(13,1,3,1,3,'KG',200000,0),(14,1,3,1,1,'KG',80000,0)",
     "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000)",
@@ -464,6 +464,9 @@ ok(f"§5.6 差异生成列 diff_qty_milli = {D}（预期 -2000）") if D == -200
 print("=== 2f. docs/01 主数据：milli 换算、损耗 ppm、往来方、节点号、下发日志 ===")
 expect_block("01 损耗容差超过 5%", "UPDATE sku SET natural_loss_tolerance_ppm = 50001 WHERE id = 1", "ck_sku_loss_ppm")
 expect_block("01 出库禁发期大于保质期", "UPDATE sku SET ship_min_shelf_life = 31 WHERE id = 1", "ck_sku_shelf_life")
+expect_block("01 可售天数大于保质期", "UPDATE sku SET sell_days = 31 WHERE id = 1", "ck_sku_sell_days")
+expect_block("01 冷藏 SKU 可售天数为空", "UPDATE sku SET sell_days = NULL WHERE id = 1", "ck_sku_sell_days_req")
+expect_block("01 库区温度下限不小于上限", "UPDATE zone SET temp_min_c10 = 40, temp_max_c10 = 0 WHERE id = 1", "ck_zone_temp")
 expect_block("01 单位换算为 0", "INSERT INTO sku_unit (id,sku_id,uom,base_qty_milli) VALUES (901,1,'BOX',0)", "ck_unit_ratio")
 expect_allow("01 单位换算 1 箱 = 12500 milli", "INSERT INTO sku_unit (id,sku_id,uom,base_qty_milli) VALUES (902,1,'BOX',12500)")
 expect_block("01 库位补货水位 max < min", "UPDATE location SET min_level_milli = 5000, max_level_milli = 1000 WHERE id = 1", "ck_loc_level")
@@ -529,7 +532,7 @@ expect_allow('01 仓库编码正向：字母数字混合 WHSH01', "UPDATE wareho
 expect_block("01 仓库编码反向：改成带 - 的编码", "UPDATE warehouse SET code='WH-SH-01' WHERE id=1", "ck_wh_code")
 
 print("=== 2f4. docs/01 小吴复评 M1 条码换绑同批次 / M2 APPLIED 带版本 / M3 软删两段式 ===")
-conn.execute("INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life) VALUES (51,'SKU-PEAR','砀山梨','KG','CHILLED',30,10),(52,'SKU-KIWI','猕猴桃','KG','CHILLED',30,10),(53,'SKU-PLUM','李子','KG','CHILLED',30,10),(54,'SKU-FIG','无花果','KG','CHILLED',30,10),(55,'SKU-LIME','青柠','KG','CHILLED',30,10)"); conn.commit()
+conn.execute("INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life,sell_days) VALUES (51,'SKU-PEAR','砀山梨','KG','CHILLED',30,10,7),(52,'SKU-KIWI','猕猴桃','KG','CHILLED',30,10,7),(53,'SKU-PLUM','李子','KG','CHILLED',30,10,7),(54,'SKU-FIG','无花果','KG','CHILLED',30,10,7),(55,'SKU-LIME','青柠','KG','CHILLED',30,10,7)"); conn.commit()
 conn.execute("INSERT INTO sku_barcode (id,sku_id,barcode) VALUES (901,1,'6901234500017')"); conn.commit()
 expect_allow_tx('01 M1 中心：条码换绑同一批次（batch 5001：pos1 DELETE 旧绑定 + pos2 UPSERT 新绑定）', ["INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,batch_id,batch_pos,batch_size,payload_json,operator_id) VALUES (101,'SKU_BARCODE',901,2,'DELETE',5001,1,2,'{}',100)", 'INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,batch_id,batch_pos,batch_size,payload_json,operator_id) VALUES (102,\'SKU_BARCODE\',902,1,\'UPSERT\',5001,2,2,\'{"barcode":"6901234500017","sku_id":51}\',100)'])
 expect_block_tx('01 M1 同批次同位置两条', ["INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,batch_id,batch_pos,batch_size,payload_json,operator_id) VALUES (103,'SKU_BARCODE',903,1,'UPSERT',5001,2,2,'{}',100)"], 'append_only_violation: md_change_log')
@@ -593,7 +596,7 @@ ok('01 delete-request 版本不一致（带 v1，当前 v2）→ 0 行 → 40930
 expect_block_tx('01 有引用退回却回到 ACTIVE（申请前是 DISABLED）', ["UPDATE sku SET status='ACTIVE', md_version=3 WHERE id=51"], 'md_delete_restore_mismatch')
 expect_block_tx('01 改 prior_status', ["UPDATE md_pending_disable SET prior_status='ACTIVE' WHERE id=45"], 'md_pending_immutable')
 expect_allow_tx('01 有引用退回正向：仓 2 回报引用 → 剩余 WAITING 置 CANCELLED、实体回到 DISABLED（40960）', ['UPDATE md_pending_disable SET status=\'CANCELLED\', blocker_json=\'[{"type":"STOCK","id":"40","count":1}]\' WHERE id IN (44,45) AND status=\'WAITING\'', "UPDATE sku SET status='DISABLED', md_version=3 WHERE id=51 AND status='PENDING_DELETE' AND md_version=2"])
-conn.execute("INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life) VALUES (56,'SKU-DATE','椰枣','KG','CHILLED',30,10)"); conn.commit()
+conn.execute("INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life,sell_days) VALUES (56,'SKU-DATE','椰枣','KG','CHILLED',30,10,7)"); conn.commit()
 conn.execute("UPDATE sku SET status='PENDING_DELETE', md_version=5 WHERE id=56"); conn.commit()
 conn.execute("INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by,prior_status) VALUES (46,'SKU',56,1,5,'DELETE',100,'ACTIVE')"); conn.commit()
 expect_block_tx('01 cancel 却回到 DISABLED（申请前是 ACTIVE）', ["UPDATE sku SET status='DISABLED', md_version=6 WHERE id=56"], 'md_delete_restore_mismatch')

@@ -51,14 +51,15 @@ CREATE TABLE zone (
     code            VARCHAR(32)  NOT NULL,
     name            VARCHAR(64)  NOT NULL,
     temp_zone       VARCHAR(16)  NOT NULL,   -- AMBIENT/CHILLED/FROZEN/FRESH
-    temp_min        NUMERIC(5,2),
-    temp_max        NUMERIC(5,2),
+    temp_min_c10    INTEGER,                 -- 温度下限，单位 0.1℃（docs/01 §3）
+    temp_max_c10    INTEGER,                 -- 温度上限，单位 0.1℃
     zone_type       VARCHAR(16)  NOT NULL,   -- RECEIVE/STORAGE/PICK/STAGE/SHIP/RETURN/QUARANTINE
     pick_sequence   VARCHAR(32),
     created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     updated_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     deleted_at      TIMESTAMP,
     md_version      BIGINT       NOT NULL DEFAULT 1,  -- docs/01 §4
+    CONSTRAINT ck_zone_temp CHECK (temp_min_c10 IS NULL OR temp_max_c10 IS NULL OR temp_min_c10 < temp_max_c10),
     CONSTRAINT uq_zone_code UNIQUE (warehouse_id, code)
 );
 CREATE INDEX ix_zone_wh_type ON zone(warehouse_id, zone_type, temp_zone);
@@ -109,6 +110,7 @@ CREATE TABLE sku (
     base_uom                    VARCHAR(16)  NOT NULL,          -- KG/PCS/EA
     temperature_required        VARCHAR(16)  NOT NULL DEFAULT 'AMBIENT',
     shelf_life_days             SMALLINT     NOT NULL DEFAULT 0,
+    sell_days                   INTEGER,                         -- 可售天数（盒马日日鲜口径），1..shelf_life_days；冷藏/冷冻必填（docs/01 §4）
     receive_min_shelf_life      SMALLINT     NOT NULL DEFAULT 0,-- 收货允收期
     ship_min_shelf_life         SMALLINT     NOT NULL DEFAULT 0,-- 出库禁发期
     is_weighing                 BOOLEAN      NOT NULL DEFAULT false,
@@ -130,6 +132,8 @@ CREATE TABLE sku (
     CONSTRAINT ck_sku_int CHECK (natural_loss_tolerance_ppm = CAST(natural_loss_tolerance_ppm AS BIGINT)),
     CONSTRAINT ck_sku_shelf_life CHECK (shelf_life_days >= 0 AND receive_min_shelf_life >= 0 AND ship_min_shelf_life >= 0
         AND (shelf_life_days = 0 OR (receive_min_shelf_life <= shelf_life_days AND ship_min_shelf_life <= shelf_life_days))),
+    CONSTRAINT ck_sku_sell_days CHECK (sell_days IS NULL OR (sell_days >= 1 AND sell_days <= shelf_life_days)),
+    CONSTRAINT ck_sku_sell_days_req CHECK (temperature_required NOT IN ('CHILLED','FROZEN') OR sell_days IS NOT NULL),
     CONSTRAINT ck_sku_status CHECK (status IN ('ACTIVE','PENDING_DISABLE','DISABLED','PENDING_DELETE','DELETED')),
     CONSTRAINT ck_sku_deleted CHECK ((status = 'DELETED') = (deleted_at IS NOT NULL))   -- 软删两段式（小吴 M3）：deleted_at 只随 DELETED 出现
 );
