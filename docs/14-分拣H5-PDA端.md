@@ -38,8 +38,10 @@ Hash 路由（WebView 兼容）。权限点为建议值，以第 12 篇为准。
 | `/pick/tasks/:id` | 任务执行（逐行三步扫码） | `picking.task.execute` |
 | `/pick/tasks/:id/short` | 缺货原因选择 | `picking.task.execute` |
 | `/pick/tasks/:id/summary` | 任务汇总与提交 | `picking.task.execute` |
-| `/check` | 复核：扫筐/箱 | `picking.check.execute` |
-| `/check/:orderCode` | 逐件复核、称重、装箱打印 | `picking.check.execute` |
+| `/check` | 复核：扫筐/箱 | `outbound.check.execute` |
+| `/check/:orderCode` | 逐件复核、称重（`weight_g`） | `outbound.check.execute` |
+| `/pack/:orderCode` | 开箱、装箱、封箱、打印箱码；集货（扫箱码 + 集货位） | `outbound.pack.execute` / `outbound.stage.execute` |
+| `/receive/blind` | 无预约盲收登记（门店退货等） | 待对齐：见 Q22 |
 | `/sync` | 补交队列（待上传/失败红条/已完成） | — |
 | `/putaway`、`/move` | 上架、移库 | `inbound.putaway.execute` / `inventory.move.execute` |
 | `/settings` | 声音/震动、扫码模式、版本与设备信息 | — |
@@ -91,7 +93,12 @@ Hash 路由（WebView 兼容）。权限点为建议值，以第 12 篇为准。
 | 补交队列 | 批量/逐条补交、查询任务当前状态 | 待对齐：见第 5 篇 |
 | 补交队列 / 红条 | 查询待回库记录状态 | `GET /api/v1/return-records/{returnRecordId}`（§9.4.2） |
 | 回库 | 扫原库位确认回库 | `POST /api/v1/return-records/{returnRecordId}/confirm`（§9.4.2） |
-| 复核 | 应复核清单、逐件复核、复核通过/退回、装箱、箱码 | 待对齐：见第 6 篇 |
+| 复核 | 开复核单 | `POST /api/v1/outbound-orders/{code}/checks`（第 6 篇 §7） |
+| 复核 | 复核扫码 / 撤销一扫（四元键） | `POST /api/v1/checks/{code}/scans` |
+| 复核 | 提交（带 `version`） | `POST /api/v1/checks/{code}/submit` |
+| 装箱 | 开箱 / 整体替换箱明细（仅 OPEN） / 封箱 | `POST /api/v1/outbound-orders/{code}/boxes`、`PUT /api/v1/boxes/{code}/lines`、`POST /api/v1/boxes/{code}/seal` |
+| 集货 | 扫箱码 + 集货位（四元键） | `POST /api/v1/boxes/{code}/stage` |
+| 收货 | 盲收登记 | 待对齐：见 Q22 |
 
 ## 7. 权限点
 
@@ -309,6 +316,39 @@ stateDiagram-v2
 - 重连后先刷新 token 与任务版本，再上传 outbox；任务版本变化按 §9.4 处理。
 - 离线超过 2 小时：提示「任务可能已被回收」，仍补交，由服务端裁决。
 
+### 9.9 复核与装箱（第 6 篇 #11 @820d4e8 + 大肥鱼裁定）
+- 开复核单、提交、装箱、封箱只能在线（需取冻结期望数）；复核扫码 / 撤销一扫可离线入 outbox（四元键去重）。
+- **复核人 = 拣货人**：`403` `40312 SOD_VIOLATION`，`detail.reason=CHECK_SOD`。前端按「码 + reason」分支：`40312` 且 `CHECK_SOD` → 红条「你拣过此单，不能复核，请换人」，不重试；`40312` 其他 reason → 按 `detail.rule` 通用提示。`CHECK_SOD` 只是 reason，不是业务码。
+- **多扫**：`42214 OVER_QTY`，`detail.reason=OVER_CHECK`（复核数量超过已拣数量，02 @7592793）→ 长鸣 + 红条「复核数量超过已拣数量」，不自动重试；与 `OVER_PICK`、`OVER_REVERSE` 分开文案，未知 reason 红条交人工。
+- **复核少件不允许提交**：清单未扫齐时「提交」置灰，提示「数量不足：先撤销拣货，再重新复核」；不提供「短发通过」按钮。
+- **封箱后不可改明细**：SEALED 箱的明细只读；服务端返回 `409` `40937 BOX_SEALED_IMMUTABLE` → 刷新箱详情，提示「箱已封，需主管解封」，不重试。
+- **不允许跨单混箱**：一个箱只装一张出库单；扫到其他出库单的商品立即长鸣拒绝，不入箱（服务端为准）。
+- **集货温区不符**：`422` `42215 STAGING_TEMP_ZONE_MISMATCH` → 红条「集货位温区不符」，重扫正确集货位，不重试。
+- 称重品显示与录入重量为整数克 `weight_g`，不带小数。
+- 交接后装错车不可撤回：PDA 不提供撤回入口。封箱后丢失/损坏由主管走 `BOX_VOID` 审批（管理后台，第 13 篇），PDA 不处理。
+
+### 9.10 断网可用清单与剩余离线时间（Yuri 裁定）
+- 仓库进入断网 / 镜像不可信状态时按 `stale_stock_policy`（默认 `PAUSE`）处理，PDA 首页宫格按下表置灰：
+
+| 功能 | 断网时 |
+|---|---|
+| 执行**已下发**的拣货任务（含扫码、确认、缺货上报、撤销） | 可用，入 outbox |
+| 领取新拣货任务 | **置灰**（领取即新分配） |
+| 复核扫码 / 撤销一扫 | 可用，入 outbox |
+| 开复核单、提交、装箱、封箱 | 置灰（需在线） |
+| 收货登记（含盲收登记） | 可用，入 outbox |
+| 新分配、调拨 / 移库、波次下发 | **置灰**（跨站点分配类，`PAUSE` 暂停） |
+| 待回库确认 | 置灰（需在线校验状态） |
+
+- 置灰项点击提示「断网期间不可用，联网后操作」。
+- **剩余离线时间**：顶栏常驻倒计时，取离线令牌 `exp`（最长 12h，等于离线作业上限）；剩余 < 1 小时变红提醒；到期后停止新作业记录、只允许查看与联网补交（§9.7）。
+- 重连后按 §9.8 对账补交；补交冲突进入服务端异常队列，PDA 对应条目显示红条与异常单号（若响应提供）。
+
+### 9.11 盲收登记（无预约到货）
+- 门店退货等无预约到货允许**盲收**：扫/录 SKU、批次、数量（3 位小数字符串），提交后服务端自动生成一张异常单，须在 48 小时内关联到原出库单，否则升级到主管（管理后台处理，第 13 篇）。
+- 有退货预约的到货走预约收货，到货进入 `RETURN_QC` 冻结；PDA 只显示「待质检」，不提供解冻。
+- 盲收提交接口与响应（是否返回异常单号）未定义，见 Q22。
+
 ## 10. 测试要点
 
 | 层 | 工具 | 重点 |
@@ -316,6 +356,7 @@ stateDiagram-v2
 | 单元 | Vitest + fake-indexeddb | outbox 写入原子性；Key 与 `op_seq` 在失败/重启/退避后不变；`local_seq` 排序（时钟回拨后顺序不变）；串行与失败暂停只影响本账号同任务；`failed` 不被 24h 清理、只在服务端回执后删除；撤销在确认被拒后置 `superseded`；重扫生成新条目并关联；`format_version` 迁移（含迁移失败标红）；数量字符串计算 |
 | 组件 | Vitest + @vue/test-utils | 三步扫码不可跳步、缺货跳行、30 秒撤销、BigButton ≥56dp、离线确认即时反馈；计件模式 1 秒扫 5 件得 5（不被去抖）；非计件模式壳重复广播被丢弃；outbox 非空不能登出、可交主管；首页显示其他账号待补交数 |
 | 模拟弱网 | MSW | `40110 DEVICE_UNBOUND` 清令牌回登录且 outbox 保留；`40111 NOT_BOUND` 重新登录再发起绑定；`WAREHOUSE_MISMATCH` 提示主管；等待页按 approval_id 查询状态；离线令牌剩余时间取响应 `exp`；`40111 BINDING_PENDING` 显示等待页且 outbox 无写入、刷新后审批通过进入首页；`40920` 带 `new_holder_device_id` 时红条显示持有设备、排队操作转待回库队列、无重试请求；`40111` 暂停队列且不清 outbox；`40112` 四种 reason 分别提示、均不清 outbox；`40312` 红条显示 rule；离线令牌剩余 <1h 提醒、过期仍记录 outbox；离线用任务行 `expected_barcodes[]` 预校验（不匹配长鸣不入队）、本地通过但服务端 `42210` 时红条重扫（服务端胜出）；在线扫码调用 barcodes 解析；IndexedDB 无条码全表；`40110` 三种 reason：TOKEN_EXPIRED 刷新后同 Key 续传、PERM_VERSION_CHANGED 重拉 /me 后按权限继续或转红条、DEVICE_UNBOUND 进入重新绑定且 outbox 保留；`42214 OVER_QTY` 按 `detail.reason` 分支：`OVER_PICK` 超拣红条、`OVER_REVERSE` 红条按 `detail{outbound_line_id, picked_qty, reversed_qty, requested_qty}` 渲染且数量经 `formatQty` 显示（不做浮点运算）、缺失/未知红条交人工，三种情况均不自动重试（断言无二次请求）；超时后重试同 Key；响应丢失；**Key 过期（服务端无 Key 记录）后补交按四元组重放，不重复扣减**；`40932` detail 五字段齐全：非 `NEARBY_PUTBACK` 时 `target_location` 有值也被忽略（不提示去目标库位）、`NEARBY_PUTBACK` 且 `target_location` 为空按契约异常保留红条；`40932` 按 `resolution` 分支：`CONFIRMED`/`RETURNED_TO_ORIGINAL` 立即删除、`NEARBY_PUTBACK` 红条保留直到 `putback-ack` 成功（扫错 `42212` 重扫、ack 不写流水）、`SCRAP_HANDOVER` 红条保留直到 GET 详情 `handover_confirmed_at` 非空（为空保留）、缺失/未知保留；`40910` 的 `POD_OP`/`POD_CORRECT`/`SOURCE_ORDER` 按契约异常处理；断网时用缓存的 endpoint + epoch 继续作业且写请求带 `X-Write-Epoch`；`50303 STALE_WRITE_NODE` → 暂停 outbox、重取 write-endpoint、按 `local_seq` 原 Key 重放，不标红；`50302 ID_CLOCK_BACKWARD` 不触发重取地址、不与 STALE 混淆（只退避重试）；非计划切换后按原业务键重提交补数且新节点号无影响；`50301` 或 `epoch` 变化 → 重取 write-endpoint 后按 `local_seq` 用原 Key/`op_seq` 重提交，切换前已成功的操作得到重放不重复扣减；切换期间不标红；40920/40921/40922 返回 `confirmedLines` + `returnRecordId`，重复被拒返回同一 id（按四元组）；confirm 扫错库位 `42212` 红条保留并提示重扫原库位；confirm 成功后删除 failed 条目；confirm 与主管 resolve 并发：**`40930` 不删除、红条保留**；`40910` 按 `detail.key_type` 分支（`PDA_OP` 交主管、`IDEMPOTENCY_KEY` 上报；缺失/未知时红条、不自动重试、不生成新 Key）；`50000` 退避同 Key 重试；`50010` 不自动重试、红条；`42214 OVER_QTY`（`OVER_PICK`）超拣红条且不自动重试；`42212` 后修正重扫用同 Key 被重新执行（422 不缓存）；5xx/429 后同 Key 重试被重新执行且由业务键兜底不重复扣减；confirm 网络失败同 Key 重试；401 中途失效 |
+| 复核/装箱/离线清单 | Vitest + MSW | `40312` + `detail.reason=CHECK_SOD` 红条「换人复核」不重试，`40312` 其他 reason 走通用；`42214 OVER_CHECK` 长鸣红条不重试，文案区别于 OVER_PICK/OVER_REVERSE；未扫齐时提交置灰并提示先撤销拣货；SEALED 箱明细只读，`40937` 刷新不重试；扫到他单商品拒绝入箱；`42215` 红条重扫集货位；重量只接受整数克；断网时领取新任务、新分配、调拨、波次下发、开复核/封箱置灰，已下发任务执行、复核扫码、收货与盲收登记可用并入 outbox；顶栏倒计时取离线令牌 `exp`（≤12h），<1h 变红、到期停止新记录；盲收提交成功显示待关联提示 |
 | 真机 | 手工清单 | 冷库断网 30 分钟及跨夜（>24h）后补交；拔电池/杀 WebView 后恢复；手动改系统时间后上传顺序；换班换账号；outbox 非空时强制更新 |
 
 覆盖率目标：`offline/`、`utils/`、`composables/` 行 ≥ 85%、分支 ≥ 75%；组件 ≥ 70%。
@@ -343,3 +384,6 @@ stateDiagram-v2
 | Q17 | ~~`OVER_REVERSE` detail 字段~~ **已定**：`{outbound_line_id, picked_qty, reversed_qty, requested_qty}`，数量为 3 位小数字符串（00 §6.4 @5e44905） | 已关闭 |
 | Q18 | ~~离线条码预校验~~ **已定**：任务行 `expected_barcodes[]` 快照，仅预校验，服务端判定为准，见 §9.6 | 已关闭 |
 | Q19 | ~~me 与首次绑定确认~~ **已定**：`GET /api/v1/me`；首次绑定 PENDING + `DEVICE_BIND` 审批，审批前 `40111 BINDING_PENDING`，见 §9.7 | 已关闭 |
+| Q20 | 复核/装箱错误码在 00 §6.4 的登记：`40937 BOX_SEALED_IMMUTABLE`、`42215 STAGING_TEMP_ZONE_MISMATCH`、`40312` 的 `detail.reason=CHECK_SOD`（#11 @820d4e8 正文仍为 40310/42213，待按裁定更新） | 第 6 篇 / 00 |
+| Q21 | 断网状态（镜像不可信）如何下发给 PDA：字段名、`stale_stock_policy` 读取接口 | 00 §9 / 第 2 篇 |
+| Q22 | 盲收登记接口、请求字段与响应（异常单号、48h 截止时间） | 第 3 / 10 篇 |
