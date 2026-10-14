@@ -16,8 +16,8 @@ SCHEMA=sql/schema_postgres.sql
 # 期望值：main 8ed5f0c 为 38 表 / 99 索引 / 1 视图。docs/02 新增 stock_hold、stock_recon_alert、
 # stock_movement_key、stock_ledger_line → 42 表 / 114 索引（含 PK、UNIQUE 自动索引和分区父表上的分区索引；
 # 分区子表及其继承来的索引不计）/ 1 视图。改 DDL 必须同步改这里。
-EXPECT_TABLES=42
-EXPECT_INDEXES=115
+EXPECT_TABLES=43
+EXPECT_INDEXES=118
 EXPECT_VIEWS=1
 
 CTR=wms-pg-verify
@@ -252,6 +252,15 @@ expect_block "11 同源同单号重复落库" \
 expect_block "11 入站报文非法状态" \
   "UPDATE inbound_message SET status='OK' WHERE id=100;" \
   "ck_in_msg_status"
+
+expect_allow "11 推送日志：同单号重推各记一行（只追加，不唯一）" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,warehouse_id,payload_sha,payload,received_at,result_status,retain_until) VALUES (1,'ERP','SALES_ORDER','SO-1',1,'h1','{}','2026-10-15 01:00:00','ACCEPTED','2026-10-22 01:00:00'),(2,'ERP','SALES_ORDER','SO-1',1,'h1','{}','2026-10-15 01:05:00','DUPLICATE','2026-10-22 01:05:00');"
+expect_block "11 推送日志结果取值" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (3,'ERP','SALES_ORDER','SO-2','h','{}','2026-10-15 01:00:00','OK','2026-10-22 01:00:00');" \
+  "ck_upl_result"
+expect_block "11 推送日志保留期必须晚于接收时间" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (4,'ERP','SALES_ORDER','SO-3','h','{}','2026-10-15 01:00:00','ACCEPTED','2026-10-15 01:00:00');" \
+  "ck_upl_retain"
 
 echo "=== 3. §5.6 盘点差异生成列（实盘 − 基准账面 − 期间流水）==="
 seed "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000);"

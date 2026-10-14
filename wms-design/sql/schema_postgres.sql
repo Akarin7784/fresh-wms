@@ -783,6 +783,28 @@ CREATE TABLE adjust_line (
     CONSTRAINT ck_adj_delta CHECK (delta_qty <> 0)
 );
 
+-- 第 11 篇 集成：上游入站推送日志（只追加，部署在中心侧；保留期 ≥ 全量备份周期，默认 7 天）。
+-- 每次推送都记一行（含重推），供 00 §9.1 故障恢复按时间窗对账；对不上的进第 10 篇异常队列 FAILOVER_GAP。
+CREATE TABLE upstream_push_log (
+    id              BIGINT       PRIMARY KEY,
+    source_system   VARCHAR(24)  NOT NULL,
+    biz_type        VARCHAR(32)  NOT NULL,
+    source_order_no VARCHAR(64)  NOT NULL,
+    warehouse_id    BIGINT       NOT NULL DEFAULT 0,
+    payload_sha     VARCHAR(64)  NOT NULL,   -- 规范化报文 SHA-256（= 业务侧 source_hash）
+    payload         TEXT         NOT NULL,   -- 原文（脱敏后）
+    received_at     TIMESTAMP    NOT NULL,   -- 中心接收时间（UTC）
+    result_status   VARCHAR(16)  NOT NULL,   -- ACCEPTED/DUPLICATE/CONFLICT/REJECTED/FAILED
+    result_code     VARCHAR(8)   NOT NULL DEFAULT '0',
+    wms_doc_no      VARCHAR(64),
+    inbound_message_id BIGINT    NOT NULL DEFAULT 0,
+    retain_until    TIMESTAMP    NOT NULL,   -- ≥ received_at + max(配置保留天数, 全量备份周期)
+    CONSTRAINT ck_upl_result CHECK (result_status IN ('ACCEPTED','DUPLICATE','CONFLICT','REJECTED','FAILED')),
+    CONSTRAINT ck_upl_retain CHECK (retain_until > received_at)
+);
+CREATE INDEX ix_upl_time ON upstream_push_log(warehouse_id, received_at);
+CREATE INDEX ix_upl_src  ON upstream_push_log(source_system, source_order_no, received_at);
+
 -- -----------------------------------------------------------------------------
 -- 幂等 / 集成 / 审计
 -- -----------------------------------------------------------------------------
