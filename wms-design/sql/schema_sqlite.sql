@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 43 处 DEFAULT now() → DEFAULT (datetime('now'))（表达式默认值需括号）
---   3. 方言专属行：删除 70 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 24 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 84 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 32 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -545,7 +545,9 @@ CREATE TABLE inbound_order (
     updated_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     created_by      BIGINT,
     CONSTRAINT uq_inb_code  UNIQUE (code),
-    CONSTRAINT uq_inb_src   UNIQUE (source_system, source_order_no)   -- 业务层幂等
+    CONSTRAINT uq_inb_src   UNIQUE (source_system, source_order_no),  -- 业务层幂等
+    -- docs/10：退货入库单（RTN）来源。WMS_DELIVERY=第 16 篇拒收回仓；STORE_RETURN=门店退货回仓；MALL/ERP=客户退货经第 11 篇
+    CONSTRAINT ck_inb_rtn_src CHECK (order_type <> 'RETURN' OR source_system IN ('WMS_DELIVERY','STORE_RETURN','MALL','ERP'))
 );
 CREATE INDEX ix_inb_wh_status ON inbound_order(warehouse_id, status, work_date DESC);
 
@@ -565,7 +567,18 @@ CREATE TABLE inbound_line (
     location_id     BIGINT,
     cost_amount     BIGINT,
     quality_status  VARCHAR(16),
-    CONSTRAINT uq_inb_line UNIQUE (inbound_id, line_no)
+    -- 退货入库（docs/10 I3）：数量一律 *_qty_milli（00 R2）。上面的 NUMERIC 列归第 3 篇，按 00 §9.2「加列 → 双写 → 删旧」迁移；
+    -- 退货（order_type='RETURN'）只读写下面四列，入账 post_in 只用 received_qty_milli
+    claimed_qty_milli   BIGINT      NOT NULL DEFAULT 0,   -- 对方声称（司机拒收登记数 / 客户申请数）
+    received_qty_milli  BIGINT      NOT NULL DEFAULT 0,   -- 仓管实点（入账以此为准）
+    qc_passed_qty_milli BIGINT      NOT NULL DEFAULT 0,
+    qc_failed_qty_milli BIGINT      NOT NULL DEFAULT 0,
+    CONSTRAINT uq_inb_line UNIQUE (inbound_id, line_no),
+    -- CAST 对 BIGINT 在 PG 上恒为真，只在 SQLite（REAL/TEXT 亲和）起作用，写法与 02 相同
+    CONSTRAINT ck_inbl_int CHECK (claimed_qty_milli = CAST(claimed_qty_milli AS BIGINT) AND received_qty_milli = CAST(received_qty_milli AS BIGINT)
+                                  AND qc_passed_qty_milli = CAST(qc_passed_qty_milli AS BIGINT) AND qc_failed_qty_milli = CAST(qc_failed_qty_milli AS BIGINT)),
+    CONSTRAINT ck_inbl_qc  CHECK (claimed_qty_milli >= 0 AND received_qty_milli >= 0 AND qc_passed_qty_milli >= 0 AND qc_failed_qty_milli >= 0
+                                  AND qc_passed_qty_milli + qc_failed_qty_milli <= received_qty_milli)
 );
 
 CREATE TABLE outbound_order (
@@ -880,9 +893,9 @@ CREATE TABLE exception_case (
     id              BIGINT          PRIMARY KEY,
     code            VARCHAR(64)     NOT NULL,      -- EXC-{仓}-{节点}-{作业日}-{序号}
     warehouse_id    BIGINT          NOT NULL,
-    exception_code  VARCHAR(32)     NOT NULL,
-    source_type     VARCHAR(24)     NOT NULL,      -- DELIVERY_RETURN(16)/RETURN_INBOUND/RR_HOLD_FAILED/PICK/COUNT/MANUAL
-    source_key      VARCHAR(96)     NOT NULL,      -- 来源业务键，如 {waybill_no}:{stop_no}:{line_no}
+    exception_code  VARCHAR(32)     NOT NULL REFERENCES exception_code(code),   -- I1：外键到字典
+    source_type     VARCHAR(24)     NOT NULL,      -- 取值见 ck_exc_src_type
+    source_key      VARCHAR(96)     NOT NULL,      -- DELIVERY_RETURN：POD:{pod_id}:{correct_seq}（16，首签 0）；FAILOVER_GAP：FG:{failover_id}:{source_system}:{source_order_no}
     source_hash     VARCHAR(64)     NOT NULL,      -- 规范化内容 SHA-256：同键不同内容 → 40910 SOURCE_ORDER
     sku_id          BIGINT          NOT NULL DEFAULT 0,
     lot_id          BIGINT          NOT NULL DEFAULT 0,
@@ -906,10 +919,22 @@ CREATE TABLE exception_case (
     CONSTRAINT ck_exc_status CHECK (status IN ('OPEN','PROCESSING','RESOLVED','CLOSED','CANCELLED')),
     CONSTRAINT ck_exc_int    CHECK (claimed_qty_milli = CAST(claimed_qty_milli AS BIGINT) AND counted_qty_milli = CAST(counted_qty_milli AS BIGINT) AND diff_qty_milli = CAST(diff_qty_milli AS BIGINT)),
     CONSTRAINT ck_exc_diff   CHECK (diff_qty_milli = counted_qty_milli - claimed_qty_milli),
-    CONSTRAINT ck_exc_close  CHECK (status NOT IN ('RESOLVED','CLOSED') OR (resolution IS NOT NULL AND closed_by IS NOT NULL))
+    CONSTRAINT ck_exc_close  CHECK (status NOT IN ('RESOLVED','CLOSED') OR (resolution IS NOT NULL AND closed_by IS NOT NULL)),
+    CONSTRAINT ck_exc_src_type CHECK (source_type IN ('DELIVERY_RETURN','STORE_RETURN','RETURN_INBOUND','RR_HOLD_FAILED','FAILOVER_GAP','PICK','COUNT','MANUAL')),
+    CONSTRAINT ck_exc_hash   CHECK (length(source_hash) = 64 AND lower(source_hash) = source_hash AND replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(source_hash,'0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9',''),'a',''),'b',''),'c',''),'d',''),'e',''),'f','') = '')
 );
 CREATE INDEX ix_exc_wh_status ON exception_case(warehouse_id, status, due_at);
-
+-- I2：状态只能前进；进入 RESOLVED 后声称/实点/差异/来源不可改；CLOSED、CANCELLED 是终态，不能离开
+--   允许：OPEN→PROCESSING/RESOLVED/CANCELLED，PROCESSING→RESOLVED/CANCELLED，RESOLVED→CLOSED、RESOLVED→PROCESSING（X4 下游单据被驳回），同状态内改其他列（认领、升级）
+CREATE TRIGGER trg_exc_forward BEFORE UPDATE ON exception_case
+WHEN (OLD.status IN ('CLOSED','CANCELLED') AND NEW.status <> OLD.status)
+  OR (OLD.status = 'RESOLVED' AND NEW.status NOT IN ('RESOLVED','CLOSED','PROCESSING'))
+  OR (OLD.status = 'PROCESSING' AND NEW.status = 'OPEN')
+  OR (OLD.status IN ('RESOLVED','CLOSED','CANCELLED') AND (NEW.claimed_qty_milli <> OLD.claimed_qty_milli
+      OR NEW.counted_qty_milli <> OLD.counted_qty_milli OR NEW.diff_qty_milli <> OLD.diff_qty_milli
+      OR NEW.source_key <> OLD.source_key OR NEW.source_hash <> OLD.source_hash))
+BEGIN SELECT RAISE(ABORT, 'exc_state_forward_only'); END;
+-- I4：授权。字典只读写不删；异常单不删（取消走状态）
 -- -----------------------------------------------------------------------------
 -- 幂等 / 集成 / 审计
 -- -----------------------------------------------------------------------------
