@@ -571,6 +571,8 @@ CREATE TABLE outbound_line (
     amount          BIGINT          NOT NULL DEFAULT 0,
     short_reason    VARCHAR(24),
     alloc_round     INT             NOT NULL DEFAULT 0,   -- 每次重新分配 +1，进入占用幂等键（04 B1）
+    reversed_qty_milli BIGINT       NOT NULL DEFAULT 0,   -- 已撤销/回冲累计量；条件更新 reversed + qty <= picked，否则 42214（04 §6.3）
+    CONSTRAINT ck_obl_reversed CHECK (reversed_qty_milli >= 0 AND reversed_qty_milli = CAST(reversed_qty_milli AS BIGINT)),
     CONSTRAINT uq_obo_line UNIQUE (outbound_id, line_no)
 );
 CREATE INDEX ix_obl_sku ON outbound_line(sku_id);
