@@ -678,6 +678,7 @@ CREATE TABLE wave (
     route_code          VARCHAR(32)  NOT NULL,
     carrier_code        VARCHAR(32),
     pick_strategy       VARCHAR(24)  NOT NULL DEFAULT 'BATCH',
+    wave_type           VARCHAR(24)  NOT NULL,                -- docs/05 Q7：NORMAL/URGENT/REPLENISH_FIRST，容量配置按它取
     status              VARCHAR(16)  NOT NULL DEFAULT 'PLANNED',
     order_count         INT          NOT NULL DEFAULT 0,
     pick_line_count     INT          NOT NULL DEFAULT 0,
@@ -689,11 +690,12 @@ CREATE TABLE wave (
     created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     updated_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT uq_wave_code UNIQUE (code),
+    CONSTRAINT ck_wave_type CHECK (wave_type IN ('NORMAL','URGENT','REPLENISH_FIRST')),
     CONSTRAINT ck_wave_status CHECK (status IN ('PLANNED','RELEASED','PICKING','COMPLETED','HOLD','CANCELLED'))
 );
 CREATE INDEX ix_wave_wh ON wave(warehouse_id, status, work_date DESC);
 
--- docs/05 Q7：波次容量参数，仓库级配置（不放主数据），按仓库 + 波次类型（= wave.pick_strategy 取值）唯一
+-- docs/05 Q7：波次容量参数，仓库级配置（不放主数据），按仓库 + 波次类型（wave.wave_type）唯一
 CREATE TABLE wave_capacity_config (
     id                  BIGINT       PRIMARY KEY,
     warehouse_id        BIGINT       NOT NULL,
@@ -704,6 +706,7 @@ CREATE TABLE wave_capacity_config (
     updated_by          BIGINT,
     updated_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT uq_wcc UNIQUE (warehouse_id, wave_type),
+    CONSTRAINT ck_wcc_type CHECK (wave_type IN ('NORMAL','URGENT','REPLENISH_FIRST')),
     CONSTRAINT ck_wcc_cap CHECK (max_order_count > 0 AND max_pick_lines > 0)
 );
 

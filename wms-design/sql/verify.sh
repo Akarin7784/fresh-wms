@@ -325,9 +325,9 @@ case "$OUT" in *"permission denied for table stock_movement_key"*) ok "只追加
 
 echo "=== 2e. docs/05 §12 Q1–Q5：wave / pick_task / pick_task_line / pick_op / return_record ==="
 expect_allow "05 Q4 wave 合法状态 PLANNED" \
-  "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status) VALUES (1,'WV1',1,'2026-10-16','CHILLED','R1','PLANNED');"
+  "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,wave_type,status) VALUES (1,'WV1',1,'2026-10-16','CHILLED','R1','NORMAL','PLANNED');"
 expect_block "05 Q4 wave 非法状态 RELEASING" \
-  "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status) VALUES (2,'WV2',1,'2026-10-16','CHILLED','R1','RELEASING');" \
+  "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,wave_type,status) VALUES (2,'WV2',1,'2026-10-16','CHILLED','R1','NORMAL','RELEASING');" \
   'ck_wave_status'
 expect_allow "05 Q4 wave version 乐观锁：带旧 version 迁移" \
   "UPDATE wave SET status='RELEASED', version=version+1 WHERE id=1 AND status='PLANNED' AND version=0;"
@@ -428,15 +428,28 @@ case "$OUT" in *"permission denied for table pick_op"*) ok "05 Q2 wms_app 不能
 M=$(psql -t -A -c "SELECT count(*) FROM stock_movement WHERE biz_no='PT3'")
 [ "$M" = "0" ] && ok "05 Q2 报缺/拒收只写 pick_op，不产生流水（PT3 流水 0 条）" || bad "PT3 流水 $M 条"
 
-expect_allow "05 Q7 容量配置（仓 1 / BATCH）" \
-  "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (1,1,'BATCH',200,1500);"
-expect_allow "05 Q7 同仓不同波次类型（DISCRETE）" \
-  "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (2,1,'DISCRETE',50,300);"
+expect_allow "05 Q7 wave_type=REPLENISH_FIRST" \
+  "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,wave_type) VALUES (7,'WV7',1,'2026-10-16','CHILLED','R1','REPLENISH_FIRST');"
+expect_block "05 Q7 wave_type 复用 pick_strategy 取值（BATCH）" \
+  "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,wave_type) VALUES (5,'WV5',1,'2026-10-16','CHILLED','R1','BATCH');" \
+  "ck_wave_type"
+expect_block "05 Q7 wave_type 为空" \
+  "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code) VALUES (6,'WV6',1,'2026-10-16','CHILLED','R1');" \
+  'column "wave_type"'
+expect_allow "05 Q7 容量配置 REPLENISH_FIRST" \
+  "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (6,1,'REPLENISH_FIRST',100,800);"
+expect_block "05 Q7 容量配置类型非法（BATCH）" \
+  "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (5,1,'BATCH',200,1500);" \
+  "ck_wcc_type"
+expect_allow "05 Q7 容量配置（仓 1 / NORMAL）" \
+  "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (1,1,'NORMAL',200,1500);"
+expect_allow "05 Q7 同仓不同波次类型（URGENT）" \
+  "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (2,1,'URGENT',50,300);"
 expect_block "05 Q7 同仓同类型重复配置" \
-  "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (3,1,'BATCH',100,800);" \
+  "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (3,1,'NORMAL',100,800);" \
   "uq_wcc"
 expect_block "05 Q7 容量上限为 0" \
-  "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (4,2,'BATCH',0,1500);" \
+  "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (4,2,'NORMAL',0,1500);" \
   "ck_wcc_cap"
 OUT=$(psql -q -c "SET ROLE wms_app; UPDATE wave_capacity_config SET max_order_count=180, version=version+1 WHERE id=1 AND version=0;")
 case "$OUT" in *ERROR*) bad "wms_app 改容量配置被拒：$OUT";; *) ok "05 Q7 wms_app 可按 version 改容量配置";; esac

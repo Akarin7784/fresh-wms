@@ -382,8 +382,8 @@ c = conn.execute("UPDATE stock_hold SET released_qty_milli = hold_qty_milli, sta
 ok("冻结只释放一次：再次释放 rowcount=0") if c == 0 else bad(f"重复释放 rowcount={c}")
 
 print("=== 2f. docs/05 §12 Q1–Q5：wave / pick_task / pick_task_line / pick_op / return_record ===")
-expect_allow('05 Q4 wave 合法状态 PLANNED', "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status) VALUES (1,'WV1',1,'2026-10-16','CHILLED','R1','PLANNED')")
-expect_block('05 Q4 wave 非法状态 RELEASING', "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status) VALUES (2,'WV2',1,'2026-10-16','CHILLED','R1','RELEASING')", 'ck_wave_status')
+expect_allow('05 Q4 wave 合法状态 PLANNED', "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,wave_type,status) VALUES (1,'WV1',1,'2026-10-16','CHILLED','R1','NORMAL','PLANNED')")
+expect_block('05 Q4 wave 非法状态 RELEASING', "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,wave_type,status) VALUES (2,'WV2',1,'2026-10-16','CHILLED','R1','NORMAL','RELEASING')", 'ck_wave_status')
 expect_allow('05 Q4 wave version 乐观锁：带旧 version 迁移', "UPDATE wave SET status='RELEASED', version=version+1 WHERE id=1 AND status='PLANNED' AND version=0")
 expect_allow('05 Q4 pick_task CLOSED 合法（主管强制关闭）', "INSERT INTO pick_task (id,code,wave_id,warehouse_id,status,assigned_to,device_instance_id) VALUES (1,'PT1',1,1,'CLOSED',7,'DEV-A')")
 expect_block('05 Q4 pick_task 非法状态 REASSIGNED', "INSERT INTO pick_task (id,code,wave_id,warehouse_id,status) VALUES (2,'PT2',1,1,'REASSIGNED')", 'ck_pt_status')
@@ -424,10 +424,15 @@ ok(f"05 Q2 40910 判定基准：ON CONFLICT DO NOTHING 0 行，读回首次 {f} 
 m = one("SELECT count(*) FROM stock_movement WHERE biz_no='PT3'")[0]
 ok("05 Q2 报缺/拒收只写 pick_op，不产生流水（PT3 流水 0 条）") if m == 0 else bad(f"PT3 流水 {m} 条")
 
-expect_allow("05 Q7 容量配置（仓 1 / BATCH）", "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (1,1,'BATCH',200,1500)")
-expect_allow("05 Q7 同仓不同波次类型（DISCRETE）", "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (2,1,'DISCRETE',50,300)")
-expect_block("05 Q7 同仓同类型重复配置", "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (3,1,'BATCH',100,800)", "wave_capacity_config.warehouse_id, wave_capacity_config.wave_type")
-expect_block("05 Q7 容量上限为 0", "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (4,2,'BATCH',0,1500)", "ck_wcc_cap")
+expect_allow("05 Q7 wave_type=REPLENISH_FIRST", "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,wave_type) VALUES (7,'WV7',1,'2026-10-16','CHILLED','R1','REPLENISH_FIRST')")
+expect_block("05 Q7 wave_type 复用 pick_strategy 取值（BATCH）", "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,wave_type) VALUES (5,'WV5',1,'2026-10-16','CHILLED','R1','BATCH')", "ck_wave_type")
+expect_block("05 Q7 wave_type 为空", "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code) VALUES (6,'WV6',1,'2026-10-16','CHILLED','R1')", "wave.wave_type")
+expect_allow("05 Q7 容量配置 REPLENISH_FIRST", "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (6,1,'REPLENISH_FIRST',100,800)")
+expect_block("05 Q7 容量配置类型非法（BATCH）", "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (5,1,'BATCH',200,1500)", "ck_wcc_type")
+expect_allow("05 Q7 容量配置（仓 1 / NORMAL）", "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (1,1,'NORMAL',200,1500)")
+expect_allow("05 Q7 同仓不同波次类型（URGENT）", "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (2,1,'URGENT',50,300)")
+expect_block("05 Q7 同仓同类型重复配置", "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (3,1,'NORMAL',100,800)", "wave_capacity_config.warehouse_id, wave_capacity_config.wave_type")
+expect_block("05 Q7 容量上限为 0", "INSERT INTO wave_capacity_config (id,warehouse_id,wave_type,max_order_count,max_pick_lines) VALUES (4,2,'NORMAL',0,1500)", "ck_wcc_cap")
 
 print("=== 2c2. A3 RETURN_QC 系统冻结、release_qc_hold、QUALITY/RETURN_QC → SCRAP_PENDING ===")
 expect_allow_tx('A3 准备：stock 41 质检冻结 9000（RETURN_QC 6000 + QUALITY 3000）', ["INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,quality_hold_qty_milli) VALUES (41,1,2,2,3,'KG',9000,9000)", "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (50,41,'RETURN_QC','RETURN_QC','QC',7001,'RQC:7001',6000,0,'HELD',0)", "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (51,41,'QUALITY','QC_PENDING','INBOUND_QC',1,'H51',3000,0,'HELD',0)"])
