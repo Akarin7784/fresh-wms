@@ -266,7 +266,7 @@ CREATE TABLE stock_hold (
     CONSTRAINT ck_hold_reason CHECK (
         hold_type NOT IN ('QUALITY','MANUAL','RETURN_PENDING')      -- 类型非法交给 ck_hold_type 报，避免两条约束同时报
         OR (hold_type = 'QUALITY'        AND reason_code IN ('QC_PENDING','RETURN_QC','COUNT_LOCK'))
-        OR (hold_type = 'MANUAL'      AND reason_code IN ('DAMAGE','EXCEPTION','OTHER'))
+        OR (hold_type = 'MANUAL'      AND reason_code IN ('DAMAGE','EXCEPTION','OTHER','SCRAP_PENDING'))
         OR (hold_type = 'RETURN_PENDING' AND reason_code = 'RETURN_PENDING')
     ),
     -- RETURN_PENDING 是系统冻结：必须挂在一条待回库记录上、operator_id=0；人工解冻接口拒绝它（应用层），只能由 confirm/resolve 同事务释放
@@ -782,6 +782,50 @@ CREATE TABLE adjust_line (
     delta_qty       NUMERIC(14,3)   NOT NULL,   -- 正入负出
     CONSTRAINT ck_adj_delta CHECK (delta_qty <> 0)
 );
+
+-- 第 9 篇 效期与损耗：报损单（SCR）。审批通过后由服务端按行调 02 原语 post_out(SCRAP)；
+-- 申请时对每行建 MANUAL/SCRAP_PENDING 冻结（op_key = SCRH:{scrap_line_id}），审批出账与解冻同事务。
+CREATE TABLE scrap_order (
+    id              BIGINT          PRIMARY KEY,
+    code            VARCHAR(64)     NOT NULL,   -- SCR-{仓}-{节点}-{作业日}-{序号}
+    warehouse_id    BIGINT          NOT NULL,
+    source_type     VARCHAR(24)     NOT NULL,   -- EXPIRY_SCAN/MANUAL/RETURN_QC/RETURN_RECORD/COUNT
+    source_id       BIGINT          NOT NULL DEFAULT 0,
+    reason_code     VARCHAR(24)     NOT NULL,   -- EXPIRED/NEAR_EXPIRY/DAMAGED/QC_REJECT/NATURAL_LOSS/OTHER
+    status          VARCHAR(16)     NOT NULL DEFAULT 'DRAFT',
+    work_date       DATE            NOT NULL,   -- 仓库时区作业日
+    amount_impact   BIGINT          NOT NULL DEFAULT 0,   -- 分
+    applicant_id    BIGINT          NOT NULL,
+    approver_id     BIGINT,
+    approved_at     TIMESTAMP,
+    posted_at       TIMESTAMP,
+    version         BIGINT          NOT NULL DEFAULT 0,
+    created_at      TIMESTAMP       NOT NULL DEFAULT now(),
+    CONSTRAINT uq_scr_code   UNIQUE (code),
+    CONSTRAINT ck_scr_status CHECK (status IN ('DRAFT','PENDING_APPROVAL','APPROVED','POSTED','REJECTED','CANCELLED')),
+    CONSTRAINT ck_scr_sod    CHECK (approver_id IS NULL OR approver_id <> applicant_id)
+);
+CREATE INDEX ix_scr_wh_status ON scrap_order(warehouse_id, status, work_date);
+CREATE UNIQUE INDEX uq_scr_source ON scrap_order(source_type, source_id) WHERE source_id <> 0 AND status NOT IN ('REJECTED','CANCELLED');
+-- ↑ 同一来源（效期扫描任务、待回库记录等）最多一张有效报损单
+
+CREATE TABLE scrap_line (
+    id              BIGINT          PRIMARY KEY,
+    scrap_id        BIGINT          NOT NULL,
+    line_no         INT             NOT NULL,
+    stock_id        BIGINT          NOT NULL,
+    sku_id          BIGINT          NOT NULL,
+    lot_id          BIGINT          NOT NULL,
+    qty_milli       BIGINT          NOT NULL,
+    hold_id         BIGINT          NOT NULL DEFAULT 0,   -- SCRAP_PENDING 冻结；0 = 已出库待报损（不冻结）
+    ledger_mode     VARCHAR(16)     NOT NULL DEFAULT 'POST_OUT',   -- POST_OUT 出账 / NONE 已扣账只记损耗
+    cost_amount     BIGINT          NOT NULL DEFAULT 0,
+    CONSTRAINT uq_scr_line   UNIQUE (scrap_id, line_no),
+    CONSTRAINT ck_scrl_int   CHECK (qty_milli = CAST(qty_milli AS BIGINT)),
+    CONSTRAINT ck_scrl_qty   CHECK (qty_milli > 0),
+    CONSTRAINT ck_scrl_mode  CHECK (ledger_mode IN ('POST_OUT','NONE'))
+);
+CREATE INDEX ix_scrl_stock ON scrap_line(stock_id);
 
 -- -----------------------------------------------------------------------------
 -- 幂等 / 集成 / 审计

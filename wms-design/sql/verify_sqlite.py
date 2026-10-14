@@ -119,7 +119,7 @@ NI = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='index' AND sql
 NV = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='view'").fetchone()[0]
 print(f"  → 表 {NT} 张 / 手工建索引 {NI} 个 / 视图 {NV} 个")
 # 期望值：main 8ed5f0c 为 38 表；docs/02 新增 stock_hold、stock_recon_alert、stock_movement_key、stock_ledger_line → 42 表（PG 分区子表不计）。改表数必须同步改这里和 verify.sh
-EXPECT_TABLES, EXPECT_VIEWS = 42, 1
+EXPECT_TABLES, EXPECT_VIEWS = 44, 1
 ok(f"表数 = {NT}（期望 {EXPECT_TABLES}）") if NT == EXPECT_TABLES else bad(f"表数 = {NT}，期望 {EXPECT_TABLES}")
 ok(f"视图数 = {NV}") if NV == EXPECT_VIEWS else bad(f"视图数 = {NV}，期望 {EXPECT_VIEWS}")
 
@@ -333,6 +333,16 @@ expect_block(
 
 D = one("SELECT diff_qty_milli FROM count_line WHERE id=1")[0]
 ok(f"§5.6 差异生成列 diff_qty_milli = {D}（预期 -2000）") if D == -2000 else bad(f"差异列 = {D}")
+
+print("=== 2f. docs/09 效期与损耗：报损单、SCRAP_PENDING 冻结 ===")
+expect_allow('09 报损单建单（DRAFT，来源=效期扫描 501）', "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (100,'SCR-1',1,'EXPIRY_SCAN',501,'EXPIRED','2026-10-15',7)")
+expect_block('09 同一来源重复建有效报损单', "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (101,'SCR-2',1,'EXPIRY_SCAN',501,'EXPIRED','2026-10-15',7)", 'scrap_order.source_type, scrap_order.source_id')
+expect_block('09 报损审批 SoD（审批人=申请人）', "UPDATE scrap_order SET approver_id=7, status='APPROVED' WHERE id=100", 'ck_scr_sod')
+expect_block('09 报损单非法状态值', "UPDATE scrap_order SET status='DONE' WHERE id=100", 'ck_scr_status')
+expect_block('09 报损行数量非整数 milli（SQLite REAL）', 'INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,qty_milli) VALUES (100,100,1,14,1,1,1.5)', 'ck_scrl_int')
+expect_block('09 报损行数量 0', 'INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,qty_milli) VALUES (101,100,1,14,1,1,0)', 'ck_scrl_qty')
+expect_allow('09 报损冻结 MANUAL/SCRAP_PENDING（SCRH:100）', "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (100,13,'MANUAL','SCRAP_PENDING','SCRAP',100,'SCRH:100',1000,0,'HELD',7)")
+expect_block('09 SCRAP_PENDING 不能挂 QUALITY', "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (101,13,'QUALITY','SCRAP_PENDING','SCRAP',100,'SCRH:101',1000,0,'HELD',7)", 'ck_hold_reason')
 
 print("=== 3. §4.4 FEFO 候选池排序（视图 + 排序键）===")
 rows = conn.execute(
