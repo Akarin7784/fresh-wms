@@ -18,7 +18,7 @@ SCHEMA=sql/schema_postgres.sql
 # 分区子表及其继承来的索引不计）/ 1 视图。二轮 C2 加 uq_mvk_mv（外键被引用键）→ 115；A3 加 stock_hold_release（PK、uq_hr_op、ix_hr_hold）→ 43 表 / 118。改 DDL 必须同步改这里。
 # 必须用新建的空库跑（DROP SCHEMA public 重建会丢 wms_app 的 USAGE；schema 里已 GRANT USAGE 兜底，小赵 C6）。
 EXPECT_TABLES=46   # +3 docs/12：user_device_binding offline_token approval_request
-EXPECT_INDEXES=129   # +11 docs/12
+EXPECT_INDEXES=130   # +12 docs/12：3 主键 + uq_offline_jti + uq_audit_node_seq + 7 个显式索引
 EXPECT_VIEWS=1
 
 CTR=wms-pg-verify
@@ -374,23 +374,47 @@ expect_block "12 离线令牌 jti 重复" \
 expect_block "12 SoD：申请人自己审批" \
   "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,first_approver_id,expires_at) VALUES (2,'CANCEL_AFTER_PICK',1,'OUTBOUND',2,'{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','客户取消',201,201,'2026-10-16');" "ck_apr_sod"
 expect_block "12 非计划切换第二确认人 = 第一审批人" \
-  "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,first_approver_id,second_approver_id,expires_at) VALUES (3,'UNPLANNED_FAILOVER',1,'WAREHOUSE',1,'{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','边缘硬盘故障',201,202,202,'2026-10-16');" "ck_apr_dual"
+  "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,first_approver_id,first_approver_role,second_approver_id,second_approver_role,expires_at) VALUES (3,'UNPLANNED_FAILOVER',1,'WAREHOUSE',1,'{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','边缘硬盘故障',201,202,'WH_SUPERVISOR',202,'CENTER_OPS','2026-10-16');" "ck_apr_dual"
 expect_block "12 非双人类型填了第二审批人" \
   "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,first_approver_id,second_approver_id,expires_at) VALUES (4,'POD_CORRECT',1,'POD',9,'{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','签收数量填错',201,202,203,'2026-10-16');" "ck_apr_dual"
 expect_block "12 非计划切换只有一人确认就 APPROVED" \
-  "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,first_approver_id,status,expires_at) VALUES (5,'UNPLANNED_FAILOVER',1,'WAREHOUSE',2,'{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','边缘硬盘故障',201,202,'APPROVED','2026-10-16');" "ck_apr_done"
+  "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,first_approver_id,first_approver_role,status,expires_at) VALUES (5,'UNPLANNED_FAILOVER',1,'WAREHOUSE',2,'{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','边缘硬盘故障',201,202,'WH_SUPERVISOR','APPROVED','2026-10-16');" "ck_apr_done"
 expect_block "12 同一目标两条待审批（重复申请）" \
   "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (6,'CANCEL_AFTER_PICK',1,'OUTBOUND','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','再申请一次',203,'2026-10-16');" "uq_apr_open"
 expect_block "12 审计重复回传同 (node_id,node_seq)" \
   "INSERT INTO audit_log (id,action,node_id,node_seq) VALUES (2,'x',7,1);" "uq_audit_node_seq"
 expect_allow "12 非计划切换两人确认 APPROVED" \
-  "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,first_approver_id,second_approver_id,status,expires_at) VALUES (7,'UNPLANNED_FAILOVER',1,'WAREHOUSE',3,'{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','边缘硬盘故障',201,202,203,'APPROVED','2026-10-16');"
+  "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,first_approver_id,first_approver_role,second_approver_id,second_approver_role,status,expires_at) VALUES (7,'UNPLANNED_FAILOVER',1,'WAREHOUSE',3,'{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','边缘硬盘故障',201,202,'WH_SUPERVISOR',203,'CENTER_OPS','APPROVED','2026-10-16');"
 expect_block "12 audit_log 只追加（UPDATE）" \
   "UPDATE audit_log SET reason='x' WHERE id=1;" "append_only_violation: audit_log"
 expect_block "12 audit_log 只追加（DELETE）" \
   "DELETE FROM audit_log WHERE id=1;" "append_only_violation: audit_log"
 OUT=$(psql -q -c "TRUNCATE audit_log;" 2>&1)
 case "$OUT" in *"append_only_violation"*) ok "12 TRUNCATE audit_log 被语句级触发器拦下";; *) bad "TRUNCATE audit_log 未被拦：$OUT";; esac
+
+echo "=== 2e2. docs/12 二轮：绑定 PENDING/DEVICE_BIND、三人切换角色、审批终态、perm_version、授权 ==="
+seed "INSERT INTO sys_user (id,username,password_hash) VALUES (101,'picker01','x');"
+seed "UPDATE sys_user SET perm_version = 3 WHERE id = 101;"
+expect_block "12 ACTIVE 绑定没有审批单/激活时间" \
+  "INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id,status) VALUES (4,'DEV-C','PDA',101,1,'ACTIVE');" "ck_udb_status"
+expect_block "12 同一实例已有 PENDING 再申请一条" \
+  "INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id) VALUES (5,'DEV-A','PDA',103,1);" "uq_udb_active"
+expect_block "12 非计划切换第一确认人不是仓库主管" \
+  "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,first_approver_id,first_approver_role,expires_at) VALUES (8,'UNPLANNED_FAILOVER',1,'WAREHOUSE',8,'{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','x',201,202,'CENTER_OPS','2026-10-16');" "ck_apr_failover_roles"
+expect_block "12 非计划切换第二确认人不是中心运维" \
+  "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,first_approver_id,first_approver_role,second_approver_id,second_approver_role,expires_at) VALUES (9,'UNPLANNED_FAILOVER',1,'WAREHOUSE',9,'{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','x',201,202,'WH_SUPERVISOR',203,'WH_SUPERVISOR','2026-10-16');" "ck_apr_failover_roles"
+expect_allow "12 DEVICE_BIND 审批通过 → 绑定 PENDING→ACTIVE" \
+  "BEGIN; INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,first_approver_id,first_approver_role,status,decided_at,expires_at) VALUES (10,'DEVICE_BIND',1,'DEVICE_BINDING','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','新 PDA',101,201,'WH_SUPERVISOR','APPROVED','2026-10-15 08:00','2026-10-16'); UPDATE user_device_binding SET status='ACTIVE', approval_id=10, activated_at='2026-10-15 08:00' WHERE id=1 AND status='PENDING'; COMMIT;"
+expect_block "12 已 APPROVED 的审批被改回 PENDING" \
+  "UPDATE approval_request SET status='PENDING' WHERE id=7;" "approval_final"
+expect_block "12 perm_version 回退" \
+  "UPDATE sys_user SET perm_version = 1 WHERE id = 101;" "perm_version_rewind"
+OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM approval_request WHERE id=1;" 2>&1)
+case "$OUT" in *"permission denied for table approval_request"*) ok "12 wms_app 不能删审批";; *) bad "12 wms_app 不能删审批 未被拒：$OUT";; esac
+OUT=$(psql -q -c "SET ROLE wms_app; UPDATE offline_token SET expires_at='2030-01-01' WHERE id=1;" 2>&1)
+case "$OUT" in *"permission denied for table offline_token"*) ok "12 wms_app 不能改离线令牌有效期";; *) bad "12 wms_app 不能改离线令牌有效期 未被拒：$OUT";; esac
+OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM user_device_binding WHERE id=1;" 2>&1)
+case "$OUT" in *"permission denied for table user_device_binding"*) ok "12 wms_app 不能删设备绑定";; *) bad "12 wms_app 不能删设备绑定 未被拒：$OUT";; esac
 
 echo "=== 2d. Q7：PG 写入 bigint 的取整行为（QA 在 PG16.14 实测，已关闭）==="
 # 临时表只活在一个会话里：建表、插入、查询必须在同一次 psql 调用（小赵 C1）

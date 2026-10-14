@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 44 处 DEFAULT now() → DEFAULT (datetime('now'))（表达式默认值需括号）
---   3. 方言专属行：删除 76 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 26 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 99 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 32 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -965,9 +965,11 @@ CREATE TABLE sys_user (
     mp_openid       VARCHAR(64),
     status          VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
     last_login_at   TIMESTAMP,
+    perm_version    BIGINT       NOT NULL DEFAULT 1,   -- docs/12 §3.1：角色/权限/仓分配任何变化 +1，只升不降
     created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     deleted_at      TIMESTAMP,
-    CONSTRAINT uq_user_name UNIQUE (username)
+    CONSTRAINT uq_user_name UNIQUE (username),
+    CONSTRAINT ck_user_perm_ver CHECK (perm_version > 0)
 );
 CREATE INDEX ix_user_openid ON sys_user(mp_openid) WHERE mp_openid IS NOT NULL;
 
@@ -1017,15 +1019,20 @@ CREATE TABLE user_device_binding (
     client_type         VARCHAR(16)  NOT NULL,       -- PDA / DRIVER_APP
     user_id             BIGINT       NOT NULL,
     warehouse_id        BIGINT       NOT NULL,
-    status              VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
+    status              VARCHAR(16)  NOT NULL DEFAULT 'PENDING',   -- PENDING（待主管确认）/ ACTIVE / REVOKED
+    approval_id         BIGINT,                      -- DEVICE_BIND 审批单
     bound_at            TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    activated_at        TIMESTAMP,
     revoked_at          TIMESTAMP,
     revoked_by          BIGINT,
     revoke_reason       VARCHAR(64),
     CONSTRAINT ck_udb_client CHECK (client_type IN ('PDA','DRIVER_APP')),
-    CONSTRAINT ck_udb_status CHECK ((status = 'ACTIVE' AND revoked_at IS NULL) OR (status = 'REVOKED' AND revoked_at IS NOT NULL))
+    CONSTRAINT ck_udb_status CHECK ((status = 'PENDING' AND revoked_at IS NULL AND activated_at IS NULL)
+        OR (status = 'ACTIVE' AND revoked_at IS NULL AND activated_at IS NOT NULL AND approval_id IS NOT NULL)
+        OR (status = 'REVOKED' AND revoked_at IS NOT NULL))
 );
-CREATE UNIQUE INDEX uq_udb_active ON user_device_binding(device_instance_id) WHERE status = 'ACTIVE';
+-- 同一设备实例同时最多一条未吊销绑定（PENDING 或 ACTIVE）
+CREATE UNIQUE INDEX uq_udb_active ON user_device_binding(device_instance_id) WHERE status IN ('PENDING','ACTIVE');
 CREATE INDEX ix_udb_user ON user_device_binding(user_id, status);
 
 -- 离线令牌：断网时边缘节点/终端本地校验用。签名在应用层，库里只存 jti 与吊销状态
@@ -1048,7 +1055,7 @@ CREATE INDEX ix_offline_binding ON offline_token(binding_id) WHERE revoked_at IS
 -- 主管审批（docs/12 §5）：申请人 ≠ 审批人；双人确认类第二审批人与前两人都不同
 CREATE TABLE approval_request (
     id                  BIGINT       PRIMARY KEY,
-    approval_type       VARCHAR(32)  NOT NULL,       -- POD_CORRECT / CANCEL_AFTER_PICK / UNPLANNED_FAILOVER
+    approval_type       VARCHAR(32)  NOT NULL,       -- POD_CORRECT / CANCEL_AFTER_PICK / UNPLANNED_FAILOVER / DEVICE_BIND
     warehouse_id        BIGINT       NOT NULL,
     target_type         VARCHAR(32)  NOT NULL,
     target_id           VARCHAR(64)  NOT NULL,
@@ -1058,15 +1065,22 @@ CREATE TABLE approval_request (
     requested_by        BIGINT       NOT NULL,
     status              VARCHAR(16)  NOT NULL DEFAULT 'PENDING',
     first_approver_id   BIGINT,
+    first_approver_role VARCHAR(32),                 -- 审批时实际使用的角色（服务端写入）
     first_approved_at   TIMESTAMP,
     second_approver_id  BIGINT,                      -- 仅双人确认类
+    second_approver_role VARCHAR(32),
     second_approved_at  TIMESTAMP,
+    result_ref          VARCHAR(64),                 -- 执行结果引用：如 POD 更正的新 pod_id + correct_seq（服务端执行时分配）
     decided_at          TIMESTAMP,
     reject_reason       VARCHAR(256),
     expires_at          TIMESTAMP    NOT NULL,
     version             INT          NOT NULL DEFAULT 0,
     created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
-    CONSTRAINT ck_apr_type CHECK (approval_type IN ('POD_CORRECT','CANCEL_AFTER_PICK','UNPLANNED_FAILOVER')),
+    CONSTRAINT ck_apr_type CHECK (approval_type IN ('POD_CORRECT','CANCEL_AFTER_PICK','UNPLANNED_FAILOVER','DEVICE_BIND')),
+    -- 非计划切换 = 发起人 + 仓库主管 + 中心运维三人（00 §9.1），角色固定
+    CONSTRAINT ck_apr_failover_roles CHECK (approval_type <> 'UNPLANNED_FAILOVER'
+        OR ((first_approver_id IS NULL OR first_approver_role = 'WH_SUPERVISOR')
+            AND (second_approver_id IS NULL OR second_approver_role = 'CENTER_OPS'))),
     CONSTRAINT ck_apr_status CHECK (status IN ('PENDING','PARTIAL','APPROVED','REJECTED','EXPIRED','WITHDRAWN')),
     CONSTRAINT ck_apr_sod CHECK (first_approver_id IS NULL OR first_approver_id <> requested_by),
     CONSTRAINT ck_apr_dual CHECK (second_approver_id IS NULL
@@ -1077,6 +1091,15 @@ CREATE TABLE approval_request (
 );
 CREATE UNIQUE INDEX uq_apr_open ON approval_request(approval_type, target_type, target_id) WHERE status IN ('PENDING','PARTIAL');
 CREATE INDEX ix_apr_wh ON approval_request(warehouse_id, status, created_at);
+CREATE INDEX ix_apr_requester ON approval_request(requested_by, status, created_at);   -- GET /approvals?mine=true
+-- 审批终态不可再改（APPROVED/REJECTED/EXPIRED/WITHDRAWN），PENDING/PARTIAL 只能前进
+CREATE TRIGGER trg_apr_final BEFORE UPDATE ON approval_request
+WHEN OLD.status IN ('APPROVED','REJECTED','EXPIRED','WITHDRAWN') OR NEW.payload_hash IS NOT OLD.payload_hash
+  OR NEW.requested_by IS NOT OLD.requested_by OR NEW.approval_type IS NOT OLD.approval_type
+BEGIN SELECT RAISE(ABORT, 'approval_final'); END;
+-- sys_user.perm_version 只升不降（撤权必须让旧令牌失效）
+CREATE TRIGGER trg_user_perm_ver BEFORE UPDATE ON sys_user WHEN NEW.perm_version < OLD.perm_version
+BEGIN SELECT RAISE(ABORT, 'perm_version_rewind'); END;
 
 -- -----------------------------------------------------------------------------
 -- 视图：可用量（避免每个查询手写减法，也避免算错）
@@ -1119,3 +1142,4 @@ WHERE s.on_hand_qty_milli > 0 AND l.status = 'AVAILABLE' AND l.deleted_at IS NUL
 -- wms_app 授权清单（其余表，docs/02 §4.4.4）：public 下每张表/视图都必须对 wms_app 有显式授权，
 -- verify.sh 按 pg_class 逐表检查，缺一张就失败。新增表必须在这里（或表旁）写 GRANT，按需最小授权；不给 TRUNCATE。
 -- ============================================================
+-- docs/12 新表 wms_app 最小授权：不给 DELETE/TRUNCATE；离线令牌只能写吊销时间；审批只能改决策相关列
