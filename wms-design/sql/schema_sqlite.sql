@@ -519,14 +519,14 @@ CREATE TABLE outbound_order (
     cutoff_at               TIMESTAMP,
     priority                SMALLINT        NOT NULL DEFAULT 5,
     status                  VARCHAR(24)     NOT NULL,   -- 迁移表见 docs/04 §5.1
-    source_hash             VARCHAR(64)     NOT NULL DEFAULT '',  -- 上游单据内容摘要，同号不同 hash → 40910（04 I1）
+    source_hash             VARCHAR(64)     NOT NULL,   -- 上游单据规范化内容的 SHA-256 hex；同号不同 hash → 40910（04 I1）；无默认值（小赵 D6）
     wave_id                 BIGINT,
     short_ship_policy       VARCHAR(16)     NOT NULL DEFAULT 'ALLOW_SHORT',
-    total_qty               NUMERIC(14,3)   NOT NULL DEFAULT 0,
-    allocated_qty           NUMERIC(14,3)   NOT NULL DEFAULT 0,
-    picked_qty              NUMERIC(14,3)   NOT NULL DEFAULT 0,
-    shipped_qty             NUMERIC(14,3)   NOT NULL DEFAULT 0,
-    short_qty               NUMERIC(14,3)   NOT NULL DEFAULT 0,
+    total_qty_milli         BIGINT          NOT NULL DEFAULT 0,   -- 以下汇总量均为基本单位 milli（00 R2），由 Service 维护
+    allocated_qty_milli     BIGINT          NOT NULL DEFAULT 0,
+    picked_qty_milli        BIGINT          NOT NULL DEFAULT 0,
+    shipped_qty_milli       BIGINT          NOT NULL DEFAULT 0,
+    short_qty_milli         BIGINT          NOT NULL DEFAULT 0,
     total_amount            BIGINT          NOT NULL DEFAULT 0,
     picker_id               BIGINT,
     checker_id              BIGINT,
@@ -541,12 +541,22 @@ CREATE TABLE outbound_order (
     created_at              TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     updated_at              TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     status_changed_at       TIMESTAMP,
+    reserve_expires_at      TIMESTAMP,                   -- 预占过期时刻（04 T6）
+    version                 BIGINT          NOT NULL DEFAULT 0,   -- 状态条件更新时 +1
     shipped_at              TIMESTAMP,
     delivered_at            TIMESTAMP,
     created_by              BIGINT,
     CONSTRAINT uq_obo_code UNIQUE (code),
     CONSTRAINT uq_obo_src  UNIQUE (source_system, source_order_no),
     CONSTRAINT ck_obo_sod  CHECK (checker_id IS NULL OR picker_id IS NULL OR picker_id <> checker_id),
+    CONSTRAINT ck_obo_hash CHECK (length(source_hash) = 64),
+    CONSTRAINT ck_obo_qty CHECK (
+        total_qty_milli >= 0 AND allocated_qty_milli >= 0 AND picked_qty_milli >= 0
+        AND shipped_qty_milli >= 0 AND short_qty_milli >= 0
+        AND total_qty_milli = CAST(total_qty_milli AS BIGINT) AND allocated_qty_milli = CAST(allocated_qty_milli AS BIGINT)
+        AND picked_qty_milli = CAST(picked_qty_milli AS BIGINT) AND shipped_qty_milli = CAST(shipped_qty_milli AS BIGINT)
+        AND short_qty_milli = CAST(short_qty_milli AS BIGINT)
+    ),
     CONSTRAINT ck_obo_status CHECK (status IN ('CREATED','PENDING_ALLOC','ALLOCATED','SHORT','WAVED','PICKING','PICKED',
                                                'CHECKED','STAGED','SHIPPED','DELIVERED','COMPLETED','CANCELLED'))
 );
@@ -561,16 +571,34 @@ CREATE TABLE outbound_line (
     outbound_id     BIGINT          NOT NULL,
     line_no         SMALLINT        NOT NULL,
     sku_id          BIGINT          NOT NULL,
-    order_qty       NUMERIC(14,3)   NOT NULL,
-    allocated_qty   NUMERIC(14,3)   NOT NULL DEFAULT 0,
-    picked_qty      NUMERIC(14,3)   NOT NULL DEFAULT 0,
-    shipped_qty     NUMERIC(14,3)   NOT NULL DEFAULT 0,
-    short_qty       NUMERIC(14,3)   NOT NULL DEFAULT 0,
+    order_qty_milli     BIGINT      NOT NULL,             -- 基本单位 milli（00 R2）
+    reserved_qty_milli  BIGINT      NOT NULL DEFAULT 0,
+    allocated_qty_milli BIGINT      NOT NULL DEFAULT 0,
+    picked_qty_milli    BIGINT      NOT NULL DEFAULT 0,   -- 累计拣出量（不因撤销/回冲减少）
+    shipped_qty_milli   BIGINT      NOT NULL DEFAULT 0,
+    short_qty_milli     BIGINT      NOT NULL DEFAULT 0,
     uom             VARCHAR(16)     NOT NULL,
     unit_price      BIGINT          NOT NULL DEFAULT 0,
     amount          BIGINT          NOT NULL DEFAULT 0,
     short_reason    VARCHAR(24),
     alloc_round     INT             NOT NULL DEFAULT 0,   -- 每次重新分配 +1，进入占用幂等键（04 B1）
+    reversed_qty_milli  BIGINT      NOT NULL DEFAULT 0,   -- 已撤销/回冲累计量；条件更新 reversed + qty <= picked，否则 42214（04 §6.3）
+    CONSTRAINT ck_obl_int CHECK (
+        order_qty_milli = CAST(order_qty_milli AS BIGINT) AND reserved_qty_milli = CAST(reserved_qty_milli AS BIGINT)
+        AND allocated_qty_milli = CAST(allocated_qty_milli AS BIGINT) AND picked_qty_milli = CAST(picked_qty_milli AS BIGINT)
+        AND shipped_qty_milli = CAST(shipped_qty_milli AS BIGINT) AND short_qty_milli = CAST(short_qty_milli AS BIGINT)
+        AND reversed_qty_milli = CAST(reversed_qty_milli AS BIGINT)
+    ),
+    CONSTRAINT ck_obl_nonneg CHECK (
+        order_qty_milli > 0 AND reserved_qty_milli >= 0 AND allocated_qty_milli >= 0 AND picked_qty_milli >= 0
+        AND shipped_qty_milli >= 0 AND short_qty_milli >= 0 AND reversed_qty_milli >= 0
+    ),
+    CONSTRAINT ck_obl_reversed CHECK (reversed_qty_milli <= picked_qty_milli),   -- 库层兜底：回冲不超过拣出（04 D4）
+    CONSTRAINT ck_obl_sum CHECK (
+        (picked_qty_milli - reversed_qty_milli) + short_qty_milli <= order_qty_milli
+        AND reserved_qty_milli + allocated_qty_milli + (picked_qty_milli - reversed_qty_milli) <= order_qty_milli
+        AND shipped_qty_milli <= picked_qty_milli - reversed_qty_milli
+    ),
     CONSTRAINT uq_obo_line UNIQUE (outbound_id, line_no)
 );
 CREATE INDEX ix_obl_sku ON outbound_line(sku_id);
@@ -629,16 +657,19 @@ CREATE TABLE pick_task_line (
     lot_id              BIGINT          NOT NULL,
     stock_id            BIGINT          NOT NULL,
     outbound_line_id    BIGINT,                     -- 分播墙按单分发时用
-    plan_qty            NUMERIC(14,3)   NOT NULL,
-    plan_qty_base       NUMERIC(14,3)   NOT NULL,
-    actual_qty          NUMERIC(14,3)   NOT NULL DEFAULT 0,
-    uom                 VARCHAR(16)     NOT NULL,
+    planned_qty_milli   BIGINT          NOT NULL,   -- 应拣量，基本单位 milli（原 plan_qty_base）
+    confirmed_qty_milli BIGINT          NOT NULL DEFAULT 0,  -- 已确认量；条件更新 confirmed + qty <= planned，否则 42214（00 §6.5）
+    uom                 VARCHAR(16)     NOT NULL,   -- 作业单位，仅展示
     barcode_expected    VARCHAR(64),
     status              VARCHAR(16)     NOT NULL DEFAULT 'PENDING',
     short_reason_code   VARCHAR(24),
     scanned_at          TIMESTAMP,
     override_reason     VARCHAR(128),               -- FEFO 越权原因（RK4）
     override_by         BIGINT,
+    CONSTRAINT ck_ptl_qty CHECK (
+        planned_qty_milli > 0 AND confirmed_qty_milli >= 0 AND confirmed_qty_milli <= planned_qty_milli
+        AND planned_qty_milli = CAST(planned_qty_milli AS BIGINT) AND confirmed_qty_milli = CAST(confirmed_qty_milli AS BIGINT)
+    ),
     CONSTRAINT uq_ptl UNIQUE (pick_task_id, seq)
 );
 CREATE INDEX ix_ptl_loc ON pick_task_line(location_id, status);
@@ -663,8 +694,9 @@ CREATE TABLE pack_box_line (
     box_id      BIGINT          NOT NULL,
     sku_id      BIGINT          NOT NULL,
     lot_id      BIGINT          NOT NULL DEFAULT 0,   -- 0 = 未记批次；同 stock.container_id，不可空（uq 含 NULL 会失效）
-    quantity    NUMERIC(14,3)   NOT NULL,
+    qty_milli   BIGINT          NOT NULL,   -- 基本单位 milli
     uom         VARCHAR(16)     NOT NULL,
+    CONSTRAINT ck_box_line_qty CHECK (qty_milli > 0 AND qty_milli = CAST(qty_milli AS BIGINT)),
     CONSTRAINT uq_box_line UNIQUE (box_id, sku_id, lot_id)
 );
 
