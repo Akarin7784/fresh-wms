@@ -17,8 +17,8 @@ SCHEMA=sql/schema_postgres.sql
 # stock_movement_key、stock_ledger_line → 42 表 / 114 索引（含 PK、UNIQUE 自动索引和分区父表上的分区索引；
 # 分区子表及其继承来的索引不计）/ 1 视图。二轮 C2 加 uq_mvk_mv（外键被引用键）→ 115。改 DDL 必须同步改这里。
 # 必须用新建的空库跑（DROP SCHEMA public 重建会丢 wms_app 的 USAGE；schema 里已 GRANT USAGE 兜底，小赵 C6）。
-EXPECT_TABLES=42
-EXPECT_INDEXES=115
+EXPECT_TABLES=45   # docs/12 +3：user_device_binding offline_token approval_request
+EXPECT_INDEXES=126   # docs/12 +11：3 张表主键 + uq_offline_jti + uq_audit_node_seq + 6 个显式索引
 EXPECT_VIEWS=1
 
 CTR=wms-pg-verify
@@ -328,6 +328,40 @@ R=$(psql -t -A -c "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli + 1000
 R=$(psql -t -A -c "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli + 1000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 13 AND ('MOVE' = 'REVERSE_PICK' OR EXISTS (SELECT 1 FROM location l WHERE l.id = stock.location_id AND l.status <> 'LOCKED'))")
 [ "$R" = "UPDATE 0" ] && ok "库位 LOCKED：MOVE 目标腿 rowcount=0" || bad "MOVE 未被锁拦：$R"
 psql -q -c "UPDATE location SET status='AVAILABLE' WHERE id=3; UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq - 1 WHERE id = 13;" >/dev/null
+
+echo "=== 2e. docs/12 权限与审计：设备绑定、离线令牌、审批 SoD、审计只追加 ==="
+seed "INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id) VALUES (1,'DEV-A','PDA',101,1);"
+seed "INSERT INTO offline_token (id,jti,binding_id,user_id,device_instance_id,warehouse_id,perm_version,issued_at,expires_at) VALUES (1,'J1',1,101,'DEV-A',1,1,'2026-10-15 08:00','2026-10-16 08:00');"
+seed "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (1,'CANCEL_AFTER_PICK',1,'OUTBOUND','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','客户取消',201,'2026-10-16');"
+seed "INSERT INTO audit_log (id,action,node_id,node_seq,warehouse_id) VALUES (1,'outbound.cancel_after_pick',7,1,1);"
+expect_block "12 同一设备实例两条 ACTIVE 绑定（换人登录未先解绑）" \
+  "INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id) VALUES (2,'DEV-A','PDA',102,1);" "uq_udb_active"
+expect_block "12 REVOKED 绑定没有吊销时间" \
+  "INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id,status) VALUES (3,'DEV-B','PDA',101,1,'REVOKED');" "ck_udb_status"
+expect_block "12 离线令牌到期早于签发" \
+  "INSERT INTO offline_token (id,jti,binding_id,user_id,device_instance_id,warehouse_id,perm_version,issued_at,expires_at) VALUES (2,'J2',1,101,'DEV-A',1,1,'2026-10-15 08:00','2026-10-15 07:00');" "ck_offline_ttl"
+expect_block "12 离线令牌 jti 重复" \
+  "INSERT INTO offline_token (id,jti,binding_id,user_id,device_instance_id,warehouse_id,perm_version,issued_at,expires_at) VALUES (3,'J1',1,101,'DEV-A',1,1,'2026-10-15 08:00','2026-10-16 08:00');" "uq_offline_jti"
+expect_block "12 SoD：申请人自己审批" \
+  "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,first_approver_id,expires_at) VALUES (2,'CANCEL_AFTER_PICK',1,'OUTBOUND',2,'{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','客户取消',201,201,'2026-10-16');" "ck_apr_sod"
+expect_block "12 非计划切换第二确认人 = 第一审批人" \
+  "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,first_approver_id,second_approver_id,expires_at) VALUES (3,'UNPLANNED_FAILOVER',1,'WAREHOUSE',1,'{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','边缘硬盘故障',201,202,202,'2026-10-16');" "ck_apr_dual"
+expect_block "12 非双人类型填了第二审批人" \
+  "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,first_approver_id,second_approver_id,expires_at) VALUES (4,'POD_CORRECT',1,'POD',9,'{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','签收数量填错',201,202,203,'2026-10-16');" "ck_apr_dual"
+expect_block "12 非计划切换只有一人确认就 APPROVED" \
+  "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,first_approver_id,status,expires_at) VALUES (5,'UNPLANNED_FAILOVER',1,'WAREHOUSE',2,'{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','边缘硬盘故障',201,202,'APPROVED','2026-10-16');" "ck_apr_done"
+expect_block "12 同一目标两条待审批（重复申请）" \
+  "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (6,'CANCEL_AFTER_PICK',1,'OUTBOUND','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','再申请一次',203,'2026-10-16');" "uq_apr_open"
+expect_block "12 审计重复回传同 (node_id,node_seq)" \
+  "INSERT INTO audit_log (id,action,node_id,node_seq) VALUES (2,'x',7,1);" "uq_audit_node_seq"
+expect_allow "12 非计划切换两人确认 APPROVED" \
+  "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,first_approver_id,second_approver_id,status,expires_at) VALUES (7,'UNPLANNED_FAILOVER',1,'WAREHOUSE',3,'{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','边缘硬盘故障',201,202,203,'APPROVED','2026-10-16');"
+expect_block "12 audit_log 只追加（UPDATE）" \
+  "UPDATE audit_log SET reason='x' WHERE id=1;" "append_only_violation: audit_log"
+expect_block "12 audit_log 只追加（DELETE）" \
+  "DELETE FROM audit_log WHERE id=1;" "append_only_violation: audit_log"
+OUT=$(psql -q -c "TRUNCATE audit_log;" 2>&1)
+case "$OUT" in *"append_only_violation"*) ok "12 TRUNCATE audit_log 被语句级触发器拦下";; *) bad "TRUNCATE audit_log 未被拦：$OUT";; esac
 
 echo "=== 2d. Q7：PG 写入 bigint 的取整行为（QA 在 PG16.14 实测，已关闭）==="
 # 临时表只活在一个会话里：建表、插入、查询必须在同一次 psql 调用（小赵 C1）

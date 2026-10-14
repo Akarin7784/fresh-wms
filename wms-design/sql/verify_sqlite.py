@@ -119,7 +119,7 @@ NI = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='index' AND sql
 NV = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='view'").fetchone()[0]
 print(f"  → 表 {NT} 张 / 手工建索引 {NI} 个 / 视图 {NV} 个")
 # 期望值：main 8ed5f0c 为 38 表；docs/02 新增 stock_hold、stock_recon_alert、stock_movement_key、stock_ledger_line → 42 表（PG 分区子表不计）。改表数必须同步改这里和 verify.sh
-EXPECT_TABLES, EXPECT_VIEWS = 42, 1
+EXPECT_TABLES, EXPECT_VIEWS = 45, 1  # docs/12 +3：user_device_binding offline_token approval_request
 ok(f"表数 = {NT}（期望 {EXPECT_TABLES}）") if NT == EXPECT_TABLES else bad(f"表数 = {NT}，期望 {EXPECT_TABLES}")
 ok(f"视图数 = {NV}") if NV == EXPECT_VIEWS else bad(f"视图数 = {NV}，期望 {EXPECT_VIEWS}")
 
@@ -407,6 +407,25 @@ expect_block(
 
 D = one("SELECT diff_qty_milli FROM count_line WHERE id=1")[0]
 ok(f"§5.6 差异生成列 diff_qty_milli = {D}（预期 -2000）") if D == -2000 else bad(f"差异列 = {D}")
+
+print("=== 2f. docs/12 权限与审计：设备绑定、离线令牌、审批 SoD、审计只追加 ===")
+conn.execute("INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id) VALUES (1,'DEV-A','PDA',101,1)")
+conn.execute("INSERT INTO offline_token (id,jti,binding_id,user_id,device_instance_id,warehouse_id,perm_version,issued_at,expires_at) VALUES (1,'J1',1,101,'DEV-A',1,1,'2026-10-15 08:00','2026-10-16 08:00')")
+conn.execute("INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (1,'CANCEL_AFTER_PICK',1,'OUTBOUND','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','客户取消',201,'2026-10-16')")
+conn.execute("INSERT INTO audit_log (id,action,node_id,node_seq,warehouse_id) VALUES (1,'outbound.cancel_after_pick',7,1,1)")
+expect_block('12 同一设备实例两条 ACTIVE 绑定（换人登录未先解绑）', "INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id) VALUES (2,'DEV-A','PDA',102,1)", 'user_device_binding.device_instance_id')
+expect_block('12 REVOKED 绑定没有吊销时间', "INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id,status) VALUES (3,'DEV-B','PDA',101,1,'REVOKED')", 'ck_udb_status')
+expect_block('12 离线令牌到期早于签发', "INSERT INTO offline_token (id,jti,binding_id,user_id,device_instance_id,warehouse_id,perm_version,issued_at,expires_at) VALUES (2,'J2',1,101,'DEV-A',1,1,'2026-10-15 08:00','2026-10-15 07:00')", 'ck_offline_ttl')
+expect_block('12 离线令牌 jti 重复', "INSERT INTO offline_token (id,jti,binding_id,user_id,device_instance_id,warehouse_id,perm_version,issued_at,expires_at) VALUES (3,'J1',1,101,'DEV-A',1,1,'2026-10-15 08:00','2026-10-16 08:00')", 'offline_token.jti')
+expect_block('12 SoD：申请人自己审批', "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,first_approver_id,expires_at) VALUES (2,'CANCEL_AFTER_PICK',1,'OUTBOUND',2,'{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','客户取消',201,201,'2026-10-16')", 'ck_apr_sod')
+expect_block('12 非计划切换第二确认人 = 第一审批人', "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,first_approver_id,second_approver_id,expires_at) VALUES (3,'UNPLANNED_FAILOVER',1,'WAREHOUSE',1,'{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','边缘硬盘故障',201,202,202,'2026-10-16')", 'ck_apr_dual')
+expect_block('12 非双人类型填了第二审批人', "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,first_approver_id,second_approver_id,expires_at) VALUES (4,'POD_CORRECT',1,'POD',9,'{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','签收数量填错',201,202,203,'2026-10-16')", 'ck_apr_dual')
+expect_block('12 非计划切换只有一人确认就 APPROVED', "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,first_approver_id,status,expires_at) VALUES (5,'UNPLANNED_FAILOVER',1,'WAREHOUSE',2,'{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','边缘硬盘故障',201,202,'APPROVED','2026-10-16')", 'ck_apr_done')
+expect_block('12 同一目标两条待审批（重复申请）', "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (6,'CANCEL_AFTER_PICK',1,'OUTBOUND','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','再申请一次',203,'2026-10-16')", 'approval_request.approval_type, approval_request.target_type, approval_request.target_id')
+expect_block('12 审计重复回传同 (node_id,node_seq)', "INSERT INTO audit_log (id,action,node_id,node_seq) VALUES (2,'x',7,1)", 'audit_log.node_id, audit_log.node_seq')
+expect_allow('12 非计划切换两人确认 APPROVED', "INSERT INTO approval_request (id,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,first_approver_id,second_approver_id,status,expires_at) VALUES (7,'UNPLANNED_FAILOVER',1,'WAREHOUSE',3,'{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','边缘硬盘故障',201,202,203,'APPROVED','2026-10-16')")
+expect_block_tx('12 audit_log 只追加（UPDATE）', ["UPDATE audit_log SET reason='x' WHERE id=1"], "append_only_violation: audit_log")
+expect_block_tx('12 audit_log 只追加（DELETE）', ['DELETE FROM audit_log WHERE id=1'], "append_only_violation: audit_log")
 
 print("=== 3. §4.4 FEFO 候选池排序（视图 + 排序键）===")
 rows = conn.execute(

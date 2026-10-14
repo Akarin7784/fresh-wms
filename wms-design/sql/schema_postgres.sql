@@ -942,10 +942,25 @@ CREATE TABLE audit_log (
     warehouse_id    BIGINT,
     trace_id        VARCHAR(32),
     ip              VARCHAR(45),
-    occurred_at     TIMESTAMP    NOT NULL DEFAULT now()
+    occurred_at     TIMESTAMP    NOT NULL DEFAULT now(),
+    node_id         INT          NOT NULL,           -- 产生审计的节点（docs/12 §6.4，边缘回传按 (node_id, node_seq) 去重）
+    node_seq        BIGINT       NOT NULL,           -- 节点内单调递增
+    device_instance_id VARCHAR(64),                  -- PDA/司机端操作时必填（应用层）
+    approval_id     BIGINT,                          -- 经审批的操作关联 approval_request.id
+    CONSTRAINT uq_audit_node_seq UNIQUE (node_id, node_seq)
 );
 CREATE INDEX ix_audit_target ON audit_log(target_type, target_id, occurred_at DESC);
 CREATE INDEX ix_audit_actor  ON audit_log(actor_id, occurred_at DESC);
+CREATE INDEX ix_audit_wh     ON audit_log(warehouse_id, occurred_at DESC);
+-- audit_log 只追加（docs/12 §6.4）：行级 UPDATE/DELETE 与 TRUNCATE 都拦；归档走按月导出 + 维护窗口内专用角色
+CREATE FUNCTION trg_audit_append_only() RETURNS trigger LANGUAGE plpgsql AS $$                             -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    RAISE EXCEPTION 'append_only_violation: audit_log' USING ERRCODE = '42501';                             -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_audit_append_only BEFORE UPDATE OR DELETE ON audit_log FOR EACH ROW EXECUTE FUNCTION trg_audit_append_only();  -- @pg-only
+CREATE TRIGGER trg_audit_no_truncate BEFORE TRUNCATE ON audit_log FOR EACH STATEMENT EXECUTE FUNCTION trg_audit_append_only();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_audit_no_update BEFORE UPDATE ON audit_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: audit_log'); END;
+-- @sqlite-only CREATE TRIGGER trg_audit_no_delete BEFORE DELETE ON audit_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: audit_log'); END;
 
 CREATE TABLE numbering_segment (
     biz_prefix   VARCHAR(16)  NOT NULL,
@@ -1011,6 +1026,79 @@ CREATE TABLE api_credential (
     last_used_at     TIMESTAMP,
     CONSTRAINT uq_api_key UNIQUE (api_key)
 );
+
+-- -----------------------------------------------------------------------------
+-- docs/12 权限与审计：设备绑定、离线令牌、主管审批
+-- -----------------------------------------------------------------------------
+
+-- 设备实例绑定：device_instance_id（App 安装实例）↔ 账号 + 仓。一个实例同时只有一条 ACTIVE 绑定
+CREATE TABLE user_device_binding (
+    id                  BIGINT       PRIMARY KEY,
+    device_instance_id  VARCHAR(64)  NOT NULL,
+    device_id           BIGINT,                      -- 第 1 篇 device 台账；司机自有手机可为空
+    client_type         VARCHAR(16)  NOT NULL,       -- PDA / DRIVER_APP
+    user_id             BIGINT       NOT NULL,
+    warehouse_id        BIGINT       NOT NULL,
+    status              VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
+    bound_at            TIMESTAMP    NOT NULL DEFAULT now(),
+    revoked_at          TIMESTAMP,
+    revoked_by          BIGINT,
+    revoke_reason       VARCHAR(64),
+    CONSTRAINT ck_udb_client CHECK (client_type IN ('PDA','DRIVER_APP')),
+    CONSTRAINT ck_udb_status CHECK ((status = 'ACTIVE' AND revoked_at IS NULL) OR (status = 'REVOKED' AND revoked_at IS NOT NULL))
+);
+CREATE UNIQUE INDEX uq_udb_active ON user_device_binding(device_instance_id) WHERE status = 'ACTIVE';
+CREATE INDEX ix_udb_user ON user_device_binding(user_id, status);
+
+-- 离线令牌：断网时边缘节点/终端本地校验用。签名在应用层，库里只存 jti 与吊销状态
+CREATE TABLE offline_token (
+    id                  BIGINT       PRIMARY KEY,
+    jti                 VARCHAR(64)  NOT NULL,
+    binding_id          BIGINT       NOT NULL,       -- user_device_binding.id
+    user_id             BIGINT       NOT NULL,
+    device_instance_id  VARCHAR(64)  NOT NULL,
+    warehouse_id        BIGINT       NOT NULL,
+    perm_version        BIGINT       NOT NULL,       -- 签发时的权限版本，权限变更后旧令牌联网即失效
+    issued_at           TIMESTAMP    NOT NULL,
+    expires_at          TIMESTAMP    NOT NULL,
+    revoked_at          TIMESTAMP,
+    CONSTRAINT uq_offline_jti UNIQUE (jti),
+    CONSTRAINT ck_offline_ttl CHECK (expires_at > issued_at)
+);
+CREATE INDEX ix_offline_binding ON offline_token(binding_id) WHERE revoked_at IS NULL;
+
+-- 主管审批（docs/12 §5）：申请人 ≠ 审批人；双人确认类第二审批人与前两人都不同
+CREATE TABLE approval_request (
+    id                  BIGINT       PRIMARY KEY,
+    approval_type       VARCHAR(32)  NOT NULL,       -- POD_CORRECT / CANCEL_AFTER_PICK / UNPLANNED_FAILOVER
+    warehouse_id        BIGINT       NOT NULL,
+    target_type         VARCHAR(32)  NOT NULL,
+    target_id           VARCHAR(64)  NOT NULL,
+    payload_json        TEXT         NOT NULL,       -- 申请时的完整命令，审批通过后原样执行
+    payload_hash        CHAR(64)     NOT NULL,
+    reason              VARCHAR(256) NOT NULL,
+    requested_by        BIGINT       NOT NULL,
+    status              VARCHAR(16)  NOT NULL DEFAULT 'PENDING',
+    first_approver_id   BIGINT,
+    first_approved_at   TIMESTAMP,
+    second_approver_id  BIGINT,                      -- 仅双人确认类
+    second_approved_at  TIMESTAMP,
+    decided_at          TIMESTAMP,
+    reject_reason       VARCHAR(256),
+    expires_at          TIMESTAMP    NOT NULL,
+    version             INT          NOT NULL DEFAULT 0,
+    created_at          TIMESTAMP    NOT NULL DEFAULT now(),
+    CONSTRAINT ck_apr_type CHECK (approval_type IN ('POD_CORRECT','CANCEL_AFTER_PICK','UNPLANNED_FAILOVER')),
+    CONSTRAINT ck_apr_status CHECK (status IN ('PENDING','PARTIAL','APPROVED','REJECTED','EXPIRED','WITHDRAWN')),
+    CONSTRAINT ck_apr_sod CHECK (first_approver_id IS NULL OR first_approver_id <> requested_by),
+    CONSTRAINT ck_apr_dual CHECK (second_approver_id IS NULL
+        OR (approval_type = 'UNPLANNED_FAILOVER' AND second_approver_id <> requested_by AND second_approver_id <> first_approver_id)),
+    CONSTRAINT ck_apr_done CHECK (status <> 'APPROVED' OR (first_approver_id IS NOT NULL
+        AND (approval_type <> 'UNPLANNED_FAILOVER' OR second_approver_id IS NOT NULL))),
+    CONSTRAINT ck_apr_hash CHECK (length(payload_hash) = 64)
+);
+CREATE UNIQUE INDEX uq_apr_open ON approval_request(approval_type, target_type, target_id) WHERE status IN ('PENDING','PARTIAL');
+CREATE INDEX ix_apr_wh ON approval_request(warehouse_id, status, created_at);
 
 -- -----------------------------------------------------------------------------
 -- 视图：可用量（避免每个查询手写减法，也避免算错）
