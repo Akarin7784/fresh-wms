@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 57 处 DEFAULT now() → DEFAULT (datetime('now'))（表达式默认值需括号）
---   3. 方言专属行：删除 165 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 72 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 199 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 106 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -79,7 +79,7 @@ CREATE TABLE location (
     pickable            BOOLEAN       NOT NULL DEFAULT true,
     abc_class           VARCHAR(2),
     status              VARCHAR(16)   NOT NULL DEFAULT 'AVAILABLE', -- 作业状态 AVAILABLE/LOCKED（盘点冻结）
-    md_status           VARCHAR(16)   NOT NULL DEFAULT 'ACTIVE',    -- 主数据状态 ACTIVE/PENDING_DISABLE/DISABLED（docs/01 §5.1，与 status 正交）
+    md_status           VARCHAR(16)   NOT NULL DEFAULT 'ACTIVE',    -- 主数据状态 ACTIVE/PENDING_DISABLE/DISABLED/PENDING_DELETE/DELETED（docs/01 §5.1，与 status 正交）
     lock_reason         VARCHAR(64),
     min_level_milli     BIGINT        NOT NULL DEFAULT 0,  -- 拣货位补货水位，milli（docs/01 §4.3，替代 NUMERIC min_level）
     max_level_milli     BIGINT        NOT NULL DEFAULT 0,
@@ -91,7 +91,8 @@ CREATE TABLE location (
     CONSTRAINT uq_location_code UNIQUE (warehouse_id, code),
     CONSTRAINT ck_loc_level CHECK (min_level_milli >= 0 AND max_level_milli >= min_level_milli),
     CONSTRAINT ck_loc_status CHECK (status IN ('AVAILABLE','LOCKED')),
-    CONSTRAINT ck_loc_md_status CHECK (md_status IN ('ACTIVE','PENDING_DISABLE','DISABLED')),
+    CONSTRAINT ck_loc_md_status CHECK (md_status IN ('ACTIVE','PENDING_DISABLE','DISABLED','PENDING_DELETE','DELETED')),
+    CONSTRAINT ck_loc_deleted CHECK ((md_status = 'DELETED') = (deleted_at IS NOT NULL)),
     CONSTRAINT ck_loc_int CHECK (min_level_milli = CAST(min_level_milli AS BIGINT) AND max_level_milli = CAST(max_level_milli AS BIGINT))
 );
 -- 待补货扫描：available < min_level_milli 且 pickable
@@ -129,7 +130,8 @@ CREATE TABLE sku (
     CONSTRAINT ck_sku_int CHECK (natural_loss_tolerance_ppm = CAST(natural_loss_tolerance_ppm AS BIGINT)),
     CONSTRAINT ck_sku_shelf_life CHECK (shelf_life_days >= 0 AND receive_min_shelf_life >= 0 AND ship_min_shelf_life >= 0
         AND (shelf_life_days = 0 OR (receive_min_shelf_life <= shelf_life_days AND ship_min_shelf_life <= shelf_life_days))),
-    CONSTRAINT ck_sku_status CHECK (status IN ('ACTIVE','PENDING_DISABLE','DISABLED'))
+    CONSTRAINT ck_sku_status CHECK (status IN ('ACTIVE','PENDING_DISABLE','DISABLED','PENDING_DELETE','DELETED')),
+    CONSTRAINT ck_sku_deleted CHECK ((status = 'DELETED') = (deleted_at IS NOT NULL))   -- 软删两段式（小吴 M3）：deleted_at 只随 DELETED 出现
 );
 CREATE INDEX ix_sku_category ON sku(category_id, status);
 
@@ -189,7 +191,7 @@ CREATE TABLE supplier (
     created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     updated_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT uq_supplier_code UNIQUE (code),
-    CONSTRAINT ck_supplier_status CHECK (status IN ('ACTIVE','PENDING_DISABLE','DISABLED'))
+    CONSTRAINT ck_supplier_status CHECK (status IN ('ACTIVE','PENDING_DISABLE','DISABLED','PENDING_DELETE','DELETED'))
 );
 
 -- 客户与门店同表：STORE 必须挂在一个 CUSTOMER 下；签收、配送线路按门店
@@ -208,7 +210,7 @@ CREATE TABLE customer (
     updated_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT uq_customer_code UNIQUE (code),
     CONSTRAINT ck_customer_type CHECK ((customer_type = 'CUSTOMER' AND parent_id IS NULL) OR (customer_type = 'STORE' AND parent_id IS NOT NULL)),
-    CONSTRAINT ck_customer_status CHECK (status IN ('ACTIVE','PENDING_DISABLE','DISABLED'))
+    CONSTRAINT ck_customer_status CHECK (status IN ('ACTIVE','PENDING_DISABLE','DISABLED','PENDING_DELETE','DELETED'))
 );
 CREATE INDEX ix_customer_parent ON customer(parent_id) WHERE parent_id IS NOT NULL;
 
@@ -224,7 +226,7 @@ CREATE TABLE vehicle (
     updated_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT uq_vehicle_plate UNIQUE (plate_no),
     CONSTRAINT ck_vehicle_cap CHECK (capacity_weight_milli >= 0 AND capacity_weight_milli = CAST(capacity_weight_milli AS BIGINT)),
-    CONSTRAINT ck_vehicle_status CHECK (status IN ('ACTIVE','PENDING_DISABLE','DISABLED'))
+    CONSTRAINT ck_vehicle_status CHECK (status IN ('ACTIVE','PENDING_DISABLE','DISABLED','PENDING_DELETE','DELETED'))
 );
 CREATE INDEX ix_vehicle_wh ON vehicle(warehouse_id, status);
 
@@ -242,7 +244,7 @@ CREATE TABLE driver (
     created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     updated_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT uq_driver_user UNIQUE (user_id),
-    CONSTRAINT ck_driver_status CHECK (status IN ('ACTIVE','PENDING_DISABLE','DISABLED'))
+    CONSTRAINT ck_driver_status CHECK (status IN ('ACTIVE','PENDING_DISABLE','DISABLED','PENDING_DELETE','DELETED'))
 );
 CREATE INDEX ix_driver_wh ON driver(warehouse_id, status);
 
@@ -285,13 +287,19 @@ CREATE TABLE md_change_log (
     entity_type     VARCHAR(24)  NOT NULL,              -- WAREHOUSE/ZONE/LOCATION/SKU/SKU_UNIT/SKU_BARCODE/SUPPLIER/CUSTOMER/VEHICLE/DRIVER/DEVICE/USER_PERM
     entity_id       BIGINT       NOT NULL,
     md_version      BIGINT       NOT NULL,
-    op              VARCHAR(16)  NOT NULL,              -- UPSERT / DISABLE
+    op              VARCHAR(16)  NOT NULL,              -- UPSERT / DISABLE / DELETE（DELETE 只用于条码、单位行物理删除，小吴 M1）
+    batch_id        BIGINT       NOT NULL,              -- 变更批次：中心一个事务 = 一个批次；边缘按批次在一个事务里整批应用（小吴 M1）
+    batch_pos       INT          NOT NULL,              -- 批内顺序，1..batch_size；条码换绑 = 1 DELETE 旧绑定 + 2 UPSERT 新绑定
+    batch_size      INT          NOT NULL,              -- 批内条数；边缘收齐 batch_size 条才应用，缺条视为缺口
     scope_warehouse_id BIGINT,                          -- NULL = 全部仓（SKU、供应商等全局主数据）
     payload_json    TEXT         NOT NULL,              -- 全量快照，不发差量
     operator_id     BIGINT       NOT NULL,
     created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT uq_mdlog_ver UNIQUE (entity_type, entity_id, md_version),
-    CONSTRAINT ck_mdlog_op CHECK (op IN ('UPSERT','DISABLE')),
+    CONSTRAINT uq_mdlog_batch UNIQUE (batch_id, batch_pos),
+    CONSTRAINT ck_mdlog_op CHECK (op IN ('UPSERT','DISABLE','DELETE')),
+    CONSTRAINT ck_mdlog_delete CHECK (op <> 'DELETE' OR entity_type IN ('SKU_BARCODE','SKU_UNIT')),   -- 业务主数据不物理删除（软删走 PENDING_DELETE → DELETED 的 UPSERT 快照）
+    CONSTRAINT ck_mdlog_batch CHECK (batch_size >= 1 AND batch_pos BETWEEN 1 AND batch_size),
     CONSTRAINT ck_mdlog_ver CHECK (md_version > 0),
     CONSTRAINT ck_mdlog_entity CHECK (entity_type IN ('WAREHOUSE','ZONE','LOCATION','SKU','SKU_UNIT','SKU_BARCODE','SUPPLIER','CUSTOMER','VEHICLE','DRIVER','DEVICE','USER_PERM'))
 );
@@ -310,13 +318,18 @@ CREATE TABLE md_pending_disable (
     entity_type     VARCHAR(24)  NOT NULL,
     entity_id       BIGINT       NOT NULL,
     warehouse_id    BIGINT       NOT NULL,              -- 在哪个仓的权威库里判定引用
-    requested_version BIGINT     NOT NULL,
+    requested_version BIGINT     NOT NULL,              -- 发起时（进入 PENDING_DISABLE / PENDING_DELETE 后）的 md_version
+    action          VARCHAR(16)  NOT NULL DEFAULT 'DISABLE',  -- DISABLE 停用 / DELETE 软删（小吴 M3，复用同一确认机制）
+    applied_version BIGINT,                             -- 权威库回传 APPLIED 时带的 md_version（小吴 M2）；中心条件更新 requested_version = 回传版本，0 行忽略
     status          VARCHAR(16)  NOT NULL DEFAULT 'WAITING',  -- WAITING/APPLIED/CANCELLED
     blocker_json    TEXT,                               -- 最近一次检查到的引用摘要
     requested_by    BIGINT       NOT NULL,
     created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     updated_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT ck_mdpd_status CHECK (status IN ('WAITING','APPLIED','CANCELLED')),
+    CONSTRAINT ck_mdpd_action CHECK (action IN ('DISABLE','DELETE')),
+    CONSTRAINT ck_mdpd_applied CHECK ((status = 'APPLIED' AND applied_version IS NOT NULL AND applied_version = requested_version)
+        OR (status <> 'APPLIED' AND applied_version IS NULL)),
     CONSTRAINT ck_mdpd_entity CHECK (entity_type IN ('LOCATION','SKU','SUPPLIER','CUSTOMER','VEHICLE','DRIVER'))
 );
 CREATE UNIQUE INDEX uq_mdpd_waiting ON md_pending_disable(entity_type, entity_id, warehouse_id) WHERE status = 'WAITING';
@@ -350,7 +363,7 @@ INSERT INTO md_disable_action_policy (action_code, ref_effect, allowed_when_pend
 
 -- md_change_log 只追加（小钱 B3）：行级 UPDATE/DELETE + 语句级 TRUNCATE；SQLite 另拦 REPLACE
 CREATE TRIGGER trg_mdlog_no_replace BEFORE INSERT ON md_change_log
-WHEN EXISTS (SELECT 1 FROM md_change_log m WHERE m.seq = NEW.seq
+WHEN EXISTS (SELECT 1 FROM md_change_log m WHERE m.seq = NEW.seq OR (m.batch_id = NEW.batch_id AND m.batch_pos = NEW.batch_pos)
   OR (m.entity_type = NEW.entity_type AND m.entity_id = NEW.entity_id AND m.md_version = NEW.md_version))
 BEGIN SELECT RAISE(ABORT, 'append_only_violation: md_change_log'); END;
 CREATE TRIGGER trg_mdlog_no_update BEFORE UPDATE ON md_change_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: md_change_log'); END;
@@ -364,6 +377,44 @@ CREATE TRIGGER trg_node_no_revive BEFORE UPDATE ON node_registry
 WHEN OLD.status = 'RETIRED' OR NEW.node_id IS NOT OLD.node_id OR NEW.warehouse_id IS NOT OLD.warehouse_id
   OR NEW.form IS NOT OLD.form OR NEW.role IS NOT OLD.role OR NEW.host_label IS NOT OLD.host_label OR NEW.assigned_at IS NOT OLD.assigned_at
 BEGIN SELECT RAISE(ABORT, 'node_id_never_reused'); END;
+
+-- ===== 小吴 M2：md_pending_disable 终态不可改、身份列不可改 =====
+CREATE TRIGGER trg_mdpd_guard BEFORE UPDATE ON md_pending_disable
+WHEN OLD.status IN ('APPLIED','CANCELLED') OR NEW.entity_type IS NOT OLD.entity_type OR NEW.entity_id IS NOT OLD.entity_id
+  OR NEW.warehouse_id IS NOT OLD.warehouse_id OR NEW.requested_version IS NOT OLD.requested_version OR NEW.action IS NOT OLD.action
+BEGIN SELECT RAISE(ABORT, 'md_pending_immutable'); END;
+
+-- ===== 小吴 M3：软删两段式。DELETED 只能从 PENDING_DELETE 进入，且各权威库对当前版本的 DELETE 确认都已 APPLIED、没有 WAITING；DELETED 是终态 =====
+CREATE TRIGGER trg_mddel_final_location BEFORE UPDATE ON location WHEN OLD.md_status = 'DELETED' BEGIN SELECT RAISE(ABORT, 'md_deleted_final'); END;
+CREATE TRIGGER trg_mddel_location BEFORE UPDATE ON location WHEN NEW.md_status = 'DELETED' AND OLD.md_status <> 'DELETED' AND (OLD.md_status <> 'PENDING_DELETE'
+  OR NOT EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'LOCATION' AND p.entity_id = OLD.id AND p.action = 'DELETE' AND p.status = 'APPLIED' AND p.requested_version = OLD.md_version)
+  OR EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'LOCATION' AND p.entity_id = OLD.id AND p.status = 'WAITING'))
+BEGIN SELECT RAISE(ABORT, 'md_delete_not_confirmed'); END;
+CREATE TRIGGER trg_mddel_final_sku BEFORE UPDATE ON sku WHEN OLD.status = 'DELETED' BEGIN SELECT RAISE(ABORT, 'md_deleted_final'); END;
+CREATE TRIGGER trg_mddel_sku BEFORE UPDATE ON sku WHEN NEW.status = 'DELETED' AND OLD.status <> 'DELETED' AND (OLD.status <> 'PENDING_DELETE'
+  OR NOT EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'SKU' AND p.entity_id = OLD.id AND p.action = 'DELETE' AND p.status = 'APPLIED' AND p.requested_version = OLD.md_version)
+  OR EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'SKU' AND p.entity_id = OLD.id AND p.status = 'WAITING'))
+BEGIN SELECT RAISE(ABORT, 'md_delete_not_confirmed'); END;
+CREATE TRIGGER trg_mddel_final_supplier BEFORE UPDATE ON supplier WHEN OLD.status = 'DELETED' BEGIN SELECT RAISE(ABORT, 'md_deleted_final'); END;
+CREATE TRIGGER trg_mddel_supplier BEFORE UPDATE ON supplier WHEN NEW.status = 'DELETED' AND OLD.status <> 'DELETED' AND (OLD.status <> 'PENDING_DELETE'
+  OR NOT EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'SUPPLIER' AND p.entity_id = OLD.id AND p.action = 'DELETE' AND p.status = 'APPLIED' AND p.requested_version = OLD.md_version)
+  OR EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'SUPPLIER' AND p.entity_id = OLD.id AND p.status = 'WAITING'))
+BEGIN SELECT RAISE(ABORT, 'md_delete_not_confirmed'); END;
+CREATE TRIGGER trg_mddel_final_customer BEFORE UPDATE ON customer WHEN OLD.status = 'DELETED' BEGIN SELECT RAISE(ABORT, 'md_deleted_final'); END;
+CREATE TRIGGER trg_mddel_customer BEFORE UPDATE ON customer WHEN NEW.status = 'DELETED' AND OLD.status <> 'DELETED' AND (OLD.status <> 'PENDING_DELETE'
+  OR NOT EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'CUSTOMER' AND p.entity_id = OLD.id AND p.action = 'DELETE' AND p.status = 'APPLIED' AND p.requested_version = OLD.md_version)
+  OR EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'CUSTOMER' AND p.entity_id = OLD.id AND p.status = 'WAITING'))
+BEGIN SELECT RAISE(ABORT, 'md_delete_not_confirmed'); END;
+CREATE TRIGGER trg_mddel_final_vehicle BEFORE UPDATE ON vehicle WHEN OLD.status = 'DELETED' BEGIN SELECT RAISE(ABORT, 'md_deleted_final'); END;
+CREATE TRIGGER trg_mddel_vehicle BEFORE UPDATE ON vehicle WHEN NEW.status = 'DELETED' AND OLD.status <> 'DELETED' AND (OLD.status <> 'PENDING_DELETE'
+  OR NOT EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'VEHICLE' AND p.entity_id = OLD.id AND p.action = 'DELETE' AND p.status = 'APPLIED' AND p.requested_version = OLD.md_version)
+  OR EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'VEHICLE' AND p.entity_id = OLD.id AND p.status = 'WAITING'))
+BEGIN SELECT RAISE(ABORT, 'md_delete_not_confirmed'); END;
+CREATE TRIGGER trg_mddel_final_driver BEFORE UPDATE ON driver WHEN OLD.status = 'DELETED' BEGIN SELECT RAISE(ABORT, 'md_deleted_final'); END;
+CREATE TRIGGER trg_mddel_driver BEFORE UPDATE ON driver WHEN NEW.status = 'DELETED' AND OLD.status <> 'DELETED' AND (OLD.status <> 'PENDING_DELETE'
+  OR NOT EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'DRIVER' AND p.entity_id = OLD.id AND p.action = 'DELETE' AND p.status = 'APPLIED' AND p.requested_version = OLD.md_version)
+  OR EXISTS (SELECT 1 FROM md_pending_disable p WHERE p.entity_type = 'DRIVER' AND p.entity_id = OLD.id AND p.status = 'WAITING'))
+BEGIN SELECT RAISE(ABORT, 'md_delete_not_confirmed'); END;
 
 -- 版本只升不降（小钱 I2）：主数据 md_version、边缘应用水位 applied_seq
 CREATE TRIGGER trg_mdv_warehouse BEFORE UPDATE ON warehouse WHEN NEW.md_version < OLD.md_version BEGIN SELECT RAISE(ABORT, 'md_version_rewind'); END;

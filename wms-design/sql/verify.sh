@@ -18,7 +18,7 @@ SCHEMA=sql/schema_postgres.sql
 # 分区子表及其继承来的索引不计）/ 1 视图。二轮 C2 加 uq_mvk_mv（外键被引用键）→ 115；A3 加 stock_hold_release（PK、uq_hr_op、ix_hr_hold）→ 43 表 / 118。改 DDL 必须同步改这里。
 # 必须用新建的空库跑（DROP SCHEMA public 重建会丢 wms_app 的 USAGE；schema 里已 GRANT USAGE 兜底，小赵 C6）。
 EXPECT_TABLES=53   # +10 docs/01（含 md_disable_action_policy）
-EXPECT_INDEXES=140   # +22 docs/01：10 主键 + 6 唯一 + 6 显式
+EXPECT_INDEXES=141   # +23 docs/01：10 主键 + 7 唯一（含 uq_mdlog_batch）+ 6 显式
 EXPECT_VIEWS=1
 
 CTR=wms-pg-verify
@@ -67,7 +67,7 @@ echo "  → 表 $T 张 / 索引 $I 个 / 视图 $V 个"
 [ "$V" = "$EXPECT_VIEWS" ]   && ok "视图数 = $V" || bad "视图数 = $V，期望 $EXPECT_VIEWS"
 
 # 小赵 S4：按期望权限矩阵逐表核对 wms_app（表、分区父表、视图、物化视图；序列查 USAGE），多给、少给、漏表都失败
-EXPECT_PRIVS="adjust_line:SELECT,INSERT,UPDATE adjust_order:SELECT,INSERT,UPDATE api_credential:SELECT,INSERT,UPDATE audit_log:SELECT,INSERT count_line:SELECT,INSERT,UPDATE count_order:SELECT,INSERT,UPDATE customer:SELECT,INSERT,UPDATE device:SELECT,INSERT,UPDATE driver:SELECT,INSERT,UPDATE idempotency_record:SELECT,INSERT,UPDATE inbound_line:SELECT,INSERT,UPDATE inbound_message:SELECT,INSERT,UPDATE inbound_order:SELECT,INSERT,UPDATE location:SELECT,INSERT,UPDATE lot:SELECT,INSERT,UPDATE md_change_log:SELECT,INSERT md_disable_action_policy:SELECT md_pending_disable:SELECT,INSERT,UPDATE md_sync_state:SELECT,INSERT,UPDATE node_registry:SELECT,INSERT numbering_segment:SELECT,INSERT,UPDATE outbound_line:SELECT,INSERT,UPDATE outbound_order:SELECT,INSERT,UPDATE outbox_event:SELECT,INSERT,UPDATE pack_box:SELECT,INSERT,UPDATE pack_box_line:SELECT,INSERT,UPDATE pick_task:SELECT,INSERT,UPDATE pick_task_line:SELECT,INSERT,UPDATE shipment:SELECT,INSERT,UPDATE shipment_order:SELECT,INSERT,UPDATE sku:SELECT,INSERT,UPDATE sku_barcode:SELECT,INSERT,UPDATE sku_unit:SELECT,INSERT,UPDATE stock:SELECT,INSERT,UPDATE stock_hold:SELECT,INSERT stock_hold_release:SELECT,INSERT stock_ledger_line:SELECT,INSERT stock_movement:SELECT,INSERT stock_movement_key:SELECT,INSERT stock_recon_alert:SELECT,INSERT,UPDATE stock_reservation:SELECT,INSERT,UPDATE stock_snapshot_daily:SELECT,INSERT supplier:SELECT,INSERT,UPDATE sys_permission:SELECT,INSERT,UPDATE sys_role:SELECT,INSERT,UPDATE sys_role_perm:SELECT,INSERT,UPDATE sys_user:SELECT,INSERT,UPDATE sys_user_role:SELECT,INSERT,UPDATE sys_user_warehouse:SELECT,INSERT,UPDATE v_stock_available:SELECT vehicle:SELECT,INSERT,UPDATE warehouse:SELECT,INSERT,UPDATE wave:SELECT,INSERT,UPDATE zone:SELECT,INSERT,UPDATE"
+EXPECT_PRIVS="adjust_line:SELECT,INSERT,UPDATE adjust_order:SELECT,INSERT,UPDATE api_credential:SELECT,INSERT,UPDATE audit_log:SELECT,INSERT count_line:SELECT,INSERT,UPDATE count_order:SELECT,INSERT,UPDATE customer:SELECT,INSERT,UPDATE device:SELECT,INSERT,UPDATE driver:SELECT,INSERT,UPDATE idempotency_record:SELECT,INSERT,UPDATE inbound_line:SELECT,INSERT,UPDATE inbound_message:SELECT,INSERT,UPDATE inbound_order:SELECT,INSERT,UPDATE location:SELECT,INSERT,UPDATE lot:SELECT,INSERT,UPDATE md_change_log:SELECT,INSERT md_disable_action_policy:SELECT md_pending_disable:SELECT,INSERT,UPDATE md_sync_state:SELECT,INSERT,UPDATE node_registry:SELECT,INSERT numbering_segment:SELECT,INSERT,UPDATE outbound_line:SELECT,INSERT,UPDATE outbound_order:SELECT,INSERT,UPDATE outbox_event:SELECT,INSERT,UPDATE pack_box:SELECT,INSERT,UPDATE pack_box_line:SELECT,INSERT,UPDATE pick_task:SELECT,INSERT,UPDATE pick_task_line:SELECT,INSERT,UPDATE shipment:SELECT,INSERT,UPDATE shipment_order:SELECT,INSERT,UPDATE sku:SELECT,INSERT,UPDATE sku_barcode:SELECT,INSERT,UPDATE,DELETE sku_unit:SELECT,INSERT,UPDATE,DELETE stock:SELECT,INSERT,UPDATE stock_hold:SELECT,INSERT stock_hold_release:SELECT,INSERT stock_ledger_line:SELECT,INSERT stock_movement:SELECT,INSERT stock_movement_key:SELECT,INSERT stock_recon_alert:SELECT,INSERT,UPDATE stock_reservation:SELECT,INSERT,UPDATE stock_snapshot_daily:SELECT,INSERT supplier:SELECT,INSERT,UPDATE sys_permission:SELECT,INSERT,UPDATE sys_role:SELECT,INSERT,UPDATE sys_role_perm:SELECT,INSERT,UPDATE sys_user:SELECT,INSERT,UPDATE sys_user_role:SELECT,INSERT,UPDATE sys_user_warehouse:SELECT,INSERT,UPDATE v_stock_available:SELECT vehicle:SELECT,INSERT,UPDATE warehouse:SELECT,INSERT,UPDATE wave:SELECT,INSERT,UPDATE zone:SELECT,INSERT,UPDATE"
 ACT=$(psql -t -A -c "SELECT string_agg(x, ' ' ORDER BY x) FROM (SELECT c.relname || ':' || COALESCE(NULLIF(concat_ws(',', CASE WHEN c.relkind='S' THEN (CASE WHEN has_sequence_privilege('wms_app', c.oid, 'USAGE') THEN 'USAGE' END) ELSE (CASE WHEN has_table_privilege('wms_app', c.oid, 'SELECT') THEN 'SELECT' END) END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'INSERT') THEN 'INSERT' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'UPDATE') THEN 'UPDATE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'DELETE') THEN 'DELETE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'TRUNCATE') THEN 'TRUNCATE' END), ''), 'NONE') AS x FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','S') AND NOT c.relispartition) t")
 if [ "$ACT" = "$EXPECT_PRIVS" ]; then ok "S4 wms_app 权限矩阵与期望逐表一致（$(echo "$ACT" | wc -w) 个对象；列级 UPDATE 另测）"
 else bad "S4 wms_app 权限矩阵不符：$(diff <(echo "$EXPECT_PRIVS" | tr ' ' '\n') <(echo "$ACT" | tr ' ' '\n') | grep '^[<>]' | tr '\n' ' ')"; fi
@@ -421,9 +421,9 @@ expect_block "01 退役节点号复活" \
   "UPDATE node_registry SET status='ACTIVE', retired_at=NULL WHERE node_id = 7;" "node_id_never_reused"
 expect_block "01 删除节点登记" \
   "DELETE FROM node_registry WHERE node_id = 7;" "node_id_never_reused"
-seed "INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,payload_json,operator_id) VALUES (1,'SKU',1,2,'UPSERT','{}',100);"
+seed "INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,batch_id,batch_pos,batch_size,payload_json,operator_id) VALUES (1,'SKU',1,2,'UPSERT',1,1,1,'{}',100);"
 expect_block "01 同一实体同一版本两条下发日志" \
-  "INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,payload_json,operator_id) VALUES (2,'SKU',1,2,'UPSERT','{\"x\":1}',100);" "uq_mdlog_ver"
+  "INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,batch_id,batch_pos,batch_size,payload_json,operator_id) VALUES (2,'SKU',1,2,'UPSERT',2,1,1,'{\"x\":1}',100);" "uq_mdlog_ver"
 expect_block "01 下发日志只追加（UPDATE）" \
   "UPDATE md_change_log SET payload_json='{}' WHERE seq = 1;" "append_only_violation: md_change_log"
 seed "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,requested_by) VALUES (1,'SKU',1,1,3,100);"
@@ -460,7 +460,7 @@ expect_block "01 门店挂在不存在的客户下" \
 expect_block "01 门店挂在门店下" \
   "INSERT INTO customer (id,code,name,customer_type,parent_id) VALUES (905,'ST-905','x','STORE',2);" "customer_parent_invalid"
 expect_block "01 entity_type 不在码表" \
-  "INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,payload_json,operator_id) VALUES (9,'BANANA',1,1,'UPSERT','{}',1);" "ck_mdlog_entity"
+  "INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,batch_id,batch_pos,batch_size,payload_json,operator_id) VALUES (9,'BANANA',1,1,'UPSERT',9,1,1,'{}',1);" "ck_mdlog_entity"
 expect_block "01 待停用 entity_type 不在码表" \
   "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,requested_by) VALUES (9,'WHATEVER',1,1,1,1);" "ck_mdpd_entity"
 OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM supplier;" 2>&1)
@@ -484,6 +484,88 @@ expect_allow "01 仓库编码正向：长度 2 W2" "INSERT INTO warehouse (id,co
 expect_allow "01 仓库编码正向：长度 16 AAAAAAAA12345678" "INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (71,'AAAAAAAA12345678','x','20:00');"
 expect_allow "01 仓库编码正向：字母数字混合 WHSH01" "UPDATE warehouse SET code='WHSH01' WHERE id=1;"
 expect_block "01 仓库编码反向：改成带 - 的编码" "UPDATE warehouse SET code='WH-SH-01' WHERE id=1;" "ck_wh_code"
+
+echo "=== 2e4. docs/01 小吴复评 M1 条码换绑同批次 / M2 APPLIED 带版本 / M3 软删两段式 ==="
+seed "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life) VALUES (51,'SKU-PEAR','砀山梨','KG','CHILLED',30,10),(52,'SKU-KIWI','猕猴桃','KG','CHILLED',30,10),(53,'SKU-PLUM','李子','KG','CHILLED',30,10),(54,'SKU-FIG','无花果','KG','CHILLED',30,10),(55,'SKU-LIME','青柠','KG','CHILLED',30,10);"
+seed "INSERT INTO sku_barcode (id,sku_id,barcode) VALUES (901,1,'6901234500017');"
+expect_allow "01 M1 中心：条码换绑同一批次（batch 5001：pos1 DELETE 旧绑定 + pos2 UPSERT 新绑定）" \
+  "BEGIN; INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,batch_id,batch_pos,batch_size,payload_json,operator_id) VALUES (101,'SKU_BARCODE',901,2,'DELETE',5001,1,2,'{}',100); INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,batch_id,batch_pos,batch_size,payload_json,operator_id) VALUES (102,'SKU_BARCODE',902,1,'UPSERT',5001,2,2,'{\"barcode\":\"6901234500017\",\"sku_id\":51}',100); COMMIT;"
+expect_block "01 M1 同批次同位置两条" \
+  "BEGIN; INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,batch_id,batch_pos,batch_size,payload_json,operator_id) VALUES (103,'SKU_BARCODE',903,1,'UPSERT',5001,2,2,'{}',100); COMMIT;" "uq_mdlog_batch"
+expect_block "01 M1 批内位置超出 batch_size" \
+  "BEGIN; INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,batch_id,batch_pos,batch_size,payload_json,operator_id) VALUES (104,'SKU_BARCODE',904,1,'UPSERT',5002,3,2,'{}',100); COMMIT;" "ck_mdlog_batch"
+expect_block "01 M1 批内位置 0" \
+  "BEGIN; INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,batch_id,batch_pos,batch_size,payload_json,operator_id) VALUES (105,'SKU_BARCODE',905,1,'UPSERT',5003,0,1,'{}',100); COMMIT;" "ck_mdlog_batch"
+expect_block "01 M1 DELETE 只给条码/单位行（SKU 不能物理删）" \
+  "BEGIN; INSERT INTO md_change_log (seq,entity_type,entity_id,md_version,op,batch_id,batch_pos,batch_size,payload_json,operator_id) VALUES (106,'SKU',51,2,'DELETE',5004,1,1,'{}',100); COMMIT;" "ck_mdlog_delete"
+expect_block "01 M1 边缘：不删旧绑定直接建新绑定（拆开应用）" \
+  "BEGIN; INSERT INTO sku_barcode (id,sku_id,barcode) VALUES (902,51,'6901234500017'); COMMIT;" "uq_barcode"
+expect_allow "01 M1 边缘：同一事务先删旧绑定再建新绑定" \
+  "BEGIN; DELETE FROM sku_barcode WHERE id = 901; INSERT INTO sku_barcode (id,sku_id,barcode) VALUES (902,51,'6901234500017'); COMMIT;"
+R=$(psql -t -A -c "SELECT count(*) || ':' || max(sku_id) FROM sku_barcode WHERE barcode = '6901234500017';")
+[ "$R" = "1:51" ] && ok "01 M1 验收：换绑后条码解析到新 SKU 51，且只有一行" || bad "01 M1 验收：换绑后条码解析到新 SKU 51，且只有一行 → $R（期望 1:51）"
+seed "UPDATE sku SET status='PENDING_DISABLE', md_version=4 WHERE id=52;"
+seed "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by) VALUES (11,'SKU',52,1,4,'DISABLE',100);"
+expect_block "01 M2 APPLIED 不带版本" \
+  "BEGIN; UPDATE md_pending_disable SET status='APPLIED' WHERE id=11; COMMIT;" "ck_mdpd_applied"
+expect_block "01 M2 APPLIED 带的版本与发起版本不符" \
+  "BEGIN; UPDATE md_pending_disable SET status='APPLIED', applied_version=3 WHERE id=11; COMMIT;" "ck_mdpd_applied"
+expect_block "01 M2 未 APPLIED 却带版本" \
+  "BEGIN; UPDATE md_pending_disable SET applied_version=4 WHERE id=11; COMMIT;" "ck_mdpd_applied"
+R=$(psql -t -A -c "WITH u AS (UPDATE md_pending_disable SET status='APPLIED', applied_version=3 WHERE id=11 AND status='WAITING' AND requested_version=3 RETURNING 1) SELECT count(*) FROM u;")
+[ "$R" = "0" ] && ok "01 M2 迟到的旧版本回传（v3）→ 条件更新命中 0 行，忽略 → rowcount=0" || bad "01 M2 迟到的旧版本回传（v3）→ 条件更新命中 0 行，忽略 → rowcount=$R（期望 0）"
+R=$(psql -t -A -c "WITH u AS (UPDATE md_pending_disable SET status='APPLIED', applied_version=4 WHERE id=11 AND status='WAITING' AND requested_version=4 RETURNING 1) SELECT count(*) FROM u;")
+[ "$R" = "1" ] && ok "01 M2 正向：回传 v4 → 命中 1 行 → rowcount=1" || bad "01 M2 正向：回传 v4 → 命中 1 行 → rowcount=$R（期望 1）"
+R=$(psql -t -A -c "WITH u AS (UPDATE md_pending_disable SET status='APPLIED', applied_version=4 WHERE id=11 AND status='WAITING' AND requested_version=4 RETURNING 1) SELECT count(*) FROM u;")
+[ "$R" = "0" ] && ok "01 M2 同一回传重放 → 0 行，忽略 → rowcount=0" || bad "01 M2 同一回传重放 → 0 行，忽略 → rowcount=$R（期望 0）"
+expect_block "01 M2 APPLIED 是终态（改回 WAITING）" \
+  "BEGIN; UPDATE md_pending_disable SET status='WAITING', applied_version=NULL WHERE id=11; COMMIT;" "md_pending_immutable"
+expect_block "01 M2 改发起版本" \
+  "BEGIN; UPDATE md_pending_disable SET requested_version=5 WHERE id=1; COMMIT;" "md_pending_immutable"
+R=$(psql -t -A -c "WITH u AS (UPDATE sku SET status='DISABLED', md_version=md_version+1 WHERE id=52 AND status='PENDING_DISABLE' AND md_version=3 RETURNING 1) SELECT count(*) FROM u;")
+[ "$R" = "0" ] && ok "01 M2 中心按版本置 DISABLED：旧版本 v3 → 0 行 → rowcount=0" || bad "01 M2 中心按版本置 DISABLED：旧版本 v3 → 0 行 → rowcount=$R（期望 0）"
+R=$(psql -t -A -c "WITH u AS (UPDATE sku SET status='DISABLED', md_version=md_version+1 WHERE id=52 AND status='PENDING_DISABLE' AND md_version=4 RETURNING 1) SELECT count(*) FROM u;")
+[ "$R" = "1" ] && ok "01 M2 正向：版本 v4 → 1 行 → rowcount=1" || bad "01 M2 正向：版本 v4 → 1 行 → rowcount=$R（期望 1）"
+seed "UPDATE sku SET status='PENDING_DELETE', md_version=2 WHERE id=53;"
+seed "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by) VALUES (21,'SKU',53,1,2,'DELETE',100);"
+seed "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by) VALUES (22,'SKU',53,2,2,'DELETE',100);"
+expect_block "01 M3 两仓都未确认就软删" \
+  "BEGIN; UPDATE sku SET status='DELETED', deleted_at='2026-10-15 04:00' WHERE id=53; COMMIT;" "md_delete_not_confirmed"
+seed "UPDATE md_pending_disable SET status='APPLIED', applied_version=2 WHERE id=21 AND status='WAITING' AND requested_version=2;"
+expect_block "01 M3 只有仓 1 确认、仓 2 仍 WAITING" \
+  "BEGIN; UPDATE sku SET status='DELETED', deleted_at='2026-10-15 04:00' WHERE id=53; COMMIT;" "md_delete_not_confirmed"
+seed "UPDATE md_pending_disable SET status='APPLIED', applied_version=2 WHERE id=22 AND status='WAITING' AND requested_version=2;"
+expect_block "01 M3 DELETED 不带 deleted_at" \
+  "BEGIN; UPDATE sku SET status='DELETED' WHERE id=53; COMMIT;" "ck_sku_deleted"
+expect_allow "01 M3 正向：各权威库都确认后软删生效" \
+  "BEGIN; UPDATE sku SET status='DELETED', deleted_at='2026-10-15 04:00', md_version=3 WHERE id=53; COMMIT;"
+expect_block "01 M3 DELETED 是终态（恢复 ACTIVE）" \
+  "BEGIN; UPDATE sku SET status='ACTIVE', deleted_at=NULL WHERE id=53; COMMIT;" "md_deleted_final"
+expect_block "01 M3 ACTIVE 直接软删（跳过 PENDING_DELETE）" \
+  "BEGIN; UPDATE sku SET status='DELETED', deleted_at='2026-10-15 04:00' WHERE id=54; COMMIT;" "md_delete_not_confirmed"
+expect_block "01 M3 ACTIVE 却写 deleted_at（旧的一段式软删）" \
+  "BEGIN; UPDATE sku SET deleted_at='2026-10-15 04:00' WHERE id=54; COMMIT;" "ck_sku_deleted"
+seed "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by) VALUES (23,'SKU',55,1,2,'DELETE',100);"
+seed "UPDATE md_pending_disable SET status='APPLIED', applied_version=2 WHERE id=23;"
+seed "UPDATE sku SET status='PENDING_DELETE', md_version=3 WHERE id=55;"
+expect_block "01 M3 确认的是旧版本 v2，当前 v3" \
+  "BEGIN; UPDATE sku SET status='DELETED', deleted_at='2026-10-15 04:00' WHERE id=55; COMMIT;" "md_delete_not_confirmed"
+seed "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by) VALUES (24,'SKU',54,1,1,'DISABLE',100);"
+seed "UPDATE md_pending_disable SET status='APPLIED', applied_version=1 WHERE id=24;"
+seed "UPDATE sku SET status='PENDING_DELETE' WHERE id=54;"
+expect_block "01 M3 只有停用确认（action=DISABLE）不算删除确认" \
+  "BEGIN; UPDATE sku SET status='DELETED', deleted_at='2026-10-15 04:00' WHERE id=54; COMMIT;" "md_delete_not_confirmed"
+seed "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence,md_status) VALUES (60,1,2,'B09-01-01','PALLET',8,'B900','PENDING_DELETE'),(61,1,2,'B09-01-02','PALLET',8,'B901','PENDING_DELETE');"
+seed "INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by) VALUES (31,'LOCATION',60,1,1,'DELETE',100);"
+seed "UPDATE md_pending_disable SET status='APPLIED', applied_version=1 WHERE id=31;"
+expect_block "01 M3 库位未确认就软删" \
+  "BEGIN; UPDATE location SET md_status='DELETED', deleted_at='2026-10-15 04:00' WHERE id=61; COMMIT;" "md_delete_not_confirmed"
+expect_allow "01 M3 库位正向：权威库确认后软删" \
+  "BEGIN; UPDATE location SET md_status='DELETED', deleted_at='2026-10-15 04:00' WHERE id=60; COMMIT;"
+expect_block "01 M3 删除确认 action 码表" \
+  "BEGIN; INSERT INTO md_pending_disable (id,entity_type,entity_id,warehouse_id,requested_version,action,requested_by) VALUES (32,'SKU',51,1,1,'PURGE',100); COMMIT;" "ck_mdpd_action"
+OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM sku WHERE id=51;" 2>&1)
+case "$OUT" in *"permission denied for table sku"*) ok "01 M1 wms_app 只能删条码/单位行，不能删 sku";; *) bad "01 M1 wms_app 删 sku 未被拒：$OUT";; esac
 
 echo "=== 2d. Q7：PG 写入 bigint 的取整行为（QA 在 PG16.14 实测，已关闭）==="
 # 临时表只活在一个会话里：建表、插入、查询必须在同一次 psql 调用（小赵 C1）
