@@ -322,6 +322,12 @@ expect_block "09 报损行数量 0" \
   "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,qty_milli) VALUES (101,100,1,14,1,1,0);" \
   "ck_scrl_qty"
 
+expect_allow "09 交接报损单 DRAFT（origin=RETURN_HANDOVER，source_id=待回库 701）" \
+  "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (102,'SCR-3',1,'RETURN_HANDOVER',701,'DAMAGED','2026-10-15',8);"
+expect_block "09 同一待回库记录重复交接报损" \
+  "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (103,'SCR-4',1,'RETURN_HANDOVER',701,'DAMAGED','2026-10-15',8);" \
+  "uq_scr_source"
+
 echo "=== 3. §5.6 盘点差异生成列（实盘 − 基准账面 − 期间流水）==="
 seed "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000);"
 D=$(psql -t -A -c "SELECT diff_qty_milli FROM count_line WHERE id=1")

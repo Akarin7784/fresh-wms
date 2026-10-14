@@ -393,6 +393,9 @@ expect_block('09 报损单非法状态值', "UPDATE scrap_order SET status='DONE
 expect_block('09 报损行数量非整数 milli（SQLite REAL）', 'INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,qty_milli) VALUES (100,100,1,14,1,1,1.5)', 'ck_scrl_int')
 expect_block('09 报损行数量 0', 'INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,qty_milli) VALUES (101,100,1,14,1,1,0)', 'ck_scrl_qty')
 
+expect_allow('09 交接报损单 DRAFT（origin=RETURN_HANDOVER，source_id=待回库 701）', "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (102,'SCR-3',1,'RETURN_HANDOVER',701,'DAMAGED','2026-10-15',8)")
+expect_block('09 同一待回库记录重复交接报损', "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (103,'SCR-4',1,'RETURN_HANDOVER',701,'DAMAGED','2026-10-15',8)", 'scrap_order.source_type, scrap_order.source_id')
+
 print("=== 3. §4.4 FEFO 候选池排序（视图 + 排序键）===")
 rows = conn.execute(
     """

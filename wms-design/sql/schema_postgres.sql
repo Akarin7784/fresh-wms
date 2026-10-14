@@ -857,12 +857,12 @@ CREATE TABLE adjust_line (
 );
 
 -- 第 9 篇 效期与损耗：报损单（SCR）。审批通过后由服务端按行调 02 原语 post_out(SCRAP)；
--- 申请时对每行建 SCRAP_PENDING 系统冻结（类型由第 2 篇落 DDL）（op_key = SCRH:{scrap_line_id}），审批出账与解冻同事务。
+-- SCRAP_PENDING 冻结 source_type='SCRAP'、source_id=本表 id（04 N2）（op_key = SCRH:{scrap_line_id}），审批出账与解冻同事务。
 CREATE TABLE scrap_order (
     id              BIGINT          PRIMARY KEY,
     code            VARCHAR(64)     NOT NULL,   -- SCR-{仓}-{节点}-{作业日}-{序号}
     warehouse_id    BIGINT          NOT NULL,
-    source_type     VARCHAR(24)     NOT NULL,   -- EXPIRY_SCAN/MANUAL/RETURN_QC/RETURN_RECORD/COUNT
+    source_type     VARCHAR(24)     NOT NULL,   -- EXPIRY_SCAN/MANUAL/RETURN_QC/RETURN_HANDOVER(04 交接，source_id=待回库记录 id)/COUNT
     source_id       BIGINT          NOT NULL DEFAULT 0,
     reason_code     VARCHAR(24)     NOT NULL,   -- EXPIRED/NEAR_EXPIRY/DAMAGED/QC_REJECT/NATURAL_LOSS/OTHER
     status          VARCHAR(16)     NOT NULL DEFAULT 'DRAFT',
