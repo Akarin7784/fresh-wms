@@ -57,10 +57,13 @@ def translate(pg: str) -> tuple[str, list[str]]:
         deltas.append(f"删除 {n_comment} 条 COMMENT ON（SQLite 无该语法，注释降级到行内）")
 
     # delta 2: now() —— SQLite 无 now() 函数，且表达式默认值必须加括号
+    #   九轮 P1：UTC 默认值 DEFAULT (now() AT TIME ZONE 'UTC') 同属这一类，SQLite 的 datetime('now') 恒为 UTC
     n_now = len(re.findall(r"DEFAULT now\(\)", s))
-    if n_now:
+    n_utc = s.count("DEFAULT (now() AT TIME ZONE 'UTC')")
+    if n_now or n_utc:
+        s = s.replace("DEFAULT (now() AT TIME ZONE 'UTC')", "DEFAULT (datetime('now'))")
         s = s.replace("DEFAULT now()", "DEFAULT (datetime('now'))")
-        deltas.append(f"{n_now} 处 DEFAULT now() → DEFAULT (datetime('now'))（表达式默认值需括号）")
+        deltas.append(f"{n_now} 处 DEFAULT now()、{n_utc} 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）")
 
     # delta 4: 方言专属行 —— 行尾 "-- @pg-only" 的行删除；"-- @sqlite-only " 开头的行取消注释。
     #   只用于交集之外、两库语义相同但语法不同的东西：分区子句、触发器、角色权限（docs/02 §4.4、§4.8）
@@ -328,6 +331,22 @@ expect_block_tx('C3 归属行 src_kind 从 PDA 改成 DOC', ["UPDATE stock_ledge
 expect_block_tx('C3 归属行 biz_no 不可改', ["UPDATE stock_ledger_line SET biz_no='PK9' WHERE biz_no='PK2' AND line_no=3"], 'ledger_line_immutable')
 expect_allow_tx('C3 换主（只改 owner_device_instance_id）仍允许', ["UPDATE stock_ledger_line SET owner_device_instance_id='DEV-B', post_count=post_count+1 WHERE biz_no='PK2' AND line_no=3"])
 expect_block_tx("C4 check_code='ZZZ'", ["INSERT INTO stock_recon_alert (id,check_code,warehouse_id,stock_id,expected_qty_milli,actual_qty_milli) VALUES (9,'ZZZ',1,13,1,2)"], 'ck_recon_code')
+try:
+    conn.execute("SAVEPOINT rrc")
+    conn.execute("INSERT INTO stock_recon_alert (id,check_code,warehouse_id,stock_id,expected_qty_milli,actual_qty_milli) VALUES (9021,'RR_HOLD_FAILED',1,12,1000,0),(9020,'RR_HOLD_MISMATCH',1,14,5000,0)")
+    ok("C4 正向：check_code='RR_HOLD_FAILED'、'RR_HOLD_MISMATCH'（04 §9 / 05 巡检，#7 Q15）可写入 → 通过（已回滚）")
+except sqlite3.Error as e:
+    bad(f"C4 RR_HOLD_* 被误拦：{e}")
+finally:
+    conn.execute("ROLLBACK TO rrc"); conn.execute("RELEASE rrc")
+try:
+    conn.execute("SAVEPOINT cbx")
+    conn.execute("INSERT INTO stock_recon_alert (id,check_code,warehouse_id,stock_id,expected_qty_milli,actual_qty_milli) VALUES (9022,'CHECK_BOX_MISMATCH',1,12,1000,0),(9023,'SHIP_EVENT_MISSING',1,14,5000,0)")
+    ok("C4 正向：check_code='CHECK_BOX_MISMATCH'、'SHIP_EVENT_MISSING'（06 巡检，#11 Q10）可写入 → 通过（已回滚）")
+except sqlite3.Error as e:
+    bad(f"C4 06 巡检码被误拦：{e}")
+finally:
+    conn.execute("ROLLBACK TO cbx"); conn.execute("RELEASE cbx")
 expect_allow_tx('convert_hold 准备：stock 40 被 RETURN_PENDING 冻满（available=0）', ["INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (40,1,2,1,3,'KG',5000,5000)", "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (30,40,'RETURN_PENDING','RETURN_PENDING','RETURN_RECORD',601,'RRH:601',5000,0,'HELD',0)"])
 expect_allow_tx('convert_hold：available=0 时 RETURN_PENDING → SCRAP_PENDING/SCRAP（source_id = 报损单 9001）', ["UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 30 AND status = 'HELD' AND released_qty_milli = 0", "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (31,40,'SCRAP_PENDING','SCRAP','SCRAP',9001,'CVT:30',5000,0,'HELD',0)"])
 expect_block_tx('convert_hold 重试：CVT:30 已存在（幂等；SQLite 由 trg_hold_no_replace 先拦，PG 由 uq_hold_op）', ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (32,40,'SCRAP_PENDING','SCRAP','SCRAP',9001,'CVT:30',5000,0,'HELD',0)"], 'hold_duplicate')
@@ -418,6 +437,11 @@ conn.execute("INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_t
 r = [x[0] for x in conn.execute("SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.released_qty_milli <> COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id = h.id), 0) + COALESCE((SELECT c.hold_qty_milli FROM stock_hold c WHERE c.op_key = 'CVT:' || h.id), 0)").fetchall()]
 conn.execute("ROLLBACK")
 ok("S6 I3e 反向：绕过释放记录直接 UPDATE 释放 → 对账查出 hold 55") if r == [55] else bad(f"I3e 未查出：{r}")
+# 十六轮：SQLite 应用只能插入 PENDING（trg_outbox_insert_pending）。SENT 种子走单独的种子路径：临时 DROP 触发器，写完原样重建
+_OB_TRG = one("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_outbox_insert_pending'")[0]
+def outbox_seed_begin(): conn.execute("DROP TRIGGER trg_outbox_insert_pending"); conn.commit()
+def outbox_seed_end(): conn.execute(_OB_TRG); conn.commit()
+outbox_seed_begin()
 expect_allow_tx('Q2 准备：去重记录（未过期/已过期）+ outbox（PENDING / 8 天前 SENT / 刚 SENT）', ["INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,expires_at) VALUES ('live','h','{}',200,datetime('now','+1 day')),('dead','h','{}',200,datetime('now','-1 hour'))", "INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at,ack_kind) VALUES (8801,'t','k','{}','PENDING',NULL,NULL),(8802,'t','k','{}','SENT',datetime('now','-8 days'),'2XX'),(8803,'t','k','{}','SENT',datetime('now'),'2XX')"])
 expect_block_tx('Q2 删未过期去重记录', ["DELETE FROM idempotency_record WHERE idem_key = 'live'"], 'purge_not_allowed: idempotency_record')
 expect_block_tx('Q2 删 PENDING 事件', ["DELETE FROM outbox_event WHERE id = 8801"], 'purge_not_allowed: outbox_event')
@@ -428,6 +452,98 @@ expect_allow_tx('Q2 清理（与 purge_expired 同条件）：删已过期去重
 r = (one("SELECT group_concat(idem_key) FROM idempotency_record")[0], one("SELECT group_concat(id) FROM (SELECT id FROM outbox_event ORDER BY id)")[0])
 ok(f"Q2 清理后剩余 idem={r[0]} outbox={r[1]}（只删了 dead、8802）") if r == ('live', '8801,8803') else bad(f"Q2 清理后 {r}")
 
+print("=== 2c3b. 九轮 P1–P3：UTC 清理、过期列只许往后改、SENT 必带 sent_at ===")
+expect_block_tx('P3 status=SENT 但 sent_at 为空', ["INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at,ack_kind) VALUES (8804,'t','k','{}','SENT',NULL,'2XX')"], 'ck_outbox_sent')
+expect_allow_tx('P3 正向：PENDING 不带 sent_at、SENT 带 sent_at', ["INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at,ack_kind) VALUES (8805,'t','k','{}','PENDING',NULL,NULL),(8806,'t','k','{}','SENT',datetime('now'),'2XX')"])
+outbox_seed_end()
+r = one("SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name='trg_outbox_insert_pending'")[0]
+ok("种子路径结束后 trg_outbox_insert_pending 已重建") if r == 1 else bad("trg_outbox_insert_pending 未重建")
+expect_block_tx('R1 补洞：应用以 SENT 状态插入 outbox（sent_at 倒写 1 天前）', ["INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at) VALUES (8811,'t','k','{}','SENT',datetime('now','-1 day'))"], 'outbox_insert_not_pending')
+expect_block_tx('R1 补洞：应用以 PENDING 插入但带过去的 sent_at', ["INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at) VALUES (8812,'t','k','{}','PENDING',datetime('now','-8 days'))"], 'outbox_insert_not_pending')
+expect_block_tx('P2 idem expires_at 改早', ["UPDATE idempotency_record SET expires_at = '2000-01-01 00:00:00' WHERE idem_key = 'live'"], 'expiry_backdate: idempotency_record')
+expect_block_tx('P2 idem created_at 被改', ["UPDATE idempotency_record SET created_at = '2000-01-01 00:00:00' WHERE idem_key = 'live'"], 'expiry_backdate: idempotency_record')
+expect_block_tx('P2 outbox sent_at 改早', ["UPDATE outbox_event SET sent_at = datetime('now','-30 days') WHERE id = 8803"], 'expiry_backdate: outbox_event')
+expect_block_tx('P2 outbox sent_at 清空', ["UPDATE outbox_event SET sent_at = NULL, status = 'SENT' WHERE id = 8803"], 'expiry_backdate: outbox_event')
+expect_block_tx('P2 PENDING → SENT 时 sent_at 倒填 2000-01-01（R1 起先由 sent_at_not_now 拦）（早于 created_at）', ["UPDATE outbox_event SET status = 'SENT', sent_at = '2000-01-01 00:00:00' WHERE id = 8801"], 'sent_at_not_now')
+expect_block_tx('P2 SENT 退回 PENDING', ["UPDATE outbox_event SET status = 'PENDING' WHERE id = 8803"], 'expiry_backdate: outbox_event')
+def allow_rb(desc, stmts):
+    try:
+        conn.execute("SAVEPOINT p2")
+        for x in stmts: conn.execute(x)
+        ok(f"{desc} → 通过（已回滚）")
+    except sqlite3.Error as e:
+        bad(f"{desc} → 被误拦：{e}")
+    finally:
+        conn.execute("ROLLBACK TO p2"); conn.execute("RELEASE p2")
+allow_rb('P2 正向：idem expires_at 往后延', ["UPDATE idempotency_record SET expires_at = datetime('now','+2 days') WHERE idem_key = 'live'"])
+allow_rb('P2 正向：outbox sent_at 往后改、PENDING → SENT 写当前时间', ["UPDATE outbox_event SET sent_at = datetime('now','+1 minute') WHERE id = 8803", "UPDATE outbox_event SET status = 'SENT', ack_kind = '2XX', sent_at = datetime('now') WHERE id = 8801"])
+expect_block_tx('R1 PENDING → SENT 时 sent_at 写成 1 小时前', ["UPDATE outbox_event SET status = 'SENT', sent_at = datetime('now','-1 hour') WHERE id = 8801"], 'sent_at_not_now')
+expect_block_tx('R1 PENDING → SENT 时 sent_at 写成 1 小时后', ["UPDATE outbox_event SET status = 'SENT', sent_at = datetime('now','+1 hour') WHERE id = 8801"], 'sent_at_not_now')
+allow_rb('R1 正向：PENDING → SENT 写当前 UTC（容差内 +3 秒）', ["UPDATE outbox_event SET status = 'SENT', ack_kind = '2XX', sent_at = datetime('now','+3 seconds') WHERE id = 8801"])
+import os, time
+cnt = {}
+conn.execute("INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,expires_at) VALUES ('tz_live12h','h','{}',200,datetime('now','+12 hours')),('tz_dead','h','{}',200,datetime('now','-1 hour'))")
+old_tz = os.environ.get('TZ')
+for tz in ('Etc/GMT-8', 'Etc/GMT+10'):   # POSIX 记号相反：Etc/GMT-8 = UTC+8，Etc/GMT+10 = UTC-10
+    os.environ['TZ'] = tz; time.tzset()
+    conn.execute("SAVEPOINT tz")
+    cnt[tz] = conn.execute("DELETE FROM idempotency_record WHERE expires_at < datetime('now')").rowcount
+    conn.execute("ROLLBACK TO tz"); conn.execute("RELEASE tz")
+if old_tz is None: os.environ.pop('TZ', None)
+else: os.environ['TZ'] = old_tz
+time.tzset()
+conn.execute("DELETE FROM idempotency_record WHERE idem_key = 'tz_dead'")
+ok(f"P1 进程时区 +8 / -10 下清理行数相同 {cnt}（只删 tz_dead）") if list(cnt.values()) == [1, 1] else bad(f"P1 时区清理行数 {cnt}")
+r = one("SELECT count(*) FROM idempotency_record WHERE idem_key = 'tz_live12h'")[0]
+ok("P1 还剩 12 小时的 tz_live12h 未被删") if r == 1 else bad("tz_live12h 被删")
+
+print("=== 2c4. 误报回转 SCRAP_PENDING → RETURN_QC（SCRAP_MISREPORT 审批）===")
+r = one("SELECT quality_hold_qty_milli, hold_qty_milli, on_hand_qty_milli-allocated_qty_milli-reserved_qty_milli-quality_hold_qty_milli-hold_qty_milli FROM stock WHERE id=41")
+ok(f"误报回转前 quality/hold/available = {tuple(r)}") if tuple(r) == (0, 8000, 1000) else bad(f"误报回转前 {r}")
+expect_block_tx('误报回转缺审批单号（→ 应用层 40930，库层 ck_hold_approval 兜底）', ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (57,41,'RETURN_QC','RETURN_QC','QC',7011,'CVT:53',5000,0,'HELD',0,NULL,NULL)"], 'ck_hold_approval')
+expect_block_tx('误报回转审批类型不是 SCRAP_MISREPORT', ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (59,41,'RETURN_QC','RETURN_QC','QC',7011,'CVT:53',5000,0,'HELD',0,'OTHER','APR-WHSH01-20261015-000002')"], 'ck_hold_approval')
+expect_block_tx('非误报回转的明细不能挂审批（MANUAL + SCRAP_MISREPORT）', ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (60,41,'MANUAL','DAMAGE','MANUAL',0,'H60',1000,0,'HELD',7,'SCRAP_MISREPORT','APR-WHSH01-20261015-000003')"], 'ck_hold_approval')
+expect_allow_tx('误报回转：SCRAP_PENDING 52（3000）→ RETURN_QC 56，挂新质检单 7010 + 审批 APR-WHSH01-20261015-000001；hold −q、quality +q', ["UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 52 AND hold_type = 'SCRAP_PENDING' AND status = 'HELD' AND released_qty_milli = 0", "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (56,41,'RETURN_QC','RETURN_QC','QC',7010,'CVT:52',3000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH01-20261015-000001')", "UPDATE stock SET hold_qty_milli = hold_qty_milli - 3000, quality_hold_qty_milli = quality_hold_qty_milli + 3000, version = version + 1 WHERE id = 41 AND hold_qty_milli >= 3000"])
+r = one("SELECT quality_hold_qty_milli, hold_qty_milli, on_hand_qty_milli-allocated_qty_milli-reserved_qty_milli-quality_hold_qty_milli-hold_qty_milli FROM stock WHERE id=41")
+ok(f"误报回转后 quality/hold/available = {tuple(r)}（冻结总量 8000、可用量 1000 不变）") if tuple(r) == (3000, 5000, 1000) else bad(f"误报回转后 {r}")
+expect_block_tx('误报回转后审批单号不可改', ["UPDATE stock_hold SET approval_no = 'APR-WHSH01-20261015-000099' WHERE id = 56"], 'hold_immutable')
+r = conn.execute("SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.op_key LIKE 'CVT:%' AND NOT EXISTS (SELECT 1 FROM stock_hold o WHERE 'CVT:' || o.id = h.op_key AND o.hold_type = 'SCRAP_PENDING' AND o.status = 'RELEASED' AND o.stock_id = h.stock_id) UNION ALL SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.released_qty_milli <> COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id = h.id), 0) + COALESCE((SELECT c.hold_qty_milli FROM stock_hold c WHERE c.op_key = 'CVT:' || h.id), 0)").fetchall()
+ok("I3e（含误报回转口径）无差异行") if r == [] else bad(f"I3e 差异 {r}")
+conn.execute("BEGIN"); conn.execute("INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (58,41,'RETURN_QC','RETURN_QC','QC',7012,'CVT:999',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH01-20261015-000004')")
+r = [x[0] for x in conn.execute("SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.op_key LIKE 'CVT:%' AND NOT EXISTS (SELECT 1 FROM stock_hold o WHERE 'CVT:' || o.id = h.op_key AND o.hold_type = 'SCRAP_PENDING' AND o.status = 'RELEASED' AND o.stock_id = h.stock_id) UNION ALL SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.released_qty_milli <> COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id = h.id), 0) + COALESCE((SELECT c.hold_qty_milli FROM stock_hold c WHERE c.op_key = 'CVT:' || h.id), 0)").fetchall()]
+conn.execute("ROLLBACK")
+ok("I3e 反向：RETURN_QC 声称回转自不存在的 SCRAP_PENDING 999→ 查出 58") if r == [58] else bad(f"I3e 未查出 {r}")
+
+print("=== 2c5. 审批单号格式 ck_hold_approval_no：APR-{仓库编码}-{yyyyMMdd}-{6位数字} ===")
+expect_block_tx("审批单号格式反向：仓库编码小写", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (70,41,'RETURN_QC','RETURN_QC','QC',7100,'CVT:870',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-whsh01-20261015-000001')"], "ck_hold_approval_no")
+expect_block_tx("审批单号格式反向：前缀不是 APR", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (71,41,'RETURN_QC','RETURN_QC','QC',7100,'CVT:871',1000,0,'HELD',0,'SCRAP_MISREPORT','APV-WHSH01-20261015-000001')"], "ck_hold_approval_no")
+expect_block_tx("审批单号格式反向：仓库编码含 '-'", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (72,41,'RETURN_QC','RETURN_QC','QC',7100,'CVT:872',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-WH-SH-01-20261015-000001')"], "ck_hold_approval_no")
+expect_block_tx("审批单号格式反向：仓库编码为空", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (73,41,'RETURN_QC','RETURN_QC','QC',7100,'CVT:873',1000,0,'HELD',0,'SCRAP_MISREPORT','APR--20261015-000001')"], "ck_hold_approval_no")
+expect_block_tx("审批单号格式反向：月份 13", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (74,41,'RETURN_QC','RETURN_QC','QC',7100,'CVT:874',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH01-20261315-000001')"], "ck_hold_approval_no")
+expect_block_tx("审批单号格式反向：日期 32", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (75,41,'RETURN_QC','RETURN_QC','QC',7100,'CVT:875',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH01-20261032-000001')"], "ck_hold_approval_no")
+expect_block_tx("审批单号格式反向：序号 5 位", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (76,41,'RETURN_QC','RETURN_QC','QC',7100,'CVT:876',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH01-20261015-00001')"], "ck_hold_approval_no")
+expect_block_tx("审批单号格式反向：序号 7 位", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (77,41,'RETURN_QC','RETURN_QC','QC',7100,'CVT:877',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH01-20261015-0000001')"], "ck_hold_approval_no")
+expect_block_tx("审批单号格式反向：日期 7 位", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (78,41,'RETURN_QC','RETURN_QC','QC',7100,'CVT:878',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH01-2026101-000001')"], "ck_hold_approval_no")
+expect_block_tx("审批单号格式反向：末尾多空格", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (79,41,'RETURN_QC','RETURN_QC','QC',7100,'CVT:879',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH01-20261015-000001 ')"], "ck_hold_approval_no")
+expect_block_tx("审批单号格式反向：仓库编码 17 位", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (80,41,'RETURN_QC','RETURN_QC','QC',7100,'CVT:880',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-AAAAAAAAAAAAAAAAA-20261015-000001')"], "ck_hold_approval_no")
+expect_block_tx("审批单号格式反向：仓库编码 1 位", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (81,41,'RETURN_QC','RETURN_QC','QC',7100,'CVT:881',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-W-20261015-000001')"], "ck_hold_approval_no")
+expect_block_tx("审批单号格式反向：仓库编码含下划线", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (82,41,'RETURN_QC','RETURN_QC','QC',7100,'CVT:882',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH_01-20261015-000001')"], "ck_hold_approval_no")
+def _allow_rb(desc, stmts):
+    try:
+        conn.execute('SAVEPOINT fmt')
+        for x in stmts: conn.execute(x)
+        ok(f'{desc} → 通过（已回滚）')
+    except sqlite3.Error as e:
+        bad(f'{desc} → 被误拦：{e}')
+    finally:
+        conn.execute('ROLLBACK TO fmt'); conn.execute('RELEASE fmt')
+_allow_rb("审批单号格式正向：常规 WHSH01（APR-WHSH01-20261015-000123）", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (90,41,'RETURN_QC','RETURN_QC','QC',7100,'CVT:890',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH01-20261015-000123')"])
+_allow_rb("审批单号格式正向：年末日期（APR-WHSH01-20261231-999999）", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (91,41,'RETURN_QC','RETURN_QC','QC',7100,'CVT:891',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH01-20261231-999999')"])
+_allow_rb("审批单号格式正向：16 位编码（APR-Z9Z9Z9Z9Z9Z9Z9Z9-20260101-000000）", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (92,41,'RETURN_QC','RETURN_QC','QC',7100,'CVT:892',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-Z9Z9Z9Z9Z9Z9Z9Z9-20260101-000000')"])
+_allow_rb("审批单号格式正向：2 位编码（APR-W1-20261015-000001）", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (95,41,'RETURN_QC','RETURN_QC','QC',7100,'CVT:895',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-W1-20261015-000001')"])
+_allow_rb("审批单号格式正向：年初 + 序号全 0（APR-WHSH01-20260101-000000）", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (96,41,'RETURN_QC','RETURN_QC','QC',7100,'CVT:896',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH01-20260101-000000')"])
+r = one("SELECT count(*) FROM stock_hold WHERE id >= 70 AND id < 100")[0]
+ok("审批单号格式用例全部回滚，无残留明细") if r == 0 else bad(f"审批单号格式用例残留 {r} 行")
 print("=== 2d. docs/02 40906：库位锁定写进扣减原语的 WHERE ===")
 conn.execute("UPDATE location SET status = 'LOCKED' WHERE id = 3")
 DEDUCT = ("UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq + 1, version = version + 1 "
@@ -493,10 +609,12 @@ r = one("SELECT count(*) FROM upstream_push_log WHERE id IN (1,2,8,20)")
 ok(f"11 B1 绕过尝试后日志仍在（{r[0]} 行）") if r[0] == 4 else bad(f"11 日志被动过：{r}")
 print("=== 2i. docs/11 小吴 C1 死信阻塞同 biz_key / C2 409 判定 / C3 形态 A relay 补 seq ===")
 expect_allow_tx('C1 同一单 3 个事件入队（OBT-C1：创建/变更/取消）', ["INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (9101,'wms.outbound.changed','OBT-C1','{}',1,0,0),(9102,'wms.outbound.changed','OBT-C1','{}',1,0,0),(9103,'wms.outbound.changed','OBT-C1','{}',1,0,0)"])
-expect_allow_tx('C1 第 1 个事件投递成功（SENDING→SENT 2XX）', ["UPDATE outbox_event SET status='SENDING' WHERE id=9101", "UPDATE outbox_event SET status='SENT', ack_kind='2XX', sent_at='2026-10-15 03:00:00' WHERE id=9101"])
+expect_allow_tx('C1 第 1 个事件投递成功（SENDING→SENT 2XX）', ["UPDATE outbox_event SET status='SENDING' WHERE id=9101", "UPDATE outbox_event SET status='SENT', ack_kind='2XX', sent_at=datetime('now') WHERE id=9101"])
 expect_allow_tx('C1 第 2 个事件进死信（SENDING→FAILED→DEAD）', ["UPDATE outbox_event SET status='SENDING' WHERE id=9102", "UPDATE outbox_event SET status='FAILED' WHERE id=9102", "UPDATE outbox_event SET status='DEAD' WHERE id=9102"])
 expect_block_tx('C1 第 3 个事件在前序 DEAD 时不能投递（验收用例）', ["UPDATE outbox_event SET status='SENDING' WHERE id=9103"], 'outbox_bizkey_blocked')
+outbox_seed_begin()  # DEAD 种子走种子路径（应用只能插入 PENDING）
 expect_block_tx('C1 同一 biz_key 第二条 DEAD', ["INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq,status) VALUES (9104,'wms.outbound.changed','OBT-C1','{}',1,0,0,'DEAD')"], 'outbox_event.biz_key')
+outbox_seed_end()
 expect_block_tx('C1 跳过不带审计（无人、无时间、无原因）', ["UPDATE outbox_event SET status='SKIPPED' WHERE id=9102"], 'ck_outbox_skip')
 expect_block_tx('C1 跳过原因过短', ["UPDATE outbox_event SET status='SKIPPED', skipped_by=7, skipped_at='2026-10-15 03:00:00', skip_reason='x' WHERE id=9102"], 'ck_outbox_skip')
 expect_block_tx('C1 非 DEAD 事件不能直接跳过（PENDING→SKIPPED）', ["UPDATE outbox_event SET status='SKIPPED', skipped_by=7, skipped_at='2026-10-15 03:00:00', skip_reason='下游已手工补录' WHERE id=9103"], 'outbox_illegal_transition')
@@ -504,15 +622,17 @@ expect_block_tx('C1 非 SKIPPED 行不能带跳过审计字段', ["UPDATE outbox
 expect_allow_tx('C1 人工跳过死信（谁/何时/原因齐全）', ["UPDATE outbox_event SET status='SKIPPED', skipped_by=7, skipped_at='2026-10-15 03:00:00', skip_reason='下游已手工补录' WHERE id=9102"])
 expect_allow_tx('C1 跳过后第 3 个事件放行', ["UPDATE outbox_event SET status='SENDING' WHERE id=9103"])
 expect_block_tx('C1 SKIPPED 是终态（不能改回 PENDING）', ["UPDATE outbox_event SET status='PENDING', skipped_by=NULL, skipped_at=NULL, skip_reason=NULL WHERE id=9102"], 'outbox_illegal_transition')
+outbox_seed_begin()  # DEAD 种子走种子路径（应用只能插入 PENDING）
 expect_allow_tx('C1 另一单：头事件 DEAD、后续 PENDING', ["INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq,status) VALUES (9201,'wms.outbound.changed','OBT-C1B','{}',1,0,0,'DEAD')", "INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (9202,'wms.outbound.changed','OBT-C1B','{}',1,0,0)"])
+outbox_seed_end()
 expect_block_tx('C1 重放前后续事件被阻塞', ["UPDATE outbox_event SET status='SENDING' WHERE id=9202"], 'outbox_bizkey_blocked')
-expect_allow_tx('C1 重放死信成功（DEAD→PENDING→SENDING→SENT，replay_count+1）', ["UPDATE outbox_event SET status='PENDING', replay_count=replay_count+1 WHERE id=9201", "UPDATE outbox_event SET status='SENDING' WHERE id=9201", "UPDATE outbox_event SET status='SENT', ack_kind='2XX', sent_at='2026-10-15 03:00:00' WHERE id=9201"])
+expect_allow_tx('C1 重放死信成功（DEAD→PENDING→SENDING→SENT，replay_count+1）', ["UPDATE outbox_event SET status='PENDING', replay_count=replay_count+1 WHERE id=9201", "UPDATE outbox_event SET status='SENDING' WHERE id=9201", "UPDATE outbox_event SET status='SENT', ack_kind='2XX', sent_at=datetime('now') WHERE id=9201"])
 expect_allow_tx('C1 重放成功后后续事件放行', ["UPDATE outbox_event SET status='SENDING' WHERE id=9202"])
-expect_block_tx('C2 SENT 不注明依据', ["UPDATE outbox_event SET status='SENT', sent_at='2026-10-15 03:00:00' WHERE id=9202"], 'ck_outbox_ack')
-expect_block_tx('C2 SENT 依据为任意 409', ["UPDATE outbox_event SET status='SENT', ack_kind='409', sent_at='2026-10-15 03:00:00' WHERE id=9202"], 'ck_outbox_ack')
+expect_block_tx('C2 SENT 不注明依据', ["UPDATE outbox_event SET status='SENT', sent_at=datetime('now') WHERE id=9202"], 'ck_outbox_ack')
+expect_block_tx('C2 SENT 依据为任意 409', ["UPDATE outbox_event SET status='SENT', ack_kind='409', sent_at=datetime('now') WHERE id=9202"], 'ck_outbox_ack')
 expect_block_tx('C2 非 SENT 行带 ack_kind', ["UPDATE outbox_event SET status='FAILED', ack_kind='DUP_409' WHERE id=9202"], 'ck_outbox_ack')
-expect_allow_tx('C2 下游 409 且识别为同一请求重复 → SENT(DUP_409)', ["UPDATE outbox_event SET status='SENT', ack_kind='DUP_409', sent_at='2026-10-15 03:00:00' WHERE id=9202"])
-expect_block_tx('C2 SENT 是终态（不能改回 PENDING 重发）', ["UPDATE outbox_event SET status='PENDING', ack_kind=NULL WHERE id=9202"], 'outbox_illegal_transition')
+expect_allow_tx('C2 下游 409 且识别为同一请求重复 → SENT(DUP_409)', ["UPDATE outbox_event SET status='SENT', ack_kind='DUP_409', sent_at=datetime('now') WHERE id=9202"])
+expect_block_tx('C2 SENT 是终态（不能改回 PENDING 重发；合并 02 后先由 02 的 SENT 终态守卫拦）', ["UPDATE outbox_event SET status='PENDING', ack_kind=NULL WHERE id=9202"], 'expiry_backdate: outbox_event')
 expect_allow_tx('C3 形态 A 业务事务只写 seq=0（不碰 numbering_segment）', ["INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (9301,'wms.outbound.changed','OBT-C3-9301','{}',1,9,0),(9302,'wms.outbound.changed','OBT-C3-9302','{}',1,9,0),(9303,'wms.outbound.changed','OBT-C3-9303','{}',1,9,0)"])
 expect_allow_tx('C3 relay 提交后补号', ['UPDATE outbox_event SET seq = m.b + r.rn FROM (SELECT id, row_number() OVER (ORDER BY id) AS rn FROM outbox_event WHERE node_id = 9 AND seq = 0) r, (SELECT COALESCE(MAX(seq), 0) AS b FROM outbox_event WHERE node_id = 9) m WHERE outbox_event.id = r.id'])
 expect_block_tx('C3 已补的 seq 不可改', ['UPDATE outbox_event SET seq=100 WHERE id=9301'], 'outbox_seq_immutable')
