@@ -130,7 +130,7 @@ CREATE TABLE stock_hold (
         hold_type <> 'RETURN_PENDING'
         OR (source_type = 'RETURN_RECORD' AND source_id > 0 AND operator_id = 0)
     ),
-    -- SCRAP_PENDING 也是系统冻结：挂报损单（source_type=SCRAP）、operator_id=0；人工解冻拒绝（40933，应用层），只能由第 9 篇报损完成/撤销释放
+    -- SCRAP_PENDING 也是系统冻结：挂报损单 id（source_type=SCRAP，source_id=报损单 id，不是报损行 id）、operator_id=0；人工解冻拒绝（40933），只能由第 9 篇报损完成/撤销释放。不走 place_hold，继续用 hold(SCRAP_PENDING)
     -- RETURN_QC 系统冻结（A3）：挂质检单（source_type=QC，source_id=质检单 id）、operator_id=0；人工解冻拒绝（40933），只能由 release_qc_hold 释放
     CONSTRAINT ck_hold_retqc CHECK (
         hold_type <> 'RETURN_QC'
@@ -257,6 +257,7 @@ CREATE TABLE stock_movement (
     biz_type                    VARCHAR(24)     NOT NULL,   -- RECEIVE/PUTAWAY/PICK/REVERSE_PICK/SHIP/MOVE/ADJUST/COUNT/RETURN/SCRAP/CROSS_DOCK/OPENING/PROCESS_ISSUE/PROCESS_CONSUME/PROCESS_OUTPUT/PROCESS_REVERSE（无 CHECK，第 17 篇登记）
     direction                   SMALLINT        NOT NULL,   -- 1 入 / -1 出 / 0 纯事件（如 SHIP，不改 on_hand）
     stock_id                    BIGINT          NOT NULL,   -- 记账到哪一行库存，按行回放的依据
+    hold_id                     BIGINT,                     -- 冻结类流水指向单条 stock_hold；非冻结流水 NULL。I3f/I3g 按此对账，不按 stock 汇总
     stock_seq                   BIGINT          NOT NULL,   -- = 该次条件 UPDATE 后的 stock.ledger_seq；direction=0 时填当前 ledger_seq（不入链）
     warehouse_id                BIGINT          NOT NULL,
     location_id                 BIGINT          NOT NULL,
@@ -293,6 +294,7 @@ CREATE TABLE stock_movement (
     CONSTRAINT ck_mv_pos     CHECK (move_qty_milli > 0 AND on_hand_after_qty_milli >= 0),
     CONSTRAINT ck_mv_balance CHECK (on_hand_after_qty_milli = on_hand_before_qty_milli + move_qty_milli * direction),
     CONSTRAINT ck_mv_opening CHECK (biz_type <> 'OPENING' OR (direction = 1 AND stock_seq = 1 AND on_hand_before_qty_milli = 0)),
+    CONSTRAINT fk_mv_hold FOREIGN KEY (hold_id) REFERENCES stock_hold(id),
     -- 库层绑定（小赵 C2）：没有对应 key 行、或 key 行内容对不上，流水写不进去。
     -- 只列 NOT NULL 列：MATCH SIMPLE 下任一列为 NULL 会跳过整条外键检查；PDA 四元组由 ck_mv_kind / ck_mvk_kind + uq_mvk_pda_op 管。
     -- DEFERRABLE INITIALLY DEFERRED：提交时检查，同一事务内流水与 key 的写入顺序不限。
@@ -308,6 +310,7 @@ CREATE TABLE stock_movement_p202611 PARTITION OF stock_movement FOR VALUES FROM 
 CREATE TABLE stock_movement_pdefault PARTITION OF stock_movement DEFAULT;   -- @pg-only
 CREATE INDEX ix_mv_biz      ON stock_movement(biz_type, biz_no);
 CREATE INDEX ix_mv_stock    ON stock_movement(stock_id, stock_seq);
+CREATE INDEX ix_mv_hold     ON stock_movement(hold_id) WHERE hold_id IS NOT NULL;
 CREATE INDEX ix_mv_time     ON stock_movement(warehouse_id, occurred_at DESC);
 CREATE INDEX ix_mv_sku_time ON stock_movement(sku_id, occurred_at DESC);
 -- 数据量大：PG 侧按月 RANGE 分区（分区由运维任务提前一个月建好，DEFAULT 分区兜底）；SQLite 侧按月归档导出。
