@@ -10,7 +10,7 @@
 - 扫码输入、语音/震动反馈、大按钮单手操作。
 
 **不负责**
-- 库存扣减、任务分配、FEFO 选批、状态迁移合法性：全部由服务端决定。本地只做**预校验**（库位匹配；条码在线时走服务端解析，见 §9.6）以便即时反馈，以服务端结果为最终结果。
+- 库存扣减、任务分配、FEFO 选批、状态迁移合法性：全部由服务端决定。本地只做**预校验**（库位匹配、`expected_barcodes[]` 匹配，见 §9.6）以便即时反馈，以服务端结果为最终结果。
 - 权限安全边界（后端负责，见 §7）。
 - 司机装车/签收：二期，见第 15 篇。
 
@@ -65,7 +65,7 @@ Hash 路由（WebView 兼容）。权限点为建议值，以第 12 篇为准。
 | 位置 | 内容 |
 |---|---|
 | Pinia `user` / `perm` / `dict` / `warehouse` | 同第 13 篇，仅存跨页、变化慢的数据 |
-| IndexedDB `task_pack` | 已领任务包：任务行、库位码、批次、任务版本号（**不含条码表**，见 §9.6） |
+| IndexedDB `task_pack` | 已领任务包：任务行（含 `expected_barcodes[]`）、库位码、批次、任务版本号（**不含条码全表**，见 §9.6） |
 | 安全存储 | `device_instance_id`、离线令牌（`offline_token`） |
 | IndexedDB `outbox` | 待上传操作（见 §9） |
 | 组件本地 | 当前行、当前步骤、输入中的数量 |
@@ -79,7 +79,7 @@ Hash 路由（WebView 兼容）。权限点为建议值，以第 12 篇为准。
 | 登录 | 设备登录 | `POST /api/v1/auth/device-login` `{username, password, device_instance_id, client_type}`（第 12 篇 §8） |
 | 登录 | 签发离线令牌 | `POST /api/v1/auth/offline-token` |
 | 登录 | 刷新、登出 | `POST /api/v1/auth/refresh`、`/auth/logout` |
-| 登录 | `me`（权限点、features、`min_client_version`） | 待对齐：见第 12 篇（#9 未列） |
+| 登录 | 当前用户（用户、仓库、权限点、`perm_version`） | `GET /api/v1/me` |
 | 任务执行 | 扫商品码解析 | `GET /api/v1/master/barcodes/{barcode}`（第 1 篇 §7，边缘节点本地可用） |
 | 任务列表 | 我的任务、可领任务 | 待对齐：见第 5 篇 |
 | 任务列表 | 领取任务（`rowcount==1` 语义，失败返回 `40923` TASK_ALREADY_CLAIMED，提示「任务已被领取」并刷新列表） | 待对齐：见第 5 篇 |
@@ -134,7 +134,7 @@ Hash 路由（WebView 兼容）。权限点为建议值，以第 12 篇为准。
 ### 9.2 离线流程
 ```mermaid
 flowchart TD
-  A[领取任务 在线] --> B[下载任务包到 IndexedDB<br/>含库位码/批次与任务版本 不含条码表]
+  A[领取任务 在线] --> B[下载任务包到 IndexedDB<br/>含库位码/批次/expected_barcodes 与任务版本]
   B --> C[现场确认]
   C --> D[本地预校验]
   D -->|不通过| E[长鸣 停留当前步]
@@ -204,7 +204,10 @@ outbox 每条：`{ op_id(uuid), local_seq, format_version, idem_key, device_inst
 | `40902` 库存不足 | 本地认为拣到但服务端扣不了 | 原条目 `failed`；选「重扫」生成**新操作、新 Key、新 `op_seq`**，新条目 `linked_op_id` 指向原条目，新条目成功后原条目置 `superseded`；或选「报缺」 |
 | `42210` 条码不匹配 | 扫错（离线时未做条码预校验） | 同上，重扫生成新条目并关联 |
 | `40903` 批次效期不符 | 任务包批次信息过期 | 同上，重扫生成新条目并关联 |
-| 401 / `40110` | 令牌失效或 `perm_version` 落后 | 暂停该账号队列；先刷新令牌，失败则同一账号重新登录后继续 |
+| 401 `40110`，`detail.reason=TOKEN_EXPIRED` | 令牌过期 | 暂停该账号队列；刷新令牌后同 Key 继续补交，刷新失败则同一账号重新登录后继续 |
+| 401 `40110`，`PERM_VERSION_CHANGED` | 权限已变 | 暂停队列；刷新令牌并重拉 `GET /api/v1/me`，更新首页宫格；仍有对应权限点则继续补交，否则条目转 `failed` 红条交主管 |
+| 401 `40110`，`DEVICE_UNBOUND` | 设备绑定已失效 | 暂停队列，不清 outbox，进入重新绑定流程（§9.7），绑定后同一账号登录继续 |
+| 401 `40110`，reason 缺失/未知 | — | 暂停队列，要求同一账号重新登录 |
 | 401 `40111 DEVICE_NOT_BOUND` | 设备未绑定或绑定仓不符 | 暂停队列，提示「请主管在后台确认绑定」；不清 outbox |
 | 401 `40112 OFFLINE_TOKEN_INVALID` | 离线令牌无效，`detail.reason`：`EXPIRED` / `REVOKED` / `PERM_STALE` / `DEVICE_MISMATCH` | 暂停队列，不清 outbox：`EXPIRED`/`PERM_STALE` → 在线重新登录后继续；`REVOKED` → 提示「令牌已吊销（设备可能被挂失），请联系主管」；`DEVICE_MISMATCH` → 提示「设备与账号不符」交主管；未知 reason 同 `REVOKED` |
 | 403 `40312 SOD_VIOLATION` | 违反职责分离（如复核自己拣的单，SoD-1） | `failed` 红条，显示 `detail.rule`，不重试，交其他人处理 |
@@ -285,10 +288,11 @@ stateDiagram-v2
 - **非计划切换（边缘硬件故障）**：从备份恢复到备用机，RPO 窗口内的写入可能丢失；PDA 只需重取地址，然后 outbox 按原业务键重提交补数，幂等保证不重复入账。恢复后的节点可能使用**新的节点号**，对 PDA 无影响（除重取地址外）。对账（动碰盘点）完成前若服务端暂不开放作业，写请求按 503 处理，条目保持 `pending`。
 - 任务包里的任务版本以新库为准；版本变化按 §9.4 处理。
 
-### 9.6 条码解析（不缓存条码表）
-- 依第 1 篇 Q4/A14：**PDA 不缓存条码表**。扫商品码时在线调用 `GET /api/v1/master/barcodes/{barcode}`（形态 B 走仓内边缘节点，局域网内通常可达）。
-- PDA 与写节点也断开时：本地只校验库位码（任务包内）；商品码**原样记录**进 outbox，不做本地 SKU 匹配，界面提示「离线，条码待校验」；补交时由服务端校验，错误返回 `42210` 红条重扫。
-- 待定：离线时是否允许任务包携带**本任务行的预期条码**（任务范围，非全表）以便现场即时报错（Q18，已在 #8 提出）。
+### 9.6 条码解析与离线预校验
+- **PDA 不缓存条码全表**（第 1 篇）。任务包的每个任务行带 `expected_barcodes[]`：任务生成时的该 SKU 条码**快照**，只在本任务范围内。
+- 在线：扫商品码调用 `GET /api/v1/master/barcodes/{barcode}` 解析；离线：用 `expected_barcodes[]` 做**预校验**，不匹配立即长鸣提示重扫。
+- 预校验只用于现场即时反馈，**以服务端补交时的判定为准**：快照之后条码换绑等导致服务端判定不一致时，服务端结果胜出（例如本地通过、服务端返回 `42210` → 红条重扫；本地不通过的码不会入队）。
+- 扫到的原始条码随 outbox 条目一起上传，便于服务端判定与审计。
 
 ### 9.7 设备绑定与离线令牌（第 12 篇 §3.2、§3.3）
 - `device_instance_id` 首次安装生成并存安全存储，**重装即变**（同时是四元组组成部分）。登录走 `device-login`；未绑定返回 `40111`，界面显示设备实例 id 二维码/短码供主管在后台确认绑定，确认后重新登录。
@@ -308,7 +312,7 @@ stateDiagram-v2
 |---|---|---|
 | 单元 | Vitest + fake-indexeddb | outbox 写入原子性；Key 与 `op_seq` 在失败/重启/退避后不变；`local_seq` 排序（时钟回拨后顺序不变）；串行与失败暂停只影响本账号同任务；`failed` 不被 24h 清理、只在服务端回执后删除；撤销在确认被拒后置 `superseded`；重扫生成新条目并关联；`format_version` 迁移（含迁移失败标红）；数量字符串计算 |
 | 组件 | Vitest + @vue/test-utils | 三步扫码不可跳步、缺货跳行、30 秒撤销、BigButton ≥56dp、离线确认即时反馈；计件模式 1 秒扫 5 件得 5（不被去抖）；非计件模式壳重复广播被丢弃；outbox 非空不能登出、可交主管；首页显示其他账号待补交数 |
-| 模拟弱网 | MSW | `40111` 暂停队列且不清 outbox；`40112` 四种 reason 分别提示、均不清 outbox；`40312` 红条显示 rule；离线令牌剩余 <1h 提醒、过期仍记录 outbox；离线扫商品码原样入队不做本地 SKU 匹配、补交 `42210` 红条；在线扫码调用 barcodes 解析；不存在条码表缓存（IndexedDB 无条码库断言）；`42214 OVER_QTY` 按 `detail.reason` 分支：`OVER_PICK` 超拣红条、`OVER_REVERSE` 红条按 `detail{outbound_line_id, picked_qty, reversed_qty, requested_qty}` 渲染且数量经 `formatQty` 显示（不做浮点运算）、缺失/未知红条交人工，三种情况均不自动重试（断言无二次请求）；超时后重试同 Key；响应丢失；**Key 过期（服务端无 Key 记录）后补交按四元组重放，不重复扣减**；`40932` detail 五字段齐全：非 `NEARBY_PUTBACK` 时 `target_location` 有值也被忽略（不提示去目标库位）、`NEARBY_PUTBACK` 且 `target_location` 为空按契约异常保留红条；`40932` 按 `resolution` 分支：`CONFIRMED`/`RETURNED_TO_ORIGINAL` 立即删除、`NEARBY_PUTBACK` 红条保留直到 `putback-ack` 成功（扫错 `42212` 重扫、ack 不写流水）、`SCRAP_HANDOVER` 红条保留直到 GET 详情 `handover_confirmed_at` 非空（为空保留）、缺失/未知保留；`40910` 的 `POD_OP`/`POD_CORRECT`/`SOURCE_ORDER` 按契约异常处理；断网时用缓存的 endpoint + epoch 继续作业且写请求带 `X-Write-Epoch`；`50303 STALE_WRITE_NODE` → 暂停 outbox、重取 write-endpoint、按 `local_seq` 原 Key 重放，不标红；`50302 ID_CLOCK_BACKWARD` 不触发重取地址、不与 STALE 混淆（只退避重试）；非计划切换后按原业务键重提交补数且新节点号无影响；`50301` 或 `epoch` 变化 → 重取 write-endpoint 后按 `local_seq` 用原 Key/`op_seq` 重提交，切换前已成功的操作得到重放不重复扣减；切换期间不标红；40920/40921/40922 返回 `confirmedLines` + `returnRecordId`，重复被拒返回同一 id（按四元组）；confirm 扫错库位 `42212` 红条保留并提示重扫原库位；confirm 成功后删除 failed 条目；confirm 与主管 resolve 并发：**`40930` 不删除、红条保留**；`40910` 按 `detail.key_type` 分支（`PDA_OP` 交主管、`IDEMPOTENCY_KEY` 上报；缺失/未知时红条、不自动重试、不生成新 Key）；`50000` 退避同 Key 重试；`50010` 不自动重试、红条；`42214 OVER_QTY`（`OVER_PICK`）超拣红条且不自动重试；`42212` 后修正重扫用同 Key 被重新执行（422 不缓存）；5xx/429 后同 Key 重试被重新执行且由业务键兜底不重复扣减；confirm 网络失败同 Key 重试；401 中途失效 |
+| 模拟弱网 | MSW | `40111` 暂停队列且不清 outbox；`40112` 四种 reason 分别提示、均不清 outbox；`40312` 红条显示 rule；离线令牌剩余 <1h 提醒、过期仍记录 outbox；离线用任务行 `expected_barcodes[]` 预校验（不匹配长鸣不入队）、本地通过但服务端 `42210` 时红条重扫（服务端胜出）；在线扫码调用 barcodes 解析；IndexedDB 无条码全表；`40110` 三种 reason：TOKEN_EXPIRED 刷新后同 Key 续传、PERM_VERSION_CHANGED 重拉 /me 后按权限继续或转红条、DEVICE_UNBOUND 进入重新绑定且 outbox 保留；`42214 OVER_QTY` 按 `detail.reason` 分支：`OVER_PICK` 超拣红条、`OVER_REVERSE` 红条按 `detail{outbound_line_id, picked_qty, reversed_qty, requested_qty}` 渲染且数量经 `formatQty` 显示（不做浮点运算）、缺失/未知红条交人工，三种情况均不自动重试（断言无二次请求）；超时后重试同 Key；响应丢失；**Key 过期（服务端无 Key 记录）后补交按四元组重放，不重复扣减**；`40932` detail 五字段齐全：非 `NEARBY_PUTBACK` 时 `target_location` 有值也被忽略（不提示去目标库位）、`NEARBY_PUTBACK` 且 `target_location` 为空按契约异常保留红条；`40932` 按 `resolution` 分支：`CONFIRMED`/`RETURNED_TO_ORIGINAL` 立即删除、`NEARBY_PUTBACK` 红条保留直到 `putback-ack` 成功（扫错 `42212` 重扫、ack 不写流水）、`SCRAP_HANDOVER` 红条保留直到 GET 详情 `handover_confirmed_at` 非空（为空保留）、缺失/未知保留；`40910` 的 `POD_OP`/`POD_CORRECT`/`SOURCE_ORDER` 按契约异常处理；断网时用缓存的 endpoint + epoch 继续作业且写请求带 `X-Write-Epoch`；`50303 STALE_WRITE_NODE` → 暂停 outbox、重取 write-endpoint、按 `local_seq` 原 Key 重放，不标红；`50302 ID_CLOCK_BACKWARD` 不触发重取地址、不与 STALE 混淆（只退避重试）；非计划切换后按原业务键重提交补数且新节点号无影响；`50301` 或 `epoch` 变化 → 重取 write-endpoint 后按 `local_seq` 用原 Key/`op_seq` 重提交，切换前已成功的操作得到重放不重复扣减；切换期间不标红；40920/40921/40922 返回 `confirmedLines` + `returnRecordId`，重复被拒返回同一 id（按四元组）；confirm 扫错库位 `42212` 红条保留并提示重扫原库位；confirm 成功后删除 failed 条目；confirm 与主管 resolve 并发：**`40930` 不删除、红条保留**；`40910` 按 `detail.key_type` 分支（`PDA_OP` 交主管、`IDEMPOTENCY_KEY` 上报；缺失/未知时红条、不自动重试、不生成新 Key）；`50000` 退避同 Key 重试；`50010` 不自动重试、红条；`42214 OVER_QTY`（`OVER_PICK`）超拣红条且不自动重试；`42212` 后修正重扫用同 Key 被重新执行（422 不缓存）；5xx/429 后同 Key 重试被重新执行且由业务键兜底不重复扣减；confirm 网络失败同 Key 重试；401 中途失效 |
 | 真机 | 手工清单 | 冷库断网 30 分钟及跨夜（>24h）后补交；拔电池/杀 WebView 后恢复；手动改系统时间后上传顺序；换班换账号；outbox 非空时强制更新 |
 
 覆盖率目标：`offline/`、`utils/`、`composables/` 行 ≥ 85%、分支 ≥ 75%；组件 ≥ 70%。
@@ -334,5 +338,5 @@ stateDiagram-v2
 | Q15 | ~~切换后继承与地址获取~~ **已定**：随库迁移继承；`write-endpoint` + `epoch`，见 §9.5 | 已关闭 |
 | Q16 | ~~`STALE_WRITE_NODE` 码值~~ **已定**：`50303`，`50302` 仍为 `ID_CLOCK_BACKWARD`（00 §6.4 @8314830） | 已关闭 |
 | Q17 | ~~`OVER_REVERSE` detail 字段~~ **已定**：`{outbound_line_id, picked_qty, reversed_qty, requested_qty}`，数量为 3 位小数字符串（00 §6.4 @5e44905） | 已关闭 |
-| Q18 | 离线时任务包可否携带本任务行的预期条码（任务范围，非条码全表）用于即时报错；第 1 篇 Q4 当前为不缓存 | 第 1 篇（#8） |
-| Q19 | `me` 接口与首次绑定的主管确认方式（扫主管绑定码的接口未定义） | 第 12 篇（#9） |
+| Q18 | ~~离线条码预校验~~ **已定**：任务行 `expected_barcodes[]` 快照，仅预校验，服务端判定为准，见 §9.6 | 已关闭 |
+| Q19 | `me` 已定（`GET /api/v1/me`）；首次绑定的主管确认方式（扫主管绑定码接口）仍待定 | 第 12 篇 |
