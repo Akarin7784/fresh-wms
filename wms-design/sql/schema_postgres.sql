@@ -964,7 +964,7 @@ CREATE TABLE scrap_order (
     warehouse_id    BIGINT          NOT NULL,
     source_type     VARCHAR(24)     NOT NULL,   -- 取值见 ck_scr_src_type；SELL_EXPIRED：可售天数到期扫描（source_id=lot_id，来源键 SELL_EXPIRED:{lot_id}:{date}，落库 source_id=lot_id + source_date=作业日，见 uq_scr_source；冻结 op_key SELLEXP:{lot_id}:{date}）；RETURN_HANDOVER：04 交接，source_id=待回库记录 id；RETURN_QC：10 质检不合格，source_id=inbound_line.id
     source_id       BIGINT          NOT NULL DEFAULT 0,
-    source_date     DATE            NOT NULL DEFAULT '1970-01-01',   -- 00 §6.4 D3：按日去重的来源（SELL_EXPIRED）写仓库作业日；其余来源固定 '1970-01-01'
+    source_date     DATE            NOT NULL DEFAULT '1970-01-01',   -- 00 §6.4 D3：按日去重白名单（SELL_EXPIRED / LIVE_SHRINK）写仓库作业日；其余来源固定 '1970-01-01'
     reason_code     VARCHAR(24)     NOT NULL,   -- 取值见 ck_scr_reason
     status          VARCHAR(16)     NOT NULL DEFAULT 'DRAFT',
     work_date       DATE            NOT NULL,   -- 仓库时区作业日
@@ -987,8 +987,8 @@ CREATE TABLE scrap_order (
     CONSTRAINT ck_scr_appr   CHECK (status NOT IN ('APPROVED','POSTED') OR (approver_id IS NOT NULL AND approved_at IS NOT NULL)),
     CONSTRAINT ck_scr_posted CHECK (status <> 'POSTED' OR posted_at IS NOT NULL),
     CONSTRAINT ck_scr_src_type CHECK (source_type IN ('EXPIRY_SCAN','SELL_EXPIRED','MANUAL','RETURN_QC','RETURN_HANDOVER','COUNT','EXCEPTION','LIVE_DEATH','LIVE_SHRINK')),
-    -- 00 §6.4 D3：SELL_EXPIRED 的 source_date = work_date；不按日去重的来源固定 '1970-01-01'（LIVE_DEATH / LIVE_SHRINK 的日期口径待第 18 篇定，暂不约束）
-    CONSTRAINT ck_scr_src_date CHECK ((source_type <> 'SELL_EXPIRED' OR source_date = work_date) AND (source_type IN ('SELL_EXPIRED','LIVE_DEATH','LIVE_SHRINK') OR source_date = '1970-01-01')),
+    -- 00 §6.4 D3（大肥鱼定）：按日去重白名单 SELL_EXPIRED / LIVE_SHRINK 的 source_date = work_date；其余来源（含 LIVE_DEATH）固定 '1970-01-01'
+    CONSTRAINT ck_scr_src_date CHECK (CASE WHEN source_type IN ('SELL_EXPIRED','LIVE_SHRINK') THEN source_date = work_date ELSE source_date = '1970-01-01' END),
     CONSTRAINT ck_scr_reason CHECK (reason_code IN ('EXPIRED','NEAR_EXPIRY','SELL_EXPIRED','DAMAGED','QC_REJECT','NATURAL_LOSS','OTHER'))
 );
 CREATE INDEX ix_scr_wh_status ON scrap_order(warehouse_id, status, work_date);
