@@ -362,6 +362,21 @@ stateDiagram-v2
   - **24 小时时限**：必须在恢复联网后 24 小时内提交，超时由服务端转异常单（第 10 篇）。补录入口显示「补录剩余 HH:MM」倒计时，只读服务端下发的 `backfill_deadline_at`（`GET /api/v1/me` 与心跳返回，UTC，= 恢复联网 + 24h；前端**不用设备时间推算**），每次断网→恢复联网后都会下发（不论是否有待补纸单，服务端无从得知），**窗口期内一直显示「纸单补录」入口与倒计时**；为 `null`（窗口已过或设备从未断网）时隐藏补录入口、倒计时与提醒，已提交的补录记录仍可查看（00 §6.6.2 @6906310），<1 小时标红。
   - 补录本身必须在线，不进 outbox。
 
+### 9.12 加工中心与活鲜暂存现场流程（骨架，待第 17 / 18 篇）
+加工中心（第 17 篇）与活鲜暂存（第 18 篇）纳入范围，库存状态新增 `PROCESSING`、`LIVE_HOLD`。以下 PDA 流程只列规划，接口、字段、是否可离线均**待第 17 / 18 篇定义**。
+
+| 流程（暂定路由） | 现场动作 |
+|---|---|
+| `/processing/issue` | 加工领料：扫加工单 → 扫原料批次/库位 → 录入数量（按基本单位 3 位小数） |
+| `/processing/receipt` | 成品入库：扫加工单 → 录成品数量/重量 → 打印成品批次标签 → 上架 |
+| `/processing/loss` | 加工损耗登记（超得率容差提示） |
+| `/live/patrol` | 水质/水温巡检：扫池位 → 录入指标 → 超限长鸣告警 |
+| `/live/death` | 死亡登记：扫池位 → 录入重量 + 尾数 → 拍照 → 生成报损 |
+| `/live/weigh-out` | 称重出库：扫池位 → 电子秤取重 + 录尾数 → 确认 |
+| `/live/move` | 池位间移动（如第 18 篇定义） |
+
+- 重量 + 尾数双单位的输入与显示、电子秤接入方式、离线可用性、幂等业务键均见 Q28–Q33。
+
 ## 10. 测试要点
 
 | 层 | 工具 | 重点 |
@@ -370,6 +385,7 @@ stateDiagram-v2
 | 组件 | Vitest + @vue/test-utils | 三步扫码不可跳步、缺货跳行、30 秒撤销、BigButton ≥56dp、离线确认即时反馈；计件模式 1 秒扫 5 件得 5（不被去抖）；非计件模式壳重复广播被丢弃；outbox 非空不能登出、可交主管；首页显示其他账号待补交数 |
 | 模拟弱网 | MSW | `40110 DEVICE_UNBOUND` 清令牌回登录且 outbox 保留；`40111 NOT_BOUND` 重新登录再发起绑定；`WAREHOUSE_MISMATCH` 提示主管；等待页按 approval_id 查询状态；离线令牌剩余时间取响应 `exp`；`40111 BINDING_PENDING` 显示等待页且 outbox 无写入、刷新后审批通过进入首页；`40920` 带 `new_holder_device_id` 时红条显示持有设备、排队操作转待回库队列、无重试请求；`40111` 暂停队列且不清 outbox；`40112` 四种 reason 分别提示、均不清 outbox；`40312` 红条显示 rule；离线令牌剩余 <1h 提醒、过期仍记录 outbox；离线用任务行 `expected_barcodes[]` 预校验（不匹配长鸣不入队）、本地通过但服务端 `42210` 时红条重扫（服务端胜出）；在线扫码调用 barcodes 解析；IndexedDB 无条码全表；`40110` 三种 reason：TOKEN_EXPIRED 刷新后同 Key 续传、PERM_VERSION_CHANGED 重拉 /me 后按权限继续或转红条、DEVICE_UNBOUND 进入重新绑定且 outbox 保留；`42214 OVER_QTY` 按 `detail.reason` 分支：`OVER_PICK` 超拣红条、`OVER_REVERSE` 红条按 `detail{outbound_line_id, picked_qty, reversed_qty, requested_qty}` 渲染且数量经 `formatQty` 显示（不做浮点运算）、缺失/未知红条交人工，三种情况均不自动重试（断言无二次请求）；超时后重试同 Key；响应丢失；**Key 过期（服务端无 Key 记录）后补交按四元组重放，不重复扣减**；`40932` detail 五字段齐全：非 `NEARBY_PUTBACK` 时 `target_location` 有值也被忽略（不提示去目标库位）、`NEARBY_PUTBACK` 且 `target_location` 为空按契约异常保留红条；`40932` 按 `resolution` 分支：`CONFIRMED`/`RETURNED_TO_ORIGINAL` 立即删除、`NEARBY_PUTBACK` 红条保留直到 `putback-ack` 成功（扫错 `42212` 重扫、ack 不写流水）、`SCRAP_HANDOVER` 红条保留直到 GET 详情 `handover_confirmed_at` 非空（为空保留）、缺失/未知保留；`40910` 的 `POD_OP`/`POD_CORRECT`/`SOURCE_ORDER` 按契约异常处理；断网时用缓存的 endpoint + epoch 继续作业且写请求带 `X-Write-Epoch`；`50303 STALE_WRITE_NODE` → 暂停 outbox、重取 write-endpoint、按 `local_seq` 原 Key 重放，不标红；`50302 ID_CLOCK_BACKWARD` 不触发重取地址、不与 STALE 混淆（只退避重试）；非计划切换后按原业务键重提交补数且新节点号无影响；`50301` 或 `epoch` 变化 → 重取 write-endpoint 后按 `local_seq` 用原 Key/`op_seq` 重提交，切换前已成功的操作得到重放不重复扣减；切换期间不标红；40920/40921/40922 返回 `confirmedLines` + `returnRecordId`，重复被拒返回同一 id（按四元组）；confirm 扫错库位 `42212` 红条保留并提示重扫原库位；confirm 成功后删除 failed 条目；confirm 与主管 resolve 并发：**`40930` 不删除、红条保留**；`40910` 按 `detail.key_type` 分支（`PDA_OP` 交主管、`IDEMPOTENCY_KEY` 上报；缺失/未知时红条、不自动重试、不生成新 Key）；`50000` 退避同 Key 重试；`50010` 不自动重试、红条；`42214 OVER_QTY`（`OVER_PICK`）超拣红条且不自动重试；`42212` 后修正重扫用同 Key 被重新执行（422 不缓存）；5xx/429 后同 Key 重试被重新执行且由业务键兜底不重复扣减；confirm 网络失败同 Key 重试；401 中途失效 |
 | 复核/装箱/离线清单 | Vitest + MSW | `40312` + `detail.reason=CHECK_SOD` 红条「换人复核」不重试，`40312` 其他 reason 走通用；`42214 OVER_CHECK` 长鸣红条不重试，文案区别于 OVER_PICK/OVER_REVERSE；未扫齐时提交置灰并提示先撤销拣货；SEALED 箱明细只读，`40937` 刷新不重试；扫到他单商品拒绝入箱；多人拣同一单时复核人与任一拣货人相同、或无拣货人记录均被 `40312 CHECK_SOD` 拒绝；零扫描「通过」置灰；复核未 PASSED 不显示封箱，封箱人规则拒绝走通用处理；SHIPPED 箱无编辑入口；`42215` 红条重扫集货位；重量只接受整数克；断网时领取新任务、新分配、调拨、波次下发、开复核/封箱置灰，已下发任务执行、复核扫码、收货与盲收登记可用并入 outbox；顶栏倒计时取离线令牌 `exp`（≤12h），<1h 变红、到期停止新记录；复核 `42214 SELL_EXPIRED` 红条「批次已过可售期」并提示拣后取消、不重试；离线超过 12h 的补交被服务端拒绝时转红条不删除，重连先重放后对账；盲收未选 `reason_code` 或未扫 `container_code` 时提交置灰、离线也不入队，服务端 `400` 按字段提示；纸单补录需 `offline.paper.backfill`、照片必传、在线提交生成 `PAPER_BACKFILL` 审批，恢复联网后 24h 倒计时只取 `backfill_deadline_at`（改设备时间不影响）、<1h 标红、每次恢复联网后都有值、窗口内入口一直显示（无待补纸单也显示），为 `null`（窗口已过 / 从未断网）时隐藏入口与倒计时但已提交补录记录仍可查看；`50301 STALE_STOCK_PAUSED` 提示暂停、不重试、重拉 /me、不重取写节点，其他 `50301` 仍走写节点重取；盲收提交成功显示收货记录号 + 异常单号与 48h 提示、离线时入队补交后显示；预约收货调用 receive 后显示待质检；置灰完全由 `paused_actions[]` 驱动（返回空数组时不置灰、返回新动作时置灰）；倒计时取 `offline_deadline_at` 而非本地推算；非复核人看不到封箱按钮，`40930 SEALER_NOT_CHECKER` 提示不重试 |
+| 加工 / 活鲜（骨架） | Vitest | `PROCESSING`、`LIVE_HOLD` 状态显示；其余用例待第 17 / 18 篇定稿后补充（Q28–Q33） |
 | 真机 | 手工清单 | 冷库断网 30 分钟及跨夜（>24h）后补交；拔电池/杀 WebView 后恢复；手动改系统时间后上传顺序；换班换账号；outbox 非空时强制更新 |
 
 覆盖率目标：`offline/`、`utils/`、`composables/` 行 ≥ 85%、分支 ≥ 75%；组件 ≥ 70%。
@@ -404,3 +420,9 @@ stateDiagram-v2
 | Q25 | ~~盲收必填~~ **已定**：`reason_code`、`container_code` 必填，缺失 `400`；`container_code` 更名为 `container_code` | 已关闭 |
 | Q26 | ~~纸单补录~~ **已定**：`POST /api/v1/offline/paper-records`，审批 `PAPER_BACKFILL`，`offline.paper.backfill` / `.approve`，联网后 24h 内（00 §6.6.1） | 已关闭 |
 | Q27 | ~~纸单补录截止字段~~ **已定**（00 §6.6.2 @fadb60a）：`/me` 与心跳返回 `backfill_deadline_at`（UTC，恢复联网 + 24h，窗口已过或从未断网时为 `null`；每次恢复联网都下发，不代表有待补纸单，@6906310 修正） | 已关闭 |
+| Q28 | 加工领料 / 成品入库 / 损耗的 PDA 接口、权限点与业务键 | 第 17 篇 |
+| Q29 | 成品批次标签格式与打印接口；领料与成品是否可离线 | 第 17 篇 / 第 14 篇 Q5 |
+| Q30 | 活鲜巡检 / 死亡登记 / 称重出库 / 池位移动的 PDA 接口与权限点 | 第 18 篇 |
+| Q31 | 重量 + 尾数双单位：字段名、重量精度、尾数整数与否、扫码与电子秤取重的输入规则 | 第 18 篇 / 00 R2 |
+| Q32 | 巡检频率（是否 PDA 定时提醒）、指标阈值下发方式 | 第 18 篇 |
+| Q33 | 加工得率容差在 PDA 端是提示还是拦截 | 第 17 篇 |
