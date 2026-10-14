@@ -427,6 +427,14 @@ case "$OUT" in *"permission denied for table pick_op"*) ok "05 Q2 wms_app 不能
 M=$(psql -t -A -c "SELECT count(*) FROM stock_movement WHERE biz_no='PT3'")
 [ "$M" = "0" ] && ok "05 Q2 报缺/拒收只写 pick_op，不产生流水（PT3 流水 0 条）" || bad "PT3 流水 $M 条"
 
+NG=$(psql -t -A -c "SELECT coalesce(string_agg(c.relname, ',' ORDER BY c.relname),'') FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p') AND NOT c.relispartition AND NOT has_table_privilege('wms_app', c.oid, 'SELECT')")
+[ -z "$NG" ] && ok "05 每张 public 表 wms_app 都有授权（SELECT）" || bad "wms_app 无授权的表：$NG"
+ND=$(psql -t -A -c "SELECT coalesce(string_agg(c.relname, ',' ORDER BY c.relname),'') FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p') AND NOT c.relispartition AND (has_table_privilege('wms_app', c.oid, 'DELETE') OR has_table_privilege('wms_app', c.oid, 'TRUNCATE'))")
+[ -z "$ND" ] && ok "05 wms_app 对任何表都没有 DELETE/TRUNCATE" || bad "wms_app 可删的表：$ND"
+OUT=$(psql -q -c "SET ROLE wms_app; UPDATE return_record SET qty_milli=1 WHERE id=501;")
+case "$OUT" in *"permission denied for table return_record"*) ok "05 Q1 wms_app 不能改 return_record.qty_milli（只能改处理列）";; *) bad "wms_app 改 RR 数量未被拒：$OUT";; esac
+OUT=$(psql -q -c "SET ROLE wms_app; UPDATE wave SET version=version WHERE id=1; UPDATE pick_task SET version=version WHERE id=3;")
+case "$OUT" in *ERROR*) bad "wms_app 更新 wave/pick_task 被拒：$OUT";; *) ok "05 wms_app 可条件更新 wave / pick_task";; esac
 echo "=== 2c. docs/02 40906：库位锁定写进扣减原语的 WHERE ==="
 psql -q -c "UPDATE location SET status='LOCKED' WHERE id=3;" >/dev/null
 DEDUCT="UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 13 AND on_hand_qty_milli - allocated_qty_milli - reserved_qty_milli - quality_hold_qty_milli - hold_qty_milli >= 1000 AND EXISTS (SELECT 1 FROM location l WHERE l.id = stock.location_id AND l.status <> 'LOCKED');"

@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 43 处 DEFAULT now() → DEFAULT (datetime('now'))（表达式默认值需括号）
---   3. 方言专属行：删除 63 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 22 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 67 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 22 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -1094,3 +1094,7 @@ WHERE s.on_hand_qty_milli > 0 AND l.status = 'AVAILABLE' AND l.deleted_at IS NUL
 -- [SQLite] 视图支持一致；now() 在 SQLite 侧用 datetime('now')，故未在本文件使用
 
 
+
+-- 应用角色基线授权（docs/05 补齐：每张表 wms_app 都要有授权，verify 断言）。一律不给 DELETE/TRUNCATE。
+-- 账本类表（stock_movement*、stock_hold、stock_ledger_line、stock、stock_reservation、stock_recon_alert、pick_op、return_record）已在上方按列精确授权，这里不重复。
+-- 各表属主篇可以再收紧。audit_log 只追加。

@@ -857,6 +857,8 @@ CREATE INDEX ix_rr_open   ON return_record(warehouse_id, status, created_at);
 CREATE INDEX ix_rr_picker ON return_record(picker_id, status);
 -- pick_op 的四元组、op_type、qty_milli 是 40910 PDA_OP 比对基准，应用角色只能补写首次结果列
 GRANT SELECT, INSERT ON pick_op, return_record TO wms_app;                                                     -- @pg-only
+GRANT UPDATE (status, resolution, target_location_id, putback_acked_at, putback_acked_by, scrap_doc_id, handover_confirmed_at, handover_confirmed_by, hold_id, hold_failed, closed_by, closed_at, version) ON return_record TO wms_app;  -- @pg-only
+GRANT SELECT, INSERT, UPDATE ON wave, pick_task, pick_task_line TO wms_app;                                   -- @pg-only
 GRANT UPDATE (result_code, movement_id, return_record_id) ON pick_op TO wms_app;                             -- @pg-only
 
 CREATE TABLE pack_box (
@@ -1151,3 +1153,9 @@ WHERE s.on_hand_qty_milli > 0 AND l.status = 'AVAILABLE' AND l.deleted_at IS NUL
 -- [SQLite] 视图支持一致；now() 在 SQLite 侧用 datetime('now')，故未在本文件使用
 
 COMMIT;
+
+-- 应用角色基线授权（docs/05 补齐：每张表 wms_app 都要有授权，verify 断言）。一律不给 DELETE/TRUNCATE。
+-- 账本类表（stock_movement*、stock_hold、stock_ledger_line、stock、stock_reservation、stock_recon_alert、pick_op、return_record）已在上方按列精确授权，这里不重复。
+-- 各表属主篇可以再收紧。audit_log 只追加。
+GRANT SELECT, INSERT ON audit_log TO wms_app;                                                                 -- @pg-only
+GRANT SELECT, INSERT, UPDATE ON adjust_line, adjust_order, api_credential, count_line, count_order, idempotency_record, inbound_line, inbound_message, inbound_order, location, lot, numbering_segment, outbound_line, outbound_order, outbox_event, pack_box, pack_box_line, shipment, shipment_order, sku, sku_barcode, sku_unit, stock_snapshot_daily, sys_permission, sys_role, sys_role_perm, sys_user, sys_user_role, sys_user_warehouse, warehouse, zone TO wms_app;  -- @pg-only
