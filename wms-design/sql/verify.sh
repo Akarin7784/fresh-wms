@@ -304,11 +304,6 @@ expect_block "09 报损单非法状态值" \
 expect_block "09 报损行数量 0" \
   "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,qty_milli) VALUES (101,100,1,14,1,1,0);" \
   "ck_scrl_qty"
-expect_allow "09 报损冻结 MANUAL/SCRAP（SCRH:100）" \
-  "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (100,13,'MANUAL','SCRAP','SCRAP',100,'SCRH:100',1000,0,'HELD',7);"
-expect_block "09 SCRAP 不能挂 QUALITY" \
-  "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (101,13,'QUALITY','SCRAP','SCRAP',100,'SCRH:101',1000,0,'HELD',7);" \
-  "ck_hold_reason"
 
 echo "=== 3. §5.6 盘点差异生成列（实盘 − 基准账面 − 期间流水）==="
 seed "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000);"

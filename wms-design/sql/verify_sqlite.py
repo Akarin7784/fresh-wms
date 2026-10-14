@@ -376,8 +376,6 @@ expect_block('09 报损审批 SoD（审批人=申请人）', "UPDATE scrap_order
 expect_block('09 报损单非法状态值', "UPDATE scrap_order SET status='DONE' WHERE id=100", 'ck_scr_status')
 expect_block('09 报损行数量非整数 milli（SQLite REAL）', 'INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,qty_milli) VALUES (100,100,1,14,1,1,1.5)', 'ck_scrl_int')
 expect_block('09 报损行数量 0', 'INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,qty_milli) VALUES (101,100,1,14,1,1,0)', 'ck_scrl_qty')
-expect_allow('09 报损冻结 MANUAL/SCRAP（SCRH:100）', "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (100,13,'MANUAL','SCRAP','SCRAP',100,'SCRH:100',1000,0,'HELD',7)")
-expect_block('09 SCRAP 不能挂 QUALITY', "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (101,13,'QUALITY','SCRAP','SCRAP',100,'SCRH:101',1000,0,'HELD',7)", 'ck_hold_reason')
 
 print("=== 3. §4.4 FEFO 候选池排序（视图 + 排序键）===")
 rows = conn.execute(

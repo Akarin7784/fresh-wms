@@ -851,7 +851,7 @@ CREATE TABLE adjust_line (
 );
 
 -- 第 9 篇 效期与损耗：报损单（SCR）。审批通过后由服务端按行调 02 原语 post_out(SCRAP)；
--- 申请时对每行建 MANUAL/SCRAP 冻结（op_key = SCRH:{scrap_line_id}），审批出账与解冻同事务。
+-- 申请时对每行建 SCRAP_PENDING 系统冻结（类型由第 2 篇落 DDL）（op_key = SCRH:{scrap_line_id}），审批出账与解冻同事务。
 CREATE TABLE scrap_order (
     id              BIGINT          PRIMARY KEY,
     code            VARCHAR(64)     NOT NULL,   -- SCR-{仓}-{节点}-{作业日}-{序号}
@@ -884,7 +884,7 @@ CREATE TABLE scrap_line (
     sku_id          BIGINT          NOT NULL,
     lot_id          BIGINT          NOT NULL,
     qty_milli       BIGINT          NOT NULL,
-    hold_id         BIGINT          NOT NULL DEFAULT 0,   -- MANUAL/SCRAP 冻结；0 = 已出库待报损（不冻结）
+    hold_id         BIGINT          NOT NULL DEFAULT 0,   -- SCRAP_PENDING 冻结；0 = 已出库待报损（不冻结）
     ledger_mode     VARCHAR(16)     NOT NULL DEFAULT 'POST_OUT',   -- POST_OUT 出账 / NONE 已扣账只记损耗
     cost_amount     BIGINT          NOT NULL DEFAULT 0,
     CONSTRAINT uq_scr_line   UNIQUE (scrap_id, line_no),
