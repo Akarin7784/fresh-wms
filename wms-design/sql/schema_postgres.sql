@@ -257,6 +257,8 @@ CREATE TABLE stock_hold (
     released_qty_milli  BIGINT          NOT NULL DEFAULT 0,
     status              VARCHAR(16)     NOT NULL DEFAULT 'HELD',      -- HELD/RELEASED，由余量决定
     operator_id         BIGINT          NOT NULL,   -- 系统冻结填 0
+    approval_type       VARCHAR(24),                -- 需要审批的转换才填：SCRAP_MISREPORT（SCRAP_PENDING → RETURN_QC 误报回转）
+    approval_no         VARCHAR(64),                -- 审批单号
     version             BIGINT          NOT NULL DEFAULT 0,
     created_at          TIMESTAMP       NOT NULL DEFAULT now(),
     updated_at          TIMESTAMP       NOT NULL DEFAULT now(),
@@ -281,6 +283,12 @@ CREATE TABLE stock_hold (
     CONSTRAINT ck_hold_retqc CHECK (
         hold_type <> 'RETURN_QC'
         OR (source_type = 'QC' AND source_id > 0 AND operator_id = 0)
+    ),
+    -- 误报回转（SCRAP_PENDING → RETURN_QC，convert_hold 生成 op_key=CVT:{原 hold_id}）必须带 SCRAP_MISREPORT 审批单号；其余明细不带审批
+    CONSTRAINT ck_hold_approval CHECK (
+        (NOT (hold_type = 'RETURN_QC' AND op_key LIKE 'CVT:%') AND approval_type IS NULL AND approval_no IS NULL)
+        OR (hold_type = 'RETURN_QC' AND op_key LIKE 'CVT:%'
+            AND approval_type = 'SCRAP_MISREPORT' AND approval_no IS NOT NULL AND length(approval_no) > 0)
     ),
     CONSTRAINT ck_hold_scrap CHECK (
         hold_type <> 'SCRAP_PENDING'
@@ -474,6 +482,7 @@ BEGIN                                                                           
        OR NEW.source_type IS DISTINCT FROM OLD.source_type OR NEW.source_id IS DISTINCT FROM OLD.source_id    -- @pg-only
        OR NEW.op_key IS DISTINCT FROM OLD.op_key OR NEW.hold_qty_milli IS DISTINCT FROM OLD.hold_qty_milli   -- @pg-only
        OR NEW.operator_id IS DISTINCT FROM OLD.operator_id OR NEW.created_at IS DISTINCT FROM OLD.created_at  -- @pg-only
+       OR NEW.approval_type IS DISTINCT FROM OLD.approval_type OR NEW.approval_no IS DISTINCT FROM OLD.approval_no  -- @pg-only
        OR NEW.released_qty_milli < OLD.released_qty_milli  -- R1 释放量只增不减 -- @pg-only
        OR (OLD.status = 'RELEASED' AND NEW.status <> 'RELEASED') THEN  -- R1 RELEASED 不能回 HELD -- @pg-only
         RAISE EXCEPTION 'hold_immutable' USING ERRCODE = '23514';                                            -- @pg-only
@@ -495,6 +504,7 @@ CREATE TRIGGER trg_hr_append_only BEFORE UPDATE OR DELETE ON stock_hold_release 
 -- @sqlite-only WHEN NEW.id IS NOT OLD.id OR NEW.stock_id IS NOT OLD.stock_id OR NEW.hold_type IS NOT OLD.hold_type OR NEW.reason_code IS NOT OLD.reason_code
 -- @sqlite-only   OR NEW.source_type IS NOT OLD.source_type OR NEW.source_id IS NOT OLD.source_id OR NEW.op_key IS NOT OLD.op_key
 -- @sqlite-only   OR NEW.hold_qty_milli IS NOT OLD.hold_qty_milli OR NEW.operator_id IS NOT OLD.operator_id OR NEW.created_at IS NOT OLD.created_at
+-- @sqlite-only   OR NEW.approval_type IS NOT OLD.approval_type OR NEW.approval_no IS NOT OLD.approval_no
 -- @sqlite-only   OR NEW.released_qty_milli < OLD.released_qty_milli OR (OLD.status = 'RELEASED' AND NEW.status <> 'RELEASED')
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'hold_immutable'); END;
 -- R2（SQLite）：拒删除；REPLACE 冲突时删旧行在 recursive_triggers=OFF（默认，且是连接级开关）下不触发 DELETE 触发器，
