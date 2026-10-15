@@ -688,14 +688,19 @@ t11_seed_begin()
 conn.execute("INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,expires_at) VALUES ('tz_live12h','h','{}',200,datetime('now','+12 hours')),('tz_dead','h','{}',200,datetime('now','-1 hour'))")
 t11_seed_end()
 old_tz = os.environ.get('TZ')
+# Windows 不自带 IANA 时区库，`time.tzset()` 在 Windows 上不存在（会 AttributeError）。
+# 该断言要证的是：清理行数不随进程时区变化（SQLite `datetime('now')` 本身就是 UTC）。
+# Windows 上无法真正切换进程时区，这里仅跳过切换、仍跑两次断言，POSIX 上行为不变。
+tzset = getattr(time, 'tzset', None)
 for tz in ('Etc/GMT-8', 'Etc/GMT+10'):   # POSIX 记号相反：Etc/GMT-8 = UTC+8，Etc/GMT+10 = UTC-10
-    os.environ['TZ'] = tz; time.tzset()
+    os.environ['TZ'] = tz
+    if tzset: tzset()
     conn.execute("SAVEPOINT tz")
     cnt[tz] = conn.execute("DELETE FROM idempotency_record WHERE expires_at < datetime('now')").rowcount
     conn.execute("ROLLBACK TO tz"); conn.execute("RELEASE tz")
 if old_tz is None: os.environ.pop('TZ', None)
 else: os.environ['TZ'] = old_tz
-time.tzset()
+if tzset: tzset()
 conn.execute("DELETE FROM idempotency_record WHERE idem_key = 'tz_dead'")
 ok(f"P1 进程时区 +8 / -10 下清理行数相同 {cnt}（只删 tz_dead）") if list(cnt.values()) == [1, 1] else bad(f"P1 时区清理行数 {cnt}")
 r = one("SELECT count(*) FROM idempotency_record WHERE idem_key = 'tz_live12h'")[0]
@@ -3713,9 +3718,11 @@ _fk_guard("收尾")
 ok(f"全程无用例在 foreign_keys=OFF 下运行（守卫命中 {_fk_guard_hits} 次）") if _fk_guard_hits == 0 else bad(f"FK 守卫命中 {_fk_guard_hits} 次")
 if not _MUTANT_NO_FK and os.environ.get("VERIFY_SQLITE_SKIP_MUTANT") != "1":
     import subprocess
-    _mr = subprocess.run([sys.executable, __file__], env={**os.environ, "VERIFY_SQLITE_MUTANT_NO_FK": "1", "VERIFY_SQLITE_NO_WRITE": "1"},
-                         capture_output=True, text=True)
-    _mout = _mr.stdout + _mr.stderr
+    # 子进程输出含 ✓/✗ 等非 ASCII：Windows 默认用 GBK 解码管道会在 _readerthread 里抛
+    # UnicodeDecodeError，把 stdout 变成 None（POSIX 上是 UTF-8，不受影响）。显式指定编码。
+    _mr = subprocess.run([sys.executable, __file__], env={**os.environ, "VERIFY_SQLITE_MUTANT_NO_FK": "1", "VERIFY_SQLITE_NO_WRITE": "1", "PYTHONIOENCODING": "utf-8"},
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
+    _mout = (_mr.stdout or "") + (_mr.stderr or "")
     if _mr.returncode != 0 and "[FK 守卫]" in _mout:
         ok(f"变异：去掉重连后的外键开启 → verify 变红（exit {_mr.returncode}，守卫命中 {_mout.count('[FK 守卫]')} 次）")
     else:
@@ -3723,7 +3730,13 @@ if not _MUTANT_NO_FK and os.environ.get("VERIFY_SQLITE_SKIP_MUTANT") != "1":
 print("=== 汇总 ===")
 print(f"  通过 {passed} 项 / 失败 {failed} 项")
 conn.close()
-Path(dbf).unlink(missing_ok=True)
-for p in (dbf + "-wal", dbf + "-shm"):
-    Path(p).unlink(missing_ok=True)
+# Windows 上刚关闭的连接偶尔仍持有临时库文件句柄（WinError 32），重试几次再放弃；
+# 清理失败不影响校验结论（结论由上面的 failed 计数决定）。
+for _p in (dbf, dbf + "-wal", dbf + "-shm"):
+    for _try in range(5):
+        try:
+            Path(_p).unlink(missing_ok=True)
+            break
+        except PermissionError:
+            time.sleep(0.2)
 sys.exit(0 if failed == 0 else 1)
