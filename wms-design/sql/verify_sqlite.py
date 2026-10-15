@@ -306,7 +306,9 @@ _MASTER_MIN = ["INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (1,'WHSH
                "INSERT INTO supplier (id,code,name) VALUES (501,'SUP501','变异库父行')",
                "INSERT INTO customer (id,code,name) VALUES (1,'STORE0001','变异库父行')",
                # 16 篇 `fk_wb_driver` / `fk_podc_driver` 的父行（16 段既有用例用 driver_id=1，内存变异库同款）
-               "INSERT INTO driver (id,name,phone) VALUES (1,'变异库父行司机','13900000001')"]
+               "INSERT INTO driver (id,name,phone) VALUES (1,'变异库父行司机','13900000001')",
+               # 镜鉴 r68 建议：`fk_udb_device`（12b `user_device_binding.device_id`）的保险父行，顺手灌一条
+               "INSERT INTO device (id,device_instance_id,device_type,warehouse_id) VALUES (1,'D-BASE-1','PDA',1)"]
 print("=== 2. 库层不变量断言（与 verify.sh 同一套）===")
 seed = [
     "INSERT INTO warehouse (id,code,name,cutoff_time,work_date_offset) VALUES (1,'WHSH01','上海青浦仓','20:00',-1)",
