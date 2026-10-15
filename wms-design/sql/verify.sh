@@ -633,6 +633,21 @@ R=$(psql -t -A -c "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli + 1000
 R=$(psql -t -A -c "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli + 1000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 13 AND ('MOVE' = 'REVERSE_PICK' OR EXISTS (SELECT 1 FROM location l WHERE l.id = stock.location_id AND l.status <> 'LOCKED'))")
 [ "$R" = "UPDATE 0" ] && ok "库位 LOCKED：MOVE 目标腿 rowcount=0" || bad "MOVE 未被锁拦：$R"
 seed "UPDATE location SET status='AVAILABLE' WHERE id=3; UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq - 1 WHERE id = 13;"
+echo "=== 2c3. G19：COUNT（盘盈/盘亏）放行库位锁，post_in / post_out 同口径；其他来源仍拦 ==="
+# 白名单是 biz_type ∈ {COUNT, REVERSE_PICK}，与 §7.1 原语表、§8.1 行为矩阵同一口径。
+# 盘亏走 post_out(COUNT)，此前例外只写在 post_in 语境 → 盘亏在 LOCKED 库位被 40906 拦下（G19）。
+seed "UPDATE location SET status='LOCKED' WHERE id=3;"
+R=$(psql -t -A -c "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli + 1000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 13 AND ('COUNT' IN ('COUNT','REVERSE_PICK') OR EXISTS (SELECT 1 FROM location l WHERE l.id = stock.location_id AND l.status <> 'LOCKED'))")
+[ "$R" = "UPDATE 1" ] && ok "G19 库位 LOCKED：post_in(COUNT) 盘盈入账 rowcount=1" || bad "G19 盘盈被锁拦：$R"
+seed "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq - 1 WHERE id = 13;"
+R=$(psql -t -A -c "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 13 AND on_hand_qty_milli - allocated_qty_milli - reserved_qty_milli - quality_hold_qty_milli - hold_qty_milli >= 1000 AND ('COUNT' IN ('COUNT','REVERSE_PICK') OR EXISTS (SELECT 1 FROM location l WHERE l.id = stock.location_id AND l.status <> 'LOCKED'))")
+[ "$R" = "UPDATE 1" ] && ok "G19 库位 LOCKED：post_out(COUNT) 盘亏过账 rowcount=1" || bad "G19 盘亏被锁拦：$R"
+seed "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli + 1000, ledger_seq = ledger_seq - 1 WHERE id = 13;"
+R=$(psql -t -A -c "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 13 AND on_hand_qty_milli - allocated_qty_milli - reserved_qty_milli - quality_hold_qty_milli - hold_qty_milli >= 1000 AND ('SCRAP' IN ('COUNT','REVERSE_PICK') OR EXISTS (SELECT 1 FROM location l WHERE l.id = stock.location_id AND l.status <> 'LOCKED'))")
+[ "$R" = "UPDATE 0" ] && ok "G19 库位 LOCKED：post_out(SCRAP) rowcount=0（→ 40906）" || bad "G19 SCRAP 未被锁拦：$R"
+R=$(psql -t -A -c "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 13 AND on_hand_qty_milli - allocated_qty_milli - reserved_qty_milli - quality_hold_qty_milli - hold_qty_milli >= 1000 AND ('ADJUST' IN ('COUNT','REVERSE_PICK') OR EXISTS (SELECT 1 FROM location l WHERE l.id = stock.location_id AND l.status <> 'LOCKED'))")
+[ "$R" = "UPDATE 0" ] && ok "G19 库位 LOCKED：post_out(ADJUST) rowcount=0（待 08 篇定，§12 Q13）" || bad "G19 ADJUST 未被锁拦：$R"
+seed "UPDATE location SET status='AVAILABLE' WHERE id=3;"
 
 echo "=== 2d. Q7：PG 写入 bigint 的取整行为（QA 在 PG16.14 实测，已关闭）==="
 # 临时表只活在一个会话里：建表、插入、查询必须在同一次 psql 调用（小赵 C1）

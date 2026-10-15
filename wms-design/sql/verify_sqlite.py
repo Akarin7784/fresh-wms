@@ -807,6 +807,24 @@ ok("库位 LOCKED：MOVE 目标腿 rowcount=0") if c == 0 else bad(f"MOVE 未被
 conn.execute("UPDATE location SET status = 'AVAILABLE' WHERE id = 3")
 conn.execute("UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq - 1 WHERE id = 13")   # 复原
 
+print("=== 2d3. G19：COUNT（盘盈/盘亏）放行库位锁，post_in / post_out 同口径；其他来源仍拦 ===")
+conn.execute("SAVEPOINT g19")   # 本段完全回滚，不留副作用
+conn.execute("UPDATE location SET status = 'LOCKED' WHERE id = 3")
+POSTIN_G19 = ("UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli + 1000, ledger_seq = ledger_seq + 1, version = version + 1 "
+              "WHERE id = 13 AND (? IN ('COUNT','REVERSE_PICK') OR EXISTS (SELECT 1 FROM location l WHERE l.id = stock.location_id AND l.status <> 'LOCKED'))")
+POSTOUT_G19 = ("UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq + 1, version = version + 1 "
+               "WHERE id = 13 AND on_hand_qty_milli - allocated_qty_milli - reserved_qty_milli - quality_hold_qty_milli - hold_qty_milli >= 1000 "
+               "AND (? IN ('COUNT','REVERSE_PICK') OR EXISTS (SELECT 1 FROM location l WHERE l.id = stock.location_id AND l.status <> 'LOCKED'))")
+c = conn.execute(POSTIN_G19, ("COUNT",)).rowcount
+ok("G19 库位 LOCKED：post_in(COUNT) 盘盈入账 rowcount=1") if c == 1 else bad(f"G19 盘盈被锁拦 rowcount={c}")
+c = conn.execute(POSTOUT_G19, ("COUNT",)).rowcount
+ok("G19 库位 LOCKED：post_out(COUNT) 盘亏过账 rowcount=1") if c == 1 else bad(f"G19 盘亏被锁拦 rowcount={c}")
+c = conn.execute(POSTOUT_G19, ("SCRAP",)).rowcount
+ok("G19 库位 LOCKED：post_out(SCRAP) rowcount=0（→ 40906）") if c == 0 else bad(f"G19 SCRAP 未被锁拦 rowcount={c}")
+c = conn.execute(POSTOUT_G19, ("ADJUST",)).rowcount
+ok("G19 库位 LOCKED：post_out(ADJUST) rowcount=0（待 08 篇定，§12 Q13）") if c == 0 else bad(f"G19 ADJUST 未被锁拦 rowcount={c}")
+conn.execute("ROLLBACK TO g19"); conn.execute("RELEASE g19")
+
 print("=== 2e. count_line 整数约束（SQLite 侧）===")
 expect_block(
     "count_line 实盘写入 1.5（REAL）",
