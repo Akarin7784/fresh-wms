@@ -93,7 +93,7 @@ CREATE TABLE pod_op (
     http_status         INT          NOT NULL,                       -- 首次结果缓存
     biz_code            VARCHAR(16)  NOT NULL,
     response            TEXT,
-    client_created_at   TIMESTAMP,                                   -- 仅展示
+    client_occurred_at  TIMESTAMP,                                   -- 00 §6.8 第 7 条：设备原始时间（UTC 整秒），只供展示 / 排障，任何逻辑不得使用
     temperature_x10     INT,                                         -- 签收温度 0.1 ℃（POD_SIGN / POD_REJECT 必填）
     delivered_at        TIMESTAMP,                                   -- 服务端受理签收时间；失败签收为空
     correct_deadline_at TIMESTAMP,                                   -- = delivered_at + 24h（服务端写）
@@ -119,11 +119,13 @@ CREATE TABLE pod_op (
     CONSTRAINT ck_pod_op_cdl24 CHECK (                                                          -- @pg-only
         (delivered_at IS NULL AND correct_deadline_at IS NULL)                                  -- @pg-only
      OR correct_deadline_at = delivered_at + INTERVAL '24 hours'                                -- @pg-only
-    )                                                                                           -- @pg-only
+    ),                                                                                          -- @pg-only
 -- @sqlite-only     CONSTRAINT ck_pod_op_cdl24 CHECK (
 -- @sqlite-only         (delivered_at IS NULL AND correct_deadline_at IS NULL)
 -- @sqlite-only      OR correct_deadline_at = datetime(delivered_at, '+24 hours')
--- @sqlite-only     )
+-- @sqlite-only     ),
+    CONSTRAINT ck_pod_op_cct   CHECK (client_occurred_at = date_trunc('second', client_occurred_at))     -- @pg-only
+-- @sqlite-only     CONSTRAINT ck_pod_op_cct CHECK (client_occurred_at IS NULL OR (typeof(client_occurred_at) = 'text' AND length(client_occurred_at) = 19 AND datetime(client_occurred_at) IS client_occurred_at))
 );
 CREATE INDEX ix_pod_op_dev  ON pod_op(device_instance_id, waybill_no, stop_no, op_seq);
 CREATE INDEX ix_pod_op_stop ON pod_op(waybill_no, stop_no, created_at);
