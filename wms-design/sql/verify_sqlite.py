@@ -202,7 +202,7 @@ NI = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='index' AND sql
 NV = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='view'").fetchone()[0]
 print(f"  → 表 {NT} 张 / 手工建索引 {NI} 个 / 视图 {NV} 个")
 # 期望值：main 8ed5f0c 为 38 表；docs/02 新增 stock_hold、stock_recon_alert、stock_movement_key、stock_ledger_line → 42 表（PG 分区子表不计）。改表数必须同步改这里和 verify.sh
-EXPECT_TABLES, EXPECT_VIEWS= 93, 3  # 第 16 篇 +9 表（waybill、delivery_stop、delivery_order、pod_op、pod_line、pod_correction、pod_tolerance_config、delivery_return、delivery_return_line）→ 93 表；视图仍 3（第 7 篇 +replenish_* 与 v_location_sku_candidate、第 18 篇 v_live_death_in_transit）。第 12 篇 +device_reconnect；docs/03 +5 表； 退供 +supplier_return； docs/12 +3；第 10 篇 +exception_code、exception_case、return_reservation、return_reservation_line、return_blind_receipt；第 9 篇 +scrap_order、scrap_line；第 17 篇 +8 张 process_*；docs/18 加 9 表
+EXPECT_TABLES, EXPECT_VIEWS= 98, 3  # 01 增量 +5 表（supplier、customer、vehicle、driver、device）→ 98 表；第 16 篇 +9 表（waybill、delivery_stop、delivery_order、pod_op、pod_line、pod_correction、pod_tolerance_config、delivery_return、delivery_return_line）→ 93；视图仍 3（第 7 篇 +replenish_* 与 v_location_sku_candidate、第 18 篇 v_live_death_in_transit）。第 12 篇 +device_reconnect；docs/03 +5 表； 退供 +supplier_return； docs/12 +3；第 10 篇 +exception_code、exception_case、return_reservation、return_reservation_line、return_blind_receipt；第 9 篇 +scrap_order、scrap_line；第 17 篇 +8 张 process_*；docs/18 加 9 表
 ok(f"表数 = {NT}（期望 {EXPECT_TABLES}）") if NT == EXPECT_TABLES else bad(f"表数 = {NT}，期望 {EXPECT_TABLES}")
 ok(f"视图数 = {NV}") if NV == EXPECT_VIEWS else bad(f"视图数 = {NV}，期望 {EXPECT_VIEWS}")
 
@@ -324,6 +324,12 @@ seed = [
     # 逐键实打要「无子行」样本：这两条没有任何行引用，供 move_order(code) / replenish_task(code) 的 REPLACE 实打
     "INSERT INTO replenish_task (id,code,warehouse_id,zone_id,work_date,status,line_count) VALUES (702,'RPL-20261015-000002',1,2,'2026-10-15','PENDING',0)",
     "INSERT INTO move_order (id,code,warehouse_id,move_type,status,reason_code,line_count) VALUES (7302,'MV-20261015-000002',1,'CONSOLIDATE','DRAFT','MERGE',0)",
+    # 01 增量：台账五表各一条（供逐键实打与断言；父行 warehouse 1 在上面）
+    "INSERT INTO supplier (id,code,name) VALUES (8801,'SUP001','山东果蔬供应商')",
+    "INSERT INTO customer (id,code,name,store_type) VALUES (8802,'STORE001','门店 A','STORE')",
+    "INSERT INTO vehicle (id,plate_no,vehicle_type) VALUES (8803,'沪A12345','REFRIGERATED')",
+    "INSERT INTO driver (id,name,phone) VALUES (8804,'张师傅','13800138000')",
+    "INSERT INTO device (id,device_instance_id,device_type,warehouse_id) VALUES (8805,'D-PDA-8805','PDA',1)",
 ]
 for s in seed:
     try:
@@ -3896,10 +3902,42 @@ else:
     ok(f"变异：temp_min_c10 改回 NUMERIC 后上面那条整数列扫描会变红（实测类型 {_mtype01}）") if 'INT' not in _mtype01 else bad("变异没变红：temp_min_c10 仍是整数列")
 
 # 00 §6.8 第 3 条：服务端时间由库写 UTC 整秒（SQLite datetime('now') 本身就是整秒 UTC）
-_t01 = ("warehouse", "zone", "location", "sku", "lot")
+_t01 = ("warehouse", "zone", "location", "sku", "lot", "supplier", "customer", "vehicle", "driver", "device")
 _bad_ts01 = [f"{t}.{c}" for t in _t01 for c in ("created_at", "updated_at")
              if (dict((r[1], r[4]) for r in conn.execute(f"PRAGMA table_info({t})")).get(c) or "") != "datetime('now')"]
-ok("01 的 10 个 created_at / updated_at 默认值都是 datetime('now')（UTC 整秒，00 §6.8）") if not _bad_ts01 else bad(f"01 时间默认值不合规：{_bad_ts01}")
+ok("01 的 20 个 created_at / updated_at 默认值都是 datetime('now')（UTC 整秒，00 §6.8）") if not _bad_ts01 else bad(f"01 时间默认值不合规：{_bad_ts01}")
+
+print("=== 2a-01L. 01 增量台账五表（供应商 / 客户 / 车辆 / 司机 / 设备）===")
+# 种子已在最前面写入（supplier 8801 / customer 8802 / vehicle 8803 / driver 8804 / device 8805）
+expect_allow_tx("01 台账正向：批次挂已存在的供应商（lot.supplier_id 外键）",
+                ["INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date,supplier_id) VALUES (8806,1,'LOT-SUP-8806','2026-12-01','2026-10-15',8801)"])
+expect_block_tx("01 拒绝：ck_supplier_code 小写编码", ["INSERT INTO supplier (id,code,name) VALUES (8811,'sup001','x')"], "ck_supplier_code")
+_ttl_mut("供应商编码小写 sup001", "ck_supplier_code", "INSERT INTO supplier (id,code,name) VALUES (8811,'sup001','x')")
+expect_block_tx("01 拒绝：ck_supplier_status 未知状态", ["INSERT INTO supplier (id,code,name,status) VALUES (8812,'SUP002','x','PENDING')"], "ck_supplier_status")
+expect_block_tx("01 拒绝：ck_customer_type 未知门店类型", ["INSERT INTO customer (id,code,name,store_type) VALUES (8813,'STORE002','x','KIOSK')"], "ck_customer_type")
+expect_block_tx("01 拒绝：ck_vehicle_temp 只给上限（两列必须同空或同填）", ["INSERT INTO vehicle (id,plate_no,vehicle_type,temp_max_c10) VALUES (8814,'沪A99999','REFRIGERATED',40)"], "ck_vehicle_temp")
+_ttl_mut("车厢温区只给上限", "ck_vehicle_temp", "INSERT INTO vehicle (id,plate_no,vehicle_type,temp_max_c10) VALUES (8814,'沪A99999','REFRIGERATED',40)")
+expect_block_tx("01 拒绝：ck_driver_phone 10 位号码", ["INSERT INTO driver (id,name,phone) VALUES (8815,'李师傅','1380013800')"], "ck_driver_phone")
+_ttl_mut("司机手机号 10 位", "ck_driver_phone", "INSERT INTO driver (id,name,phone) VALUES (8815,'李师傅','1380013800')")
+expect_block_tx("01 拒绝：ck_device_instance 全空白实例号", ["INSERT INTO device (id,device_instance_id,warehouse_id) VALUES (8816,'   ',1)"], "ck_device_instance")
+_ttl_mut("设备实例号全空白", "ck_device_instance", "INSERT INTO device (id,device_instance_id,warehouse_id) VALUES (8816,'   ',1)")
+expect_block_tx("01 拒绝：lot.supplier_id 指向不存在的供应商",
+                ["INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date,supplier_id) VALUES (8817,1,'LOT-SUP-8817','2026-12-02','2026-10-15',999999)"], "FOREIGN KEY constraint failed")
+# 防 REPLACE（00 §6.10）：五张表逐唯一键各一把守卫，这里打两条代表 + 各自变异
+expect_block_tx("01 台账 REPLACE：supplier 同 code 换 id",
+                ["INSERT INTO supplier (id,code,name) VALUES (8911,'SUPREP','x')",
+                 "REPLACE INTO supplier (id,code,name) VALUES (8912,'SUPREP','x')"], "master_duplicate: supplier.code")
+_tx_allow("01 变异：去掉 trg_supplier_no_replace_code 后，同 code 换 id 的 REPLACE 通过",
+          ["DROP TRIGGER trg_supplier_no_replace_code",
+           "INSERT INTO supplier (id,code,name) VALUES (8911,'SUPREP','x')",
+           "REPLACE INTO supplier (id,code,name) VALUES (8912,'SUPREP','x')"])
+expect_block_tx("01 台账 REPLACE：device 同实例号换 id",
+                ["INSERT INTO device (id,device_instance_id,warehouse_id) VALUES (8921,'D-REP',1)",
+                 "REPLACE INTO device (id,device_instance_id,warehouse_id) VALUES (8922,'D-REP',1)"], "master_duplicate: device.device_instance_id")
+_tx_allow("01 变异：去掉 trg_device_no_replace_instance 后，同实例号换 id 的 REPLACE 通过",
+          ["DROP TRIGGER trg_device_no_replace_instance",
+           "INSERT INTO device (id,device_instance_id,warehouse_id) VALUES (8921,'D-REP',1)",
+           "REPLACE INTO device (id,device_instance_id,warehouse_id) VALUES (8922,'D-REP',1)"])
 
 print("=== 2j. 第 7 篇补货与移库（任务 / 任务行 / 需求 / 移库 / 候选视图）===")
 # 种子已在最前面写入（replenish_task 701/702、replenish_task_line 7101、replenish_demand 7201、
