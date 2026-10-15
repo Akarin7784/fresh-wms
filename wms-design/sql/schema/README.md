@@ -11,7 +11,7 @@
 | `00_preamble.sql` | 文件头、`BEGIN`、角色 `wms_app`（必须先于任何 GRANT） |
 | `01_master.sql` | 仓库、库区、库位、SKU、批次，含 `sell_deadline` 不可回溯 |
 | `02_inventory.sql` | 库存、占用、冻结、流水、快照、对账 |
-| `03_inbound.sql` | 入库单 / 入库行 |
+| `03_inbound.sql` | 第 3 篇入库：入库单 / 入库行（milli 三列与 ck_inbl_int/ck_inbl_qc/ck_inb_rtn_src 仍由 10 ALTER）、到货测温、收货记录、收货更正单 `inbound_correction`（关单后正/反向 ADJUST 流水，24h 主管 / 7d 双审 / 超窗或已对账转 08，收货人不能审批）、上架记录、入库后质量反馈（报损/退供待处置走 hold(SCRAP_PENDING)）；已关单单头与行锁定 |
 | `04_outbound.sql` | 出库单 / 出库行 |
 | `05_picking.sql` | 波次、拣货任务 |
 | `06_pack_ship.sql` | 装箱、发运 |
@@ -34,7 +34,7 @@
 
 | 对象 | 表 | 由哪一篇的文件 ALTER | 原因 | 状态 |
 |---|---|---|---|---|
-| `received_qty_milli`、`qc_passed_qty_milli`、`qc_failed_qty_milli` | `inbound_line` | 第 10 篇 `10_returns.sql` | 02 §7.1.3 `release_qc_hold` 按这三列累加质检合格量。不登记 `claimed_qty_milli`。`03_inbound.sql` 里现有的 `received_qty` 仍是 `NUMERIC(14,3)`，本篇不改 03 | #5 已落库 |
+| `received_qty_milli`、`qc_passed_qty_milli`、`qc_failed_qty_milli` | `inbound_line` | 第 10 篇 `10_returns.sql` | 02 §7.1.3 `release_qc_hold` 按这三列累加质检合格量。不登记 `claimed_qty_milli`。`03_inbound.sql` 自 docs/03 改稿起不再有 NUMERIC 数量列，也不重复定义这三列和两条约束 | #5 已落库 |
 | `node_id`、`node_seq`、`device_instance_id`、`approval_id` | `audit_log` | 第 12 篇 `12b_auth_audit.sql` | 边缘回传按 (node_id,node_seq) 去重、审批关联（12 §6）；DEFAULT 0 只兼容存量，新插入 ≤0 由 trg_audit_node_required 拦（40001） | 已落库 |
 | `approval_no` → `approval_request.code` | `stock_hold` | 第 12 篇 `12b_auth_audit.sql` | 00 审批单号关联真实审批单。PG 外键 `fk_hold_approval_no`；SQLite 用 AFTER INSERT/UPDATE 触发器（不能 ALTER 加外键） | 已落库 |
 | `ck_inbl_int`、`ck_inbl_qc` | `inbound_line` | 第 10 篇 `10_returns.sql` | `ck_inbl_int`：上述 milli 列为整数。`ck_inbl_qc`：非负，且 `qc_passed_qty_milli + qc_failed_qty_milli ≤ received_qty_milli` | #5 已落库 |
@@ -63,3 +63,5 @@
 本篇定义的 10 个函数都固定 `SET search_path = pg_catalog, public, pg_temp`（#2 第九轮起 pg_temp 必须显式且最后，见 00 §6.9）。`purge_expired()` 原本就有。另外 9 个是触发器函数，不是 SECURITY DEFINER，按调用方身份执行：`trg_mvk_line_kind`、`trg_sll_immutable`、`trg_hold_immutable`、`trg_hold_no_delete`、`trg_append_only`（`02_inventory.sql`），`trg_lot_sell_deadline`（`01_master.sql`），`trg_purge_guard`、`trg_expiry_forward`、`trg_outbox_insert_pending`（`11_integration.sql`）。
 
 `trg_outbox_insert_pending` 不按 `current_user = 'wms_app'` 判断。`wms_app` 是 NOLOGIN，应用用继承它的登录角色。不是 `outbox_event` 表属主的角色，插入时 `status` 必须是 `PENDING` 且 `sent_at` 为空，否则拒绝（`outbox_insert_not_pending`），不把状态改写成 `PENDING`。表属主可以插入其他状态，供种子和迁移使用。SQLite 没有角色，也没有 search_path；同名触发器拒绝一切非 PENDING 或带 `sent_at` 的插入，包括 `FAILED`。
+
+第 3 篇 `03_inbound.sql` 新增的 4 个 PG 函数也固定 `SET search_path = pg_catalog, public`：`trg_iqf_guard`、`trg_inb_closed_guard`、`trg_inbl_closed_guard`、`trg_irc_guard`（都是触发器函数，不是 SECURITY DEFINER）。verify.sh 第 2j-sp 段做目录断言和同名表劫持检查。
