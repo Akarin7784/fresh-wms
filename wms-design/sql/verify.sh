@@ -2259,14 +2259,20 @@ OUT=$(psql_capture "TRUNCATE approval_request, user_device_binding;")
 CNT_A=$(psql -qtAc "SELECT (SELECT count(*) FROM approval_request)||'/'||(SELECT count(*) FROM user_device_binding);")
 case "$OUT" in *"append_only_violation"*|*"cannot truncate a table referenced in a foreign key constraint"*) ok "12 TRUNCATE 审批/绑定被拦";; *) bad "TRUNCATE 审批/绑定未被拦：$OUT";; esac
 [ -n "$CNT_B" ] && [ "$CNT_B" = "$CNT_A" ] && ok "12 TRUNCATE 审批/绑定后行数不变（$CNT_A）" || bad "TRUNCATE 审批/绑定后行数变化：$CNT_B -> $CNT_A"
-# 逐表单独 TRUNCATE：同一事务内先拆掉引用它的外键（只有 stock_hold.fk_hold_approval_no 引用 approval_request；stock_hold 自身也受保护，不能清行，所以 DROP CONSTRAINT），不用 session_replication_role，确保命中目标表自己的 TRUNCATE 触发器；ROLLBACK 还原
-for T in approval_request user_device_binding audit_log; do
-  PRE=""; [ "$T" = approval_request ] && PRE="ALTER TABLE stock_hold DROP CONSTRAINT fk_hold_approval_no; ALTER TABLE user_device_binding DROP CONSTRAINT fk_udb_approval; ALTER TABLE audit_log DROP CONSTRAINT fk_audit_approval;"; [ "$T" = user_device_binding ] && PRE="ALTER TABLE device_reconnect DROP CONSTRAINT fk_drc_binding; ALTER TABLE offline_token DROP CONSTRAINT fk_offline_binding;"
-  OUT=$(psql_capture "BEGIN; $PRE TRUNCATE $T; ROLLBACK;")
-  case "$OUT" in *"append_only_violation: $T"*) ok "12 单表 TRUNCATE $T 命中自身触发器（外键已在事务内拆除）";; *) bad "12 单表 TRUNCATE $T 未报 append_only_violation：$OUT";; esac
+# 逐表单独 TRUNCATE 命中目标表自身的语句级 TRUNCATE 触发器：只挑**不被任何外键引用**的 append-only 表
+# （approval_request / user_device_binding 被 stock_hold / audit_log / device_reconnect / offline_token，以及第 16 篇的
+#   pod_correction.fk_podc_apr 引用，单表 TRUNCATE 会先撞外键 —— 那条路由由下面两条「被外键拒」断言覆盖）
+for T in audit_log device_reconnect; do
+  OUT=$(psql_capture "BEGIN; TRUNCATE $T; ROLLBACK;")
+  case "$OUT" in *"append_only_violation: $T"*) ok "12 单表 TRUNCATE $T 命中自身触发器";; *) bad "12 单表 TRUNCATE $T 未报 append_only_violation：$OUT";; esac
 done
-FKN=$(psql -qtAc "SELECT count(*) FROM pg_constraint WHERE conname='fk_hold_approval_no';")
-[ "$FKN" = 1 ] && ok "12 单表 TRUNCATE 用例回滚后 fk_hold_approval_no 仍在" || bad "fk_hold_approval_no 回滚后丢失：$FKN"
+# 被外键引用的 append-only 表：TRUNCATE 由外键先拒（#16 的 pod_correction.fk_podc_apr 让 approval_request 也走这条路由）
+for T in approval_request user_device_binding; do
+  OUT=$(psql_capture "TRUNCATE $T;")
+  case "$OUT" in *"cannot truncate a table referenced in a foreign key constraint"*) ok "12 单表 TRUNCATE $T 被外键拒（引用它的表拦在前面）";; *) bad "12 单表 TRUNCATE $T 未被外键拒：$OUT";; esac
+done
+FKN=$(psql -qtAc "SELECT count(*) FROM pg_constraint WHERE conname IN ('fk_hold_approval_no','fk_podc_apr');")
+[ "$FKN" = 2 ] && ok "12 单表 TRUNCATE 用例后 fk_hold_approval_no / fk_podc_apr 仍在（$FKN）" || bad "单表 TRUNCATE 用例后外键丢失：$FKN"
 
 
 echo "=== 2g2. 新审批类型 + audit node 必填 ==="
