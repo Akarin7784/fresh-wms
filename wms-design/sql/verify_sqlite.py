@@ -304,7 +304,9 @@ _MASTER_MIN = ["INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (1,'WHSH
                # 跨篇 FK 收口（磐石 2026-10-16）：`fk_inb_supplier` / `fk_obo_customer` 之后，凡是**开了外键的内存变异库**
                # （如 16 段 `_mut16`）都必须先有 supplier 501 / customer 1 父行——否则 `_S16_PARENT` 里的 `outbound_order.customer_id=1` 会先报 FK。
                "INSERT INTO supplier (id,code,name) VALUES (501,'SUP501','变异库父行')",
-               "INSERT INTO customer (id,code,name) VALUES (1,'STORE0001','变异库父行')"]
+               "INSERT INTO customer (id,code,name) VALUES (1,'STORE0001','变异库父行')",
+               # 16 篇 `fk_wb_driver` / `fk_podc_driver` 的父行（16 段既有用例用 driver_id=1，内存变异库同款）
+               "INSERT INTO driver (id,name,phone) VALUES (1,'变异库父行司机','13900000001')"]
 print("=== 2. 库层不变量断言（与 verify.sh 同一套）===")
 seed = [
     "INSERT INTO warehouse (id,code,name,cutoff_time,work_date_offset) VALUES (1,'WHSH01','上海青浦仓','20:00',-1)",
@@ -336,6 +338,10 @@ seed = [
     "INSERT INTO customer (id,code,name,store_type) VALUES (8802,'STORE001','门店 A','STORE')",
     "INSERT INTO vehicle (id,plate_no,vehicle_type) VALUES (8803,'沪A12345','REFRIGERATED')",
     "INSERT INTO driver (id,name,phone) VALUES (8804,'张师傅','13800138000')",
+    # 16 篇 `fk_wb_driver` / `fk_podc_driver` 的父行（16 段既有用例用 driver_id=1）
+    "INSERT INTO driver (id,name,phone) VALUES (1,'跨篇 FK 父行司机','13900000001')",
+    # 16 篇 2z3b 的签收样本（pod_correction 9401–9411）用 driver_id 101–104：只补父行，不改 16 的样本数据
+    "INSERT INTO driver (id,name,phone) VALUES (101,'16 样本司机 101','13900000101'),(102,'16 样本司机 102','13900000102'),(103,'16 样本司机 103','13900000103'),(104,'16 样本司机 104','13900000104')",
     "INSERT INTO device (id,device_instance_id,device_type,warehouse_id) VALUES (8805,'D-PDA-8805','PDA',1)",
 ]
 for s in seed:
@@ -4568,11 +4574,11 @@ _v5s = one("SELECT status FROM pick_task_line WHERE id=9405")[0]
 (ok if (_v5n, _v5s) == (1, 'DONE') else bad)(f"05 增量③变异：只减量不回退状态的旧写法，行仍是 DONE（{_v5n}/{_v5s}）")
 _t5m = conn.execute("UPDATE pick_task SET status='DONE' WHERE id=9405 AND status='EXECUTING' AND NOT EXISTS (SELECT 1 FROM pick_task_line l WHERE l.pick_task_id=9405 AND l.status IN ('PENDING','SKIP','ABNORMAL'))").rowcount
 (ok if _t5m == 1 else bad)(f"05 增量③变异：不回退状态时同一任务被判 DONE（证明回退是拦它的那条），实际 {_t5m}")
-print("=== 2w. docs/16 配送与签收：38 CHECK / 19 外键 / 3 部分唯一索引的三件套（正向 / 按名拒绝 / 变异）===")
+print("=== 2w. docs/16 配送与签收：38 CHECK / 22 外键 / 3 部分唯一索引的三件套（正向 / 按名拒绝 / 变异）===")
 # 父行（96xx；warehouse 1 / sku 1 见最前面的 seed）。同一份列表也用于变异内存库。
 _S16_PARENT = [
     "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date,quality_status,remaining_life_days) VALUES (9610,1,'LOT-16-9610','2026-12-01','2026-10-15','QUALIFIED',30)",
-    "INSERT INTO shipment (id,code,warehouse_id,status) VALUES (9610,'SHP-9610',1,'CREATED'),(9611,'SHP-9611',1,'CREATED'),(9612,'SHP-9612',1,'CREATED'),(9613,'SHP-9613',1,'CREATED'),(9614,'SHP-9614',1,'CREATED'),(9615,'SHP-9615',1,'CREATED'),(9616,'SHP-9616',1,'CREATED')",
+    "INSERT INTO shipment (id,code,warehouse_id,status) VALUES (9610,'SHP-9610',1,'CREATED'),(9611,'SHP-9611',1,'CREATED'),(9612,'SHP-9612',1,'CREATED'),(9613,'SHP-9613',1,'CREATED'),(9614,'SHP-9614',1,'CREATED'),(9615,'SHP-9615',1,'CREATED'),(9616,'SHP-9616',1,'CREATED'),(9617,'SHP-9617',1,'CREATED')",
     "INSERT INTO waybill (id,code,shipment_id,warehouse_id,work_date,status) VALUES (9610,'WB-16-9610',9610,1,'2026-10-15','IN_TRANSIT')",
     "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (9610,'OBT-16-9610',1,'SALE','MALL','M-16-9610','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'SHIPPED','2026-10-15'),(9611,'OBT-16-9611',1,'SALE','MALL','M-16-9611','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'SHIPPED','2026-10-15'),(9612,'OBT-16-9612',1,'SALE','MALL','M-16-9612','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'SHIPPED','2026-10-15'),(9613,'OBT-16-9613',1,'SALE','MALL','M-16-9613','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'SHIPPED','2026-10-15'),(9614,'OBT-16-9614',1,'SALE','MALL','M-16-9614','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'SHIPPED','2026-10-15'),(9615,'OBT-16-9615',1,'SALE','MALL','M-16-9615','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'SHIPPED','2026-10-15'),(9616,'OBT-16-9616',1,'SALE','MALL','M-16-9616','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'SHIPPED','2026-10-15')",
     "INSERT INTO outbound_line (id,outbound_id,line_no,sku_id,order_qty_milli,picked_qty_milli,uom) VALUES (9610,9610,1,1,10000,10000,'KG')",
@@ -4597,6 +4603,12 @@ expect_allow("16 正向：pod_correction（PENDING + 202）", "INSERT INTO pod_c
 expect_allow("16 正向：pod_tolerance_config", "INSERT INTO pod_tolerance_config (id,warehouse_id,sku_category,max_abs_qty_milli,max_pct_bp) VALUES (9671,1,'CHILLED',500,100)")
 expect_allow("16 正向：delivery_return（OPEN）", "INSERT INTO delivery_return (id,waybill_id,stop_no,handover_seq,status) VALUES (9677,9610,1,1,'OPEN')")
 expect_allow("16 正向：delivery_return_line", "INSERT INTO delivery_return_line (id,delivery_return_id,sku_id,lot_id,reported_qty_milli) VALUES (9671,9670,1,9610,5000)")
+# I2 跨篇 FK（Chief 2026-10-16）：16 的三列指向 01 台账，各一条正向（父行 driver 1 在 seed / _MASTER_MIN 里）。
+# 注意：SQLite 的 no-REPLACE 守卫按 `id OR code OR shipment_id` 等业务键判重，正向行必须避开 16 段坏样本用的键
+#（故用 shipment 9617 / 站点号 9 / outbound 9611），否则会把 `_S16` 的按名拒绝抢成 `*_duplicate`。
+expect_allow("16 正向：waybill.driver_id = 1（01 司机台账、快照列照旧）", "INSERT INTO waybill (id,code,shipment_id,warehouse_id,driver_id,driver_name,driver_phone,work_date,status) VALUES (9672,'WB-16-9672',9617,1,1,'司机乙','13900000002','2026-10-15','CREATED')")
+expect_allow("16 正向：delivery_stop.customer_id = 1（01 门店台账）", "INSERT INTO delivery_stop (id,waybill_id,stop_no,customer_id,display_status) VALUES (9672,9610,9,1,'PENDING')")
+expect_allow("16 正向：pod_correction.driver_id = 1（01 司机台账）", "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,response_http,auto_tolerance) VALUES (9672,9610,9610,9610,9611,1,'00000000-0000-4000-8000-000000009672','%s','202',0)" % _H)
 
 def _mut16(desc, drop, stmts):
     """变异：内存库里让该约束恒真（CHECK 用 `CHECK (1 OR …`，可覆盖多行约束）/ 删 FOREIGN KEY 行 / DROP INDEX 后，原被拒语句应当通过。"""
@@ -4638,9 +4650,11 @@ _S16 = [
     ("ck", "ck_wb_signed", ["INSERT INTO waybill (id,code,shipment_id,warehouse_id,work_date,status) VALUES (9683,'WB-16-9683',9614,1,'2026-10-15','CLOSED')"]),
     ("fk", "fk_wb_shipment", ["INSERT INTO waybill (id,code,shipment_id,warehouse_id,work_date,status) VALUES (9684,'WB-16-9684',999999,1,'2026-10-15','CREATED')"]),
     ("fk", "fk_wb_wh", ["INSERT INTO waybill (id,code,shipment_id,warehouse_id,work_date,status) VALUES (9685,'WB-16-9685',9615,999999,'2026-10-15','CREATED')"]),
+    ("fk", "fk_wb_driver", ["INSERT INTO waybill (id,code,shipment_id,warehouse_id,driver_id,work_date,status) VALUES (9699,'WB-16-9699',9616,1,999999,'2026-10-15','CREATED')"]),
     ("ck", "ck_dstop_no", ["INSERT INTO delivery_stop (id,waybill_id,stop_no,display_status) VALUES (9681,9610,0,'PENDING')"]),
     ("ck", "ck_dstop_st", ["INSERT INTO delivery_stop (id,waybill_id,stop_no,display_status) VALUES (9682,9610,2,'X')"]),
     ("fk", "fk_dstop_wb", ["INSERT INTO delivery_stop (id,waybill_id,stop_no,display_status) VALUES (9683,999999,1,'PENDING')"]),
+    ("fk", "fk_dstop_customer", ["INSERT INTO delivery_stop (id,waybill_id,stop_no,customer_id,display_status) VALUES (9699,9610,3,999999,'PENDING')"]),
     ("ck", "ck_dord_cseq", ["INSERT INTO delivery_order (id,outbound_id,waybill_id,stop_no,status,correct_seq) VALUES (9682,9613,9610,1,'SHIPPED',-1)"]),
     ("ck", "ck_dord_pod", ["INSERT INTO delivery_order (id,outbound_id,waybill_id,stop_no,status,valid_pod_id) VALUES (9683,9614,9610,1,'SHIPPED',9610)"]),
     ("fk", "fk_dord_out", ["INSERT INTO delivery_order (id,outbound_id,waybill_id,stop_no,status) VALUES (9684,999999,9610,1,'SHIPPED')"]),
@@ -4672,6 +4686,7 @@ _S16 = [
     ("fk", "fk_podc_root", ["INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,response_http,auto_tolerance) VALUES (9690,9610,9610,999999,9615,1,'00000000-0000-4000-8000-000000009690','%s','202',0)" % _H]),
     ("fk", "fk_podc_out", ["INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,response_http,auto_tolerance) VALUES (9691,9610,9610,9610,999999,1,'00000000-0000-4000-8000-000000009691','%s','202',0)" % _H]),
     ("fk", "fk_podc_apr", ["INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,approval_id,response_http,auto_tolerance) VALUES (9692,9610,9610,9610,9615,1,'00000000-0000-4000-8000-000000009692','%s',999999,'202',0)" % _H]),
+    ("fk", "fk_podc_driver", ["INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,response_http,auto_tolerance) VALUES (9699,9610,9610,9610,9614,999999,'00000000-0000-4000-8000-000000009699','%s','202',0)" % _H]),
     ("ck", "ck_podt_cat", ["INSERT INTO pod_tolerance_config (id,warehouse_id,sku_category,max_abs_qty_milli,max_pct_bp) VALUES (9681,1,' X',500,100)"]),
     ("ck", "ck_podt_abs", ["INSERT INTO pod_tolerance_config (id,warehouse_id,sku_category,max_abs_qty_milli,max_pct_bp) VALUES (9682,1,'A',-1,100)"]),
     ("ck", "ck_podt_pct", ["INSERT INTO pod_tolerance_config (id,warehouse_id,sku_category,max_abs_qty_milli,max_pct_bp) VALUES (9683,1,'B',500,10001)"]),

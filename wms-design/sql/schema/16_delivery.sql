@@ -23,7 +23,7 @@ CREATE TABLE waybill (
     code                VARCHAR(64)  NOT NULL,                       -- = waybill_no，WB-{仓}-{节点}-{作业日}-{序号}（00 §6.2）
     shipment_id         BIGINT       NOT NULL,                       -- 06 集货/发货单；1 运单 : 1 发货单（首版）
     warehouse_id        BIGINT       NOT NULL,
-    driver_id           BIGINT,                                      -- 01 司机台账落地前先存 sys_user.id（§12 Q）
+    driver_id           BIGINT,                                      -- 01 司机台账（`fk_wb_driver`）；司机姓名/电话是发车时点快照，快照与引用并存
     driver_name         VARCHAR(64),                                 -- 发车时点快照，不随主数据回溯
     driver_phone        VARCHAR(32),
     vehicle_no          VARCHAR(24),                                 -- 发车时点快照
@@ -41,6 +41,7 @@ CREATE TABLE waybill (
     CONSTRAINT uq_wb_shipment  UNIQUE (shipment_id),
     CONSTRAINT fk_wb_shipment  FOREIGN KEY (shipment_id)  REFERENCES shipment(id),
     CONSTRAINT fk_wb_wh        FOREIGN KEY (warehouse_id) REFERENCES warehouse(id),
+    CONSTRAINT fk_wb_driver    FOREIGN KEY (driver_id)    REFERENCES driver(id),   -- 跨篇 FK（01 台账；司机软删，只挡物理删除）
     CONSTRAINT ck_wb_status    CHECK (status IN ('CREATED','LOADING','IN_TRANSIT','RETURNED','CLOSED','CANCELLED')),
     CONSTRAINT ck_wb_version   CHECK (waybill_version >= 0),
     CONSTRAINT ck_wb_signed    CHECK (status <> 'CLOSED' OR signed_at IS NOT NULL)
@@ -59,6 +60,7 @@ CREATE TABLE delivery_stop (
     created_at          TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
     CONSTRAINT uq_dstop        UNIQUE (waybill_id, stop_no),
     CONSTRAINT fk_dstop_wb     FOREIGN KEY (waybill_id) REFERENCES waybill(id),
+    CONSTRAINT fk_dstop_customer FOREIGN KEY (customer_id) REFERENCES customer(id),   -- 跨篇 FK（01 门店台账）
     CONSTRAINT ck_dstop_no     CHECK (stop_no >= 1),
     CONSTRAINT ck_dstop_st     CHECK (display_status IN ('PENDING','ARRIVED','DEPARTED_UNSIGNED','FULL','PARTIAL_REJECT','FULL_REJECT','MIXED'))
 );
@@ -184,6 +186,7 @@ CREATE TABLE pod_correction (
     CONSTRAINT fk_podc_op       FOREIGN KEY (correct_op_id)    REFERENCES pod_op(id),
     CONSTRAINT fk_podc_root     FOREIGN KEY (root_pod_op_id)   REFERENCES pod_op(id),
     CONSTRAINT fk_podc_out      FOREIGN KEY (outbound_id)      REFERENCES outbound_order(id),
+    CONSTRAINT fk_podc_driver   FOREIGN KEY (driver_id)        REFERENCES driver(id),   -- 跨篇 FK（01 台账；司机软删，只挡物理删除）
     CONSTRAINT fk_podc_apr      FOREIGN KEY (approval_id)      REFERENCES approval_request(id),
     CONSTRAINT ck_podc_client   CHECK (length(correction_client_id) = 36),
     CONSTRAINT ck_podc_hash     CHECK (length(request_hash) = 64),
