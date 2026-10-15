@@ -1267,6 +1267,92 @@ expect_block "Q1 反向：APPROVED 不带审批人" "BEGIN; INSERT INTO offline_
 expect_block "Q1 反向：同仓同 biz_key 重复补录" "BEGIN; INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (19,1,'PDA-07','PICK_CONFIRM','PK-L1','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 10:00:00','PENDING',NULL,'PAPER_BACKFILL'); COMMIT;" "uq_paper_bizkey"
 R=$(psql -t -A -c "SELECT string_agg(id || ':' || status, ',' ORDER BY id) FROM offline_paper_record")
 [ "$R" = "11:APPROVED,12:EXPIRED" ] && ok "Q1 反向用例全部回滚，只剩 11:APPROVED、12:EXPIRED" || bad "Q1 残留：$R"
+echo "=== 2i4. 第 11 篇时间加固（小玛丽 time-scan 11-1…11-6；00 §6.8）==="
+PAPER_COLS="id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type"
+UPL_COLS="id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until"
+H64=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+q11() { psql -t -A -q -c "$1" 2>&1 | tr -d '\n'; }
+expect_allow "11-1 wms_app 插入倒填 received_at=2000-01-01 / retain_until=2000-04-01（库改写，不报错）" "SET ROLE wms_app; INSERT INTO upstream_push_log ($UPL_COLS) VALUES (40,'ERP','SALES_ORDER','SO-T40','$H64','{}','2000-01-01 00:00:00','ACCEPTED','2000-04-01 00:00:00');"
+R=$(q11 "SELECT (abs(extract(epoch FROM received_at - (now() AT TIME ZONE 'UTC'))) <= 5)::text || '/' || (received_at = date_trunc('second', received_at))::text || '/' || (retain_until >= received_at + interval '90 days')::text FROM upstream_push_log WHERE id=40")
+[ "$R" = "true/true/true" ] && ok "11-1 落库 received_at = 当前 UTC 整秒，retain_until ≥ +90 天（$R）" || bad "11-1 received_at 未被库改写：$R"
+OUT=$(psql -q -t -A -c "SET ROLE wms_cleaner; SELECT push_log_deleted FROM purge_push_log();" 2>&1); R=$(q11 "SELECT count(*) FROM upstream_push_log WHERE id=40")
+[ "$R" = "1" ] && ok "11-1 purge_push_log() 后倒填的日志仍在（删 $OUT 行，id=40 剩 $R）" || bad "11-1 倒填日志被清掉：$R"
+R=$(q11 "BEGIN; ALTER TABLE upstream_push_log DISABLE TRIGGER trg_upl_server_time; SET LOCAL ROLE wms_app; INSERT INTO upstream_push_log ($UPL_COLS) VALUES (41,'ERP','SALES_ORDER','SO-T41','$H64','{}','2000-01-01 00:00:00','ACCEPTED','2000-04-01 00:00:00'); RESET ROLE; SELECT 'M=' || (received_at < '2001-01-01')::text FROM upstream_push_log WHERE id=41; ROLLBACK;")
+[ "${R#*M=}" = "true" ] && ok "11-1 变异：停用 trg_upl_server_time 后倒填照样落库（上面的断言会变红）" || bad "11-1 变异未变红：$R"
+expect_block "11-2 wms_app 插入 expires_at 已过期（2000-01-01）" "SET ROLE wms_app; INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,expires_at) VALUES ('t11past','h','{}',200,'2000-01-01 00:00:00');" "idem_expires_in_past"
+expect_allow "11-2 wms_app 插入 ttl_seconds=600、created_at 倒填 2000 年（库改写）" "SET ROLE wms_app; INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,ttl_seconds,created_at,expires_at) VALUES ('t11ttl','h','{}',200,600,'2000-01-01 00:00:00','2099-01-01 00:00:00');"
+R=$(q11 "SELECT extract(epoch FROM expires_at - created_at)::int::text || '/' || (abs(extract(epoch FROM created_at - (now() AT TIME ZONE 'UTC'))) <= 5)::text || '/' || (created_at = date_trunc('second', created_at))::text FROM idempotency_record WHERE idem_key='t11ttl'")
+[ "$R" = "600/true/true" ] && ok "11-2 expires_at = 库时间 created_at + ttl（$R）" || bad "11-2 expires_at 未由库计算：$R"
+OUT=$(psql -q -t -A -c "SET ROLE wms_cleaner; SELECT idem_deleted FROM purge_expired();" 2>&1); R=$(q11 "SELECT count(*) FROM idempotency_record WHERE idem_key='t11ttl'")
+[ "$R" = "1" ] && ok "11-2 purge_expired() 不会立即清掉新记录" || bad "11-2 新记录被清：$R"
+expect_block "11-2 ttl_seconds 超过 90 天" "SET ROLE wms_app; INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,ttl_seconds) VALUES ('t11big','h','{}',200,7776001);" "ck_idem_ttl"
+R=$(q11 "BEGIN; ALTER TABLE idempotency_record DISABLE TRIGGER trg_idem_server_time; SET LOCAL ROLE wms_app; INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,expires_at) VALUES ('t11mut','h','{}',200,'2000-01-01 00:00:00'); RESET ROLE; SELECT 'M=' || count(*) FROM idempotency_record WHERE idem_key='t11mut'; ROLLBACK;")
+[ "${R#*M=}" = "1" ] && ok "11-2 变异：停用 trg_idem_server_time 后过去的 expires_at 照样落库" || bad "11-2 变异未变红：$R"
+expect_block "11-5 wms_app 6 年前的补录写 submitted_at=reconnected_at 仍以 PENDING 提交" "SET ROLE wms_app; INSERT INTO offline_paper_record ($PAPER_COLS) VALUES (40,1,'PDA-07','PICK_CONFIRM','PK-T40','2020-10-14 10:00:00',11,'{}',7,'2020-10-14 08:00:00','2020-10-14 20:00:00','2020-10-15 20:00:00','2020-10-14 20:00:00','PENDING',NULL,'PAPER_BACKFILL');" "ck_paper_expired"
+R=$(q11 "BEGIN; ALTER TABLE offline_paper_record DISABLE TRIGGER trg_paper_server_time; SET LOCAL ROLE wms_app; INSERT INTO offline_paper_record ($PAPER_COLS) VALUES (41,1,'PDA-07','PICK_CONFIRM','PK-T41','2020-10-14 10:00:00',11,'{}',7,'2020-10-14 08:00:00','2020-10-14 20:00:00','2020-10-15 20:00:00','2020-10-14 20:00:00','PENDING',NULL,'PAPER_BACKFILL'); RESET ROLE; SELECT 'M=' || status FROM offline_paper_record WHERE id=41; ROLLBACK;")
+[ "${R#*M=}" = "PENDING" ] && ok "11-5 变异：停用 trg_paper_server_time 后 6 年前补录照样 PENDING" || bad "11-5 变异未变红：$R"
+expect_allow "11-5 wms_app 正常补录（恢复联网 2 小时前，submitted_at 乱填 2000 年由库改写）" "SET ROLE wms_app; INSERT INTO offline_paper_record ($PAPER_COLS) SELECT 42,1,'PDA-07','PICK_CONFIRM','PK-T42',t - interval '3 hours',11,'{}',7,t - interval '4 hours',t - interval '2 hours',t + interval '22 hours','2000-01-01 00:00:00','PENDING',NULL,'PAPER_BACKFILL' FROM (SELECT date_trunc('second', now() AT TIME ZONE 'UTC') AS t) x;"
+expect_allow "11-5 wms_app 审批，approved_at 倒填 2000 年（库改写）" "SET ROLE wms_app; UPDATE offline_paper_record SET status='APPROVED', approver_id=8, approved_at='2000-01-01 00:00:00' WHERE id=42;"
+R=$(q11 "SELECT (abs(extract(epoch FROM submitted_at - (now() AT TIME ZONE 'UTC'))) <= 5)::text || '/' || (abs(extract(epoch FROM approved_at - (now() AT TIME ZONE 'UTC'))) <= 5)::text || '/' || (approved_at = date_trunc('second', approved_at))::text FROM offline_paper_record WHERE id=42")
+[ "$R" = "true/true/true" ] && ok "11-5 submitted_at、approved_at 都是库写的当前 UTC 整秒（$R）" || bad "11-5 时间未被库改写：$R"
+expect_block "11-5 wms_app 事后改 reconnected_at（挪截止）" "SET ROLE wms_app; UPDATE offline_paper_record SET reconnected_at = reconnected_at + interval '1 day', backfill_deadline_at = backfill_deadline_at + interval '1 day' WHERE id=42;" "paper_time_immutable"
+expect_block "11-5 超级用户事后改 approved_at（时间列不可改对所有角色）" "UPDATE offline_paper_record SET approved_at = '2000-01-01 00:00:00' WHERE id=42;" "paper_time_immutable"
+R=$(q11 "BEGIN; ALTER TABLE offline_paper_record DISABLE TRIGGER trg_paper_server_time; UPDATE offline_paper_record SET approved_at = '2000-01-01 00:00:00' WHERE id=42; SELECT 'M=' || approved_at FROM offline_paper_record WHERE id=42; ROLLBACK;")
+[ "${R#*M=}" = "2000-01-01 00:00:00" ] && ok "11-5 变异：停用触发器后 approved_at 可被改（paper_time_immutable 断言会变红）" || bad "11-5 不可改变异未变红：$R"
+R=$(q11 "BEGIN; SET LOCAL TIME ZONE 'Asia/Shanghai'; SET LOCAL ROLE wms_app; INSERT INTO audit_log (id,action,node_id,node_seq,warehouse_id) VALUES (9501,'t11.tz',7,9501,1); INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha) VALUES (9501,'ERP','SALES_ORDER','SO-T9501','{}','h'); INSERT INTO numbering_segment (biz_prefix,date_key,next_value) VALUES ('T11','20261015',1); INSERT INTO idempotency_record (idem_key,req_hash,response,status_code) VALUES ('t11tz','h','{}',200); RESET ROLE; SELECT 'M=' || (SELECT (abs(extract(epoch FROM occurred_at - (now() AT TIME ZONE 'UTC'))) <= 5 AND occurred_at = date_trunc('second', occurred_at))::text FROM audit_log WHERE id=9501) || '/' || (SELECT (abs(extract(epoch FROM received_at - (now() AT TIME ZONE 'UTC'))) <= 5 AND received_at = date_trunc('second', received_at))::text FROM inbound_message WHERE id=9501) || '/' || (SELECT (abs(extract(epoch FROM updated_at - (now() AT TIME ZONE 'UTC'))) <= 5 AND updated_at = date_trunc('second', updated_at))::text FROM numbering_segment WHERE biz_prefix='T11') || '/' || (SELECT (abs(extract(epoch FROM created_at - (now() AT TIME ZONE 'UTC'))) <= 5)::text FROM idempotency_record WHERE idem_key='t11tz'); ROLLBACK;")
+[ "${R#*M=}" = "true/true/true/true" ] && ok "11-6 会话 Asia/Shanghai：audit_log.occurred_at / inbound_message.received_at / numbering_segment.updated_at / idem.created_at 落库是 UTC 整秒（${R#*M=}）" || bad "11-6 Asia/Shanghai 下不是 UTC：$R"
+# 小玛丽 blocker：numbering_segment 只许前进（numbering_regress / numbering_key_immutable → 40930），inbound_message 判重键不可改（inbound_message_key_immutable → 40930）
+expect_allow "NS1 准备：wms_app 建号段 T11N/20261015 next_value=1000" "SET ROLE wms_app; INSERT INTO numbering_segment (biz_prefix,date_key,next_value,step) VALUES ('T11N','20261015',1000,100);"
+expect_allow "NS1 正向：取号原语 next_value = next_value + step" "SET ROLE wms_app; UPDATE numbering_segment SET next_value = next_value + step WHERE biz_prefix='T11N' AND date_key='20261015';"
+R=$(q11 "SELECT next_value FROM numbering_segment WHERE biz_prefix='T11N'"); [ "$R" = "1100" ] && ok "NS1 取号后 next_value=1100" || bad "NS1 取号结果：$R"
+expect_block "NS1 wms_app 把 next_value 调回 500（号段回退）" "SET ROLE wms_app; UPDATE numbering_segment SET next_value = 500 WHERE biz_prefix='T11N';" "numbering_regress"
+expect_block "NS1 属主也不能把 next_value 调小" "UPDATE numbering_segment SET next_value = next_value - 1 WHERE biz_prefix='T11N';" "numbering_regress"
+expect_block "NS1 step 改负再取号（等于回退）" "SET ROLE wms_app; UPDATE numbering_segment SET step = -100, next_value = next_value - 100 WHERE biz_prefix='T11N';" "numbering_regress"
+expect_block "NS1 改键列 date_key（把今天的号段挪成别的日子）" "SET ROLE wms_app; UPDATE numbering_segment SET date_key='20261016' WHERE biz_prefix='T11N';" "numbering_key_immutable"
+expect_block "NS1 改键列 biz_prefix" "UPDATE numbering_segment SET biz_prefix='T11X' WHERE biz_prefix='T11N';" "numbering_key_immutable"
+expect_block "NS1 属主 DELETE 号段（删了重插 = 回退）" "DELETE FROM numbering_segment WHERE biz_prefix='T11N';" "numbering_regress"
+expect_block "NS1 属主 TRUNCATE numbering_segment" "TRUNCATE numbering_segment;" "numbering_regress"
+R=$(q11 "SELECT next_value FROM numbering_segment WHERE biz_prefix='T11N' AND date_key='20261015'"); [ "$R" = "1100" ] && ok "NS1 拒绝用例后号段仍为 1100" || bad "NS1 号段被改：$R"
+R=$(q11 "BEGIN; ALTER TABLE numbering_segment DISABLE TRIGGER trg_numbering_guard; UPDATE numbering_segment SET next_value = 500 WHERE biz_prefix='T11N'; SELECT 'M=' || (next_value = 500)::text FROM numbering_segment WHERE biz_prefix='T11N'; ROLLBACK;")
+[ "${R#*M=}" = "true" ] && ok "NS1 变异：停用 trg_numbering_guard 后号段可回退（上面的断言会变红）" || bad "NS1 变异未变红：$R"
+R=$(q11 "BEGIN; ALTER TABLE numbering_segment DISABLE TRIGGER trg_numbering_guard; DELETE FROM numbering_segment WHERE biz_prefix='T11N'; INSERT INTO numbering_segment (biz_prefix,date_key,next_value) VALUES ('T11N','20261015',1); SELECT 'M=' || (next_value = 1)::text FROM numbering_segment WHERE biz_prefix='T11N'; ROLLBACK;")
+[ "${R#*M=}" = "true" ] && ok "NS1 变异：停用后删了重插把号段回到 1（DELETE 断言会变红）" || bad "NS1 删除变异未变红：$R"
+R=$(q11 "BEGIN; ALTER TABLE numbering_segment DISABLE TRIGGER trg_numbering_guard; UPDATE numbering_segment SET date_key='20261016' WHERE biz_prefix='T11N'; SELECT 'M=' || count(*)::text FROM numbering_segment WHERE biz_prefix='T11N' AND date_key='20261016'; ROLLBACK;")
+[ "${R#*M=}" = "1" ] && ok "NS1 变异：停用后键列可改（键列断言会变红）" || bad "NS1 键列变异未变红：$R"
+R=$(q11 "BEGIN; ALTER TABLE numbering_segment DISABLE TRIGGER trg_numbering_no_truncate; TRUNCATE numbering_segment; SELECT 'M=' || count(*)::text FROM numbering_segment; ROLLBACK;")
+[ "${R#*M=}" = "0" ] && ok "NS1 变异：停用 trg_numbering_no_truncate 后可清空（TRUNCATE 断言会变红）" || bad "NS1 TRUNCATE 变异未变红：$R"
+expect_allow "IM1 准备：入站报文 ERP/SALES_ORDER/SO-I1" "SET ROLE wms_app; INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha) VALUES (9601,'ERP','SALES_ORDER','SO-I1','{}','h');"
+expect_allow "IM1 正向：处理状态可推进（status/processed_at/biz_ref）" "SET ROLE wms_app; UPDATE inbound_message SET status='DONE', processed_at = now() AT TIME ZONE 'UTC', biz_ref='OBT-1' WHERE id=9601;"
+expect_block "IM1 改 external_no（腾出判重键让同号重推再进一次）" "SET ROLE wms_app; UPDATE inbound_message SET external_no='SO-I1-x' WHERE id=9601;" "inbound_message_key_immutable"
+expect_block "IM1 改 source" "SET ROLE wms_app; UPDATE inbound_message SET source='WMS' WHERE id=9601;" "inbound_message_key_immutable"
+expect_block "IM1 改 biz_type" "SET ROLE wms_app; UPDATE inbound_message SET biz_type='PURCHASE' WHERE id=9601;" "inbound_message_key_immutable"
+expect_block "IM1 改 id" "UPDATE inbound_message SET id=9602 WHERE id=9601;" "inbound_message_key_immutable"
+expect_block "IM1 同号重推再插（uq_in_msg）" "SET ROLE wms_app; INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha) VALUES (9603,'ERP','SALES_ORDER','SO-I1','{}','h');" "uq_in_msg"
+R=$(q11 "BEGIN; ALTER TABLE inbound_message DISABLE TRIGGER trg_in_msg_key_immutable; UPDATE inbound_message SET external_no='SO-I1-x' WHERE id=9601; SELECT 'M=' || count(*)::text FROM inbound_message WHERE external_no='SO-I1-x'; ROLLBACK;")
+[ "${R#*M=}" = "1" ] && ok "IM1 变异：停用 trg_in_msg_key_immutable 后判重键可改（上面的断言会变红）" || bad "IM1 变异未变红：$R"
+R=$(q11 "BEGIN; ALTER TABLE audit_log ALTER COLUMN occurred_at SET DEFAULT now(); SET LOCAL TIME ZONE 'Asia/Shanghai'; INSERT INTO audit_log (id,action,node_id,node_seq,warehouse_id) VALUES (9502,'t11.tz',7,9502,1); SELECT 'M=' || (abs(extract(epoch FROM occurred_at - (now() AT TIME ZONE 'UTC'))) <= 5)::text FROM audit_log WHERE id=9502; ROLLBACK;")
+[ "${R#*M=}" = "false" ] && ok "11-6 变异：occurred_at 改回 DEFAULT now() 后 Asia/Shanghai 下偏 8 小时（断言变红）" || bad "11-6 变异未变红：$R"
+R=$(q11 "SELECT string_agg(c.relname || '.' || a.attname, ',') FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid WHERE c.relname IN ('upstream_push_log','offline_paper_record','idempotency_record','inbound_message','outbox_event','audit_log','numbering_segment') AND a.attnum > 0 AND NOT a.attisdropped AND a.atttypid = 'timestamptz'::regtype")
+[ -z "$R" ] && ok "11 时间列全是 TIMESTAMP（无 timestamptz）" || bad "11 有 timestamptz 列：$R"
+R=$(q11 "SELECT count(*) FILTER (WHERE proconfig = ARRAY['search_path=pg_catalog, public, pg_temp']::text[]) || '/' || count(*) FROM pg_proc WHERE pronamespace='public'::regnamespace AND proname IN ('trg_upl_server_time','trg_idem_server_time','trg_paper_server_time')")
+[ "$R" = "3/3" ] && ok "11 时间加固新增 3 个函数 search_path = pg_catalog, public, pg_temp（00 §6.9）" || bad "11 新函数 search_path：$R"
+# T2（Doro 裁定）：audit_log.occurred_at / inbound_message.received_at 由库写，设备原始时间留在 client_occurred_at
+expect_allow "T2 wms_app 写审计：occurred_at 倒填 2000 年、client_occurred_at=2000-01-01 00:00:00" "SET ROLE wms_app; INSERT INTO audit_log (id,action,node_id,node_seq,warehouse_id,occurred_at,client_occurred_at) VALUES (9503,'t11.t2',7,9503,1,'2000-01-01 00:00:00','2000-01-01 00:00:00');"
+expect_allow "T2 wms_app 写入站报文：received_at 倒填 2000 年、client_occurred_at=2000-01-01 00:00:00" "SET ROLE wms_app; INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha,received_at,client_occurred_at) VALUES (9503,'ERP','SALES_ORDER','SO-T9503','{}','h','2000-01-01 00:00:00','2000-01-01 00:00:00');"
+R=$(q11 "SELECT (SELECT (abs(extract(epoch FROM occurred_at - (now() AT TIME ZONE 'UTC'))) <= 5)::text || ',' || client_occurred_at FROM audit_log WHERE id=9503) || '/' || (SELECT (abs(extract(epoch FROM received_at - (now() AT TIME ZONE 'UTC'))) <= 5)::text || ',' || client_occurred_at FROM inbound_message WHERE id=9503)")
+[ "$R" = "true,2000-01-01 00:00:00/true,2000-01-01 00:00:00" ] && ok "T2 occurred_at / received_at 被改写为库时间，client_occurred_at 原样保留（$R）" || bad "T2 改写/保留不符：$R"
+R=$(q11 "BEGIN; ALTER TABLE audit_log DISABLE TRIGGER trg_audit_server_time; ALTER TABLE inbound_message DISABLE TRIGGER trg_in_msg_server_time; SET LOCAL ROLE wms_app; INSERT INTO audit_log (id,action,node_id,node_seq,warehouse_id,occurred_at) VALUES (9504,'t11.t2',7,9504,1,'2000-01-01 00:00:00'); INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha,received_at) VALUES (9504,'ERP','SALES_ORDER','SO-T9504','{}','h','2000-01-01 00:00:00'); RESET ROLE; SELECT 'M=' || (SELECT occurred_at FROM audit_log WHERE id=9504) || '/' || (SELECT received_at FROM inbound_message WHERE id=9504); ROLLBACK;")
+[ "${R#*M=}" = "2000-01-01 00:00:00/2000-01-01 00:00:00" ] && ok "T2 变异：停用两个触发器后倒填照样落库（上面的断言会变红）" || bad "T2 变异未变红：$R"
+expect_block "T2 client_occurred_at 带小数秒（审计）" "INSERT INTO audit_log (id,action,node_id,node_seq,warehouse_id,client_occurred_at) VALUES (9505,'t11.t2',7,9505,1,'2026-01-01 00:00:00.5');" "ck_audit_cts"
+expect_block "T2 client_occurred_at 带小数秒（入站报文）" "INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha,client_occurred_at) VALUES (9505,'ERP','SALES_ORDER','SO-T9505','{}','h','2026-01-01 00:00:00.5');" "ck_in_msg_cts"
+expect_allow "T2 client_occurred_at 不设容差：1999 年、2099 年都接受" "INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha,client_occurred_at) VALUES (9506,'ERP','SALES_ORDER','SO-T9506','{}','h','1999-01-01 00:00:00'),(9507,'ERP','SALES_ORDER','SO-T9507','{}','h','2099-01-01 00:00:00');"
+T2CAT="SELECT (SELECT count(*) FROM pg_proc WHERE pronamespace='public'::regnamespace AND prosrc LIKE '%client_occurred_at%') + (SELECT count(*) FROM pg_constraint WHERE connamespace='public'::regnamespace AND pg_get_constraintdef(oid) LIKE '%client_occurred_at%' AND conname NOT IN ('ck_audit_cts','ck_in_msg_cts')) + (SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexdef LIKE '%client_occurred_at%') + (SELECT count(*) FROM pg_views WHERE schemaname='public' AND definition LIKE '%client_occurred_at%')"
+R=$(q11 "$T2CAT")
+[ "$R" = "0" ] && ok "T2 client_occurred_at 不进任何函数（含 purge_expired / purge_push_log）、约束（格式 CHECK 除外）、索引、视图" || bad "T2 client_occurred_at 被引用：$R"
+R=$(q11 "BEGIN; CREATE FUNCTION public.t11_bad_purge() RETURNS void LANGUAGE sql SET search_path = pg_catalog, public, pg_temp AS \$f\$ SELECT 1 FROM public.audit_log WHERE client_occurred_at < now() \$f\$; SELECT 'M=' || ($T2CAT); ROLLBACK;")
+[ "${R#*M=}" = "1" ] && ok "T2 变异：加一个按 client_occurred_at 清理的函数，目录断言变红" || bad "T2 目录变异未变红：$R"
+R=$(q11 "SELECT string_agg(id::text, ',' ORDER BY id) FROM offline_paper_record WHERE id >= 40")
+[ "$R" = "42" ] && ok "11-5 反向用例全部回滚（只剩 42）" || bad "11-5 残留：$R"
 echo "=== 2i-sp. search_path 固定（pg_catalog, public）：目录断言 + 同名表劫持 + 变异检查（PG）==="
 R=$(psql -q -t -A <<'HJSQL' | grep '^HJ#'
 BEGIN;
@@ -2498,7 +2584,7 @@ echo "=== 2z. pg_temp 劫持（#2 第九轮）：search_path 必须显式写 pg_
 # SQLite 没有对应攻击面：没有 schema 搜索路径，TEMP 表只对本连接可见，触发器体里的表名在建触发器时就绑到 main（不跟会话走），verify_sqlite.py 不加对应用例。
 # 目录断言：public 里所有带 search_path 设置的函数（含退供增量自带的 5 个，米雪儿已按本规则写）都必须正好是 pg_catalog, public, pg_temp。
 R=$(psql -t -A -c "SELECT count(*) FILTER (WHERE c <> 'search_path=pg_catalog, public, pg_temp') || '/' || count(*) FROM (SELECT unnest(p.proconfig) c FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace) s WHERE c LIKE 'search_path=%'")
-[ "$R" = "0/53" ] && ok "pg_temp 目录断言：53 个固定 search_path 的函数都显式以 pg_temp 结尾（不合规/总数 = $R）" || bad "pg_temp 目录断言：不合规/总数 = $R（期望 0/53）"
+[ "$R" = "0/59" ] && ok "pg_temp 目录断言：59 个固定 search_path 的函数都显式以 pg_temp 结尾（不合规/总数 = $R）" || bad "pg_temp 目录断言：不合规/总数 = $R（期望 0/59）"
 # 通用断言（不限函数个数）：public 下任何函数只要设了 search_path，pg_temp 必须是最后一项
 R=$(psql -t -A -c "SELECT count(*) FILTER (WHERE c !~ ',\s*pg_temp\s*$') || '/' || count(*) || '#' || COALESCE(string_agg(proname, ',') FILTER (WHERE c !~ ',\s*pg_temp\s*$'), '') FROM (SELECT p.proname, c FROM pg_proc p, unnest(p.proconfig) c WHERE p.pronamespace = 'public'::regnamespace AND c LIKE 'search_path=%') s")
 [ "${R%%/*}" = "0" ] && ok "pg_temp 末位断言：public 下设了 search_path 的函数 pg_temp 都在最后（缺/总 = ${R%%#*}）" || bad "pg_temp 末位断言：缺/总 = ${R%%#*}，函数：${R#*#}"
@@ -2550,7 +2636,7 @@ echo "  → fixed/mut：02[$A0 | $A1] 09[$B0 | $B1] 11[$C0 | $C1] 12[$D0 | $D1]"
 [ "$B0" = "scrap_line_locked" ] && ok "pg_temp 劫持 09 trg_scrl_draft_only：临时表 scrap_order 把已取消单伪造成 DRAFT，函数仍读 public → $B0" || bad "09 pg_temp 劫持：$B0（期望 scrap_line_locked）"
 [ "$C0" = "PT_PASSED" ] && ok "pg_temp 劫持 11 trg_outbox_order_guard：临时表 outbox_event 伪造同 biz_key 更早的 PENDING 行想卡住投递，函数仍读 public，真实事件照常进 SENDING（$C0）" || bad "11 pg_temp 劫持：$C0（期望正常放行 PT_PASSED）"
 [ "$D0" = "approval_code_warehouse_mismatch" ] && ok "pg_temp 劫持 12 trg_apr_insert：临时表 warehouse 把仓 1 编码伪造成 PTFAKE，函数仍读 public → $D0" || bad "12 pg_temp 劫持：$D0（期望 approval_code_warehouse_mismatch）"
-[ "$PC1" = "4/53" ] && ok "变异：四个函数去掉 pg_temp 后目录断言变红（$PC1）" || bad "变异目录断言没变红：$PC1（期望 4/53）"
+[ "$PC1" = "4/59" ] && ok "变异：四个函数去掉 pg_temp 后目录断言变红（$PC1）" || bad "变异目录断言没变红：$PC1（期望 4/59）"
 [ "$A1" != "$A0" ] && ok "变异：trg_mvk_line_kind 去掉 pg_temp 后临时表劫持生效（$A1）" || bad "变异没变红：trg_mvk_line_kind 去掉 pg_temp 后仍是 $A1"
 [ "$B1" != "$B0" ] && ok "变异：trg_scrl_draft_only 去掉 pg_temp 后临时表劫持生效（$B1）" || bad "变异没变红：trg_scrl_draft_only 去掉 pg_temp 后仍是 $B1"
 [ "$C1" != "$C0" ] && ok "变异：trg_outbox_order_guard 去掉 pg_temp 后临时表劫持生效（$C1）" || bad "变异没变红：trg_outbox_order_guard 去掉 pg_temp 后仍是 $C1"
@@ -2649,6 +2735,29 @@ for KIND in TRG IDX; do
   [ -z "${MISS// /}" ] && ok "01/02 $KIND 名单与冻结基线一致（$(wc -w <<<"$BASE") 个）" || bad "01/02 $KIND 少了：$MISS"
   [ -z "${EXTRA// /}" ] || echo "  · 01/02 $KIND 基线外新增（请补进基线）：$EXTRA"
 done
+echo "=== 2z4-11 第 11 篇触发器 / 索引名冻结基线（同 #2 第十三轮机制；少一个 = 红）==="
+# audit_log 属第 11 篇（爱弥斯确认），12b 挂在它上面的触发器 / 索引一并冻结
+T11="'outbox_event','idempotency_record','upstream_push_log','offline_paper_record','inbound_message','numbering_segment','audit_log'"
+Q11_TRG="SELECT string_agg(DISTINCT t.tgname, ' ' ORDER BY t.tgname) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal AND c.relnamespace = 'public'::regnamespace AND NOT c.relispartition AND c.relname IN ($T11)"
+Q11_IDX="SELECT string_agg(i.relname, ' ' ORDER BY i.relname) FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_class c ON c.oid = x.indrelid WHERE c.relnamespace = 'public'::regnamespace AND NOT c.relispartition AND c.relname IN ($T11)"
+PG11_TRG_NOW=$(psql -t -A -c "$Q11_TRG"); PG11_IDX_NOW=$(psql -t -A -c "$Q11_IDX")
+PG11_TRG_BASE="trg_audit_append_only trg_audit_no_truncate trg_audit_node_required trg_audit_server_time trg_idem_expiry_fwd trg_idem_no_truncate trg_idem_purge_guard trg_idem_server_time trg_in_msg_key_immutable trg_in_msg_server_time trg_numbering_guard trg_numbering_no_truncate trg_outbox_expiry_fwd trg_outbox_insert_pending trg_outbox_no_truncate trg_outbox_order_guard trg_outbox_purge_guard trg_paper_server_time trg_upl_append_only trg_upl_no_truncate trg_upl_server_time"
+PG11_IDX_BASE="audit_log_pkey idempotency_record_pkey inbound_message_pkey ix_audit_actor ix_audit_target ix_audit_wh ix_idem_exp ix_in_msg_retry ix_outbox_bizkey ix_outbox_noseq ix_outbox_pending ix_paper_pending ix_upl_src ix_upl_time numbering_segment_pkey offline_paper_record_pkey outbox_event_pkey upstream_push_log_pkey uq_audit_node_seq uq_in_msg uq_outbox_dead_bizkey uq_outbox_seq uq_paper_bizkey"
+miss11() { comm -23 <(tr ' ' '\n' <<<"$1" | sort) <(tr ' ' '\n' <<<"$2" | sort) | tr '\n' ' '; }
+for KIND in TRG IDX; do
+  eval "NOW=\$PG11_${KIND}_NOW; BASE=\$PG11_${KIND}_BASE"
+  MISS=$(miss11 "$BASE" "$NOW"); EXTRA=$(miss11 "$NOW" "$BASE")
+  [ -z "${MISS// /}" ] && ok "11 $KIND 名单与冻结基线一致（$(wc -w <<<"$BASE") 个）" || bad "11 $KIND 少了：$MISS"
+  [ -z "${EXTRA// /}" ] || echo "  · 11 $KIND 基线外新增（请补进基线）：$EXTRA"
+done
+MT=$(psql -t -A -q -c "BEGIN; DROP TRIGGER trg_numbering_guard ON numbering_segment; DROP INDEX uq_outbox_seq; $Q11_TRG; $Q11_IDX; ROLLBACK;" 2>&1 | tr '\n' '|')
+MTT=$(miss11 "$PG11_TRG_BASE" "$(cut -d'|' -f1 <<<"$MT")"); MTI=$(miss11 "$PG11_IDX_BASE" "$(cut -d'|' -f2 <<<"$MT")")
+[ "${MTT// /}" = "trg_numbering_guard" ] && [ "${MTI// /}" = "uq_outbox_seq" ] && ok "变异：去掉 trg_numbering_guard + uq_outbox_seq → 11 基线变红（$MTT/ $MTI）" || bad "变异：11 基线未变红：[$MTT] [$MTI]"
+# 第 13 轮配套：11 表声明外键，种子无孤儿
+R=$(psql -t -A -c "SELECT (SELECT count(*) FROM audit_log a WHERE a.warehouse_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM warehouse w WHERE w.id = a.warehouse_id)) || '/' || (SELECT count(*) FROM offline_paper_record p WHERE NOT EXISTS (SELECT 1 FROM warehouse w WHERE w.id = p.warehouse_id))")
+[ "$R" = "0/0" ] && ok "11 外键：audit_log / offline_paper_record 的 warehouse_id 无孤儿（$R）" || bad "11 外键孤儿：$R"
+expect_block "11 外键：audit_log.warehouse_id 指向不存在的仓" "INSERT INTO audit_log (id,action,node_id,node_seq,warehouse_id) VALUES (779701,'t11.fk',7,779701,999999);" "audit_log_warehouse_id_fkey"
+expect_block "11 外键：offline_paper_record.warehouse_id 指向不存在的仓" "INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (779702,999999,'PDA-07','PICK_CONFIRM','PK-FK','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 10:00:00','PENDING',NULL,'PAPER_BACKFILL');" "offline_paper_record_warehouse_id_fkey"
 echo "=== 汇总 ==="
 echo "  通过 $pass 项 / 失败 $fail 项"
 cleanup
