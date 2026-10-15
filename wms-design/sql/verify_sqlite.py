@@ -144,7 +144,7 @@ NI = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='index' AND sql
 NV = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='view'").fetchone()[0]
 print(f"  → 表 {NT} 张 / 手工建索引 {NI} 个 / 视图 {NV} 个")
 # 期望值：main 8ed5f0c 为 38 表；docs/02 新增 stock_hold、stock_recon_alert、stock_movement_key、stock_ledger_line → 42 表（PG 分区子表不计）。改表数必须同步改这里和 verify.sh
-EXPECT_TABLES, EXPECT_VIEWS= 72, 2  # docs/12 +3；第 10 篇 +exception_code、exception_case、return_reservation、return_reservation_line、return_blind_receipt；第 9 篇 +scrap_order、scrap_line；第 17 篇 +8 张 process_*；docs/18 加 9 表 + v_live_death_in_transit
+EXPECT_TABLES, EXPECT_VIEWS= 73, 2  # 退供 +supplier_return； docs/12 +3；第 10 篇 +exception_code、exception_case、return_reservation、return_reservation_line、return_blind_receipt；第 9 篇 +scrap_order、scrap_line；第 17 篇 +8 张 process_*；docs/18 加 9 表 + v_live_death_in_transit
 ok(f"表数 = {NT}（期望 {EXPECT_TABLES}）") if NT == EXPECT_TABLES else bad(f"表数 = {NT}，期望 {EXPECT_TABLES}")
 ok(f"视图数 = {NV}") if NV == EXPECT_VIEWS else bad(f"视图数 = {NV}，期望 {EXPECT_VIEWS}")
 
@@ -1855,6 +1855,366 @@ except sqlite3.IntegrityError as e:
     conn.rollback()
     ok(f"C3 并发补号后重复 seq（同节点） → 已拦截（{e}）") if "outbox_seq_immutable" in str(e) else bad(f"C3 改 seq 拦错：{e}")
 # 边缘 SQLite 单写者：BEGIN IMMEDIATE 串行，业务事务内取号不会出现"小 seq 后提交"；文档 §4.3 说明
+
+# ---------------------------------------------------------------------------
+# 第 10/9 篇 退供应商（Alex 定案）：每条规则 正向 / 拒绝 / 变异（去掉约束后被拒语句通过）
+# ---------------------------------------------------------------------------
+print("=== 2s. 退供应商：原因白名单、处置必填、食安只退或报废、提货时限、超期转 09 报损 + hold(SCRAP_PENDING) ===")
+conn.close()
+conn = sqlite3.connect(dbf, isolation_level=None)
+conn.execute("PRAGMA foreign_keys = ON")
+# 种子模式：SQLite 没有「表属主」，时钟窗口 / 只能以 OPEN 建单的触发器对所有写入生效。2s–2s3 用固定日期验证业务规则，
+# 先摘掉这三个触发器（同第 11 篇 outbox_seed_begin 口径），2s4 再装回来专测时钟。
+SRTN_CLOCK_TRG = ("trg_srtn_ins_open", "trg_srtn_clock_ins", "trg_srtn_clock_upd")
+SRTN_CLOCK_SQL = [one("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", t)[0] for t in SRTN_CLOCK_TRG]
+for _t in SRTN_CLOCK_TRG:
+    conn.execute(f"DROP TRIGGER {_t}")
+SRTN_SKU = "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life,return_as_fresh) VALUES (97001,'SKU-SR-FRZ','冷冻虾仁','KG','FROZEN',180,30,false),(97002,'SKU-SR-AMB','常温大米','KG','AMBIENT',365,30,false),(97003,'SKU-SR-AMBF','常温香蕉（按生鲜退）','KG','AMBIENT',7,1,true),(97004,'SKU-SR-LIVE','活鲜（未定义映射）','KG','LIVE',3,1,false)"
+conn.execute(SRTN_SKU)
+SRTN_I = "INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES "
+T0 = "2026-10-15 08:00:00"
+def srtn(i, reason, contract, fs, disp, temp, dl):
+    c = "NULL" if contract is None else f"'{contract}'"
+    d = "NULL" if dl is None else f"'{dl}'"
+    return SRTN_I + f"({i},'SRN-{i}',1,501,14,{ {'FRESH': 1, 'FROZEN': 97001, 'STANDARD': 97002}[temp]},1,5000,'{reason}',{c},{'true' if fs else 'false'},'{disp}','{temp}','{T0}',{d},31)"
+
+
+def _mut_ddl(drop):
+    """drop = ('ck', 约束名) 删掉该行 CONSTRAINT；('line', 片段) 删含片段的一行； 删掉该行 CONSTRAINT；('nn', 列) 去掉该列 NOT NULL；('trg', 触发器名) 建库后 DROP。"""
+    lines = sqlite_ddl.split("\n")
+    if drop[0] == "ck":
+        idx = [k for k, l in enumerate(lines) if l.strip().startswith(f"CONSTRAINT {drop[1]} ")]
+        assert len(idx) == 1, drop
+        k = idx[0]
+        if not lines[k].rstrip().endswith(","):   # 最后一条约束：去掉上一行的逗号
+            lines[k - 1] = lines[k - 1].rstrip().rstrip(",")
+        del lines[k]
+    elif drop[0] == "line":   # 删掉含该片段的一行（多行 CHECK 里的一个子句）
+        idx = [k for k, l in enumerate(lines) if drop[1] in l]
+        assert len(idx) == 1, drop
+        del lines[idx[0]]
+    elif drop[0] == "sub":   # 删掉一段文本（列级 CHECK）
+        txt = "\n".join(lines)
+        assert txt.count(drop[1]) == 1, drop
+        return txt.replace(drop[1], "")
+    elif drop[0] == "rep":   # 文本替换（比较符变异）
+        txt = "\n".join(lines)
+        assert txt.count(drop[1]) == 1, drop
+        return txt.replace(drop[1], drop[2])
+    elif drop[0] == "nn":
+        idx = [k for k, l in enumerate(lines) if l.strip().startswith(drop[1] + " ") and "NOT NULL" in l]
+        k = [k for k in idx if "VARCHAR(16)" in lines[k]][0]
+        lines[k] = lines[k].replace("NOT NULL", "", 1)
+    return "\n".join(lines)
+
+
+def srtn_mut(desc, drop, setup, stmt):
+    mc = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        mc.executescript(_mut_ddl(drop))
+        if drop[0] == "trg":
+            mc.execute(f"DROP TRIGGER {drop[1]}")
+        for _t in SRTN_CLOCK_TRG:
+            mc.execute(f"DROP TRIGGER IF EXISTS {_t}")
+        mc.execute("INSERT INTO sku (id,code,name,base_uom,temperature_required) VALUES (1,'SKU-APPLE','x','KG','CHILLED')")
+        mc.execute(SRTN_SKU)
+        for st in setup:
+            mc.execute(st)
+        mc.execute(stmt)
+        ok(f"变异：去掉 {desc} 后，原被拒语句通过")
+    except sqlite3.Error as e:
+        bad(f"变异：去掉 {desc} 后仍被拒（{e}）—— 拒绝不是这条约束给的")
+    finally:
+        mc.close()
+
+
+bad_reason = srtn(97109, 'OVERSTOCK', None, False, 'SCRAP', 'FRESH', None)
+bad_slow = srtn(97109, 'SLOW_MOVING', None, False, 'DISCOUNT', 'STANDARD', None)
+bad_disp = srtn(97109, 'QUALITY', None, False, 'DONATE', 'FRESH', None)
+null_disp = SRTN_I + f"(97109,'SRN-97109',1,501,14,1,1,5000,'QUALITY',NULL,false,NULL,'FRESH','{T0}',NULL,31)"
+bad_fs = srtn(97109, 'QUALITY', None, True, 'DISCOUNT', 'FRESH', None)
+bad_recall = srtn(97109, 'RECALL', None, False, 'SCRAP', 'FRESH', None)
+bad_dl = srtn(97109, 'QUALITY', None, False, 'RETURN', 'FRESH', '2026-10-17 08:00:00')
+bad_dl2 = srtn(97109, 'QUALITY', None, False, 'RETURN', 'FROZEN', None)
+expect_allow("退供 R1 正向：质量问题退供（生鲜，T+24h）", srtn(97101, 'QUALITY', None, False, 'RETURN', 'FRESH', '2026-10-16 08:00:00'))
+expect_allow("退供 R1 正向：错送 + 换货", srtn(97102, 'WRONG_DELIVERY', None, False, 'EXCHANGE', 'STANDARD', None))
+expect_block("退供 R1 拒绝：原因不在白名单（OVERSTOCK）", bad_reason, "ck_srtn_reason")
+srtn_mut("ck_srtn_reason", ("ck", "ck_srtn_reason"), [], bad_reason)
+expect_allow("退供 R1 正向：滞销 + 合同约定", srtn(97103, 'SLOW_MOVING', 'CT-2026-018 §7.2', False, 'RETURN', 'STANDARD', '2026-10-30 08:00:00'))
+expect_block("退供 R1 拒绝：滞销无合同约定", bad_slow, "ck_srtn_slow")
+srtn_mut("ck_srtn_slow", ("ck", "ck_srtn_slow"), [], bad_slow)
+expect_allow("退供 R2 正向：处置折价（非食安）", srtn(97104, 'QUALITY', None, False, 'DISCOUNT', 'FRESH', None))
+expect_block("退供 R2 拒绝：处置方式不在四选一", bad_disp, "ck_srtn_disp")
+srtn_mut("ck_srtn_disp", ("ck", "ck_srtn_disp"), [], bad_disp)
+expect_block("退供 R2 拒绝：处置方式为空", null_disp, "supplier_return.disposition")
+srtn_mut("disposition NOT NULL", ("nn", "disposition"), [], null_disp)
+expect_allow("退供 R2 正向：食安 + 报废", srtn(97105, 'QUALITY', None, True, 'SCRAP', 'FRESH', None))
+expect_block("退供 R2 拒绝：食安问题折价", bad_fs, "ck_srtn_fsafe")
+srtn_mut("ck_srtn_fsafe", ("ck", "ck_srtn_fsafe"), [], bad_fs)
+expect_allow("退供 R2 正向：召回（食安）退供，冷冻 T+7d", srtn(97106, 'RECALL', None, True, 'RETURN', 'FROZEN', '2026-10-22 08:00:00'))
+expect_block("退供 R2 拒绝：召回未标食安", bad_recall, "ck_srtn_recall_fs")
+srtn_mut("ck_srtn_recall_fs", ("ck", "ck_srtn_recall_fs"), [], bad_recall)
+expect_allow("退供 R3 正向：常温 T+15d", srtn(97107, 'QUALITY', None, False, 'RETURN', 'STANDARD', '2026-10-30 08:00:00'))
+expect_block("退供 R3 拒绝：生鲜截止写成 T+48h", bad_dl, "ck_srtn_deadline")
+srtn_mut("ck_srtn_deadline（时限）", ("ck", "ck_srtn_deadline"), [], bad_dl)
+expect_block("退供 R3 拒绝：退供缺截止时间", bad_dl2, "ck_srtn_deadline")
+expect_allow_tx("退供 R3 正向：截止前提货", ["UPDATE supplier_return SET status='AWAITING_PICKUP' WHERE id=97107", "UPDATE supplier_return SET status='PICKED_UP', picked_up_at='2026-10-30 07:59:59' WHERE id=97107"])
+expect_allow("退供 R3 种子：97106 待提货", "UPDATE supplier_return SET status='AWAITING_PICKUP' WHERE id=97106")
+late = "UPDATE supplier_return SET status='PICKED_UP', picked_up_at='2026-10-22 08:00:01' WHERE id=97106"
+expect_block("退供 R3 拒绝：超过截止再提货（必须走超期报损）", late, "ck_srtn_picked")
+srtn_mut("ck_srtn_picked", ("ck", "ck_srtn_picked"), [srtn(97106, 'RECALL', None, True, 'RETURN', 'FROZEN', '2026-10-22 08:00:00'), "UPDATE supplier_return SET status='AWAITING_PICKUP' WHERE id=97106"], late)
+expect_allow("退供 R4 种子：97101 待提货", "UPDATE supplier_return SET status='AWAITING_PICKUP' WHERE id=97101")
+SCR_INS = "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (97101,'SCR-97101',1,'SUPPLIER_RETURN',97101,'PICKUP_OVERDUE','2026-10-16',0)"
+HOLD_INS = "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (97101,14,'SCRAP_PENDING','SCRAP','SCRAP',97101,'SRTO:97101',5000,0,'HELD',0)"
+expect_allow("退供 R4 种子：09 报损单（SUPPLIER_RETURN / PICKUP_OVERDUE）", SCR_INS)
+expect_block("09 拒绝：PICKUP_OVERDUE 用在非退供来源", "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (97109,'SCR-97109',1,'MANUAL',0,'PICKUP_OVERDUE','2026-10-16',7)", "ck_scr_reason_src")
+srtn_mut("ck_scr_reason_src 的 PICKUP_OVERDUE 子句", ("line", "AND (reason_code <> 'PICKUP_OVERDUE' OR source_type = 'SUPPLIER_RETURN')"), [], "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (97109,'SCR-97109',1,'MANUAL',0,'PICKUP_OVERDUE','2026-10-16',7)")
+to_overdue = "UPDATE supplier_return SET status='OVERDUE_SCRAP', overdue_at='2026-10-16 08:00:01', scrap_order_id=97101 WHERE id=97101"
+expect_block("退供 R4 拒绝：有报损单但没有 hold(SCRAP_PENDING) 就转超期", to_overdue, "srtn_overdue_no_scrap_hold")
+srtn_mut("trg_srtn_overdue", ("trg", "trg_srtn_overdue"), [srtn(97101, 'QUALITY', None, False, 'RETURN', 'FRESH', '2026-10-16 08:00:00'), "UPDATE supplier_return SET status='AWAITING_PICKUP' WHERE id=97101", SCR_INS], to_overdue)
+expect_block("退供 R4 拒绝：建单直接写 OVERDUE_SCRAP", SRTN_I.replace("created_by)", "created_by,status,overdue_at,scrap_order_id)") + f"(97109,'SRN-97109',1,501,14,1,1,5000,'QUALITY',NULL,false,'RETURN','FRESH','{T0}','2026-10-16 08:00:00',31,'OVERDUE_SCRAP','2026-10-16 09:00:00',97101)", "srtn_overdue_no_scrap_hold")
+expect_allow("退供 R4 种子：02 原语 hold(SCRAP_PENDING)，op_key=SRTO:97101", HOLD_INS)
+early = "UPDATE supplier_return SET status='OVERDUE_SCRAP', overdue_at='2026-10-16 08:00:00', scrap_order_id=97101 WHERE id=97101"
+expect_block("退供 R4 拒绝：未过截止（overdue_at = 截止）就转超期", early, "ck_srtn_overdue")
+srtn_mut("ck_srtn_overdue", ("ck", "ck_srtn_overdue"), [srtn(97101, 'QUALITY', None, False, 'RETURN', 'FRESH', '2026-10-16 08:00:00'), "UPDATE supplier_return SET status='AWAITING_PICKUP' WHERE id=97101", SCR_INS, HOLD_INS], early)
+expect_allow("退供 R4 正向：超期 + 报损单 + SCRAP_PENDING 冻结 → OVERDUE_SCRAP", to_overdue)
+expect_block_tx("退供 R4 拒绝：报损单号不存在（外键兜底：即使绕过 trg_srtn_overdue）", ["DROP TRIGGER trg_srtn_overdue", "DROP TRIGGER trg_srtn_forward", "UPDATE supplier_return SET status='OVERDUE_SCRAP', overdue_at='2026-10-30 09:00:00', scrap_order_id=987654 WHERE id=97103"], "fk_srtn_scrap")
+_r = one("SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name='trg_srtn_overdue'")[0]
+ok("退供 外键兜底测试回滚后 trg_srtn_overdue 仍在") if _r == 1 else bad(f"trg_srtn_overdue 丢失：{_r}")
+print("=== 2s2. 退供 食安/滞销、超期绕过、op_key 与重放、唯一与并发 ===")
+def _tx_allow(desc, stmts):
+    conn.execute("BEGIN")
+    try:
+        for st in stmts: conn.execute(st)
+        ok(f"{desc} → 通过（随后回滚）")
+    except sqlite3.Error as e:
+        bad(f"{desc} → 仍被拒：{e}")
+    finally:
+        conn.execute("ROLLBACK")
+def _tx_block(desc, stmts, want):
+    conn.execute("BEGIN")
+    try:
+        for st in stmts: conn.execute(st)
+        bad(f"{desc} → 未拦截")
+    except sqlite3.IntegrityError as e:
+        m = str(e)
+        ok(f"{desc} → 已拦截（{m}）") if (m == want or m.endswith(": " + want) or want in m) else bad(f"{desc} → 约束不对：期望 {want!r}，实际 {m!r}")
+    finally:
+        conn.execute("ROLLBACK")
+expect_allow_tx("退供 食安 正向：合同滞销 + 折价", ["INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97110,'SRN-97110',1,501,14,1,1,5000,'SLOW_MOVING','CT-1',false,'DISCOUNT','FRESH','2026-10-15 08:00:00',NULL,31)"])
+expect_allow_tx("退供 食安 正向：合同滞销 + 换货", ["INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97111,'SRN-97111',1,501,14,1,1,5000,'SLOW_MOVING','CT-1',false,'EXCHANGE','FRESH','2026-10-15 08:00:00',NULL,31)"])
+expect_allow_tx("退供 食安 正向：合同滞销 + 报废", ["INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97112,'SRN-97112',1,501,14,1,1,5000,'SLOW_MOVING','CT-1',false,'SCRAP','FRESH','2026-10-15 08:00:00',NULL,31)"])
+expect_block_tx("退供 食安 拒绝：合同滞销标成食安", ["INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97119,'SRN-97119',1,501,14,1,1,5000,'SLOW_MOVING','CT-1',true,'SCRAP','FRESH','2026-10-15 08:00:00',NULL,31)"], "ck_srtn_slow_fs")
+srtn_mut("ck_srtn_slow_fs", ["ck", "ck_srtn_slow_fs"], [], "INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97119,'SRN-97119',1,501,14,1,1,5000,'SLOW_MOVING','CT-1',true,'SCRAP','FRESH','2026-10-15 08:00:00',NULL,31)")
+expect_allow_tx("退供 食安 正向：召回 + 报废", ["INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97113,'SRN-97113',1,501,14,1,1,5000,'RECALL',NULL,true,'SCRAP','FRESH','2026-10-15 08:00:00',NULL,31)"])
+expect_block_tx("退供 食安 拒绝：召回 + 折价", ["INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97119,'SRN-97119',1,501,14,1,1,5000,'RECALL',NULL,true,'DISCOUNT','FRESH','2026-10-15 08:00:00',NULL,31)"], "ck_srtn_fsafe")
+expect_block_tx("退供 食安 拒绝：召回 + 换货", ["INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97119,'SRN-97119',1,501,14,1,1,5000,'RECALL',NULL,true,'EXCHANGE','FRESH','2026-10-15 08:00:00',NULL,31)"], "ck_srtn_fsafe")
+srtn_mut("ck_srtn_fsafe（召回换货）", ["ck", "ck_srtn_fsafe"], [], "INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97119,'SRN-97119',1,501,14,1,1,5000,'RECALL',NULL,true,'EXCHANGE','FRESH','2026-10-15 08:00:00',NULL,31)")
+expect_block_tx("退供 食安 拒绝：质量食安 + 换货", ["INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97119,'SRN-97119',1,501,14,1,1,5000,'QUALITY',NULL,true,'EXCHANGE','FRESH','2026-10-15 08:00:00',NULL,31)"], "ck_srtn_fsafe")
+expect_block_tx("退供 食安 拒绝：建单后把食安单改成折价（UPDATE 绕过）", ["UPDATE supplier_return SET disposition='DISCOUNT' WHERE id=97105"], "ck_srtn_fsafe")
+expect_block_tx("退供 食安 拒绝：建单后把召回的食安标记去掉", ["UPDATE supplier_return SET food_safety=false WHERE id=97113"], "ck_srtn_recall_fs")
+expect_block_tx("退供 食安 拒绝：召回改成合同滞销（仍是食安）", ["UPDATE supplier_return SET reason_code='SLOW_MOVING', contract_ref='CT-1' WHERE id=97113"], "ck_srtn_slow_fs")
+expect_allow_tx("退供 绕过 种子：97130 待提货 + 报损单 97130", ["INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97130,'SRN-97130',1,501,14,1,1,5000,'QUALITY',NULL,false,'RETURN','FRESH','2026-10-15 08:00:00','2026-10-16 08:00:00',31)", "UPDATE supplier_return SET status='AWAITING_PICKUP' WHERE id=97130", "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (97130,'SCR-97130',1,'SUPPLIER_RETURN',97130,'PICKUP_OVERDUE','2026-10-16',0)"])
+_tx_block("退供 绕过 拒绝：op_key 小写 srto:", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (97131,14,'SCRAP_PENDING','SCRAP','SCRAP',97130,'srto:97130',5000,0,'HELD',0)", "UPDATE supplier_return SET status='OVERDUE_SCRAP', overdue_at='2026-10-16 09:00:00', scrap_order_id=97130 WHERE id=97130"], "srtn_overdue_no_scrap_hold")
+_tx_block("退供 绕过 拒绝：op_key 前导零 SRTO:097130", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (97131,14,'SCRAP_PENDING','SCRAP','SCRAP',97130,'SRTO:097130',5000,0,'HELD',0)", "UPDATE supplier_return SET status='OVERDUE_SCRAP', overdue_at='2026-10-16 09:00:00', scrap_order_id=97130 WHERE id=97130"], "srtn_overdue_no_scrap_hold")
+_tx_block("退供 绕过 拒绝：op_key 尾随空格", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (97131,14,'SCRAP_PENDING','SCRAP','SCRAP',97130,'SRTO:97130 ',5000,0,'HELD',0)", "UPDATE supplier_return SET status='OVERDUE_SCRAP', overdue_at='2026-10-16 09:00:00', scrap_order_id=97130 WHERE id=97130"], "srtn_overdue_no_scrap_hold")
+_tx_block("退供 绕过 拒绝：op_key 指向别的退供单 SRTO:97101x", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (97131,14,'SCRAP_PENDING','SCRAP','SCRAP',97130,'SRTO:971300',5000,0,'HELD',0)", "UPDATE supplier_return SET status='OVERDUE_SCRAP', overdue_at='2026-10-16 09:00:00', scrap_order_id=97130 WHERE id=97130"], "srtn_overdue_no_scrap_hold")
+_tx_block("退供 绕过 拒绝：冻结量 ≠ 退供量", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (97131,14,'SCRAP_PENDING','SCRAP','SCRAP',97130,'SRTO:97130',4999,0,'HELD',0)", "UPDATE supplier_return SET status='OVERDUE_SCRAP', overdue_at='2026-10-16 09:00:00', scrap_order_id=97130 WHERE id=97130"], "srtn_overdue_no_scrap_hold")
+_tx_block("退供 绕过 拒绝：冻结在别的库存行", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (97131,13,'SCRAP_PENDING','SCRAP','SCRAP',97130,'SRTO:97130',5000,0,'HELD',0)", "UPDATE supplier_return SET status='OVERDUE_SCRAP', overdue_at='2026-10-16 09:00:00', scrap_order_id=97130 WHERE id=97130"], "srtn_overdue_no_scrap_hold")
+_tx_block("退供 绕过 拒绝：冻结已释放", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (97131,14,'SCRAP_PENDING','SCRAP','SCRAP',97130,'SRTO:97130',5000,5000,'RELEASED',0)", "UPDATE supplier_return SET status='OVERDUE_SCRAP', overdue_at='2026-10-16 09:00:00', scrap_order_id=97130 WHERE id=97130"], "srtn_overdue_no_scrap_hold")
+_tx_block("退供 绕过 拒绝：冻结挂在别的报损单", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (97131,14,'SCRAP_PENDING','SCRAP','SCRAP',97101,'SRTO:97130',5000,0,'HELD',0)", "UPDATE supplier_return SET status='OVERDUE_SCRAP', overdue_at='2026-10-16 09:00:00', scrap_order_id=97130 WHERE id=97130"], "srtn_overdue_no_scrap_hold")
+_tx_allow("变异：去掉 trg_srtn_overdue（op_key 小写） 后，原被拒语句通过", ["DROP TRIGGER trg_srtn_overdue", "DROP TRIGGER trg_srtn_overdue_lock"] + ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (97131,14,'SCRAP_PENDING','SCRAP','SCRAP',97130,'srto:97130',5000,0,'HELD',0)", "UPDATE supplier_return SET status='OVERDUE_SCRAP', overdue_at='2026-10-16 09:00:00', scrap_order_id=97130 WHERE id=97130"])
+expect_allow_tx("退供 绕过 种子：97132 报损单已取消（有冻结）", ["INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97132,'SRN-97132',1,501,14,1,1,5000,'QUALITY',NULL,false,'RETURN','FRESH','2026-10-15 08:00:00','2026-10-16 08:00:00',31)", "UPDATE supplier_return SET status='AWAITING_PICKUP' WHERE id=97132", "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (97132,'SCR-97132',1,'SUPPLIER_RETURN',97132,'PICKUP_OVERDUE','2026-10-16',0)", "UPDATE scrap_order SET status='CANCELLED' WHERE id=97132", "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (97132,14,'SCRAP_PENDING','SCRAP','SCRAP',97132,'SRTO:97132',5000,0,'HELD',0)"])
+expect_block_tx("退供 绕过 拒绝：报损单已取消", ["UPDATE supplier_return SET status='OVERDUE_SCRAP', overdue_at='2026-10-16 09:00:00', scrap_order_id=97132 WHERE id=97132"], "srtn_overdue_no_scrap_hold")
+expect_allow("退供 绕过 种子：97133 OPEN（未进待提货）", "INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97133,'SRN-97133',1,501,14,1,1,5000,'QUALITY',NULL,false,'RETURN','FRESH','2026-10-15 08:00:00','2026-10-16 08:00:00',31)")
+expect_block("退供 0 行 拒绝：给未进待提货的退供单开报损单", "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (97133,'SCR-97133',1,'SUPPLIER_RETURN',97133,'PICKUP_OVERDUE','2026-10-16',0)", "srtn_scrap_not_awaiting")
+_tx_allow("变异：去掉 trg_scr_srtn_ins 后，给未进待提货的退供单开报损单通过", ["DROP TRIGGER trg_scr_srtn_ins", "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (97133,'SCR-97133',1,'SUPPLIER_RETURN',97133,'PICKUP_OVERDUE','2026-10-16',0)"])
+expect_block_tx("退供 绕过 拒绝：OPEN 直接跳 OVERDUE_SCRAP（去掉超期守卫后仍由状态机拦；SQLite 触发器顺序与 PG 不同）", ["DROP TRIGGER trg_srtn_overdue", "UPDATE supplier_return SET status='OVERDUE_SCRAP', overdue_at='2026-10-16 09:00:00', scrap_order_id=97130 WHERE id=97133"], "srtn_state_forward_only")
+expect_block_tx("退供 绕过 拒绝：OPEN 直接跳 OVERDUE_SCRAP（去掉状态机后仍由超期守卫拦）", ["DROP TRIGGER trg_srtn_forward", "UPDATE supplier_return SET status='OVERDUE_SCRAP', overdue_at='2026-10-16 09:00:00', scrap_order_id=97130 WHERE id=97133"], "srtn_overdue_no_scrap_hold")
+expect_block_tx("退供 绕过 拒绝：转超期后换挂报损单", ["UPDATE supplier_return SET scrap_order_id=97130 WHERE id=97101"], "srtn_overdue_immutable")
+expect_block_tx("退供 绕过 拒绝：转超期后退回待提货（去掉超期守卫后仍由状态机拦；SQLite 触发器顺序与 PG 不同）", ["DROP TRIGGER trg_srtn_overdue_lock", "UPDATE supplier_return SET status='AWAITING_PICKUP', overdue_at=NULL, scrap_order_id=NULL WHERE id=97101"], "srtn_state_forward_only")
+expect_block_tx("退供 绕过 拒绝：转超期后退回待提货（去掉状态机后仍由超期守卫拦）", ["DROP TRIGGER trg_srtn_forward", "UPDATE supplier_return SET status='AWAITING_PICKUP', overdue_at=NULL, scrap_order_id=NULL WHERE id=97101"], "srtn_overdue_immutable")
+expect_block_tx("退供 绕过 拒绝：转超期后改数量", ["UPDATE supplier_return SET qty_milli=1 WHERE id=97101"], "srtn_overdue_immutable")
+_tx_allow("变异：去掉 trg_srtn_overdue（转超期后换挂报损单） 后，原被拒语句通过", ["DROP TRIGGER trg_srtn_overdue", "DROP TRIGGER trg_srtn_overdue_lock"] + ["UPDATE supplier_return SET scrap_order_id=97130 WHERE id=97101"])
+expect_block_tx("退供 重放 拒绝：同一退供单再 hold(SCRAP_PENDING)（op_key SRTO:97101 已用；SQLite 先由 trg_hold_no_replace 拦，uq_hold_op 兜底）", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (97139,14,'SCRAP_PENDING','SCRAP','SCRAP',97101,'SRTO:97101',5000,0,'HELD',0)"], "hold_duplicate")
+_mc = sqlite3.connect(":memory:", isolation_level=None)
+try:
+    _mc.executescript(_mut_ddl(("ck", "uq_hold_op"))); _mc.execute("INSERT INTO sku (id,code,name,base_uom,temperature_required) VALUES (1,'SKU-APPLE','x','KG','CHILLED')"); _mc.execute("DROP TRIGGER trg_hold_no_replace")
+    _mc.execute(HOLD_INS); _mc.execute("INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (97139,14,'SCRAP_PENDING','SCRAP','SCRAP',97101,'SRTO:97101',5000,0,'HELD',0)")
+    ok("变异：去掉 uq_hold_op 与 trg_hold_no_replace 后，重放 hold(SCRAP_PENDING) 通过")
+except sqlite3.Error as e:
+    bad(f"变异：去掉 uq_hold_op 后重放仍被拒：{e}")
+finally:
+    _mc.close()
+_mc = sqlite3.connect(":memory:", isolation_level=None)
+try:
+    _mc.executescript(_mut_ddl(("ck", "uq_hold_op"))); _mc.execute("INSERT INTO sku (id,code,name,base_uom,temperature_required) VALUES (1,'SKU-APPLE','x','KG','CHILLED')"); _mc.execute(HOLD_INS); _mc.execute("INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (97139,14,'SCRAP_PENDING','SCRAP','SCRAP',97101,'SRTO:97101',5000,0,'HELD',0)")
+    bad("变异：只去掉 uq_hold_op，trg_hold_no_replace 没拦住重放")
+except sqlite3.IntegrityError as e:
+    ok(f"只去掉 uq_hold_op 时 trg_hold_no_replace 仍拦重放（{e}）") if str(e) == "hold_duplicate" else bad(f"重放拦错：{e}")
+finally:
+    _mc.close()
+_n = conn.execute("UPDATE supplier_return SET status='OVERDUE_SCRAP', overdue_at='2026-10-16 09:00:00', scrap_order_id=97101 WHERE id=97101 AND status='AWAITING_PICKUP'").rowcount; ok("退供 重放 转超期：条件更新 WHERE status='AWAITING_PICKUP' 影响 0 行" + f"（{_n}）") if _n == 0 else bad("退供 重放 转超期：条件更新 WHERE status='AWAITING_PICKUP' 影响 0 行" + f"：{_n}")
+expect_allow_tx("退供 重放 正向：同值重放转超期（终态不变）是 no-op", ["UPDATE supplier_return SET status='OVERDUE_SCRAP', overdue_at='2026-10-16 08:00:01', scrap_order_id=97101 WHERE id=97101"])
+expect_block_tx("退供 唯一 拒绝：已取消旧报损单后再给同一退供单开报损单（uq_scr_source 放过，uq_scr_srtn 拦）", ["INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (97134,'SCR-97134',1,'SUPPLIER_RETURN',97132,'PICKUP_OVERDUE','2026-10-16',0)"], "scrap_order.source_id")
+_tx_allow("变异：去掉 uq_scr_srtn 后，原被拒语句通过", ["DROP INDEX uq_scr_srtn", "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (97134,'SCR-97134',1,'SUPPLIER_RETURN',97132,'PICKUP_OVERDUE','2026-10-16',0)"])
+_tx_block("退供 唯一 拒绝：两张退供单挂同一报损单（绕过触发器后由 uq_srtn_scrap 兜底）", ["DROP TRIGGER trg_srtn_overdue", "DROP TRIGGER trg_srtn_forward", "UPDATE supplier_return SET status='OVERDUE_SCRAP', overdue_at='2026-10-30 09:00:00', scrap_order_id=97101 WHERE id=97103"], "supplier_return.scrap_order_id")
+_tx_allow("变异：去掉 uq_srtn_scrap 后，两张退供单挂同一报损单通过", ["DROP TRIGGER trg_srtn_overdue", "UPDATE supplier_return SET status='OVERDUE_SCRAP', overdue_at='2026-10-30 09:00:00', scrap_order_id=97101 WHERE id=97103", "DROP INDEX uq_srtn_scrap"][:1] + ["DROP TRIGGER trg_srtn_forward", "DROP INDEX uq_srtn_scrap"] + ["UPDATE supplier_return SET status='OVERDUE_SCRAP', overdue_at='2026-10-30 09:00:00', scrap_order_id=97101 WHERE id=97103"])
+# 并发：两个连接同时给退供单 97135 开报损单（BEGIN IMMEDIATE 串行，第二个等锁后撞唯一索引）
+import time as _time
+conn.execute("INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,status,created_by) VALUES (97135,'SRN-97135',1,501,14,1,1,5000,'QUALITY',NULL,false,'RETURN','FRESH','2026-10-15 08:00:00','2026-10-16 08:00:00','AWAITING_PICKUP',31)")
+_cc_res = []
+def _cc_scr(sid, hold_s):
+    wc = sqlite3.connect(dbf, timeout=30, isolation_level=None)
+    try:
+        wc.execute("BEGIN IMMEDIATE")
+        wc.execute(f"INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES ({sid},'SCR-{sid}',1,'SUPPLIER_RETURN',97135,'PICKUP_OVERDUE','2026-10-16',0)")
+        _time.sleep(hold_s)
+        wc.execute("COMMIT"); _cc_res.append("OK")
+    except sqlite3.Error as e:
+        try: wc.execute("ROLLBACK")
+        except sqlite3.Error: pass
+        _cc_res.append(str(e))
+    finally:
+        wc.close()
+_ths = [threading.Thread(target=_cc_scr, args=(97140, 0.5)), threading.Thread(target=_cc_scr, args=(97141, 0.0))]
+for _t in _ths: _t.start()
+for _t in _ths: _t.join()
+_n = one("SELECT count(*) FROM scrap_order WHERE source_type='SUPPLIER_RETURN' AND source_id=97135")[0]
+ok(f"退供 并发转超期：两连接同时开报损单，只成 1 张（{sorted(_cc_res)}）") if _n == 1 and _cc_res.count("OK") == 1 and any("scrap_order.source_id" in r or "uq_scr" in r or "source_type" in r for r in _cc_res) else bad(f"退供 并发：{_n} 张 {_cc_res}")
+print("=== 2s3. 退供 温区映射：FROZEN→FROZEN、CHILLED→FRESH、AMBIENT→STANDARD、AMBIENT+return_as_fresh→FRESH ===")
+expect_block("退供 温区 拒绝：冷藏 SKU 标 return_as_fresh", 'UPDATE sku SET return_as_fresh=true WHERE id=1', "ck_sku_rtn_fresh")
+srtn_mut("ck_sku_rtn_fresh", ("sub", " CONSTRAINT ck_sku_rtn_fresh CHECK (NOT return_as_fresh OR temperature_required = 'AMBIENT')"), [], 'UPDATE sku SET return_as_fresh=true WHERE id=1')
+expect_allow('退供 温区 正向：冷藏 → FRESH', "INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97150,'SRN-97150',1,501,14,1,1,5000,'QUALITY',NULL,false,'SCRAP','FRESH','2026-10-15 08:00:00',NULL,31)")
+expect_allow('退供 温区 正向：冷冻 → FROZEN', "INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97151,'SRN-97151',1,501,14,97001,1,5000,'QUALITY',NULL,false,'SCRAP','FROZEN','2026-10-15 08:00:00',NULL,31)")
+expect_allow('退供 温区 正向：常温 → STANDARD', "INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97152,'SRN-97152',1,501,14,97002,1,5000,'QUALITY',NULL,false,'SCRAP','STANDARD','2026-10-15 08:00:00',NULL,31)")
+expect_allow('退供 温区 正向：常温 + return_as_fresh → FRESH', "INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97153,'SRN-97153',1,501,14,97003,1,5000,'QUALITY',NULL,false,'SCRAP','FRESH','2026-10-15 08:00:00',NULL,31)")
+expect_allow('退供 温区 正向：常温 + return_as_fresh 退供，截止 T+24h', "INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97154,'SRN-97154',1,501,14,97003,1,5000,'QUALITY',NULL,false,'RETURN','FRESH','2026-10-15 08:00:00','2026-10-16 08:00:00',31)")
+expect_block('退供 温区 拒绝：冷藏标 STANDARD', "INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97159,'SRN-97159',1,501,14,1,1,5000,'QUALITY',NULL,false,'SCRAP','STANDARD','2026-10-15 08:00:00',NULL,31)", "srtn_temp_class_mismatch")
+expect_block('退供 温区 拒绝：冷冻标 FRESH', "INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97159,'SRN-97159',1,501,14,97001,1,5000,'QUALITY',NULL,false,'SCRAP','FRESH','2026-10-15 08:00:00',NULL,31)", "srtn_temp_class_mismatch")
+expect_block('退供 温区 拒绝：常温标 FRESH（无覆盖标记）', "INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97159,'SRN-97159',1,501,14,97002,1,5000,'QUALITY',NULL,false,'SCRAP','FRESH','2026-10-15 08:00:00',NULL,31)", "srtn_temp_class_mismatch")
+expect_block('退供 温区 拒绝：常温 + return_as_fresh 标 STANDARD（T+15d）', "INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97159,'SRN-97159',1,501,14,97003,1,5000,'QUALITY',NULL,false,'RETURN','STANDARD','2026-10-15 08:00:00','2026-10-30 08:00:00',31)", "srtn_temp_class_mismatch")
+expect_block('退供 温区 拒绝：未定义映射的温区 LIVE', "INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97159,'SRN-97159',1,501,14,97004,1,5000,'QUALITY',NULL,false,'SCRAP','FRESH','2026-10-15 08:00:00',NULL,31)", "srtn_temp_class_mismatch")
+expect_block('退供 温区 拒绝：SKU 不存在', "INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97159,'SRN-97159',1,501,14,999999,1,5000,'QUALITY',NULL,false,'SCRAP','FRESH','2026-10-15 08:00:00',NULL,31)", "srtn_temp_class_mismatch")
+expect_block('退供 温区 拒绝：建单后 UPDATE 改 temp_class', "UPDATE supplier_return SET temp_class='FROZEN' WHERE id=97150", "srtn_temp_class_mismatch")
+expect_block('退供 温区 拒绝：建单后 UPDATE 换成冷藏 SKU（类别仍 STANDARD）', 'UPDATE supplier_return SET sku_id=1 WHERE id=97152', "srtn_temp_class_mismatch")
+_tx_allow("变异：去掉 trg_srtn_temp_ins 后，冷藏 SKU 标 STANDARD 通过", ["DROP TRIGGER trg_srtn_temp_ins", "INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (97159,'SRN-97159',1,501,14,1,1,5000,'QUALITY',NULL,false,'SCRAP','STANDARD','2026-10-15 08:00:00',NULL,31)"])
+_tx_allow("变异：去掉 trg_srtn_temp_upd 后，建单后改 temp_class 通过", ["DROP TRIGGER trg_srtn_temp_upd", "UPDATE supplier_return SET temp_class='FROZEN' WHERE id=97150"])
+print("=== 2s4. 退供 时间与 0 行（pr03 同类）：格式、时钟窗口、只写一次、边界、孤儿报损单（SQLite 无角色，列级授权 N/A）===")
+def NOW(sec=0): return one("SELECT datetime('now', ?)", f"{sec} seconds")[0]
+def sr4(i, ready, disp='SCRAP', dl=None, extra_cols="", extra_vals=""):
+    d = "NULL" if dl is None else f"'{dl}'"
+    return SRTN_I.replace("created_by)", "created_by" + extra_cols + ")") + f"({i},'SRN-{i}',1,501,14,1,1,5000,'QUALITY',NULL,false,'{disp}','FRESH','{ready}',{d},31{extra_vals})"
+# 格式（种子模式，时钟触发器未装：只看 ck_srtn_ts）
+for _v, _d in [("2026/10/30 10:00:00", "斜杠"), ("zzzz", "非日期"), ("2026-10-15T08:00:00", "T 分隔"), ("2026-10-15 08:00:00+00:00", "+00:00 偏移"), ("2026-10-15 08:00:00+08:00", "+08:00 偏移"), ("2026-10-15 08:00:00.5", "小数秒"), ("2026-02-30 08:00:00", "不存在的日期")]:
+    expect_block(f"退供 格式 拒绝：ready_at {_d}（{_v}）", sr4(97160, _v), "ck_srtn_ts")
+srtn_mut("ck_srtn_ts（小数秒）", ("ck", "ck_srtn_ts"), [], sr4(97160, "2026-10-15 08:00:00.5"))
+srtn_mut("ck_srtn_ts（'zzzz' strftime NULL）", ("ck", "ck_srtn_ts"), [], sr4(97160, "zzzz"))
+expect_allow_tx("退供 格式 正向：整秒规范格式（随后回滚）", [sr4(97160, T0), "DELETE FROM supplier_return WHERE id=97160"])
+# 装回时钟触发器
+for _s in SRTN_CLOCK_SQL: conn.execute(_s)
+expect_block("退供 时钟 拒绝：'zzzz'（strftime 为 NULL 不能绕过）", sr4(97161, "zzzz"), "srtn_clock_skew")
+_tx_block("变异：时钟触发器去掉 IS NULL 分支后，'zzzz' 仍被 ck_srtn_ts 兜住（纵深）", ["DROP TRIGGER trg_srtn_clock_ins", "CREATE TRIGGER trg_srtn_clock_ins BEFORE INSERT ON supplier_return WHEN abs(CAST(strftime('%s', NEW.ready_at) AS INTEGER) - CAST(strftime('%s','now') AS INTEGER)) > 300 BEGIN SELECT RAISE(ABORT,'srtn_clock_skew'); END", sr4(97161, "zzzz")], "ck_srtn_ts")
+expect_block("退供 时钟 拒绝：'T' 分隔的当前时间（时钟内但非规范）", sr4(97161, NOW().replace(" ", "T")), "ck_srtn_ts")
+expect_block("退供 时钟 拒绝：倒签 ready_at（now−1d）", sr4(97161, NOW(-86400)), "srtn_clock_skew")
+_tx_allow("变异：去掉 trg_srtn_clock_ins 后，倒签 ready_at 通过", ["DROP TRIGGER trg_srtn_clock_ins", sr4(97161, NOW(-86400))])
+expect_block("退供 时钟 拒绝：预签 ready_at（now+1d）", sr4(97161, NOW(86400)), "srtn_clock_skew")
+expect_block("退供 时钟 拒绝：容差外 301 秒", sr4(97161, NOW(-301)), "srtn_clock_skew")
+expect_allow_tx("退供 时钟 正向：容差内 −290 秒（随后回滚）", [sr4(97161, NOW(-290)), "DELETE FROM supplier_return WHERE id=97161"])
+expect_block("退供 时钟 拒绝：越过 OPEN 直接 AWAITING_PICKUP 建单", sr4(97161, NOW(), 'RETURN', NOW(86400), ",status", ",'AWAITING_PICKUP'"), "srtn_insert_open_only")
+_tx_allow("变异：去掉 trg_srtn_ins_open 后，直接 AWAITING_PICKUP 建单通过", ["DROP TRIGGER trg_srtn_ins_open", sr4(97161, NOW(), 'RETURN', NOW(86400), ",status", ",'AWAITING_PICKUP'")])
+_r0 = NOW()
+_dl0 = one("SELECT datetime(?, '+24 hours')", _r0)[0]
+expect_allow("退供 时钟 正向：97170 以库时钟建单，退供生鲜截止 now+24h", sr4(97170, _r0, 'RETURN', _dl0))
+_shift = "UPDATE supplier_return SET ready_at=datetime(ready_at,'-1 hour'), pickup_deadline_at=datetime(pickup_deadline_at,'-1 hour') WHERE id=97170"
+expect_block("退供 只写一次 拒绝：建单后整体平移 ready_at / 截止", _shift, "srtn_time_immutable")
+_tx_allow("变异：去掉 trg_srtn_time_lock 后，平移通过", ["DROP TRIGGER trg_srtn_time_lock", _shift])
+expect_allow("退供 时钟 种子：97170 进待提货", "UPDATE supplier_return SET status='AWAITING_PICKUP' WHERE id=97170")
+_pk_bad = f"UPDATE supplier_return SET status='PICKED_UP', picked_up_at='{NOW(-3600)}' WHERE id=97170"
+expect_block("退供 时钟 拒绝：倒签 picked_up_at（now−1h）", _pk_bad, "srtn_clock_skew")
+_tx_allow("变异：去掉 trg_srtn_clock_upd 后，倒签提货通过", ["DROP TRIGGER trg_srtn_clock_upd", _pk_bad])
+_tx_allow("退供 时钟 正向：picked_up_at = 库时钟", [f"UPDATE supplier_return SET status='PICKED_UP', picked_up_at='{NOW()}' WHERE id=97170"])
+_od_seed = ["DROP TRIGGER trg_srtn_ins_open", "DROP TRIGGER trg_srtn_clock_ins",
+            sr4(97171, NOW(-90000), 'RETURN', NOW(-3600), ",status", ",'AWAITING_PICKUP'"),
+            "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (97171,'SCR-97171',1,'SUPPLIER_RETURN',97171,'PICKUP_OVERDUE','2026-10-16',0)",
+            "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (97171,14,'SCRAP_PENDING','SCRAP','SCRAP',97171,'SRTO:97171',5000,0,'HELD',0)"]
+_od = lambda t: f"UPDATE supplier_return SET status='OVERDUE_SCRAP', overdue_at='{t}', scrap_order_id=97171 WHERE id=97171"
+_tx_block("退供 时钟 拒绝：预签 overdue_at（now+1d）", _od_seed + [_od(NOW(86400))], "srtn_clock_skew")
+_tx_allow("变异：去掉 trg_srtn_clock_upd 后，预签超期通过", _od_seed + ["DROP TRIGGER trg_srtn_clock_upd", _od(NOW(86400))])
+_tx_allow("退供 时钟 正向：overdue_at = 库时钟", _od_seed + [_od(NOW())])
+print("=== 2s5. 退供 终审（小玛丽 srtn-final）：B2 状态机、N1 created_at（SQLite；B1 pg_temp 为 PG 专属）===")
+_w = lambda i, disp='RETURN': sr4(i, NOW(), disp, NOW(86400) if disp == 'RETURN' else None)
+_pk = [_w(97410), "UPDATE supplier_return SET status='AWAITING_PICKUP' WHERE id=97410", f"UPDATE supplier_return SET status='PICKED_UP', picked_up_at='{NOW()}' WHERE id=97410"]
+_tx_block("B2 拒绝：PICKED_UP → AWAITING_PICKUP 且清空 picked_up_at", _pk + ["UPDATE supplier_return SET status='AWAITING_PICKUP', picked_up_at=NULL WHERE id=97410"], "srtn_state_forward_only")
+_tx_allow("变异：去掉 trg_srtn_forward 后，PICKED_UP 回退通过", _pk + ["DROP TRIGGER trg_srtn_forward", "UPDATE supplier_return SET status='AWAITING_PICKUP', picked_up_at=NULL WHERE id=97410"])
+_tx_block("B2 拒绝：PICKED_UP 后改 picked_up_at（状态不变，容差内）", _pk + [f"UPDATE supplier_return SET picked_up_at='{NOW(-60)}' WHERE id=97410"], "srtn_time_immutable")
+_tx_allow("变异：去掉 trg_srtn_time_lock 后，改 picked_up_at 通过", _pk + ["DROP TRIGGER trg_srtn_time_lock", f"UPDATE supplier_return SET picked_up_at='{NOW(-60)}' WHERE id=97410"])
+_cx = [_w(97411, 'SCRAP'), "UPDATE supplier_return SET status='CANCELLED' WHERE id=97411"]
+_tx_block("B2 拒绝：CANCELLED → OPEN", _cx + ["UPDATE supplier_return SET status='OPEN' WHERE id=97411"], "srtn_state_forward_only")
+_tx_allow("变异：去掉 trg_srtn_forward 后，CANCELLED 复活通过", _cx + ["DROP TRIGGER trg_srtn_forward", "UPDATE supplier_return SET status='OPEN' WHERE id=97411"])
+_tx_allow("B2 正向：非 RETURN OPEN → DISPOSED", [_w(97412, 'DISCOUNT'), "UPDATE supplier_return SET status='DISPOSED' WHERE id=97412"])
+_ds = ["DROP TRIGGER trg_srtn_ins_open", sr4(97413, NOW(), 'RETURN', NOW(86400), ",status", ",'DISPOSED'")]
+_tx_block("B2 拒绝：DISPOSED → AWAITING_PICKUP", _ds + ["UPDATE supplier_return SET status='AWAITING_PICKUP' WHERE id=97413"], "srtn_state_forward_only")
+_tx_allow("变异：去掉 trg_srtn_forward 后，DISPOSED 复活通过", _ds + ["DROP TRIGGER trg_srtn_forward", "UPDATE supplier_return SET status='AWAITING_PICKUP' WHERE id=97413"])
+_tx_block("B2 拒绝：RETURN 处置 OPEN → DISPOSED", [_w(97414), "UPDATE supplier_return SET status='DISPOSED' WHERE id=97414"], "srtn_state_forward_only")
+_tx_allow("变异：去掉 trg_srtn_forward 后，RETURN 直接 DISPOSED 通过", [_w(97414), "DROP TRIGGER trg_srtn_forward", "UPDATE supplier_return SET status='DISPOSED' WHERE id=97414"])
+_tx_block("B2 拒绝：OPEN → PICKED_UP（跳过待提货）", [_w(97414), f"UPDATE supplier_return SET status='PICKED_UP', picked_up_at='{NOW()}' WHERE id=97414"], "srtn_state_forward_only")
+_tx_allow("变异：去掉 trg_srtn_forward 后，跳过待提货通过", [_w(97414), "DROP TRIGGER trg_srtn_forward", f"UPDATE supplier_return SET status='PICKED_UP', picked_up_at='{NOW()}' WHERE id=97414"])
+_ca = lambda v: sr4(97420, NOW(), 'SCRAP', None, ",created_at", f",'{v}'")
+expect_block("N1 拒绝：created_at = '1999-01-01 00:00:00'（倒签）", _ca("1999-01-01 00:00:00"), "srtn_clock_skew")
+_tx_allow("变异：去掉 trg_srtn_clock_ins 后，倒签 created_at 通过", ["DROP TRIGGER trg_srtn_clock_ins", _ca("1999-01-01 00:00:00")])
+expect_block("N1 拒绝：created_at 预签 now+1d", _ca(NOW(86400)), "srtn_clock_skew")
+expect_block("N1 拒绝：created_at = 'zzzz'（strftime NULL）", _ca("zzzz"), "srtn_clock_skew")
+expect_block("N1 拒绝：created_at 'T' 分隔（时钟内但非规范）", _ca(NOW().replace(" ", "T")), "ck_srtn_ts")
+srtn_mut("ck_srtn_ts（created_at 规范格式）", ("ck", "ck_srtn_ts"), [], _ca("2026-10-15T08:00:00"))
+_tx_allow("N1 正向：缺省 created_at（datetime('now')）与显式库时钟", [sr4(97421, NOW(), 'SCRAP'), _ca(NOW())])
+_tx_block("N1 拒绝：建单后改 created_at", [sr4(97421, NOW(), 'SCRAP'), "UPDATE supplier_return SET created_at=datetime(created_at,'-1 day') WHERE id=97421"], "srtn_time_immutable")
+_tx_allow("变异：去掉 trg_srtn_time_lock 后，改 created_at 通过", [sr4(97421, NOW(), 'SCRAP'), "DROP TRIGGER trg_srtn_time_lock", "UPDATE supplier_return SET created_at=datetime(created_at,'-1 day') WHERE id=97421"])
+_r = one("SELECT count(*) FROM supplier_return WHERE NOT (length(created_at) = 19 AND datetime(created_at) IS created_at)")[0]
+ok("N1 现有退供单 created_at 全部规范整秒") if _r == 0 else bad(f"N1 非规范 created_at {_r} 行")
+# 边界：按整秒，提货 = 截止 允许；超期 = 截止 拒绝（2s 已测）
+_bd_seed = [sr4(97172, T0, 'RETURN', '2026-10-16 08:00:00'), "UPDATE supplier_return SET status='AWAITING_PICKUP' WHERE id=97172"]
+_bd_pick = "UPDATE supplier_return SET status='PICKED_UP', picked_up_at='2026-10-16 08:00:00' WHERE id=97172"
+_tx_allow("退供 边界 正向：picked_up_at = 截止（同一秒）", [f"DROP TRIGGER {_t}" for _t in SRTN_CLOCK_TRG] + _bd_seed + [_bd_pick])
+_PK_LE = "CAST(strftime('%s', picked_up_at) AS INTEGER) <= CAST(strftime('%s', pickup_deadline_at) AS INTEGER)"
+_OD_GT = "CAST(strftime('%s', overdue_at) AS INTEGER) > CAST(strftime('%s', pickup_deadline_at) AS INTEGER)"
+def srtn_mut_red(desc, old, new, setup, stmt, want):
+    mc = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        txt = sqlite_ddl
+        assert txt.count(old) == 1, old
+        mc.executescript(txt.replace(old, new))
+        for _t in SRTN_CLOCK_TRG: mc.execute(f"DROP TRIGGER IF EXISTS {_t}")
+        mc.execute("INSERT INTO sku (id,code,name,base_uom,temperature_required) VALUES (1,'SKU-APPLE','x','KG','CHILLED')")
+        mc.execute(SRTN_SKU)
+        for st in setup: mc.execute(st)
+        mc.execute(stmt)
+        bad(f"变异：{desc} 后仍通过 —— 边界测试没变红")
+    except sqlite3.IntegrityError as e:
+        ok(f"变异：{desc} 后，边界语句被拒（变红：{e}）") if want in str(e) else bad(f"变异 {desc}：错误不对 {e}")
+    finally:
+        mc.close()
+srtn_mut_red("ck_srtn_picked 的 <= 改成 <", _PK_LE, _PK_LE.replace("<=", "<"), _bd_seed, _bd_pick, "ck_srtn_picked")
+srtn_mut("ck_srtn_overdue 的 > 改成 >=", ("rep", _OD_GT, _OD_GT.replace(" > ", " >= ")), [srtn(97101, 'QUALITY', None, False, 'RETURN', 'FRESH', '2026-10-16 08:00:00'), "UPDATE supplier_return SET status='AWAITING_PICKUP' WHERE id=97101", SCR_INS, HOLD_INS], early)
+_tx_block("退供 边界 拒绝：非规范 'T' 格式且晚 1 秒（整秒比较 / 格式检查任一拦截）", [f"DROP TRIGGER {_t}" for _t in SRTN_CLOCK_TRG] + _bd_seed + ["UPDATE supplier_return SET status='PICKED_UP', picked_up_at='2026-10-16T08:00:01' WHERE id=97172"], "ck_srtn_")
+# 孤儿报损单（0 行静默成功）
+_orph = [f"DROP TRIGGER {_t}" for _t in SRTN_CLOCK_TRG] + [sr4(97183, T0, 'RETURN', '2026-10-16 08:00:00', ",status", ",'AWAITING_PICKUP'"),
+         "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (97183,'SCR-97183',1,'SUPPLIER_RETURN',97183,'PICKUP_OVERDUE','2026-10-16',0)",
+         "UPDATE supplier_return SET status='OVERDUE_SCRAP', overdue_at='2026-10-16 09:00:00', scrap_order_id=97183 WHERE id=97183 AND status='PICKED_UP'"]
+_r = None
+conn.execute("BEGIN")
+try:
+    for st in _orph[:-1]: conn.execute(st)
+    _r = conn.execute(_orph[-1]).rowcount
+finally:
+    conn.execute("ROLLBACK")
+ok("退供 0 行 复现：转超期条件更新影响 0 行（服务端必须查 rowcount → 40930）") if _r == 0 else bad(f"0 行复现 rowcount={_r}")
+_tx_block("退供 0 行 拒绝：孤儿报损单不能提交审批", _orph + ["UPDATE scrap_order SET status='PENDING_APPROVAL' WHERE id=97183"], "srtn_scrap_orphan")
+_tx_allow("变异：去掉 trg_scr_srtn_upd 后，孤儿报损单提交通过", _orph + ["DROP TRIGGER trg_scr_srtn_upd", "UPDATE scrap_order SET status='PENDING_APPROVAL' WHERE id=97183"])
+_tx_allow("退供 0 行 正向：孤儿报损单可以取消", _orph + ["UPDATE scrap_order SET status='CANCELLED' WHERE id=97183"])
+_tx_allow("退供 0 行 正向：97101（已转超期且指回本单）报损单提交审批", ["UPDATE scrap_order SET status='PENDING_APPROVAL' WHERE id=97101"])
+_tx_block("退供 0 行 拒绝：给未进待提货（OPEN）的退供单开报损单", ["INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (97184,'SCR-97184',1,'SUPPLIER_RETURN',97104,'PICKUP_OVERDUE','2026-10-16',0)"], "srtn_scrap_not_awaiting")
+_tx_allow("变异：去掉 trg_scr_srtn_ins 后，给 OPEN 退供单开报损单通过", ["DROP TRIGGER trg_scr_srtn_ins", "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (97184,'SCR-97184',1,'SUPPLIER_RETURN',97104,'PICKUP_OVERDUE','2026-10-16',0)"])
 print("=== 汇总 ===")
 print(f"  通过 {passed} 项 / 失败 {failed} 项")
 conn.close()
