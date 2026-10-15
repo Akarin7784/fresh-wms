@@ -2923,9 +2923,9 @@ for _s in [
     "INSERT INTO delivery_order (id,outbound_id,waybill_id,stop_no,status) VALUES (9401,1,9401,1,'SHIPPED')",
     "INSERT INTO delivery_order (id,outbound_id,waybill_id,stop_no,status,valid_pod_id,root_pod_id) VALUES (9402,9402,9401,1,'DELIVERED',9403,9403)",
     "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (9401,'APR-WHSH01-20261015-009401','POD_CORRECT',1,'POD','9403','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','司机申请更正',101,NULL)",
-    "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,outbound_id,driver_id,correction_client_id,request_hash,status,response_http,auto_tolerance,correct_seq) VALUES (9401,9403,9401,9402,101,'00000000-0000-4000-8000-000000009401','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','PENDING',202,0,0)",
-    "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,outbound_id,driver_id,correction_client_id,request_hash,status,response_http,auto_tolerance,tolerance_version,correct_seq,decided_by,decided_at) VALUES (9402,9403,9401,9402,101,'00000000-0000-4000-8000-000000009402','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','APPLIED',200,1,1,1,102,'2026-10-15 05:00:00')",
-    "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,outbound_id,driver_id,correction_client_id,request_hash,status,approval_id,response_http,auto_tolerance,correct_seq) VALUES (9403,9403,9402,9402,102,'00000000-0000-4000-8000-000000009403','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','PENDING',9401,202,0,0)",
+    "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,status,response_http,auto_tolerance,correct_seq) VALUES (9401,9403,9401,9403,9402,101,'00000000-0000-4000-8000-000000009401','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','PENDING',202,0,0)",
+    "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,status,response_http,auto_tolerance,tolerance_version,correct_seq,decided_by,decided_at) VALUES (9402,9403,9401,9403,9402,101,'00000000-0000-4000-8000-000000009402','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','APPLIED',200,1,1,1,102,'2026-10-15 05:00:00')",
+    "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,status,approval_id,response_http,auto_tolerance,correct_seq) VALUES (9403,9403,9402,9403,9402,102,'00000000-0000-4000-8000-000000009403','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','PENDING',9401,202,0,0)",
     "INSERT INTO pod_tolerance_config (id,warehouse_id,sku_category,max_abs_qty_milli,max_pct_bp,version) VALUES (9401,1,'',500,100,1)",
     "INSERT INTO pod_tolerance_config (id,warehouse_id,sku_category,max_abs_qty_milli,max_pct_bp,version) VALUES (9402,1,'VEG',200,50,1)",
     "INSERT INTO delivery_return (id,waybill_id,stop_no,handover_seq,status) VALUES (9401,9401,1,1,'OPEN')",
@@ -2936,13 +2936,13 @@ for _s in [
     "INSERT INTO waybill (id,code,shipment_id,warehouse_id,work_date,status) VALUES (9410,'WB-SH01-0001-20261015-000010',9410,1,'2026-10-15','CREATED')",
     "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (9410,'OBT-16-9410',1,'SALE','MALL','M-16-9410','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'SHIPPED','2026-10-15')",
     "INSERT INTO delivery_order (id,outbound_id,waybill_id,stop_no,status) VALUES (9410,9410,9401,1,'SHIPPED')",
-    "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,outbound_id,driver_id,correction_client_id,request_hash,status,response_http,auto_tolerance,correct_seq) VALUES (9410,9402,9410,9402,103,'00000000-0000-4000-8000-000000009410','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','PENDING',202,0,0)",
+    "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,status,response_http,auto_tolerance,correct_seq) VALUES (9410,9402,9410,9402,9402,103,'00000000-0000-4000-8000-000000009410','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','PENDING',202,0,0)",
     # 生成器要能构造「只撞目标键」的冲突行：每个键至少两行可组合的样本
     "INSERT INTO shipment (id,code,warehouse_id,status) VALUES (9411,'SHP-9411',1,'CREATED')",
     "INSERT INTO waybill (id,code,shipment_id,warehouse_id,work_date,status) VALUES (9411,'WB-SH01-0001-20261015-000011',9411,1,'2026-10-15','CREATED')",
     "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (9411,'OBT-16-9411',1,'SALE','MALL','M-16-9411','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'SHIPPED','2026-10-15')",
     "INSERT INTO delivery_order (id,outbound_id,waybill_id,stop_no,status) VALUES (9411,9411,9401,1,'SHIPPED')",
-    "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,outbound_id,driver_id,correction_client_id,request_hash,status,response_http,auto_tolerance,correct_seq) VALUES (9411,9402,9411,9402,104,'00000000-0000-4000-8000-000000009411','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','PENDING',202,0,0)",
+    "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,status,response_http,auto_tolerance,correct_seq) VALUES (9411,9402,9411,9402,9402,104,'00000000-0000-4000-8000-000000009411','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','PENDING',202,0,0)",
     f"INSERT INTO pod_op (id,waybill_no,stop_no,device_instance_id,op_seq,op_type,req_hash,http_status,biz_code) VALUES (9411,'WB-SH01-0001-20261015-000001',0,'D9411',9,'LOAD','{_HASH}','200','0')",
 ]:
     conn.execute(_s)
@@ -4429,6 +4429,151 @@ _v5s = one("SELECT status FROM pick_task_line WHERE id=9405")[0]
 (ok if (_v5n, _v5s) == (1, 'DONE') else bad)(f"05 增量③变异：只减量不回退状态的旧写法，行仍是 DONE（{_v5n}/{_v5s}）")
 _t5m = conn.execute("UPDATE pick_task SET status='DONE' WHERE id=9405 AND status='EXECUTING' AND NOT EXISTS (SELECT 1 FROM pick_task_line l WHERE l.pick_task_id=9405 AND l.status IN ('PENDING','SKIP','ABNORMAL'))").rowcount
 (ok if _t5m == 1 else bad)(f"05 增量③变异：不回退状态时同一任务被判 DONE（证明回退是拦它的那条），实际 {_t5m}")
+print("=== 2w. docs/16 配送与签收：38 CHECK / 19 外键 / 3 部分唯一索引的三件套（正向 / 按名拒绝 / 变异）===")
+# 父行（96xx；warehouse 1 / sku 1 见最前面的 seed）。同一份列表也用于变异内存库。
+_S16_PARENT = [
+    "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date,quality_status,remaining_life_days) VALUES (9610,1,'LOT-16-9610','2026-12-01','2026-10-15','QUALIFIED',30)",
+    "INSERT INTO shipment (id,code,warehouse_id,status) VALUES (9610,'SHP-9610',1,'CREATED'),(9611,'SHP-9611',1,'CREATED'),(9612,'SHP-9612',1,'CREATED'),(9613,'SHP-9613',1,'CREATED'),(9614,'SHP-9614',1,'CREATED'),(9615,'SHP-9615',1,'CREATED'),(9616,'SHP-9616',1,'CREATED')",
+    "INSERT INTO waybill (id,code,shipment_id,warehouse_id,work_date,status) VALUES (9610,'WB-16-9610',9610,1,'2026-10-15','IN_TRANSIT')",
+    "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (9610,'OBT-16-9610',1,'SALE','MALL','M-16-9610','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'SHIPPED','2026-10-15'),(9611,'OBT-16-9611',1,'SALE','MALL','M-16-9611','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'SHIPPED','2026-10-15'),(9612,'OBT-16-9612',1,'SALE','MALL','M-16-9612','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'SHIPPED','2026-10-15'),(9613,'OBT-16-9613',1,'SALE','MALL','M-16-9613','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'SHIPPED','2026-10-15'),(9614,'OBT-16-9614',1,'SALE','MALL','M-16-9614','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'SHIPPED','2026-10-15'),(9615,'OBT-16-9615',1,'SALE','MALL','M-16-9615','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'SHIPPED','2026-10-15'),(9616,'OBT-16-9616',1,'SALE','MALL','M-16-9616','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'SHIPPED','2026-10-15')",
+    "INSERT INTO outbound_line (id,outbound_id,line_no,sku_id,order_qty_milli,picked_qty_milli,uom) VALUES (9610,9610,1,1,10000,10000,'KG')",
+    "INSERT INTO pod_op (id,waybill_no,stop_no,device_instance_id,op_seq,op_type,req_hash,http_status,biz_code,temperature_x10,delivered_at,correct_deadline_at) VALUES (9610,'WB-16-9610',1,'D9610',1,'POD_SIGN','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','200','0',40,'2026-10-15 02:00:00','2026-10-16 02:00:00')",
+    "INSERT INTO pod_op (id,waybill_no,stop_no,device_instance_id,op_seq,op_type,req_hash,http_status,biz_code) VALUES (9611,'WB-16-9610',0,'D9611',2,'LOAD','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','200','0'),(9612,'WB-16-9610',0,'D9612',3,'LOAD','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','200','0'),(9613,'WB-16-9610',0,'D9613',4,'LOAD','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','200','0'),(9614,'WB-16-9610',0,'D9614',5,'LOAD','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','200','0'),(9615,'WB-16-9610',0,'D9615',6,'LOAD','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','200','0'),(9671,'WB-16-9610',0,'D9671',7,'LOAD','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','200','0')",
+    "INSERT INTO delivery_return (id,waybill_id,stop_no,handover_seq,status) VALUES (9670,9610,1,90,'OPEN'),(9671,9610,1,91,'OPEN'),(9672,9610,1,92,'OPEN'),(9673,9610,1,93,'OPEN'),(9674,9610,1,94,'OPEN'),(9675,9610,1,95,'OPEN'),(9676,9610,1,96,'OPEN')",
+]
+for _q in _S16_PARENT:
+    try:
+        conn.execute(_q)
+    except sqlite3.Error as _e:
+        bad(f"16 准备父行失败：{_e}")
+conn.commit()
+_H = "a" * 64
+# 正向：9 张表各一条
+expect_allow("16 正向：waybill（CREATED + 快照列）", "INSERT INTO waybill (id,code,shipment_id,warehouse_id,driver_name,vehicle_no,work_date,status) VALUES (9671,'WB-16-9671',9611,1,'司机甲','沪A16','2026-10-15','CREATED')")
+expect_allow("16 正向：delivery_stop", "INSERT INTO delivery_stop (id,waybill_id,stop_no,display_status) VALUES (9671,9610,1,'PENDING')")
+expect_allow("16 正向：delivery_order（SHIPPED，无生效签收）", "INSERT INTO delivery_order (id,outbound_id,waybill_id,stop_no,status) VALUES (9671,9611,9610,1,'SHIPPED')")
+expect_allow("16 正向：pod_op（LOAD）", "INSERT INTO pod_op (id,waybill_no,stop_no,device_instance_id,op_seq,op_type,req_hash,http_status,biz_code) VALUES (9672,'WB-16-9610',0,'D9672',8,'LOAD','%s','200','0')" % _H)
+expect_allow("16 正向：pod_line", "INSERT INTO pod_line (id,pod_id,outbound_line_id,lot_id,shipped_qty_milli,rejected_qty_milli,receive_temp_c10) VALUES (9671,9610,9610,9610,10000,0,40)")
+expect_allow("16 正向：pod_correction（PENDING + 202）", "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,response_http,auto_tolerance) VALUES (9671,9610,9610,9610,9612,1,'00000000-0000-4000-8000-000000009671','%s','202',0)" % _H)
+expect_allow("16 正向：pod_tolerance_config", "INSERT INTO pod_tolerance_config (id,warehouse_id,sku_category,max_abs_qty_milli,max_pct_bp) VALUES (9671,1,'CHILLED',500,100)")
+expect_allow("16 正向：delivery_return（OPEN）", "INSERT INTO delivery_return (id,waybill_id,stop_no,handover_seq,status) VALUES (9677,9610,1,1,'OPEN')")
+expect_allow("16 正向：delivery_return_line", "INSERT INTO delivery_return_line (id,delivery_return_id,sku_id,lot_id,reported_qty_milli) VALUES (9671,9670,1,9610,5000)")
+
+def _mut16(desc, drop, stmts):
+    """变异：内存库里让该约束恒真（CHECK 用 `CHECK (1 OR …`，可覆盖多行约束）/ 删 FOREIGN KEY 行 / DROP INDEX 后，原被拒语句应当通过。"""
+    try:
+        mc = sqlite3.connect(":memory:", isolation_level=None)
+        mc.execute("PRAGMA foreign_keys=ON")
+        if drop[0] == "ck":
+            import re as _re
+            _txt, _n = _re.subn(rf"(CONSTRAINT\s+{_re.escape(drop[1])}\s+CHECK\s*\()", r"\g<1>1 OR ", sqlite_ddl, count=1)
+            assert _n == 1, drop
+            mc.executescript(_txt)
+        elif drop[0] == "ckmulti":   # 一次让多个 CHECK 恒真（语义重叠对）
+            import re as _re
+            _txt = sqlite_ddl
+            for _n in drop[1:]:
+                _txt, _k = _re.subn(rf"(CONSTRAINT\s+{_re.escape(_n)}\s+CHECK\s*\()", r"\g<1>1 OR ", _txt, count=1)
+                assert _k == 1, _n
+            mc.executescript(_txt)
+        elif drop[0] == "idx":
+            mc.executescript(sqlite_ddl); mc.execute(f"DROP INDEX {drop[1]}")
+        elif drop[0] == "fk":
+            _ls = sqlite_ddl.split("\n")
+            _ix = [i for i, l in enumerate(_ls) if f"CONSTRAINT {drop[1]} " in l]
+            assert len(_ix) == 1, (_ix, drop)
+            del _ls[_ix[0]]
+            mc.executescript("\n".join(_ls))
+        else:
+            mc.executescript(_mut_ddl(drop))
+        for _q in _MASTER_MIN: mc.execute(_q)
+        for _q in _S16_PARENT: mc.execute(_q)
+        for _q in stmts: mc.execute(_q)
+        ok(f"16 变异：去掉 {desc} 后，原被拒语句通过")
+    except (sqlite3.Error, AssertionError) as _e:
+        bad(f"16 变异：去掉 {desc} 后仍被拒：{_e}")
+
+_S16 = [
+    ("ck", "ck_wb_status", ["INSERT INTO waybill (id,code,shipment_id,warehouse_id,work_date,status) VALUES (9681,'WB-16-9681',9612,1,'2026-10-15','PENDING')"]),
+    ("ck", "ck_wb_version", ["INSERT INTO waybill (id,code,shipment_id,warehouse_id,work_date,status,waybill_version) VALUES (9682,'WB-16-9682',9613,1,'2026-10-15','CREATED',-1)"]),
+    ("ck", "ck_wb_signed", ["INSERT INTO waybill (id,code,shipment_id,warehouse_id,work_date,status) VALUES (9683,'WB-16-9683',9614,1,'2026-10-15','CLOSED')"]),
+    ("fk", "fk_wb_shipment", ["INSERT INTO waybill (id,code,shipment_id,warehouse_id,work_date,status) VALUES (9684,'WB-16-9684',999999,1,'2026-10-15','CREATED')"]),
+    ("fk", "fk_wb_wh", ["INSERT INTO waybill (id,code,shipment_id,warehouse_id,work_date,status) VALUES (9685,'WB-16-9685',9615,999999,'2026-10-15','CREATED')"]),
+    ("ck", "ck_dstop_no", ["INSERT INTO delivery_stop (id,waybill_id,stop_no,display_status) VALUES (9681,9610,0,'PENDING')"]),
+    ("ck", "ck_dstop_st", ["INSERT INTO delivery_stop (id,waybill_id,stop_no,display_status) VALUES (9682,9610,2,'X')"]),
+    ("fk", "fk_dstop_wb", ["INSERT INTO delivery_stop (id,waybill_id,stop_no,display_status) VALUES (9683,999999,1,'PENDING')"]),
+    ("ck", "ck_dord_cseq", ["INSERT INTO delivery_order (id,outbound_id,waybill_id,stop_no,status,correct_seq) VALUES (9682,9613,9610,1,'SHIPPED',-1)"]),
+    ("ck", "ck_dord_pod", ["INSERT INTO delivery_order (id,outbound_id,waybill_id,stop_no,status,valid_pod_id) VALUES (9683,9614,9610,1,'SHIPPED',9610)"]),
+    ("fk", "fk_dord_out", ["INSERT INTO delivery_order (id,outbound_id,waybill_id,stop_no,status) VALUES (9684,999999,9610,1,'SHIPPED')"]),
+    ("fk", "fk_dord_wb", ["INSERT INTO delivery_order (id,outbound_id,waybill_id,stop_no,status) VALUES (9685,9615,999999,1,'SHIPPED')"]),
+    ("ck", "ck_pod_op_type", ["INSERT INTO pod_op (id,waybill_no,stop_no,device_instance_id,op_seq,op_type,req_hash,http_status,biz_code) VALUES (9681,'WB-16-9610',1,'D96A',1,'X','%s','200','0')" % _H]),
+    ("ck", "ck_pod_op_hash", ["INSERT INTO pod_op (id,waybill_no,stop_no,device_instance_id,op_seq,op_type,req_hash,http_status,biz_code) VALUES (9682,'WB-16-9610',1,'D96B',1,'LOAD','abc','200','0')"]),
+    ("ck", "ck_pod_op_seq", ["INSERT INTO pod_op (id,waybill_no,stop_no,device_instance_id,op_seq,op_type,req_hash,http_status,biz_code) VALUES (9683,'WB-16-9610',1,'D96C',-1,'LOAD','%s','200','0')" % _H]),
+    ("ck", "ck_pod_op_cache", ["INSERT INTO pod_op (id,waybill_no,stop_no,device_instance_id,op_seq,op_type,req_hash,http_status,biz_code) VALUES (9684,'WB-16-9610',1,'D96D',1,'LOAD','%s','200','X')" % _H]),
+    ("ck", "ck_pod_op_temp", ["INSERT INTO pod_op (id,waybill_no,stop_no,device_instance_id,op_seq,op_type,req_hash,http_status,biz_code,temperature_x10,delivered_at,correct_deadline_at) VALUES (9685,'WB-16-9610',1,'D96E',1,'POD_SIGN','%s','200','0',NULL,'2026-10-15 02:00:00','2026-10-16 02:00:00')" % _H]),
+    ("ck", "ck_pod_op_cdl", ["INSERT INTO pod_op (id,waybill_no,stop_no,device_instance_id,op_seq,op_type,req_hash,http_status,biz_code,temperature_x10) VALUES (9686,'WB-16-9610',1,'D96F',1,'POD_SIGN','%s','200','0',40)" % _H]),
+    ("ck", "ck_pod_op_cdl24", ["INSERT INTO pod_op (id,waybill_no,stop_no,device_instance_id,op_seq,op_type,req_hash,http_status,biz_code,temperature_x10,delivered_at,correct_deadline_at) VALUES (9687,'WB-16-9610',1,'D96G',1,'POD_SIGN','%s','200','0',40,'2026-10-15 02:00:00','2026-10-15 03:00:00')" % _H]),
+    ("ck", "ck_pod_op_cct", ["INSERT INTO pod_op (id,waybill_no,stop_no,device_instance_id,op_seq,op_type,req_hash,http_status,biz_code,client_occurred_at) VALUES (9688,'WB-16-9610',0,'D96H',9,'LOAD','%s','200','0','2026-10-15 02:00:00.5')" % _H]),
+    ("ck", "ck_podl_qty", ["INSERT INTO pod_line (id,pod_id,outbound_line_id,lot_id,shipped_qty_milli,rejected_qty_milli,reason_code,receive_temp_c10) VALUES (9681,9671,9610,9610,10000,20000,'QUALITY',40)"]),
+    ("ck", "ck_podl_rsn", ["INSERT INTO pod_line (id,pod_id,outbound_line_id,lot_id,shipped_qty_milli,rejected_qty_milli,receive_temp_c10) VALUES (9682,9611,9610,9610,10000,5000,40)"]),
+    ("ck", "ck_podl_rsn_v", ["INSERT INTO pod_line (id,pod_id,outbound_line_id,lot_id,shipped_qty_milli,rejected_qty_milli,reason_code,receive_temp_c10) VALUES (9683,9612,9610,9610,10000,5000,'X',40)"]),
+    ("ck", "ck_podl_temp", ["INSERT INTO pod_line (id,pod_id,outbound_line_id,lot_id,shipped_qty_milli,rejected_qty_milli,receive_temp_c10) VALUES (9684,9613,9610,9610,10000,0,700)"]),
+    ("fk", "fk_podl_pod", ["INSERT INTO pod_line (id,pod_id,outbound_line_id,lot_id,shipped_qty_milli,rejected_qty_milli,receive_temp_c10) VALUES (9685,999999,9610,9610,10000,0,40)"]),
+    ("fk", "fk_podl_obl", ["INSERT INTO pod_line (id,pod_id,outbound_line_id,lot_id,shipped_qty_milli,rejected_qty_milli,receive_temp_c10) VALUES (9686,9614,999999,9610,10000,0,40)"]),
+    ("fk", "fk_podl_lot", ["INSERT INTO pod_line (id,pod_id,outbound_line_id,lot_id,shipped_qty_milli,rejected_qty_milli,receive_temp_c10) VALUES (9687,9615,9610,999999,10000,0,40)"]),
+    ("ck", "ck_podc_client", ["INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,response_http,auto_tolerance) VALUES (9681,9610,9610,9610,9613,1,'00000000-0000-4000-8000-00000000967','%s','202',0)" % _H]),
+    ("ck", "ck_podc_hash", ["INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,response_http,auto_tolerance) VALUES (9682,9610,9610,9610,9613,1,'00000000-0000-4000-8000-000000009682','%s','202',0)" % ("a" * 63)]),
+    ("ck", "ck_podc_status", ["INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,status,response_http,auto_tolerance) VALUES (9683,9610,9610,9610,9613,1,'00000000-0000-4000-8000-000000009683','%s','X','202',0)" % _H]),
+    ("ck", "ck_podc_http", ["INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,response_http,auto_tolerance) VALUES (9684,9610,9610,9610,9613,1,'00000000-0000-4000-8000-000000009684','%s','200',0)" % _H]),
+    ("ck", "ck_podc_auto", ["INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,response_http,auto_tolerance,tolerance_version) VALUES (9685,9610,9610,9610,9613,1,'00000000-0000-4000-8000-000000009685','%s','200',1,NULL)" % _H]),
+    ("ck", "ck_podc_seq", ["INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,status,response_http,auto_tolerance,correct_seq,decided_by,decided_at) VALUES (9686,9610,9610,9610,9613,1,'00000000-0000-4000-8000-000000009686','%s','APPLIED','202',0,0,2,'2026-10-15 09:00:00')" % _H]),
+    ("ck", "ck_podc_sod", ["INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,status,response_http,auto_tolerance,correct_seq,decided_by,decided_at) VALUES (9687,9610,9610,9610,9613,1,'00000000-0000-4000-8000-000000009687','%s','APPLIED','202',0,1,1,'2026-10-15 09:00:00')" % _H]),
+    ("ck", "ck_podc_decide", ["INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,status,response_http,auto_tolerance,correct_seq) VALUES (9688,9610,9610,9610,9614,1,'00000000-0000-4000-8000-000000009688','%s','APPLIED','202',0,1)" % _H]),
+    ("fk", "fk_podc_op", ["INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,response_http,auto_tolerance) VALUES (9689,999999,9610,9610,9615,1,'00000000-0000-4000-8000-000000009689','%s','202',0)" % _H]),
+    ("fk", "fk_podc_root", ["INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,response_http,auto_tolerance) VALUES (9690,9610,9610,999999,9615,1,'00000000-0000-4000-8000-000000009690','%s','202',0)" % _H]),
+    ("fk", "fk_podc_out", ["INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,response_http,auto_tolerance) VALUES (9691,9610,9610,9610,999999,1,'00000000-0000-4000-8000-000000009691','%s','202',0)" % _H]),
+    ("fk", "fk_podc_apr", ["INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,approval_id,response_http,auto_tolerance) VALUES (9692,9610,9610,9610,9615,1,'00000000-0000-4000-8000-000000009692','%s',999999,'202',0)" % _H]),
+    ("ck", "ck_podt_cat", ["INSERT INTO pod_tolerance_config (id,warehouse_id,sku_category,max_abs_qty_milli,max_pct_bp) VALUES (9681,1,' X',500,100)"]),
+    ("ck", "ck_podt_abs", ["INSERT INTO pod_tolerance_config (id,warehouse_id,sku_category,max_abs_qty_milli,max_pct_bp) VALUES (9682,1,'A',-1,100)"]),
+    ("ck", "ck_podt_pct", ["INSERT INTO pod_tolerance_config (id,warehouse_id,sku_category,max_abs_qty_milli,max_pct_bp) VALUES (9683,1,'B',500,10001)"]),
+    ("ck", "ck_podt_notblank", ["INSERT INTO pod_tolerance_config (id,warehouse_id,sku_category,max_abs_qty_milli,max_pct_bp) VALUES (9684,1,'C',0,0)"]),
+    ("fk", "fk_podt_wh", ["INSERT INTO pod_tolerance_config (id,warehouse_id,sku_category,max_abs_qty_milli,max_pct_bp) VALUES (9685,999999,'D',500,100)"]),
+    ("ck", "ck_dret_seq", ["INSERT INTO delivery_return (id,waybill_id,stop_no,handover_seq,status) VALUES (9681,9610,2,0,'OPEN')"]),
+    ("ck", "ck_dret_status", ["INSERT INTO delivery_return (id,waybill_id,stop_no,handover_seq,status) VALUES (9682,9610,2,2,'X')"]),
+    ("ck", "ck_dret_cnt", ["INSERT INTO delivery_return (id,waybill_id,stop_no,handover_seq,status) VALUES (9683,9610,2,3,'COUNTED')"]),
+    ("ck", "ck_dret_cancel", ["INSERT INTO delivery_return (id,waybill_id,stop_no,handover_seq,status) VALUES (9684,9610,2,4,'CANCELLED')"]),
+    ("fk", "fk_dret_wb", ["INSERT INTO delivery_return (id,waybill_id,stop_no,handover_seq,status) VALUES (9685,999999,1,5,'OPEN')"]),
+    ("fk", "fk_dret_rtn", ["INSERT INTO delivery_return (id,waybill_id,stop_no,handover_seq,status,rtn_inbound_id) VALUES (9686,9610,2,6,'OPEN',999999)"]),
+    ("ck", "ck_dretl_qty", ["INSERT INTO delivery_return_line (id,delivery_return_id,sku_id,lot_id,reported_qty_milli) VALUES (9681,9671,1,9610,-1)"]),
+    ("ck", "ck_dretl_exc", ["INSERT INTO delivery_return_line (id,delivery_return_id,sku_id,lot_id,reported_qty_milli,counted_qty_milli) VALUES (9682,9672,1,9610,5000,4000)"]),
+    ("fk", "fk_dretl_ret", ["INSERT INTO delivery_return_line (id,delivery_return_id,sku_id,lot_id,reported_qty_milli) VALUES (9683,999999,1,9610,5000)"]),
+    ("fk", "fk_dretl_sku", ["INSERT INTO delivery_return_line (id,delivery_return_id,sku_id,lot_id,reported_qty_milli) VALUES (9684,9673,999999,9610,5000)"]),
+    ("fk", "fk_dretl_lot", ["INSERT INTO delivery_return_line (id,delivery_return_id,sku_id,lot_id,reported_qty_milli) VALUES (9685,9674,1,999999,5000)"]),
+    ("fk", "fk_dretl_exc", ["INSERT INTO delivery_return_line (id,delivery_return_id,sku_id,lot_id,reported_qty_milli,counted_qty_milli,exception_case_id) VALUES (9686,9675,1,9610,5000,5000,999999)"]),
+    ("idx", "uq_podc_approval", ["INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,approval_id,response_http,auto_tolerance) VALUES (9693,9610,9701,9610,9616,1,'00000000-0000-4000-8000-000000009693','%s',(SELECT max(id) FROM approval_request),'202',0)" % _H,
+                                 "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,approval_id,response_http,auto_tolerance) VALUES (9694,9610,9702,9610,9616,1,'00000000-0000-4000-8000-000000009694','%s',(SELECT max(id) FROM approval_request),'202',0)" % _H]),
+    ("idx", "uq_podc_pending", ["INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,response_http,auto_tolerance) VALUES (9695,9610,9610,9610,9615,1,'00000000-0000-4000-8000-000000009695','%s','202',0)" % _H,
+                                "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,response_http,auto_tolerance) VALUES (9696,9610,9610,9610,9615,1,'00000000-0000-4000-8000-000000009696','%s','202',0)" % _H]),
+    ("idx", "uq_podc_seq", ["INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,status,response_http,auto_tolerance,correct_seq,decided_by,decided_at) VALUES (9697,9610,9610,9610,9616,1,'00000000-0000-4000-8000-000000009697','%s','APPLIED','202',0,1,2,'2026-10-15 09:00:00')" % _H,
+                            "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,root_pod_op_id,outbound_id,driver_id,correction_client_id,request_hash,status,response_http,auto_tolerance,correct_seq,decided_by,decided_at) VALUES (9698,9610,9610,9610,9616,1,'00000000-0000-4000-8000-000000009698','%s','APPLIED','202',0,1,2,'2026-10-15 09:00:00')" % _H]),
+]
+for _k, _n, _stmts in _S16:
+    if _k == "ck":
+        expect_block_tx(f"16 拒绝：{_n}", _stmts, _n)
+        _mut16(_n, ("ck", _n), _stmts)
+    elif _k == "fk":
+        expect_block_tx(f"16 拒绝：{_n}", _stmts, "FOREIGN KEY constraint failed")
+        _mut16(_n, ("fk", _n), _stmts)
+    else:
+        # 部分唯一索引：SQLite 侧守卫（`trg_podc_no_replace`）先于唯一索引命中，所以按名拒绝到的是 `pod_correction_duplicate`；
+        # 索引本身的逐键实打由 2z3b 覆盖（三个部分唯一索引的谓词样本行已在前面提交），PG 段另有 `uq_podc_*` 的按名拒绝 + DROP INDEX 变异。
+        expect_block_tx(f"16 拒绝：{_n}（SQLite 由 no-REPLACE 守卫先拦）", _stmts, "pod_correction_duplicate")
+# ck_dord_status 与 ck_dord_pod 语义重叠：SQLite 先报 ck_dord_status（PG 先报 ck_dord_pod，见 verify.sh），各自按实际拦它的那条断言
+expect_block_tx("16 拒绝：ck_dord_status（与 ck_dord_pod 重叠，SQLite 先报它）",
+                ["INSERT INTO delivery_order (id,outbound_id,waybill_id,stop_no,status) VALUES (9681,9612,9610,1,'X')"], "ck_dord_status")
+_mut16("ck_dord_status + ck_dord_pod", ("ckmulti", "ck_dord_status", "ck_dord_pod"),
+       ["INSERT INTO delivery_order (id,outbound_id,waybill_id,stop_no,status) VALUES (9681,9612,9610,1,'X')"])
+
 print("=== 汇总 ===")
 print(f"  通过 {passed} 项 / 失败 {failed} 项")
 conn.close()

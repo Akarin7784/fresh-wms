@@ -3311,9 +3311,16 @@ BEGIN SELECT RAISE(ABORT, 'api_credential_clock_skew'); END;
 -- 16 配送与签收（运单 / 配送站点 / 签收聚合 / POD 现场操作 / 更正 / 容差 / 回仓交接）
 --   文档：docs/16-配送与签收.md。表与约束以本文件为准。
 --   本轮（第一刀）：9 张表 + PK/UK/FK/CHECK + 索引 + 授权 + 只追加与重放只读触发器。
---   下一刀（已登记 docs/16 §12）：9 张表的 SQLite no-REPLACE 守卫（00 §6.10 新表要求）、
---     两库「正向 / 按名拒绝 / 变异」断言、verify.sh 的 EXPECT_TABLES/INDEXES/PRIVS 与
---     触发器冻结基线（归磐石，随 SCHEMA_PARTS 一并改）。
+--   本轮（2026-10-16，Chief 裁定 Q16-2 = 修法 ④ / Q16-4）：
+--     · 更正不新增 `pod_line` 行，而是**就地 UPDATE** 被更正签收的 `pod_line` 行；
+--       `pod_line.pod_id = pod_correction.correct_op_id`（`correct_op_id` = 拥有这批签收行的 `pod_op.id`）。
+--       这样 `fk_podl_pod` 与 `uq_podl(pod_id, outbound_line_id, lot_id)` 同时成立，不需要 `correction_seq`。
+--       实测反例见 docs/16 §11.3（`pod_id = pod_correction.id` 撞 `fk_podl_pod`；`pod_id = corrected_pod_id` 撞 `uq_podl`）。
+--     · `pod_correction` 新增 `root_pod_op_id`（FK → `pod_op(id)`）：链根遍历与真实外键落点；
+--       `corrected_pod_id` 是"基于哪一版"的**信息列、无 FK**（首签时是 `pod_op.id`、链式更正时是 `pod_correction.id`，单列 FK 不可兼得）。
+--     · 就地覆盖后 `pod_line` 里只剩最新值 ⇒ 更正落库**必须同事务**把更正前值写进 12 篇 `audit_log`（验收项，见 docs/16 §6.3、docs/12 §8）。
+--     · `delivery_return_line.lot_id` 改 **NOT NULL**（`uq_dretl` 含 `lot_id`，可空会让 NULL 批次绕过去重）。
+--     · 两库「正向 / 按名拒绝 / 变异」断言 + 触发器冻结基线在 verify.sh / verify_sqlite.py 的 16 段（归镜鉴）。
 --   边界（Chief 已拍）：司机 / 车辆 / 发车 / 签收的权威与快照都在本文件；06 `shipment`
 --     只留 `carrier_code` + 交接字段，`vehicle_no` / `driver_*` / `planned_depart_at` /
 --     `departed_at` / `signed_at` / `temp_log_ref` 随 16 落库那一笔从 06 删掉；
@@ -3434,6 +3441,9 @@ CREATE TABLE pod_op (
 CREATE INDEX ix_pod_op_dev  ON pod_op(device_instance_id, waybill_no, stop_no, op_seq);
 CREATE INDEX ix_pod_op_stop ON pod_op(waybill_no, stop_no, created_at);
 
+-- 签收行：`pod_id` = 拥有这批行的 `pod_op.id`（首签 op，或更正时的 `pod_correction.correct_op_id`）。
+-- 更正执行 = 就地 UPDATE 这些行（不改 `pod_id` / `outbound_line_id` / `lot_id`），因此 uq_podl 不会被撞；
+-- 变更留痕在 `pod_correction`（每版一条）与 `audit_log`（12 篇）。
 CREATE TABLE pod_line (
     id                  BIGINT       PRIMARY KEY,
     pod_id              BIGINT       NOT NULL,
@@ -3458,8 +3468,9 @@ CREATE INDEX ix_podl_pod ON pod_line(pod_id, outbound_line_id);
 
 CREATE TABLE pod_correction (
     id                  BIGINT       PRIMARY KEY,                    -- 同时是更正后的签收 id
-    correct_op_id       BIGINT       NOT NULL,
-    corrected_pod_id    BIGINT       NOT NULL,                       -- 被更正的生效签收
+    correct_op_id       BIGINT       NOT NULL,                       -- 被更正的首签 pod_op.id（就地 UPDATE 它名下那批 pod_line 行）
+    corrected_pod_id    BIGINT       NOT NULL,                       -- 本次更正"基于哪一版"签收（信息列，**无 FK**：可能是 pod_op.id 或 pod_correction.id）
+    root_pod_op_id      BIGINT       NOT NULL,                       -- 链根：首次签收的 pod_op.id，链式更正不变（FK 落在它上面，用于链根遍历）
     outbound_id         BIGINT       NOT NULL,
     driver_id           BIGINT       NOT NULL,
     correction_client_id VARCHAR(36) NOT NULL,
@@ -3475,6 +3486,7 @@ CREATE TABLE pod_correction (
     created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT uq_podc_client   UNIQUE (driver_id, correction_client_id),
     CONSTRAINT fk_podc_op       FOREIGN KEY (correct_op_id)    REFERENCES pod_op(id),
+    CONSTRAINT fk_podc_root     FOREIGN KEY (root_pod_op_id)   REFERENCES pod_op(id),
     CONSTRAINT fk_podc_out      FOREIGN KEY (outbound_id)      REFERENCES outbound_order(id),
     CONSTRAINT fk_podc_apr      FOREIGN KEY (approval_id)      REFERENCES approval_request(id),
     CONSTRAINT ck_podc_client   CHECK (length(correction_client_id) = 36),
@@ -3537,7 +3549,7 @@ CREATE TABLE delivery_return_line (
     id                  BIGINT       PRIMARY KEY,
     delivery_return_id  BIGINT       NOT NULL,
     sku_id              BIGINT       NOT NULL,
-    lot_id              BIGINT,
+    lot_id              BIGINT       NOT NULL,                       -- 拒收 RTN 必带批次（第 10 篇）；NOT NULL 才能让 uq_dretl 真的去重
     reported_qty_milli  BIGINT       NOT NULL,                       -- 司机登记（装车未签收量）
     counted_qty_milli   BIGINT,                                      -- 实点，未点为空
     exception_case_id   BIGINT,                                      -- 第 10 篇异常单
