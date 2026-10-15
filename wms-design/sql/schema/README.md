@@ -22,6 +22,7 @@
 | `12_auth.sql` | 用户、角色、权限、API 凭证 |
 | `12b_auth_audit.sql` | 设备绑定、离线令牌、审批单；audit_log 节点列与只追加；sys_user.perm_version |
 | `17_processing.sql` | 加工 BOM、加工单、领料、产出、冲回、批次追溯 |
+| `18_live.sql` | 第 18 篇活鲜暂存：池扩展、只数账、巡检、锁池单、出池称重、死亡、日失重（只建本篇表，不改 02 约束；跨篇外键待补见 docs/18 §4.11） |
 | `90_available_view.sql` | `v_stock_available`，然后 `COMMIT` |
 | `99_grants.sql` | 事务外执行：`wms_purge_owner` / `wms_cleaner` / `purge_expired()` |
 
