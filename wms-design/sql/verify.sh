@@ -2604,7 +2604,7 @@ echo "=== 2z. pg_temp 劫持（#2 第九轮）：search_path 必须显式写 pg_
 # SQLite 没有对应攻击面：没有 schema 搜索路径，TEMP 表只对本连接可见，触发器体里的表名在建触发器时就绑到 main（不跟会话走），verify_sqlite.py 不加对应用例。
 # 目录断言：public 里所有带 search_path 设置的函数（含退供增量自带的 5 个，米雪儿已按本规则写）都必须正好是 pg_catalog, public, pg_temp。
 R=$(psql -t -A -c "SELECT count(*) FILTER (WHERE c <> 'search_path=pg_catalog, public, pg_temp') || '/' || count(*) FROM (SELECT unnest(p.proconfig) c FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace) s WHERE c LIKE 'search_path=%'")
-[ "$R" = "0/84" ] && ok "pg_temp 目录断言：84 个固定 search_path 的函数都显式以 pg_temp 结尾（不合规/总数 = $R）" || bad "pg_temp 目录断言：不合规/总数 = $R（期望 0/84）"
+[ "$R" = "0/86" ] && ok "pg_temp 目录断言：86 个固定 search_path 的函数都显式以 pg_temp 结尾（不合规/总数 = $R）" || bad "pg_temp 目录断言：不合规/总数 = $R（期望 0/86）"
 # 通用断言（不限函数个数）：public 下任何函数只要设了 search_path，pg_temp 必须是最后一项
 R=$(psql -t -A -c "SELECT count(*) FILTER (WHERE c !~ ',\s*pg_temp\s*$') || '/' || count(*) || '#' || COALESCE(string_agg(proname, ',') FILTER (WHERE c !~ ',\s*pg_temp\s*$'), '') FROM (SELECT p.proname, c FROM pg_proc p, unnest(p.proconfig) c WHERE p.pronamespace = 'public'::regnamespace AND c LIKE 'search_path=%') s")
 [ "${R%%/*}" = "0" ] && ok "pg_temp 末位断言：public 下设了 search_path 的函数 pg_temp 都在最后（缺/总 = ${R%%#*}）" || bad "pg_temp 末位断言：缺/总 = ${R%%#*}，函数：${R#*#}"
@@ -2656,7 +2656,7 @@ echo "  → fixed/mut：02[$A0 | $A1] 09[$B0 | $B1] 11[$C0 | $C1] 12[$D0 | $D1]"
 [ "$B0" = "scrap_line_locked" ] && ok "pg_temp 劫持 09 trg_scrl_draft_only：临时表 scrap_order 把已取消单伪造成 DRAFT，函数仍读 public → $B0" || bad "09 pg_temp 劫持：$B0（期望 scrap_line_locked）"
 [ "$C0" = "PT_PASSED" ] && ok "pg_temp 劫持 11 trg_outbox_order_guard：临时表 outbox_event 伪造同 biz_key 更早的 PENDING 行想卡住投递，函数仍读 public，真实事件照常进 SENDING（$C0）" || bad "11 pg_temp 劫持：$C0（期望正常放行 PT_PASSED）"
 [ "$D0" = "approval_code_warehouse_mismatch" ] && ok "pg_temp 劫持 12 trg_apr_insert：临时表 warehouse 把仓 1 编码伪造成 PTFAKE，函数仍读 public → $D0" || bad "12 pg_temp 劫持：$D0（期望 approval_code_warehouse_mismatch）"
-[ "$PC1" = "4/84" ] && ok "变异：四个函数去掉 pg_temp 后目录断言变红（$PC1）" || bad "变异目录断言没变红：$PC1（期望 4/84）"
+[ "$PC1" = "4/86" ] && ok "变异：四个函数去掉 pg_temp 后目录断言变红（$PC1）" || bad "变异目录断言没变红：$PC1（期望 4/86）"
 [ "$A1" != "$A0" ] && ok "变异：trg_mvk_line_kind 去掉 pg_temp 后临时表劫持生效（$A1）" || bad "变异没变红：trg_mvk_line_kind 去掉 pg_temp 后仍是 $A1"
 [ "$B1" != "$B0" ] && ok "变异：trg_scrl_draft_only 去掉 pg_temp 后临时表劫持生效（$B1）" || bad "变异没变红：trg_scrl_draft_only 去掉 pg_temp 后仍是 $B1"
 [ "$C1" != "$C0" ] && ok "变异：trg_outbox_order_guard 去掉 pg_temp 后临时表劫持生效（$C1）" || bad "变异没变红：trg_outbox_order_guard 去掉 pg_temp 后仍是 $C1"

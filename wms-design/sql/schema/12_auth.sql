@@ -13,7 +13,10 @@ CREATE TABLE sys_user (
     last_login_at   TIMESTAMP,
     created_at      TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),   -- 00 §6.8：UTC 整秒
     deleted_at      TIMESTAMP,
-    CONSTRAINT uq_user_name UNIQUE (username)
+    CONSTRAINT uq_user_name UNIQUE (username),
+    -- 00 §6.8：本篇自有表的时间列一律 UTC 整秒（镜鉴第二轮时间加固；与 12b 的 *_zclock 覆盖配套）
+    CONSTRAINT ck_user_ts CHECK ((created_at = date_trunc('second', created_at)) AND (last_login_at IS NULL OR last_login_at = date_trunc('second', last_login_at)) AND (deleted_at IS NULL OR deleted_at = date_trunc('second', deleted_at)))  -- @pg-only
+-- @sqlite-only     CONSTRAINT ck_user_ts CHECK ((created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(created_at) IS created_at AND substr(created_at, 12, 2) <= '23') AND (last_login_at IS NULL OR (last_login_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(last_login_at) IS last_login_at AND substr(last_login_at, 12, 2) <= '23')) AND (deleted_at IS NULL OR (deleted_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(deleted_at) IS deleted_at AND substr(deleted_at, 12, 2) <= '23')))
 );
 CREATE INDEX ix_user_openid ON sys_user(mp_openid) WHERE mp_openid IS NOT NULL;
 
@@ -51,7 +54,9 @@ CREATE TABLE api_credential (
     status           VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
     ip_whitelist     VARCHAR(256),
     last_used_at     TIMESTAMP,
-    CONSTRAINT uq_api_key UNIQUE (api_key)
+    CONSTRAINT uq_api_key UNIQUE (api_key),
+    CONSTRAINT ck_api_ts CHECK (last_used_at IS NULL OR last_used_at = date_trunc('second', last_used_at))  -- @pg-only
+-- @sqlite-only     CONSTRAINT ck_api_ts CHECK (last_used_at IS NULL OR (last_used_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(last_used_at) IS last_used_at AND substr(last_used_at, 12, 2) <= '23'))
 );
 GRANT SELECT, INSERT, UPDATE ON sys_user, sys_role, sys_permission, sys_role_perm, sys_user_role, sys_user_warehouse, api_credential TO wms_app;  -- @pg-only
 -- Doro 裁定：audit_log.actor_id → sys_user(id)。SQLite 由 11 写进 CREATE TABLE；PG 在 sys_user 建好后由此处补（不搬文件、不改加载顺序）
