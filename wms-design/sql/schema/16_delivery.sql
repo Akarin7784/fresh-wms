@@ -281,6 +281,50 @@ CREATE TRIGGER trg_podc_replay_immutable BEFORE UPDATE ON pod_correction FOR EAC
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'podc_replay_immutable'); END;
 
 -- -----------------------------------------------------------------------------
+-- SQLite no-REPLACE 守卫（00 §6.10 第 3/4 条：逐唯一键，每个唯一键的每列都要在 WHEN 里）
+-- PG 侧没有 REPLACE，唯一键冲突由 ON CONFLICT / 唯一约束本身拦（应用层不用 REPLACE）。
+-- -----------------------------------------------------------------------------
+-- @sqlite-only CREATE TRIGGER trg_wb_no_replace BEFORE INSERT ON waybill
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM waybill w WHERE w.id = NEW.id OR w.code = NEW.code OR w.shipment_id = NEW.shipment_id)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'waybill_duplicate'); END;
+
+-- @sqlite-only CREATE TRIGGER trg_dstop_no_replace BEFORE INSERT ON delivery_stop
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM delivery_stop d WHERE d.id = NEW.id OR (d.waybill_id = NEW.waybill_id AND d.stop_no = NEW.stop_no))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'delivery_stop_duplicate'); END;
+
+-- @sqlite-only CREATE TRIGGER trg_dord_no_replace BEFORE INSERT ON delivery_order
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM delivery_order o WHERE o.id = NEW.id OR o.outbound_id = NEW.outbound_id)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'delivery_order_duplicate'); END;
+
+-- @sqlite-only CREATE TRIGGER trg_pod_op_no_replace BEFORE INSERT ON pod_op
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM pod_op p WHERE p.id = NEW.id OR (p.waybill_no = NEW.waybill_no AND p.stop_no = NEW.stop_no AND p.device_instance_id = NEW.device_instance_id AND p.op_seq = NEW.op_seq))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'pod_op_duplicate'); END;
+
+-- @sqlite-only CREATE TRIGGER trg_podl_no_replace BEFORE INSERT ON pod_line
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM pod_line l WHERE l.id = NEW.id OR (l.pod_id = NEW.pod_id AND l.outbound_line_id = NEW.outbound_line_id AND l.lot_id = NEW.lot_id))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'pod_line_duplicate'); END;
+
+-- @sqlite-only CREATE TRIGGER trg_podc_no_replace BEFORE INSERT ON pod_correction
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM pod_correction c WHERE c.id = NEW.id
+-- @sqlite-only   OR (c.driver_id = NEW.driver_id AND c.correction_client_id = NEW.correction_client_id)
+-- @sqlite-only   OR (NEW.approval_id IS NOT NULL AND c.approval_id = NEW.approval_id)
+-- @sqlite-only   OR (NEW.status = 'PENDING' AND c.status = 'PENDING' AND c.corrected_pod_id = NEW.corrected_pod_id AND c.outbound_id = NEW.outbound_id)
+-- @sqlite-only   OR (NEW.status = 'APPLIED' AND c.status = 'APPLIED' AND c.outbound_id = NEW.outbound_id AND c.correct_seq = NEW.correct_seq))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'pod_correction_duplicate'); END;
+
+-- @sqlite-only CREATE TRIGGER trg_podt_no_replace BEFORE INSERT ON pod_tolerance_config
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM pod_tolerance_config t WHERE t.id = NEW.id OR (t.warehouse_id = NEW.warehouse_id AND t.sku_category = NEW.sku_category))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'pod_tolerance_config_duplicate'); END;
+
+-- @sqlite-only CREATE TRIGGER trg_dret_no_replace BEFORE INSERT ON delivery_return
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM delivery_return r WHERE r.id = NEW.id OR (r.waybill_id = NEW.waybill_id AND r.stop_no = NEW.stop_no AND r.handover_seq = NEW.handover_seq))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'delivery_return_duplicate'); END;
+
+-- @sqlite-only CREATE TRIGGER trg_dretl_no_replace BEFORE INSERT ON delivery_return_line
+-- @sqlite-only WHEN EXISTS (SELECT 1 FROM delivery_return_line x WHERE x.id = NEW.id OR (x.delivery_return_id = NEW.delivery_return_id AND x.sku_id = NEW.sku_id AND x.lot_id = NEW.lot_id))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'delivery_return_line_duplicate'); END;
+
+-- -----------------------------------------------------------------------------
 -- 授权（PG；pod_op 只追加，不授 UPDATE）
 -- -----------------------------------------------------------------------------
 GRANT SELECT, INSERT, UPDATE ON waybill, delivery_stop, delivery_order, pod_line, pod_correction, pod_tolerance_config, delivery_return, delivery_return_line TO wms_app;  -- @pg-only

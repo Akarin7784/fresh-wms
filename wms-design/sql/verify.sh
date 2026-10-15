@@ -29,6 +29,7 @@ SCHEMA_PARTS=(
   11_integration.sql
   12_auth.sql
   12b_auth_audit.sql
+  16_delivery.sql
   17_processing.sql
   18_live.sql
   90_available_view.sql
@@ -46,8 +47,8 @@ SCHEMA_PARTS=(
 #    replenish_demand PK/uq_rpd_code/uq_rpd_open/ix_rpd_open/ix_rpd_task/ix_rpd_loc、
 #    move_order PK/uq_mo_code/ix_mo_wh、move_order_line PK/uq_mol/ix_mol_order/ix_mol_stock）
 #   +1 视图（v_location_sku_candidate）→ 84 表 / 276 索引 / 3 视图（PG16 实测）
-EXPECT_TABLES=84
-EXPECT_INDEXES=276
+EXPECT_TABLES=93
+EXPECT_INDEXES=307
 # 第 12 篇：+device_reconnect（PK、uq_drc_id_binding、ix_drc_binding、ix_drc_jti）+ audit_log.uq_audit_rbac_once → 79 表 / 248 索引（PG16 实测）
 # docs/05（长流）：+ix_pt_handover（pick_task 交接任务来源的部分索引）→ 249 索引
 # docs/08（长流）：+ix_cnt_wh、ix_adj_wh、ix_adj_src、uq_adjl、ix_cnt_line_count、ix_cnt_line_loc → 255 索引（249 + 6）
@@ -151,7 +152,7 @@ echo "  → 表 $T 张 / 索引 $I 个 / 视图 $V 个"
 [ "$V" = "$EXPECT_VIEWS" ]   && ok "视图数 = $V" || bad "视图数 = $V，期望 $EXPECT_VIEWS"
 
 # 小赵 S4：按期望权限矩阵逐表核对 wms_app（表、分区父表、视图、物化视图；序列查 USAGE），多给、少给、漏表都失败
-EXPECT_PRIVS="adjust_line:SELECT,INSERT,UPDATE adjust_order:SELECT,INSERT,UPDATE api_credential:SELECT,INSERT,UPDATE approval_request:SELECT,INSERT audit_log:SELECT,INSERT count_line:SELECT,INSERT,UPDATE count_order:SELECT,INSERT,UPDATE device_reconnect:SELECT,INSERT exception_case:SELECT,INSERT,UPDATE exception_code:SELECT,INSERT,UPDATE idempotency_record:SELECT,INSERT,UPDATE inbound_correction:SELECT,INSERT inbound_line:SELECT,INSERT inbound_message:SELECT,INSERT,UPDATE inbound_order:SELECT,INSERT,UPDATE inbound_putaway:SELECT,INSERT inbound_quality_feedback:SELECT,INSERT,UPDATE inbound_receipt:SELECT,INSERT inbound_temp_check:SELECT,INSERT live_count_ledger:SELECT,INSERT live_death:SELECT,INSERT live_inspection:SELECT,INSERT live_shrink_settlement:SELECT,INSERT live_stock_count:SELECT,INSERT,UPDATE live_tank:SELECT,INSERT,UPDATE live_tank_hold:SELECT,INSERT live_weigh:SELECT,INSERT location:SELECT,INSERT,UPDATE lot:SELECT,INSERT,UPDATE move_order:SELECT,INSERT,UPDATE move_order_line:SELECT,INSERT,UPDATE numbering_segment:SELECT,INSERT,UPDATE offline_paper_record:SELECT,INSERT,UPDATE offline_token:SELECT,INSERT outbound_line:SELECT,INSERT,UPDATE outbound_order:SELECT,INSERT,UPDATE outbox_event:SELECT,INSERT,UPDATE pack_box:SELECT,INSERT,UPDATE pack_box_line:SELECT,INSERT,UPDATE pick_task:SELECT,INSERT,UPDATE pick_task_line:SELECT,INSERT,UPDATE process_bom:SELECT,INSERT,UPDATE process_bom_line:SELECT,INSERT,UPDATE process_issue:SELECT,INSERT,UPDATE process_lot_trace:SELECT,INSERT process_order:SELECT,INSERT,UPDATE process_output:SELECT,INSERT,UPDATE process_report:SELECT,INSERT process_reversal:SELECT,INSERT replenish_demand:SELECT,INSERT,UPDATE replenish_task:SELECT,INSERT,UPDATE replenish_task_line:SELECT,INSERT,UPDATE return_blind_receipt:SELECT,INSERT return_reservation:SELECT,INSERT,UPDATE return_reservation_line:SELECT,INSERT,UPDATE scrap_line:SELECT,INSERT,UPDATE scrap_order:SELECT,INSERT,UPDATE shipment:SELECT,INSERT,UPDATE shipment_order:SELECT,INSERT,UPDATE sku:SELECT,INSERT,UPDATE sku_barcode:SELECT,INSERT,UPDATE sku_live_param:SELECT,INSERT,UPDATE sku_unit:SELECT,INSERT,UPDATE stock:SELECT,INSERT,UPDATE stock_hold:SELECT,INSERT stock_hold_release:SELECT,INSERT stock_ledger_line:SELECT,INSERT stock_movement:SELECT,INSERT stock_movement_key:SELECT,INSERT stock_recon_alert:SELECT,INSERT,UPDATE stock_reservation:SELECT,INSERT,UPDATE stock_snapshot_daily:SELECT,INSERT supplier_return:SELECT,INSERT sys_permission:SELECT,INSERT,UPDATE sys_role:SELECT,INSERT,UPDATE sys_role_perm:SELECT sys_user:SELECT,INSERT,UPDATE sys_user_role:SELECT sys_user_warehouse:SELECT upstream_push_log:SELECT,INSERT user_device_binding:SELECT,INSERT v_live_death_in_transit:SELECT v_location_sku_candidate:SELECT v_stock_available:SELECT warehouse:SELECT,INSERT,UPDATE wave:SELECT,INSERT,UPDATE zone:SELECT,INSERT,UPDATE"
+EXPECT_PRIVS="adjust_line:SELECT,INSERT,UPDATE adjust_order:SELECT,INSERT,UPDATE api_credential:SELECT,INSERT,UPDATE approval_request:SELECT,INSERT audit_log:SELECT,INSERT count_line:SELECT,INSERT,UPDATE count_order:SELECT,INSERT,UPDATE delivery_order:SELECT,INSERT,UPDATE delivery_return:SELECT,INSERT,UPDATE delivery_return_line:SELECT,INSERT,UPDATE delivery_stop:SELECT,INSERT,UPDATE device_reconnect:SELECT,INSERT exception_case:SELECT,INSERT,UPDATE exception_code:SELECT,INSERT,UPDATE idempotency_record:SELECT,INSERT,UPDATE inbound_correction:SELECT,INSERT inbound_line:SELECT,INSERT inbound_message:SELECT,INSERT,UPDATE inbound_order:SELECT,INSERT,UPDATE inbound_putaway:SELECT,INSERT inbound_quality_feedback:SELECT,INSERT,UPDATE inbound_receipt:SELECT,INSERT inbound_temp_check:SELECT,INSERT live_count_ledger:SELECT,INSERT live_death:SELECT,INSERT live_inspection:SELECT,INSERT live_shrink_settlement:SELECT,INSERT live_stock_count:SELECT,INSERT,UPDATE live_tank:SELECT,INSERT,UPDATE live_tank_hold:SELECT,INSERT live_weigh:SELECT,INSERT location:SELECT,INSERT,UPDATE lot:SELECT,INSERT,UPDATE move_order:SELECT,INSERT,UPDATE move_order_line:SELECT,INSERT,UPDATE numbering_segment:SELECT,INSERT,UPDATE offline_paper_record:SELECT,INSERT,UPDATE offline_token:SELECT,INSERT outbound_line:SELECT,INSERT,UPDATE outbound_order:SELECT,INSERT,UPDATE outbox_event:SELECT,INSERT,UPDATE pack_box:SELECT,INSERT,UPDATE pack_box_line:SELECT,INSERT,UPDATE pick_task:SELECT,INSERT,UPDATE pick_task_line:SELECT,INSERT,UPDATE pod_correction:SELECT,INSERT,UPDATE pod_line:SELECT,INSERT,UPDATE pod_op:SELECT,INSERT pod_tolerance_config:SELECT,INSERT,UPDATE process_bom:SELECT,INSERT,UPDATE process_bom_line:SELECT,INSERT,UPDATE process_issue:SELECT,INSERT,UPDATE process_lot_trace:SELECT,INSERT process_order:SELECT,INSERT,UPDATE process_output:SELECT,INSERT,UPDATE process_report:SELECT,INSERT process_reversal:SELECT,INSERT replenish_demand:SELECT,INSERT,UPDATE replenish_task:SELECT,INSERT,UPDATE replenish_task_line:SELECT,INSERT,UPDATE return_blind_receipt:SELECT,INSERT return_reservation:SELECT,INSERT,UPDATE return_reservation_line:SELECT,INSERT,UPDATE scrap_line:SELECT,INSERT,UPDATE scrap_order:SELECT,INSERT,UPDATE shipment:SELECT,INSERT,UPDATE shipment_order:SELECT,INSERT,UPDATE sku:SELECT,INSERT,UPDATE sku_barcode:SELECT,INSERT,UPDATE sku_live_param:SELECT,INSERT,UPDATE sku_unit:SELECT,INSERT,UPDATE stock:SELECT,INSERT,UPDATE stock_hold:SELECT,INSERT stock_hold_release:SELECT,INSERT stock_ledger_line:SELECT,INSERT stock_movement:SELECT,INSERT stock_movement_key:SELECT,INSERT stock_recon_alert:SELECT,INSERT,UPDATE stock_reservation:SELECT,INSERT,UPDATE stock_snapshot_daily:SELECT,INSERT supplier_return:SELECT,INSERT sys_permission:SELECT,INSERT,UPDATE sys_role:SELECT,INSERT,UPDATE sys_role_perm:SELECT sys_user:SELECT,INSERT,UPDATE sys_user_role:SELECT sys_user_warehouse:SELECT upstream_push_log:SELECT,INSERT user_device_binding:SELECT,INSERT v_live_death_in_transit:SELECT v_location_sku_candidate:SELECT v_stock_available:SELECT warehouse:SELECT,INSERT,UPDATE wave:SELECT,INSERT,UPDATE waybill:SELECT,INSERT,UPDATE zone:SELECT,INSERT,UPDATE"
 ACT=$(psql -t -A -c "SELECT string_agg(x, ' ' ORDER BY x) FROM (SELECT c.relname || ':' || COALESCE(NULLIF(concat_ws(',', CASE WHEN c.relkind='S' THEN (CASE WHEN has_sequence_privilege('wms_app', c.oid, 'USAGE') THEN 'USAGE' END) ELSE (CASE WHEN has_table_privilege('wms_app', c.oid, 'SELECT') THEN 'SELECT' END) END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'INSERT') THEN 'INSERT' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'UPDATE') THEN 'UPDATE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'DELETE') THEN 'DELETE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'TRUNCATE') THEN 'TRUNCATE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'REFERENCES') THEN 'REFERENCES' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'TRIGGER') THEN 'TRIGGER' END), ''), 'NONE') AS x FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','S') AND NOT c.relispartition) t")
 if [ "$ACT" = "$EXPECT_PRIVS" ]; then ok "S4 wms_app 权限矩阵与期望逐表一致（$(echo "$ACT" | wc -w) 个对象，含 TRIGGER/REFERENCES；列级 UPDATE 另测）"
 else bad "S4 wms_app 权限矩阵不符：$(diff <(echo "$EXPECT_PRIVS" | tr ' ' '\n') <(echo "$ACT" | tr ' ' '\n') | grep '^[<>]' | tr '\n' ' ')"; fi
@@ -782,7 +783,16 @@ expect_block "10 L3 DELETE 已取消异常单" "DELETE FROM exception_case WHERE
 expect_allow "10 质检单来源 SCRAP_MISREPORT（第 9 篇交接 / 质检误报回转）" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8010,'RTN-10',1,'RETURN','SCRAP_MISREPORT','APR-WHSH01-20261015-000001','CREATED','2026-10-15');"
 expect_block "10 质检单来源拼错（SCRAP_MISREPORTX）" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8011,'RTN-11',1,'RETURN','SCRAP_MISREPORTX','APR-WHSH01-20261015-000002','CREATED','2026-10-15');" "ck_inb_rtn_src"
 expect_allow "10 异常单来源 SCRAP_MISREPORT" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (142,'EXC-142',1,'RETURN_COUNT_DIFF','SCRAP_MISREPORT','APR-WHSH01-20261015-000001','0000000000000000000000000000000000000000000000000000000000000084',1,1,0,0,0,'2026-10-15 12:00:00',7);"
-expect_block "10 L3 PG TRUNCATE 异常单（超级用户 / 迁移脚本）" "TRUNCATE exception_case;" "exc_no_delete"
+# 叠加 #16 的 fk_dretl_exc（delivery_return_line → exception_case）后，PG 会先以外键拒绝 TRUNCATE（报错不再是 exc_no_delete）；
+# 两种拦法都算通过，再核对行数未变（与 02 §C5、12 的 TRUNCATE 断言同一写法）
+_EXC0=$(psql -t -A -c "SELECT count(*) FROM exception_case")
+OUT=$(psql_capture "TRUNCATE exception_case;")
+case "$OUT" in
+  *"exc_no_delete"*|*"cannot truncate a table referenced in a foreign key constraint"*) ok "10 L3 PG TRUNCATE 异常单被拦（守卫或 #16 外键）";;
+  *) bad "10 L3 TRUNCATE 异常单未被拦：$OUT";;
+esac
+_EXC1=$(psql -t -A -c "SELECT count(*) FROM exception_case")
+[ "$_EXC1" = "$_EXC0" ] && ok "10 TRUNCATE 异常单：行数不变（$_EXC0）" || bad "10 TRUNCATE 异常单后行数变化：$_EXC0 → $_EXC1"
 expect_allow "10 STORE_RETURN 门店退货回仓 RTN" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8002,'RTN-2',1,'RETURN','STORE_RETURN','ST01:R-001','CREATED','2026-10-15');"
 expect_block "10 STORE_RETURN 之外的未登记退货来源" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8003,'RTN-3',1,'RETURN','WHATEVER','X-1','CREATED','2026-10-15');" "ck_inb_rtn_src"
 expect_allow "10 非退货入库单不受退货来源 CHECK 约束" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8004,'PO-1',1,'PURCHASE','ERP_X','PO-001','CREATED','2026-10-15');"
@@ -1417,7 +1427,7 @@ R=$(q11 "BEGIN; ALTER TABLE audit_log DISABLE TRIGGER trg_audit_server_time; ALT
 expect_block "T2 client_occurred_at 带小数秒（审计）" "INSERT INTO audit_log (id,action,node_id,node_seq,warehouse_id,client_occurred_at) VALUES (9505,'t11.t2',7,9505,1,'2026-01-01 00:00:00.5');" "ck_audit_cts"
 expect_block "T2 client_occurred_at 带小数秒（入站报文）" "INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha,client_occurred_at) VALUES (9505,'ERP','SALES_ORDER','SO-T9505','{}','h','2026-01-01 00:00:00.5');" "ck_in_msg_cts"
 expect_allow "T2 client_occurred_at 不设容差：1999 年、2099 年都接受" "INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha,client_occurred_at) VALUES (9506,'ERP','SALES_ORDER','SO-T9506','{}','h','1999-01-01 00:00:00'),(9507,'ERP','SALES_ORDER','SO-T9507','{}','h','2099-01-01 00:00:00');"
-T2CAT="SELECT (SELECT count(*) FROM pg_proc WHERE pronamespace='public'::regnamespace AND prosrc LIKE '%client_occurred_at%') + (SELECT count(*) FROM pg_constraint WHERE connamespace='public'::regnamespace AND pg_get_constraintdef(oid) LIKE '%client_occurred_at%' AND conname NOT IN ('ck_audit_cts','ck_in_msg_cts')) + (SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexdef LIKE '%client_occurred_at%') + (SELECT count(*) FROM pg_views WHERE schemaname='public' AND definition LIKE '%client_occurred_at%')"
+T2CAT="SELECT (SELECT count(*) FROM pg_proc WHERE pronamespace='public'::regnamespace AND prosrc LIKE '%client_occurred_at%') + (SELECT count(*) FROM pg_constraint WHERE connamespace='public'::regnamespace AND pg_get_constraintdef(oid) LIKE '%client_occurred_at%' AND conname NOT IN ('ck_audit_cts','ck_in_msg_cts','ck_pod_op_cct')) + (SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexdef LIKE '%client_occurred_at%') + (SELECT count(*) FROM pg_views WHERE schemaname='public' AND definition LIKE '%client_occurred_at%')"
 R=$(q11 "$T2CAT")
 [ "$R" = "0" ] && ok "T2 client_occurred_at 不进任何函数（含 purge_expired / purge_push_log）、约束（格式 CHECK 除外）、索引、视图" || bad "T2 client_occurred_at 被引用：$R"
 R=$(q11 "BEGIN; CREATE FUNCTION public.t11_bad_purge() RETURNS void LANGUAGE sql SET search_path = pg_catalog, public, pg_temp AS \$f\$ SELECT 1 FROM public.audit_log WHERE client_occurred_at < now() \$f\$; SELECT 'M=' || ($T2CAT); ROLLBACK;")
@@ -2258,14 +2268,20 @@ OUT=$(psql_capture "TRUNCATE approval_request, user_device_binding;")
 CNT_A=$(psql -qtAc "SELECT (SELECT count(*) FROM approval_request)||'/'||(SELECT count(*) FROM user_device_binding);")
 case "$OUT" in *"append_only_violation"*|*"cannot truncate a table referenced in a foreign key constraint"*) ok "12 TRUNCATE 审批/绑定被拦";; *) bad "TRUNCATE 审批/绑定未被拦：$OUT";; esac
 [ -n "$CNT_B" ] && [ "$CNT_B" = "$CNT_A" ] && ok "12 TRUNCATE 审批/绑定后行数不变（$CNT_A）" || bad "TRUNCATE 审批/绑定后行数变化：$CNT_B -> $CNT_A"
-# 逐表单独 TRUNCATE：同一事务内先拆掉引用它的外键（只有 stock_hold.fk_hold_approval_no 引用 approval_request；stock_hold 自身也受保护，不能清行，所以 DROP CONSTRAINT），不用 session_replication_role，确保命中目标表自己的 TRUNCATE 触发器；ROLLBACK 还原
-for T in approval_request user_device_binding audit_log; do
-  PRE=""; [ "$T" = approval_request ] && PRE="ALTER TABLE stock_hold DROP CONSTRAINT fk_hold_approval_no; ALTER TABLE user_device_binding DROP CONSTRAINT fk_udb_approval; ALTER TABLE audit_log DROP CONSTRAINT fk_audit_approval;"; [ "$T" = user_device_binding ] && PRE="ALTER TABLE device_reconnect DROP CONSTRAINT fk_drc_binding; ALTER TABLE offline_token DROP CONSTRAINT fk_offline_binding;"
-  OUT=$(psql_capture "BEGIN; $PRE TRUNCATE $T; ROLLBACK;")
-  case "$OUT" in *"append_only_violation: $T"*) ok "12 单表 TRUNCATE $T 命中自身触发器（外键已在事务内拆除）";; *) bad "12 单表 TRUNCATE $T 未报 append_only_violation：$OUT";; esac
+# 逐表单独 TRUNCATE 命中目标表自身的语句级 TRUNCATE 触发器：只挑**不被任何外键引用**的 append-only 表
+# （approval_request / user_device_binding 被 stock_hold / audit_log / device_reconnect / offline_token，以及第 16 篇的
+#   pod_correction.fk_podc_apr 引用，单表 TRUNCATE 会先撞外键 —— 那条路由由下面两条「被外键拒」断言覆盖）
+for T in audit_log device_reconnect; do
+  OUT=$(psql_capture "BEGIN; TRUNCATE $T; ROLLBACK;")
+  case "$OUT" in *"append_only_violation: $T"*) ok "12 单表 TRUNCATE $T 命中自身触发器";; *) bad "12 单表 TRUNCATE $T 未报 append_only_violation：$OUT";; esac
 done
-FKN=$(psql -qtAc "SELECT count(*) FROM pg_constraint WHERE conname='fk_hold_approval_no';")
-[ "$FKN" = 1 ] && ok "12 单表 TRUNCATE 用例回滚后 fk_hold_approval_no 仍在" || bad "fk_hold_approval_no 回滚后丢失：$FKN"
+# 被外键引用的 append-only 表：TRUNCATE 由外键先拒（#16 的 pod_correction.fk_podc_apr 让 approval_request 也走这条路由）
+for T in approval_request user_device_binding; do
+  OUT=$(psql_capture "TRUNCATE $T;")
+  case "$OUT" in *"cannot truncate a table referenced in a foreign key constraint"*) ok "12 单表 TRUNCATE $T 被外键拒（引用它的表拦在前面）";; *) bad "12 单表 TRUNCATE $T 未被外键拒：$OUT";; esac
+done
+FKN=$(psql -qtAc "SELECT count(*) FROM pg_constraint WHERE conname IN ('fk_hold_approval_no','fk_podc_apr');")
+[ "$FKN" = 2 ] && ok "12 单表 TRUNCATE 用例后 fk_hold_approval_no / fk_podc_apr 仍在（$FKN）" || bad "单表 TRUNCATE 用例后外键丢失：$FKN"
 
 
 echo "=== 2g2. 新审批类型 + audit node 必填 ==="
@@ -2662,7 +2678,7 @@ echo "=== 2z. pg_temp 劫持（#2 第九轮）：search_path 必须显式写 pg_
 # docs/07 新增 5 个 PL/pgSQL 触发器函数（trg_rt_forward、trg_rtl_forward、trg_rpd_forward、trg_mo_forward、trg_mol_forward）→ 86 → 91。
 # 05 增量 +2：trg_wave_parent_cycle / trg_pt_handover_cycle → 91 → 93。
 R=$(psql -t -A -c "SELECT count(*) FILTER (WHERE c <> 'search_path=pg_catalog, public, pg_temp') || '/' || count(*) FROM (SELECT unnest(p.proconfig) c FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace) s WHERE c LIKE 'search_path=%'")
-[ "$R" = "0/93" ] && ok "pg_temp 目录断言：93 个固定 search_path 的函数都显式以 pg_temp 结尾（不合规/总数 = $R）" || bad "pg_temp 目录断言：不合规/总数 = $R（期望 0/93）"
+[ "$R" = "0/94" ] && ok "pg_temp 目录断言：94 个固定 search_path 的函数都显式以 pg_temp 结尾（不合规/总数 = $R）" || bad "pg_temp 目录断言：不合规/总数 = $R（期望 0/94）"
 # 通用断言（不限函数个数）：public 下任何函数只要设了 search_path，pg_temp 必须是最后一项
 R=$(psql -t -A -c "SELECT count(*) FILTER (WHERE c !~ ',\s*pg_temp\s*$') || '/' || count(*) || '#' || COALESCE(string_agg(proname, ',') FILTER (WHERE c !~ ',\s*pg_temp\s*$'), '') FROM (SELECT p.proname, c FROM pg_proc p, unnest(p.proconfig) c WHERE p.pronamespace = 'public'::regnamespace AND c LIKE 'search_path=%') s")
 [ "${R%%/*}" = "0" ] && ok "pg_temp 末位断言：public 下设了 search_path 的函数 pg_temp 都在最后（缺/总 = ${R%%#*}）" || bad "pg_temp 末位断言：缺/总 = ${R%%#*}，函数：${R#*#}"
@@ -2714,7 +2730,7 @@ echo "  → fixed/mut：02[$A0 | $A1] 09[$B0 | $B1] 11[$C0 | $C1] 12[$D0 | $D1]"
 [ "$B0" = "scrap_line_locked" ] && ok "pg_temp 劫持 09 trg_scrl_draft_only：临时表 scrap_order 把已取消单伪造成 DRAFT，函数仍读 public → $B0" || bad "09 pg_temp 劫持：$B0（期望 scrap_line_locked）"
 [ "$C0" = "PT_PASSED" ] && ok "pg_temp 劫持 11 trg_outbox_order_guard：临时表 outbox_event 伪造同 biz_key 更早的 PENDING 行想卡住投递，函数仍读 public，真实事件照常进 SENDING（$C0）" || bad "11 pg_temp 劫持：$C0（期望正常放行 PT_PASSED）"
 [ "$D0" = "approval_code_warehouse_mismatch" ] && ok "pg_temp 劫持 12 trg_apr_insert：临时表 warehouse 把仓 1 编码伪造成 PTFAKE，函数仍读 public → $D0" || bad "12 pg_temp 劫持：$D0（期望 approval_code_warehouse_mismatch）"
-[ "$PC1" = "4/93" ] && ok "变异：四个函数去掉 pg_temp 后目录断言变红（$PC1）" || bad "变异目录断言没变红：$PC1（期望 4/93）"
+[ "$PC1" = "4/94" ] && ok "变异：四个函数去掉 pg_temp 后目录断言变红（$PC1）" || bad "变异目录断言没变红：$PC1（期望 4/94）"
 [ "$A1" != "$A0" ] && ok "变异：trg_mvk_line_kind 去掉 pg_temp 后临时表劫持生效（$A1）" || bad "变异没变红：trg_mvk_line_kind 去掉 pg_temp 后仍是 $A1"
 [ "$B1" != "$B0" ] && ok "变异：trg_scrl_draft_only 去掉 pg_temp 后临时表劫持生效（$B1）" || bad "变异没变红：trg_scrl_draft_only 去掉 pg_temp 后仍是 $B1"
 [ "$C1" != "$C0" ] && ok "变异：trg_outbox_order_guard 去掉 pg_temp 后临时表劫持生效（$C1）" || bad "变异没变红：trg_outbox_order_guard 去掉 pg_temp 后仍是 $C1"
