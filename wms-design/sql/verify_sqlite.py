@@ -310,6 +310,7 @@ seed = [
     "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life,sell_days) VALUES (2,'SKU-PEAR','砀山酥梨','KG','CHILLED',30,10,14)",   # 第十三轮：stock/lot 用例引用 sku 2，补外键父行
     "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date,quality_status,remaining_life_days) VALUES (1,1,'LOT-1008','2026-10-25','2026-10-08','QUALIFIED',10),(2,1,'LOT-1012','2026-10-29','2026-10-12','QUALIFIED',14),(3,1,'LOT-1014','2026-10-31','2026-10-14','QUALIFIED',16)",
     "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,allocated_qty_milli) VALUES (11,1,1,1,2,'KG',50000,0),(12,1,2,1,1,'KG',30000,10000),(13,1,3,1,3,'KG',200000,0),(14,1,3,1,1,'KG',80000,0)",
+    "INSERT INTO count_order (id,code,warehouse_id,count_type,scope_json,status,book_at) VALUES (1,'CNT-SH01-0001-20261015-000001',1,'FULL','{}','DRAFT','2026-10-15 02:00:00')",   # 长流：count_line.count_id 加外键后的父行
     "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000)",
     "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (1,'OBT1',1,'SALE','MALL','M-2026-001','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'CREATED','2026-10-16')",
 ]
@@ -4008,6 +4009,78 @@ for _tg12t, _sql12t in [
         _passed12t = False
     conn.execute("ROLLBACK TO mut12t"); conn.execute("RELEASE mut12t")
     ok(f"变异：去掉 {_tg12t} 后原被拒语句通过（断言能抓到）") if _passed12t else bad(f"变异没变红：{_tg12t}")
+print("=== 2v. docs/08 盘点与调整：本轮新增 10 个 CHECK / 8 个外键 / 5 条索引 + uq_adjl 的三件套（正向 / 按名拒绝 / 变异）===")
+# 变异 = 模拟"去掉该约束"后再执行原被拒语句，必须变成通过，然后回滚（证明拒绝确实来自该约束）。
+# SQLite 不能 DROP CONSTRAINT：CHECK 用 @PRAGMA ignore_check_constraints@，外键用 PRAGMA foreign_keys=OFF。
+# ck_cnt_int / ck_adj_int（量必须整 milli）在 SQLite 侧是可证伪的（见上面的 "2e. count_line 整数约束"：写 1.5 被
+# ck_cnt_int 拦下）；在 PG 侧由列类型 BIGINT 直接保证（CHECK 恒真），故这两条在本段只做目录断言，两库标题一致。
+def _m08_ck(name, stmts):
+    conn.execute("PRAGMA ignore_check_constraints = ON")
+    try:
+        expect_allow_tx(f"08 变异：去掉 {name} 后，原被拒语句通过（随后回滚）", stmts)
+    finally:
+        conn.execute("PRAGMA ignore_check_constraints = OFF")
+def _m08_fk(name, stmts):
+    global _fk_off_allowed
+    _fk_off_allowed = True; conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        expect_allow_tx(f"08 变异：去掉 {name} 后，原被拒语句通过（随后回滚）", stmts)
+    finally:
+        _fk_off_allowed = False; conn.execute("PRAGMA foreign_keys = ON")
+expect_allow_tx("08 正向：盘点单 + 盘点行（COUNTING/RECOUNTED，ck_cnt_*、ck_cntl_*、fk_cnt_wh/fk_cntl_* 全满足）", ["INSERT INTO count_order (id,code,warehouse_id,count_type,scope_json,status,book_at,created_by) VALUES (9401,'CNT-SH01-9401-20261015-000001',1,'CYCLE','{}','COUNTING','2026-10-15 02:00:00',41)", "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli,recount_qty_milli,status,counted_by,counted_at) VALUES (9411,9401,1,1,1,100000,-30000,68000,69000,'RECOUNTED',41,'2026-10-15 03:00:00')"])
+expect_allow_tx("08 正向：调整单 + 调整行（ck_adj_*、fk_adj_wh/fk_adjl_order 全满足）", ["INSERT INTO adjust_order (id,code,warehouse_id,adjust_type,reason_code,status,applicant_id) VALUES (9421,'ADJ-SH01-9401-20261015-000001',1,'COUNT_LOSS','COUNT_DIFF','PENDING',41)", "INSERT INTO adjust_line (id,adjust_id,line_no,stock_id,delta_qty_milli) VALUES (9431,9421,1,11,-2000)"])
+expect_allow_tx("08 正向：盘点行回指调整单 + 同一调整单第 2 行（fk_cntl_adjust / uq_adjl 多行不撞）", ["INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli,status,counted_by,counted_at,adjust_id) VALUES (9412,9401,2,1,1,1000,0,900,'COUNTED',41,'2026-10-15 03:05:00',9421)", "INSERT INTO adjust_line (id,adjust_id,line_no,stock_id,delta_qty_milli) VALUES (9432,9421,2,12,3000)"])
+expect_block_tx("08 拒绝：ck_cnt_type 非法盘点类型", ["INSERT INTO count_order (id,code,warehouse_id,count_type,scope_json,book_at) VALUES (9402,'CNT-SH01-9402-20261015-000002',1,'BOGUS','{}','2026-10-15 02:00:00')"], "ck_cnt_type")
+_m08_ck("ck_cnt_type", ["INSERT INTO count_order (id,code,warehouse_id,count_type,scope_json,book_at) VALUES (9402,'CNT-SH01-9402-20261015-000002',1,'BOGUS','{}','2026-10-15 02:00:00')"])
+expect_block_tx("08 拒绝：ck_cnt_status 非法盘点单状态", ["INSERT INTO count_order (id,code,warehouse_id,count_type,scope_json,status,book_at) VALUES (9403,'CNT-SH01-9403-20261015-000003',1,'FULL','{}','BOGUS','2026-10-15 02:00:00')"], "ck_cnt_status")
+_m08_ck("ck_cnt_status", ["INSERT INTO count_order (id,code,warehouse_id,count_type,scope_json,status,book_at) VALUES (9403,'CNT-SH01-9403-20261015-000003',1,'FULL','{}','BOGUS','2026-10-15 02:00:00')"])
+expect_block_tx("08 拒绝：ck_cnt_approved 盘点审批人与创建人同一人", ["INSERT INTO count_order (id,code,warehouse_id,count_type,scope_json,book_at,created_by,approved_by) VALUES (9404,'CNT-SH01-9404-20261015-000004',1,'FULL','{}','2026-10-15 02:00:00',41,41)"], "ck_cnt_approved")
+_m08_ck("ck_cnt_approved", ["INSERT INTO count_order (id,code,warehouse_id,count_type,scope_json,book_at,created_by,approved_by) VALUES (9404,'CNT-SH01-9404-20261015-000004',1,'FULL','{}','2026-10-15 02:00:00',41,41)"])
+expect_block_tx("08 拒绝：ck_adj_type 非法调整类型", ["INSERT INTO adjust_order (id,code,warehouse_id,adjust_type,reason_code,applicant_id) VALUES (9422,'ADJ-SH01-9402-20261015-000002',1,'BOGUS','COUNT_DIFF',41)"], "ck_adj_type")
+_m08_ck("ck_adj_type", ["INSERT INTO adjust_order (id,code,warehouse_id,adjust_type,reason_code,applicant_id) VALUES (9422,'ADJ-SH01-9402-20261015-000002',1,'BOGUS','COUNT_DIFF',41)"])
+expect_block_tx("08 拒绝：ck_adj_status 非法调整单状态", ["INSERT INTO adjust_order (id,code,warehouse_id,adjust_type,reason_code,status,applicant_id) VALUES (9423,'ADJ-SH01-9403-20261015-000003',1,'MANUAL','COUNT_DIFF','BOGUS',41)"], "ck_adj_status")
+_m08_ck("ck_adj_status", ["INSERT INTO adjust_order (id,code,warehouse_id,adjust_type,reason_code,status,applicant_id) VALUES (9423,'ADJ-SH01-9403-20261015-000003',1,'MANUAL','COUNT_DIFF','BOGUS',41)"])
+expect_block_tx("08 拒绝：ck_adj_sod 调整单审批人与申请人同一人", ["INSERT INTO adjust_order (id,code,warehouse_id,adjust_type,reason_code,applicant_id,approver_id) VALUES (9424,'ADJ-SH01-9404-20261015-000004',1,'MANUAL','COUNT_DIFF',41,41)"], "ck_adj_sod")
+_m08_ck("ck_adj_sod", ["INSERT INTO adjust_order (id,code,warehouse_id,adjust_type,reason_code,applicant_id,approver_id) VALUES (9424,'ADJ-SH01-9404-20261015-000004',1,'MANUAL','COUNT_DIFF',41,41)"])
+expect_block_tx("08 拒绝：ck_adj_delta 调整量为 0（既不盘盈也不盘亏）", ["INSERT INTO adjust_line (id,adjust_id,line_no,stock_id,delta_qty_milli) VALUES (9433,9421,3,11,0)"], "ck_adj_delta")
+_m08_ck("ck_adj_delta", ["INSERT INTO adjust_line (id,adjust_id,line_no,stock_id,delta_qty_milli) VALUES (9433,9421,3,11,0)"])
+expect_block_tx("08 拒绝：ck_cntl_status 非法盘点行状态", ["INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli,status,counted_by,counted_at) VALUES (9413,9401,3,1,2,1000,0,1000,'BOGUS',41,'2026-10-15 03:10:00')"], "ck_cntl_status")
+_m08_ck("ck_cntl_status", ["INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli,status,counted_by,counted_at) VALUES (9413,9401,3,1,2,1000,0,1000,'BOGUS',41,'2026-10-15 03:10:00')"])
+expect_block_tx("08 拒绝：ck_cntl_counted 已盘点却没写实盘量", ["INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,status,counted_at) VALUES (9414,9401,3,2,1,1000,0,'COUNTED','2026-10-15 03:15:00')"], "ck_cntl_counted")
+_m08_ck("ck_cntl_counted", ["INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,status,counted_at) VALUES (9414,9401,3,2,1,1000,0,'COUNTED','2026-10-15 03:15:00')"])
+expect_block_tx("08 拒绝：ck_cntl_recount 未实盘就写复盘量", ["INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,recount_qty_milli) VALUES (9415,9401,2,1,2,1000,0,1000)"], "ck_cntl_recount")
+_m08_ck("ck_cntl_recount", ["INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,recount_qty_milli) VALUES (9415,9401,2,1,2,1000,0,1000)"])
+_ck08a = one("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='count_line' AND sql LIKE '%ck_cnt_int%'")[0]
+(ok if _ck08a == 1 else bad)("08 目录：ck_cnt_int 存在（基准/期间/实盘/复盘量必须是整 milli；SQLite 侧另有 1.5 反证）")
+_ck08b = one("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='adjust_line' AND sql LIKE '%ck_adj_int%'")[0]
+(ok if _ck08b == 1 else bad)("08 目录：ck_adj_int 存在（调整量必须是整 milli；SQLite 侧另有 1.5 反证）")
+expect_block_tx("08 拒绝：fk_cnt_wh 盘点单挂不存在的仓", ["INSERT INTO count_order (id,code,warehouse_id,count_type,scope_json,book_at) VALUES (9405,'CNT-SH01-9405-20261015-000005',999999,'FULL','{}','2026-10-15 02:00:00')"], "FOREIGN KEY constraint failed")
+_m08_fk("fk_cnt_wh", ["INSERT INTO count_order (id,code,warehouse_id,count_type,scope_json,book_at) VALUES (9405,'CNT-SH01-9405-20261015-000005',999999,'FULL','{}','2026-10-15 02:00:00')"])
+expect_block_tx("08 拒绝：fk_adj_wh 调整单挂不存在的仓", ["INSERT INTO adjust_order (id,code,warehouse_id,adjust_type,reason_code,applicant_id) VALUES (9425,'ADJ-SH01-9405-20261015-000005',999999,'MANUAL','COUNT_DIFF',41)"], "FOREIGN KEY constraint failed")
+_m08_fk("fk_adj_wh", ["INSERT INTO adjust_order (id,code,warehouse_id,adjust_type,reason_code,applicant_id) VALUES (9425,'ADJ-SH01-9405-20261015-000005',999999,'MANUAL','COUNT_DIFF',41)"])
+expect_block_tx("08 拒绝：fk_adjl_order 调整行挂不存在的调整单", ["INSERT INTO adjust_line (id,adjust_id,line_no,stock_id,delta_qty_milli) VALUES (9434,999999,9,11,100)"], "FOREIGN KEY constraint failed")
+_m08_fk("fk_adjl_order", ["INSERT INTO adjust_line (id,adjust_id,line_no,stock_id,delta_qty_milli) VALUES (9434,999999,9,11,100)"])
+expect_block_tx("08 拒绝：fk_cntl_count 盘点行挂不存在的盘点单", ["INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli) VALUES (9416,999999,1,1,1,1000)"], "FOREIGN KEY constraint failed")
+_m08_fk("fk_cntl_count", ["INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli) VALUES (9416,999999,1,1,1,1000)"])
+expect_block_tx("08 拒绝：fk_cntl_adjust 盘点行挂不存在的调整单", ["INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,adjust_id) VALUES (9417,9401,3,1,3,1000,999999)"], "FOREIGN KEY constraint failed")
+_m08_fk("fk_cntl_adjust", ["INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,adjust_id) VALUES (9417,9401,3,1,3,1000,999999)"])
+expect_block_tx("08 拒绝：fk_cntl_loc 盘点行挂不存在的库位", ["INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli) VALUES (9418,9401,999999,1,1,1000)"], "FOREIGN KEY constraint failed")
+_m08_fk("fk_cntl_loc", ["INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli) VALUES (9418,9401,999999,1,1,1000)"])
+expect_block_tx("08 拒绝：fk_cntl_sku 盘点行挂不存在的 SKU", ["INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli) VALUES (9419,9401,1,999999,1,1000)"], "FOREIGN KEY constraint failed")
+_m08_fk("fk_cntl_sku", ["INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli) VALUES (9419,9401,1,999999,1,1000)"])
+expect_block_tx("08 拒绝：fk_cntl_lot 盘点行挂不存在的批次", ["INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli) VALUES (9420,9401,1,1,999999,1000)"], "FOREIGN KEY constraint failed")
+_m08_fk("fk_cntl_lot", ["INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli) VALUES (9420,9401,1,1,999999,1000)"])
+expect_block_tx("08 拒绝：uq_adjl 同一调整单同一 line_no 重复（02 记账幂等键 {biz_no}:{line_no}）", ["INSERT INTO adjust_line (id,adjust_id,line_no,stock_id,delta_qty_milli) VALUES (9435,9421,1,13,500)"], "adjust_line.adjust_id, adjust_line.line_no")
+_uq08 = one("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='adjust_line' AND sql LIKE '%uq_adjl%'")[0]
+(ok if _uq08 == 1 else bad)("08 目录：uq_adjl 存在（02 记账幂等键 {biz_no}:{line_no}:D{op_no}:{leg} 的行号唯一）")
+for _ixname, _ixtbl, _ixdesc in (("ix_cnt_wh", "count_order", "count_order(warehouse_id, status, created_at)"), ("ix_adj_wh", "adjust_order", "adjust_order(warehouse_id, status, created_at)"), ("ix_adj_src", "adjust_order", "adjust_order(source_type, source_id)"), ("ix_cnt_line_count", "count_line", "count_line(count_id, status)"), ("ix_cnt_line_loc", "count_line", "count_line(location_id)")):
+    _ixdef = "(" + _ixdesc.split("(", 1)[1]   # 目录断言同时核对列清单，避免"名字在、列不对"混过去
+    _ixn = one("SELECT count(*) FROM sqlite_master WHERE type='index' AND name=? AND tbl_name=? AND sql LIKE ?", _ixname, _ixtbl, "%" + _ixdef + "%")[0]
+    (ok if _ixn == 1 else bad)(f"08 目录：{_ixname} 存在且挂在 {_ixdesc}")
+    conn.execute("SAVEPOINT ix08"); conn.execute(f"DROP INDEX {_ixname}")
+    _ixm = one("SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?", _ixname)[0]
+    conn.execute("ROLLBACK TO ix08"); conn.execute("RELEASE ix08")
+    (ok if _ixm == 0 else bad)(f"08 变异：去掉 {_ixname} 后目录断言命中 0（随后回滚）")
 print("=== 汇总 ===")
 print(f"  通过 {passed} 项 / 失败 {failed} 项")
 conn.close()
