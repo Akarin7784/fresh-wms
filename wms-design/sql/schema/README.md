@@ -15,6 +15,7 @@
 | `04_outbound.sql` | 出库单 / 出库行 |
 | `05_picking.sql` | 波次、拣货任务 |
 | `06_pack_ship.sql` | 装箱、发运 |
+| `07_replenishment.sql` | 第 7 篇补货与移库：补货任务 `replenish_task` / `replenish_task_line`（库区聚合、PDA 领取；行上有源存储位 `from_location_id` + 目标拣货位 `to_location_id`）、补货需求 `replenish_demand`（04 `Shortage(NEED_REPLENISH)` / 低水位 / 人工三种来源；一个出库行同一 `alloc_round` 只允许一条未完结需求 `uq_rpd_open`）、独立移库单 `move_order` / `move_order_line`、上架与补货共用的库位候选视图 `v_location_sku_candidate`（温区一致 + 库位未锁定 + `mix_sku`，`has_lot_slot` 给 `max_lots`）；库存效果一律走 02 `move()` 两腿 |
 | `08_count.sql` | 盘点、调整 |
 | `10_returns.sql` | 退货与异常：异常码、异常单、退货预约、盲收、退供应商（supplier_return）；对 03、01 sku 的 ALTER（见跨篇加列） |
 | `09_scrap.sql` | 报损单、报损行（含 SELL_EXPIRED / LIVE_* / PROCESS_LOSS / SUPPLIER_RETURN 来源）；对 10 supplier_return 的 ALTER（见跨篇加列） |
@@ -57,6 +58,10 @@
 | 第 11 篇时间加固：`trg_upl_server_time`、`trg_idem_server_time`、`trg_paper_server_time`（PG，`SET search_path = pg_catalog, public, pg_temp`，表属主豁免）；SQLite `trg_upl_received_now`、`trg_idem_created_now`、`trg_idem_expires_past`、`trg_idem_expires_ttl`、`trg_paper_submitted_now`、`trg_paper_approved_now`、`trg_paper_time_immutable`；`idempotency_record.ttl_seconds` + `ck_idem_ttl`；SQLite `ck_paper_ts`，`ck_upl_retain` / `ck_paper_deadline` / `ck_paper_window` / `ck_paper_expired` 改整数秒 | `upstream_push_log` / `idempotency_record` / `offline_paper_record` | 第 11 篇 `11_integration.sql`（本篇自有表） | 小玛丽 time-scan 11-1…11-5：接收/去重/补录/审批时间由库写，00 §6.8 | 本增量 |
 | `audit_log.occurred_at`、`inbound_message.received_at`、`numbering_segment.updated_at` 默认值 `DEFAULT now()` → `DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC'))`；`idempotency_record.created_at`、`outbox_event.created_at` / `next_retry_at`、`offline_paper_record.submitted_at` / `created_at` 补整秒 | 同左 | 第 11 篇 `11_integration.sql` | 11-6：原默认值是会话时区、带微秒（00 §6.8）。`audit_log` 的节点列归第 12 篇，本篇只改本篇建的列；列型本来就是 `TIMESTAMP`，无 timestamptz，无需 ALTER | 本增量 |
 | 错误码 `upl_received_not_now`、`idem_created_not_now`、`idem_expires_in_past`、`idem_expires_not_ttl`、`paper_submitted_not_now`、`paper_approved_not_now`、`audit_occurred_not_now`、`inbound_received_not_now`（SQLite） → 40003；`paper_duplicate` → 40910（`detail.key_type = OFFLINE_PAPER`，新 key_type 已加进 00 §6.5 枚举） CLIENT_TIME_INVALID；`paper_time_immutable` → 40004 TIME_FIELD_IMMUTABLE（23514） | 第 11 篇三张表 | 第 11 篇 | 复用 00 §6.4 已有码，不新开码；库层名 → 对外码映射行由本增量写入 00 §6.4（Doro 同意本次例外） | 已登记 00 §6.4（本增量） |
+
+| 05 `pick_task.task_type` 的 `REPLENISH` 取值**不使用**（注释作废，**不加列、不加触发器、不改 05 文件**） | `pick_task` | —（第 7 篇 `07_replenishment.sql` 的头部注释 + docs/07 §12 Q1 登记） | 主干的注释写「补货复用本表」，但两处走不通：① `pick_task.wave_id BIGINT NOT NULL`，补货任务不属于任何波次；② `pick_task_line` 只有一个 `location_id`，装不下「源存储位 + 目标拣货位」两个库位。第 7 篇因此自建 `replenish_task` / `replenish_task_line`。**若改用复用方案，必须 ALTER 加 `to_location_id` 并给 `pick_task` / `pick_task_line` 补 no-REPLACE 守卫（会把 05 两张表推进 00 §6.10 受锁集合）**，代价大于收益。请 05 篇 owner 把 `task_type` 注释改成只用 `PICK` | 待 05 篇确认（已报 Chief） |
+| 库层错误名 `replenish_task_duplicate`、`replenish_task_line_duplicate`、`replenish_demand_duplicate`、`move_order_duplicate`、`move_order_line_duplicate`（SQLite REPLACE / 重复插入守卫 → 40930，`detail.reason` 见 00 §6.4）；`replenish_task_forward_only`、`replenish_line_forward_only`、`replenish_demand_forward_only`、`move_order_forward_only`、`move_line_forward_only`（23514 → 40930）；`replenish_line_done_locked`、`move_line_done_locked`（23514 → 40931 DOC_LOCKED） | 07 五张表 | 第 7 篇 `07_replenishment.sql` | 上表守卫的库层错误名；对外码复用 00 §6.4 已有码与 `detail.reason`（不新开码，除 `42219 TEMP_ZONE_MISMATCH` 见下一行） | 已登记 00 §6.4（本增量） |
+| 错误码 `42219 TEMP_ZONE_MISMATCH`（上架 / 补货 / 移库的目标库区温区与 SKU 温区不符） | — | 第 7 篇登记 00 §6.4 | 03 篇 §6.3 目前用 `40001 detail.reason = PUTAWAY_TEMP_ZONE_MISMATCH` 占位（03 §12 Q7 待专用码），07 与 03 共用这一个码；42219 是 42200–42229 段里第一个空号 | 已登记 00 §6.4（本增量） |
 
 ## 触发器 search_path 与 outbox 插入
 

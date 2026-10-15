@@ -35,6 +35,7 @@ SCHEMA_PARTS = (
     "04_outbound.sql",
     "05_picking.sql",
     "06_pack_ship.sql",
+    "07_replenishment.sql",
     "08_count.sql",
     "10_returns.sql",
     "09_scrap.sql",
@@ -200,7 +201,7 @@ NI = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='index' AND sql
 NV = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='view'").fetchone()[0]
 print(f"  → 表 {NT} 张 / 手工建索引 {NI} 个 / 视图 {NV} 个")
 # 期望值：main 8ed5f0c 为 38 表；docs/02 新增 stock_hold、stock_recon_alert、stock_movement_key、stock_ledger_line → 42 表（PG 分区子表不计）。改表数必须同步改这里和 verify.sh
-EXPECT_TABLES, EXPECT_VIEWS= 79, 2  # 第 12 篇 +device_reconnect；docs/03 +5 表； 退供 +supplier_return； docs/12 +3；第 10 篇 +exception_code、exception_case、return_reservation、return_reservation_line、return_blind_receipt；第 9 篇 +scrap_order、scrap_line；第 17 篇 +8 张 process_*；docs/18 加 9 表 + v_live_death_in_transit
+EXPECT_TABLES, EXPECT_VIEWS= 84, 3  # 第 7 篇 +replenish_task、replenish_task_line、replenish_demand、move_order、move_order_line（84 表）+ v_location_sku_candidate（3 视图）。第 12 篇 +device_reconnect；docs/03 +5 表； 退供 +supplier_return； docs/12 +3；第 10 篇 +exception_code、exception_case、return_reservation、return_reservation_line、return_blind_receipt；第 9 篇 +scrap_order、scrap_line；第 17 篇 +8 张 process_*；docs/18 加 9 表 + v_live_death_in_transit
 ok(f"表数 = {NT}（期望 {EXPECT_TABLES}）") if NT == EXPECT_TABLES else bad(f"表数 = {NT}，期望 {EXPECT_TABLES}")
 ok(f"视图数 = {NV}") if NV == EXPECT_VIEWS else bad(f"视图数 = {NV}，期望 {EXPECT_VIEWS}")
 
@@ -313,6 +314,15 @@ seed = [
     "INSERT INTO count_order (id,code,warehouse_id,count_type,scope_json,status,book_at) VALUES (1,'CNT-SH01-0001-20261015-000001',1,'FULL','{}','DRAFT','2026-10-15 02:00:00')",   # 长流：count_line.count_id 加外键后的父行
     "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000)",
     "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (1,'OBT1',1,'SALE','MALL','M-2026-001','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'CREATED','2026-10-16')",
+    # 第 7 篇：补货任务 / 任务行 / 需求 / 移库单 / 移库行各一条（供逐键实打与视图断言；父行都在上面）
+    "INSERT INTO replenish_task (id,code,warehouse_id,zone_id,work_date,status,line_count) VALUES (701,'RPL-20261015-000001',1,1,'2026-10-15','PENDING',1)",
+    "INSERT INTO replenish_task_line (id,task_id,seq,from_location_id,to_location_id,sku_id,lot_id,from_stock_id,planned_qty_milli,uom) VALUES (7101,701,1,3,1,1,3,13,20000,'KG')",
+    "INSERT INTO replenish_demand (id,code,warehouse_id,work_date,cause,target_location_id,sku_id,demand_qty_milli,source_outbound_id,source_outbound_line_id,source_alloc_round,source_doc_no) VALUES (7201,'RPD-20261015-000001',1,'2026-10-15','OUTBOUND_SHORTAGE',1,1,20000,1,1,1,'OBT1')",
+    "INSERT INTO move_order (id,code,warehouse_id,move_type,status,reason_code,line_count) VALUES (7301,'MV-20261015-000001',1,'LOCATION_TRANSFER','DRAFT','TIDY',1)",
+    "INSERT INTO move_order_line (id,move_order_id,line_no,from_location_id,to_location_id,sku_id,lot_id,from_stock_id,qty_milli,uom) VALUES (7311,7301,1,2,3,1,1,12,10000,'KG')",
+    # 逐键实打要「无子行」样本：这两条没有任何行引用，供 move_order(code) / replenish_task(code) 的 REPLACE 实打
+    "INSERT INTO replenish_task (id,code,warehouse_id,zone_id,work_date,status,line_count) VALUES (702,'RPL-20261015-000002',1,2,'2026-10-15','PENDING',0)",
+    "INSERT INTO move_order (id,code,warehouse_id,move_type,status,reason_code,line_count) VALUES (7302,'MV-20261015-000002',1,'CONSOLIDATE','DRAFT','MERGE',0)",
 ]
 for s in seed:
     try:
@@ -3833,6 +3843,133 @@ _t01 = ("warehouse", "zone", "location", "sku", "lot")
 _bad_ts01 = [f"{t}.{c}" for t in _t01 for c in ("created_at", "updated_at")
              if (dict((r[1], r[4]) for r in conn.execute(f"PRAGMA table_info({t})")).get(c) or "") != "datetime('now')"]
 ok("01 的 10 个 created_at / updated_at 默认值都是 datetime('now')（UTC 整秒，00 §6.8）") if not _bad_ts01 else bad(f"01 时间默认值不合规：{_bad_ts01}")
+
+print("=== 2j. 第 7 篇补货与移库（任务 / 任务行 / 需求 / 移库 / 候选视图）===")
+# 种子已在最前面写入（replenish_task 701/702、replenish_task_line 7101、replenish_demand 7201、
+# move_order 7301/7302、move_order_line 7311）。下面每条都是「正向放行 + 反向按名拦截 + 变异」，
+# 一律用 _tx_allow / _tx_block（内部 BEGIN…ROLLBACK），断言之间不互相污染状态。
+_TL = ("INSERT INTO replenish_task_line (id,task_id,seq,from_location_id,to_location_id,sku_id,lot_id,from_stock_id,planned_qty_milli,uom) "
+       "VALUES ({i},701,{seq},{frm},{to},1,3,13,{q},'KG')")
+_tx_allow("07 补货任务行正向：源 3 → 目标 1（拣货位），计划 5 KG", [_TL.format(i=7151, seq=2, frm=3, to=1, q=5000)])
+_tx_block("07 补货任务行：源位 = 目标位", [_TL.format(i=7152, seq=3, frm=1, to=1, q=5000)], "ck_rtl_route")
+_tx_block("07 补货任务行：计划量为 0", [_TL.format(i=7153, seq=4, frm=3, to=1, q=0)], "ck_rtl_qty")
+_tx_block("07 补货任务行：DONE 但没有流水号与时间", ["UPDATE replenish_task_line SET status='DONE' WHERE id=7101"], "ck_rtl_done")
+_tx_block("07 补货任务行：ABNORMAL 但没有原因", ["UPDATE replenish_task_line SET status='ABNORMAL' WHERE id=7101"], "ck_rtl_abnormal")
+_tx_allow("07 补货任务行正向：ABNORMAL 带原因", ["UPDATE replenish_task_line SET status='ABNORMAL', abnormal_reason='SOURCE_SHORT' WHERE id=7101"])
+_tx_block("07 补货任务：只填 assigned_to 不填 claimed_at", ["UPDATE replenish_task SET assigned_to=21 WHERE id=701"], "ck_rt_claim")
+_tx_block("07 补货任务：done_count 超过 line_count", ["UPDATE replenish_task SET done_count=2 WHERE id=701"], "ck_rt_count")
+_tx_block("07 补货任务只前进：EXECUTING 已领再退回 PENDING", ["UPDATE replenish_task SET status='EXECUTING', assigned_to=21, claimed_at=datetime('now') WHERE id=701",
+                                              "UPDATE replenish_task SET status='PENDING' WHERE id=701"], "replenish_task_forward_only")
+_tx_allow("07 变异：去掉 trg_rt_forward 后，EXECUTING 退回 PENDING 通过", ["DROP TRIGGER trg_rt_forward",
+                                              "UPDATE replenish_task SET status='EXECUTING', assigned_to=21, claimed_at=datetime('now') WHERE id=701",
+                                              "UPDATE replenish_task SET status='PENDING' WHERE id=701"])
+_tx_block("07 补货行 DONE 后改计划量（历史账被改）", ["UPDATE replenish_task_line SET status='DONE', movement_biz_no='RPL-20261015-000001:1:D1', moved_at=datetime('now') WHERE id=7101",
+                                              "UPDATE replenish_task_line SET planned_qty_milli=99999 WHERE id=7101"], "replenish_line_done_locked")
+# 变异要连 SQLite 侧的第二个守卫一起拆：DONE 锁是独立触发器 trg_rtl_done_lock（SQLite 一个触发器只能一个 WHEN，
+# 因此「状态只前进」与「DONE 锁路由/数量」拆成两个），只拆 trg_rtl_forward 的话仍被 done_lock 拦住。
+_tx_allow("07 变异：去掉 trg_rtl_forward + trg_rtl_done_lock 后，DONE 行改计划量通过", ["DROP TRIGGER trg_rtl_forward",
+                                              "DROP TRIGGER trg_rtl_done_lock",
+                                              "UPDATE replenish_task_line SET status='DONE', movement_biz_no='RPL-20261015-000001:1:D1', moved_at=datetime('now') WHERE id=7101",
+                                              "UPDATE replenish_task_line SET planned_qty_milli=99999 WHERE id=7101"])
+_RPD = ("INSERT INTO replenish_demand (id,code,warehouse_id,work_date,cause,target_location_id,sku_id,demand_qty_milli,"
+        "source_outbound_id,source_outbound_line_id,source_alloc_round,status) VALUES "
+        "({i},'{c}',1,'2026-10-15','{cause}',1,1,{q},{oid},{olid},{rnd},'{st}')")
+_tx_block("07 需求：OUTBOUND_SHORTAGE 但缺出库行与轮次",
+          [_RPD.format(i=7211, c='RPD-T1', cause='OUTBOUND_SHORTAGE', q=1000, oid='NULL', olid='NULL', rnd='NULL', st='OPEN')], "ck_rpd_short")
+_tx_block("07 需求：LOW_LEVEL 却带了出库行与轮次",
+          [_RPD.format(i=7212, c='RPD-T2', cause='LOW_LEVEL', q=1000, oid=1, olid=9, rnd=1, st='OPEN')], "ck_rpd_short")
+_tx_block("07 需求：DONE 但已满足量 < 需求量", ["UPDATE replenish_demand SET status='DONE' WHERE id=7201"], "ck_rpd_done")
+_tx_block("07 需求：只挂 task_id 不挂 task_line_id", ["UPDATE replenish_demand SET task_id=701 WHERE id=7201"], "ck_rpd_task")
+_tx_block("07 需求：planned 超过 demand", ["UPDATE replenish_demand SET planned_qty_milli=30000 WHERE id=7201"], "ck_rpd_qty")
+_tx_block("07 闭环守卫：同一出库行同一轮次第二条未完结需求",
+          [_RPD.format(i=7213, c='RPD-T3', cause='OUTBOUND_SHORTAGE', q=1000, oid=1, olid=1, rnd=1, st='OPEN')],
+          "replenish_demand_duplicate: replenish_demand.source_outbound_line_id, replenish_demand.source_alloc_round")
+_tx_allow("07 闭环守卫正向：同轮次第一条 CANCELLED 后可以再建", ["UPDATE replenish_demand SET status='CANCELLED', cancelled_reason='DOC_CANCELLED' WHERE id=7201",
+                _RPD.format(i=7214, c='RPD-T4', cause='OUTBOUND_SHORTAGE', q=1000, oid=1, olid=1, rnd=1, st='OPEN')])
+_tx_allow("07 闭环守卫正向：新一轮 alloc_round 可以再建（04 重分配后）",
+          [_RPD.format(i=7215, c='RPD-T5', cause='OUTBOUND_SHORTAGE', q=1000, oid=1, olid=1, rnd=2, st='OPEN')])
+_tx_block("07 变异：去掉 trg_rpd_no_replace_open 后，同键第二条被部分唯一索引兜住",
+          ["DROP TRIGGER trg_rpd_no_replace_open",
+           _RPD.format(i=7216, c='RPD-T6', cause='OUTBOUND_SHORTAGE', q=1000, oid=1, olid=1, rnd=1, st='OPEN'),
+           _RPD.format(i=7217, c='RPD-T7', cause='OUTBOUND_SHORTAGE', q=1000, oid=1, olid=1, rnd=1, st='OPEN')],
+          "UNIQUE constraint failed: replenish_demand.source_outbound_line_id")
+_tx_block("07 需求只前进：DONE 再回 OPEN", ["UPDATE replenish_demand SET status='DONE', fulfilled_qty_milli=20000 WHERE id=7201",
+                                     "UPDATE replenish_demand SET status='OPEN' WHERE id=7201"], "replenish_demand_forward_only")
+_tx_block("07 需求只前进：已满足量回退", ["UPDATE replenish_demand SET fulfilled_qty_milli=5000 WHERE id=7201",
+                                 "UPDATE replenish_demand SET fulfilled_qty_milli=1000 WHERE id=7201"], "replenish_demand_forward_only")
+_tx_allow("07 需求正向：PLANNED 且 fulfilled 达量置 DONE", ["UPDATE replenish_demand SET status='PLANNED', task_id=701, task_line_id=7101, planned_qty_milli=20000 WHERE id=7201",
+                "UPDATE replenish_demand SET status='DONE', fulfilled_qty_milli=20000 WHERE id=7201"])
+_MOL = ("INSERT INTO move_order_line (id,move_order_id,line_no,from_location_id,to_location_id,sku_id,lot_id,from_stock_id,qty_milli,uom) "
+        "VALUES ({i},7301,{ln},{frm},{to},1,1,12,{q},'KG')")
+_tx_block("07 移库行：源位 = 目标位", [_MOL.format(i=7321, ln=2, frm=2, to=2, q=5000)], "ck_mol_route")
+_tx_block("07 移库行：数量为 0", [_MOL.format(i=7322, ln=3, frm=2, to=3, q=0)], "ck_mol_qty")
+_tx_block("07 移库行：DONE 但没有流水号", ["UPDATE move_order_line SET status='DONE' WHERE id=7311"], "ck_mol_done")
+_tx_block("07 移库单：CONFIRMED 但没有确认时间", ["UPDATE move_order SET status='CONFIRMED' WHERE id=7301"], "ck_mo_confirm")
+_tx_block("07 移库单：done_count 超过 line_count", ["UPDATE move_order SET done_count=2 WHERE id=7301"], "ck_mo_count")
+_tx_block("07 移库单只前进：CONFIRMED 再回 DRAFT", ["UPDATE move_order SET status='CONFIRMED', confirmed_at=datetime('now') WHERE id=7301",
+                                          "UPDATE move_order SET status='DRAFT' WHERE id=7301"], "move_order_forward_only")
+_tx_allow("07 变异：去掉 trg_mo_forward 后，CONFIRMED 回 DRAFT 通过（回退时同时清 confirmed_at，否则撞 ck_mo_confirm）", ["DROP TRIGGER trg_mo_forward",
+                                          "UPDATE move_order SET status='CONFIRMED', confirmed_at=datetime('now') WHERE id=7301",
+                                          "UPDATE move_order SET status='DRAFT', confirmed_at=NULL WHERE id=7301"])
+_tx_block("07 移库行 DONE 后改数量", ["UPDATE move_order_line SET status='DONE', movement_biz_no='MV-20261015-000001:1:D1', moved_at=datetime('now') WHERE id=7311",
+                              "UPDATE move_order_line SET qty_milli=99999 WHERE id=7311"], "move_line_done_locked")
+print("--- 2j-view. 上架 / 补货共用候选视图 v_location_sku_candidate ---")
+def _view_case(desc, setup, check_sql, want, why=""):
+    conn.execute("SAVEPOINT vc")
+    try:
+        for s in setup: conn.execute(s)
+        got = [r[0] for r in conn.execute(check_sql)]
+        ok(f"{desc} → {got}{why}") if got == want else bad(f"{desc} → {got}，期望 {want}{why}")
+    except sqlite3.Error as e:
+        bad(f"{desc} → 查询失败：{e}")
+    finally:
+        conn.execute("ROLLBACK TO vc"); conn.execute("RELEASE vc")
+# 视图用例一律在 SAVEPOINT 里**现造数据**，不依赖基础种子（种子的 mix_sku/max_lots/批次分布与本视图口径无关）。
+# 固定夹具：两个温区 + 五个库位（空位 mix_sku 一真一假、一个 LOCKED、一个常温位）+ 三个 SKU + 四个批次。
+# 号段避开前面各篇用例（退供占了 97001–97004、7701–7704 也可能被别处用），本轮统一取 7711+ / 971xx。
+_Z7V = [
+    "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type,temp_min_c10,temp_max_c10) VALUES (7711,1,'Z7V-C','7篇视图冷藏','CHILLED','STORAGE',0,40)",
+    "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type,temp_min_c10,temp_max_c10) VALUES (7712,1,'Z7V-A','7篇视图常温','AMBIENT','STORAGE',100,300)",
+    "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,mix_sku,pickable,pick_sequence,status) VALUES (7711,1,7711,'7V-A01','BIN',2,1,1,'7VA01','AVAILABLE')",
+    "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,mix_sku,pickable,pick_sequence,status) VALUES (7712,1,7711,'7V-A02','BIN',2,0,1,'7VA02','AVAILABLE')",
+    "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,mix_sku,pickable,pick_sequence,status) VALUES (7713,1,7711,'7V-A03','BIN',2,1,1,'7VA03','LOCKED')",
+    "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,mix_sku,pickable,pick_sequence,status) VALUES (7714,1,7711,'7V-A04','BIN',2,0,1,'7VA04','AVAILABLE')",
+    "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,mix_sku,pickable,pick_sequence,status) VALUES (7715,1,7712,'7V-B01','BIN',2,1,1,'7VB01','AVAILABLE')",
+    "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life,sell_days) VALUES (97101,'SKU7-CH','7篇视图冷藏货','KG','CHILLED',30,10,14)",
+    "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life,sell_days) VALUES (97102,'SKU7-AM','7篇视图常温货','KG','AMBIENT',365,30,30)",
+    "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life,sell_days) VALUES (97103,'SKU7-CH2','7篇视图冷藏货2','KG','CHILLED',30,10,14)",
+    "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (97111,97101,'LOT7-C1','2026-11-01','2026-10-15')",
+    "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (97114,97103,'LOT7-C3','2026-11-03','2026-10-15')",
+    "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (97115,97103,'LOT7-C4','2026-11-04','2026-10-15')",
+    "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (97113,97102,'LOT7-A1','2026-12-01','2026-10-15')",
+]
+def _s7(i, loc, sku, lot, q):
+    return (f"INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) "
+            f"VALUES ({i},1,{loc},{sku},{lot},'KG',{q})")
+_c7 = "SELECT location_id FROM v_location_sku_candidate WHERE sku_id = 97101 AND zone_id = 7711 ORDER BY location_id"
+_a7 = "SELECT location_id FROM v_location_sku_candidate WHERE sku_id = 97102 AND zone_id = 7712 ORDER BY location_id"
+_view_case("07 视图：冷藏 SKU 候选 = 冷藏可用位（7711/7712/7714）；LOCKED 7713 与常温位 7715 都不进",
+           _Z7V, _c7, [7711, 7712, 7714], "（同温区 + 未锁定）")
+_view_case("07 视图：常温 SKU 候选只有常温位 7715（四个冷藏位全不进）",
+           _Z7V, _a7, [7715], "（温区必须一致）")
+_view_case("07 视图：mix_sku=false 的 7714 已有别的冷藏 SKU 的货 → 本 SKU 不进候选",
+           _Z7V + [_s7(97141, 7714, 97103, 97114, 5000)], _c7, [7711, 7712], "（7714 被排除）")
+_view_case("07 视图：mix_sku=false 的 7714 已有同 SKU 的货 → 仍在候选且 has_same_sku=1",
+           _Z7V + [_s7(97142, 7714, 97101, 97111, 5000)],
+           "SELECT has_same_sku FROM v_location_sku_candidate WHERE sku_id = 97101 AND location_id = 7714",
+           [1], "（同 SKU 复用位）")
+_view_case("07 视图：mix_sku=true 的 7711 有别的冷藏 SKU 的货也照样进候选",
+           _Z7V + [_s7(97143, 7711, 97103, 97114, 5000)],
+           "SELECT location_id FROM v_location_sku_candidate WHERE sku_id = 97101 AND location_id = 7711",
+           [7711], "（mix_sku=true 允许混放）")
+_view_case("07 视图：max_lots=2 的 7714 已放 2 个批次 → lot_cnt=2 且 has_lot_slot=0",
+           _Z7V + [_s7(97144, 7714, 97103, 97114, 1000), _s7(97145, 7714, 97103, 97115, 1000)],
+           "SELECT lot_cnt || '/' || max_lots || '/' || has_lot_slot FROM v_location_sku_candidate WHERE sku_id = 97103 AND location_id = 7714",
+           ['2/2/0'], "（批次位占满）")
+_view_case("07 视图：7714 只有 1 个批次 → lot_cnt=1 且 has_lot_slot=1",
+           _Z7V + [_s7(97146, 7714, 97103, 97114, 1000)],
+           "SELECT lot_cnt || '/' || has_lot_slot FROM v_location_sku_candidate WHERE sku_id = 97103 AND location_id = 7714",
+           ['1/1'], "（还有批次位）")
 
 print("=== FK 自检 ===")
 _fk_guard("收尾")

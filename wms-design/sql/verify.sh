@@ -22,6 +22,7 @@ SCHEMA_PARTS=(
   04_outbound.sql
   05_picking.sql
   06_pack_ship.sql
+  07_replenishment.sql
   08_count.sql
   10_returns.sql
   09_scrap.sql
@@ -40,12 +41,17 @@ SCHEMA_PARTS=(
 # docs/12 的 DDL 在 12b_auth_audit.sql：在 43 表 / 119 索引上增加 user_device_binding、offline_token、approval_request（3 主键 + uq_offline_jti + uq_apr_code + uq_audit_node_seq + 7 个显式索引）→ 46 表 / 132 索引；合入 1d907031（#2 第四轮 ix_mv_hold，43/120）后 → 46 表 / 133 索引（PG16.15 实测）。以 PG 实测为准。
 # 退供（pr-supplier-return，基于 30041054）：+supplier_return（PK、uq_srtn_code、ix_srtn_due）+ uq_srtn_scrap、uq_scr_srtn → 73 表 / 218 索引。
 # docs/03：+5 表（测温/收货/更正单/上架/质量反馈），索引 +25
-EXPECT_TABLES=79
-EXPECT_INDEXES=255
+# docs/07（磐石）：+5 表（replenish_task、replenish_task_line、replenish_demand、move_order、move_order_line）
+#   +21 索引（replenish_task PK/uq_rt_code/ix_rt_claim/ix_rt_mine、replenish_task_line PK/uq_rtl/ix_rtl_task/ix_rtl_stock、
+#    replenish_demand PK/uq_rpd_code/uq_rpd_open/ix_rpd_open/ix_rpd_task/ix_rpd_loc、
+#    move_order PK/uq_mo_code/ix_mo_wh、move_order_line PK/uq_mol/ix_mol_order/ix_mol_stock）
+#   +1 视图（v_location_sku_candidate）→ 84 表 / 276 索引 / 3 视图（PG16 实测）
+EXPECT_TABLES=84
+EXPECT_INDEXES=276
 # 第 12 篇：+device_reconnect（PK、uq_drc_id_binding、ix_drc_binding、ix_drc_jti）+ audit_log.uq_audit_rbac_once → 79 表 / 248 索引（PG16 实测）
 # docs/05（长流）：+ix_pt_handover（pick_task 交接任务来源的部分索引）→ 249 索引
 # docs/08（长流）：+ix_cnt_wh、ix_adj_wh、ix_adj_src、uq_adjl、ix_cnt_line_count、ix_cnt_line_loc → 255 索引（249 + 6）
-EXPECT_VIEWS=2
+EXPECT_VIEWS=3
 
 CTR=wms-pg-verify
 PORT=55432
@@ -145,7 +151,7 @@ echo "  → 表 $T 张 / 索引 $I 个 / 视图 $V 个"
 [ "$V" = "$EXPECT_VIEWS" ]   && ok "视图数 = $V" || bad "视图数 = $V，期望 $EXPECT_VIEWS"
 
 # 小赵 S4：按期望权限矩阵逐表核对 wms_app（表、分区父表、视图、物化视图；序列查 USAGE），多给、少给、漏表都失败
-EXPECT_PRIVS="adjust_line:SELECT,INSERT,UPDATE adjust_order:SELECT,INSERT,UPDATE api_credential:SELECT,INSERT,UPDATE approval_request:SELECT,INSERT audit_log:SELECT,INSERT count_line:SELECT,INSERT,UPDATE count_order:SELECT,INSERT,UPDATE device_reconnect:SELECT,INSERT exception_case:SELECT,INSERT,UPDATE exception_code:SELECT,INSERT,UPDATE idempotency_record:SELECT,INSERT,UPDATE inbound_correction:SELECT,INSERT inbound_line:SELECT,INSERT inbound_message:SELECT,INSERT,UPDATE inbound_order:SELECT,INSERT,UPDATE inbound_putaway:SELECT,INSERT inbound_quality_feedback:SELECT,INSERT,UPDATE inbound_receipt:SELECT,INSERT inbound_temp_check:SELECT,INSERT live_count_ledger:SELECT,INSERT live_death:SELECT,INSERT live_inspection:SELECT,INSERT live_shrink_settlement:SELECT,INSERT live_stock_count:SELECT,INSERT,UPDATE live_tank:SELECT,INSERT,UPDATE live_tank_hold:SELECT,INSERT live_weigh:SELECT,INSERT location:SELECT,INSERT,UPDATE lot:SELECT,INSERT,UPDATE numbering_segment:SELECT,INSERT,UPDATE offline_paper_record:SELECT,INSERT,UPDATE offline_token:SELECT,INSERT outbound_line:SELECT,INSERT,UPDATE outbound_order:SELECT,INSERT,UPDATE outbox_event:SELECT,INSERT,UPDATE pack_box:SELECT,INSERT,UPDATE pack_box_line:SELECT,INSERT,UPDATE pick_task:SELECT,INSERT,UPDATE pick_task_line:SELECT,INSERT,UPDATE process_bom:SELECT,INSERT,UPDATE process_bom_line:SELECT,INSERT,UPDATE process_issue:SELECT,INSERT,UPDATE process_lot_trace:SELECT,INSERT process_order:SELECT,INSERT,UPDATE process_output:SELECT,INSERT,UPDATE process_report:SELECT,INSERT process_reversal:SELECT,INSERT return_blind_receipt:SELECT,INSERT return_reservation:SELECT,INSERT,UPDATE return_reservation_line:SELECT,INSERT,UPDATE scrap_line:SELECT,INSERT,UPDATE scrap_order:SELECT,INSERT,UPDATE shipment:SELECT,INSERT,UPDATE shipment_order:SELECT,INSERT,UPDATE sku:SELECT,INSERT,UPDATE sku_barcode:SELECT,INSERT,UPDATE sku_live_param:SELECT,INSERT,UPDATE sku_unit:SELECT,INSERT,UPDATE stock:SELECT,INSERT,UPDATE stock_hold:SELECT,INSERT stock_hold_release:SELECT,INSERT stock_ledger_line:SELECT,INSERT stock_movement:SELECT,INSERT stock_movement_key:SELECT,INSERT stock_recon_alert:SELECT,INSERT,UPDATE stock_reservation:SELECT,INSERT,UPDATE stock_snapshot_daily:SELECT,INSERT supplier_return:SELECT,INSERT sys_permission:SELECT,INSERT,UPDATE sys_role:SELECT,INSERT,UPDATE sys_role_perm:SELECT sys_user:SELECT,INSERT,UPDATE sys_user_role:SELECT sys_user_warehouse:SELECT upstream_push_log:SELECT,INSERT user_device_binding:SELECT,INSERT v_live_death_in_transit:SELECT v_stock_available:SELECT warehouse:SELECT,INSERT,UPDATE wave:SELECT,INSERT,UPDATE zone:SELECT,INSERT,UPDATE"
+EXPECT_PRIVS="adjust_line:SELECT,INSERT,UPDATE adjust_order:SELECT,INSERT,UPDATE api_credential:SELECT,INSERT,UPDATE approval_request:SELECT,INSERT audit_log:SELECT,INSERT count_line:SELECT,INSERT,UPDATE count_order:SELECT,INSERT,UPDATE device_reconnect:SELECT,INSERT exception_case:SELECT,INSERT,UPDATE exception_code:SELECT,INSERT,UPDATE idempotency_record:SELECT,INSERT,UPDATE inbound_correction:SELECT,INSERT inbound_line:SELECT,INSERT inbound_message:SELECT,INSERT,UPDATE inbound_order:SELECT,INSERT,UPDATE inbound_putaway:SELECT,INSERT inbound_quality_feedback:SELECT,INSERT,UPDATE inbound_receipt:SELECT,INSERT inbound_temp_check:SELECT,INSERT live_count_ledger:SELECT,INSERT live_death:SELECT,INSERT live_inspection:SELECT,INSERT live_shrink_settlement:SELECT,INSERT live_stock_count:SELECT,INSERT,UPDATE live_tank:SELECT,INSERT,UPDATE live_tank_hold:SELECT,INSERT live_weigh:SELECT,INSERT location:SELECT,INSERT,UPDATE lot:SELECT,INSERT,UPDATE move_order:SELECT,INSERT,UPDATE move_order_line:SELECT,INSERT,UPDATE numbering_segment:SELECT,INSERT,UPDATE offline_paper_record:SELECT,INSERT,UPDATE offline_token:SELECT,INSERT outbound_line:SELECT,INSERT,UPDATE outbound_order:SELECT,INSERT,UPDATE outbox_event:SELECT,INSERT,UPDATE pack_box:SELECT,INSERT,UPDATE pack_box_line:SELECT,INSERT,UPDATE pick_task:SELECT,INSERT,UPDATE pick_task_line:SELECT,INSERT,UPDATE process_bom:SELECT,INSERT,UPDATE process_bom_line:SELECT,INSERT,UPDATE process_issue:SELECT,INSERT,UPDATE process_lot_trace:SELECT,INSERT process_order:SELECT,INSERT,UPDATE process_output:SELECT,INSERT,UPDATE process_report:SELECT,INSERT process_reversal:SELECT,INSERT replenish_demand:SELECT,INSERT,UPDATE replenish_task:SELECT,INSERT,UPDATE replenish_task_line:SELECT,INSERT,UPDATE return_blind_receipt:SELECT,INSERT return_reservation:SELECT,INSERT,UPDATE return_reservation_line:SELECT,INSERT,UPDATE scrap_line:SELECT,INSERT,UPDATE scrap_order:SELECT,INSERT,UPDATE shipment:SELECT,INSERT,UPDATE shipment_order:SELECT,INSERT,UPDATE sku:SELECT,INSERT,UPDATE sku_barcode:SELECT,INSERT,UPDATE sku_live_param:SELECT,INSERT,UPDATE sku_unit:SELECT,INSERT,UPDATE stock:SELECT,INSERT,UPDATE stock_hold:SELECT,INSERT stock_hold_release:SELECT,INSERT stock_ledger_line:SELECT,INSERT stock_movement:SELECT,INSERT stock_movement_key:SELECT,INSERT stock_recon_alert:SELECT,INSERT,UPDATE stock_reservation:SELECT,INSERT,UPDATE stock_snapshot_daily:SELECT,INSERT supplier_return:SELECT,INSERT sys_permission:SELECT,INSERT,UPDATE sys_role:SELECT,INSERT,UPDATE sys_role_perm:SELECT sys_user:SELECT,INSERT,UPDATE sys_user_role:SELECT sys_user_warehouse:SELECT upstream_push_log:SELECT,INSERT user_device_binding:SELECT,INSERT v_live_death_in_transit:SELECT v_location_sku_candidate:SELECT v_stock_available:SELECT warehouse:SELECT,INSERT,UPDATE wave:SELECT,INSERT,UPDATE zone:SELECT,INSERT,UPDATE"
 ACT=$(psql -t -A -c "SELECT string_agg(x, ' ' ORDER BY x) FROM (SELECT c.relname || ':' || COALESCE(NULLIF(concat_ws(',', CASE WHEN c.relkind='S' THEN (CASE WHEN has_sequence_privilege('wms_app', c.oid, 'USAGE') THEN 'USAGE' END) ELSE (CASE WHEN has_table_privilege('wms_app', c.oid, 'SELECT') THEN 'SELECT' END) END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'INSERT') THEN 'INSERT' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'UPDATE') THEN 'UPDATE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'DELETE') THEN 'DELETE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'TRUNCATE') THEN 'TRUNCATE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'REFERENCES') THEN 'REFERENCES' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'TRIGGER') THEN 'TRIGGER' END), ''), 'NONE') AS x FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','S') AND NOT c.relispartition) t")
 if [ "$ACT" = "$EXPECT_PRIVS" ]; then ok "S4 wms_app 权限矩阵与期望逐表一致（$(echo "$ACT" | wc -w) 个对象，含 TRIGGER/REFERENCES；列级 UPDATE 另测）"
 else bad "S4 wms_app 权限矩阵不符：$(diff <(echo "$EXPECT_PRIVS" | tr ' ' '\n') <(echo "$ACT" | tr ' ' '\n') | grep '^[<>]' | tr '\n' ' ')"; fi
@@ -208,6 +214,50 @@ expect_block "I2 超占（allocated>on_hand）" \
   "ck_stock_nonneg"
 seed "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (1,'OBT1',1,'SALE','MALL','M-2026-001','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'CREATED','2026-10-16');"
 assert_n "种子 outbound_order" "SELECT count(*) FROM outbound_order" 1
+# 第 7 篇：补货任务 / 任务行 / 需求 / 移库单 / 移库行各一条（供逐键实打与视图断言；父行都在上面）
+seed "INSERT INTO replenish_task (id,code,warehouse_id,zone_id,work_date,status,line_count) VALUES (701,'RPL-20261015-000001',1,1,'2026-10-15','PENDING',1);"
+seed "INSERT INTO replenish_task_line (id,task_id,seq,from_location_id,to_location_id,sku_id,lot_id,from_stock_id,planned_qty_milli,uom) VALUES (7101,701,1,3,1,1,3,13,20000,'KG');"
+seed "INSERT INTO replenish_demand (id,code,warehouse_id,work_date,cause,target_location_id,sku_id,demand_qty_milli,source_outbound_id,source_outbound_line_id,source_alloc_round,source_doc_no) VALUES (7201,'RPD-20261015-000001',1,'2026-10-15','OUTBOUND_SHORTAGE',1,1,20000,1,1,1,'OBT1');"
+seed "INSERT INTO move_order (id,code,warehouse_id,move_type,status,reason_code,line_count) VALUES (7301,'MV-20261015-000001',1,'LOCATION_TRANSFER','DRAFT','TIDY',1);"
+seed "INSERT INTO move_order_line (id,move_order_id,line_no,from_location_id,to_location_id,sku_id,lot_id,from_stock_id,qty_milli,uom) VALUES (7311,7301,1,2,3,1,1,12,10000,'KG');"
+# 逐键实打要「无子行」样本：这两条没有任何行引用，供 move_order(code) / replenish_task(code) 的 REPLACE 实打
+seed "INSERT INTO replenish_task (id,code,warehouse_id,zone_id,work_date,status,line_count) VALUES (702,'RPL-20261015-000002',1,2,'2026-10-15','PENDING',0);"
+seed "INSERT INTO move_order (id,code,warehouse_id,move_type,status,reason_code,line_count) VALUES (7302,'MV-20261015-000002',1,'CONSOLIDATE','DRAFT','MERGE',0);"
+assert_n "种子 replenish_task" "SELECT count(*) FROM replenish_task" 2
+assert_n "种子 replenish_task_line" "SELECT count(*) FROM replenish_task_line" 1
+assert_n "种子 replenish_demand" "SELECT count(*) FROM replenish_demand" 1
+assert_n "种子 move_order" "SELECT count(*) FROM move_order" 2
+assert_n "种子 move_order_line" "SELECT count(*) FROM move_order_line" 1
+# 第 7 篇候选视图 v_location_sku_candidate：每个用例一个事务现造夹具（BEGIN … ROLLBACK），不依赖基础种子；
+# 与 verify_sqlite.py 的 _view_case 同名同口径（两库对称）。号段避开其他篇用例。
+_vseed="INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type,temp_min_c10,temp_max_c10) VALUES (7711,1,'Z7V-C','7篇视图冷藏','CHILLED','STORAGE',0,40),(7712,1,'Z7V-A','7篇视图常温','AMBIENT','STORAGE',100,300); \
+INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,mix_sku,pickable,pick_sequence,status) VALUES (7711,1,7711,'7V-A01','BIN',2,true,true,'7VA01','AVAILABLE'),(7712,1,7711,'7V-A02','BIN',2,false,true,'7VA02','AVAILABLE'),(7713,1,7711,'7V-A03','BIN',2,true,true,'7VA03','LOCKED'),(7714,1,7711,'7V-A04','BIN',2,false,true,'7VA04','AVAILABLE'),(7715,1,7712,'7V-B01','BIN',2,true,true,'7VB01','AVAILABLE'); \
+INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life,sell_days) VALUES (97101,'SKU7-CH','7篇视图冷藏货','KG','CHILLED',30,10,14),(97102,'SKU7-AM','7篇视图常温货','KG','AMBIENT',365,30,30),(97103,'SKU7-CH2','7篇视图冷藏货2','KG','CHILLED',30,10,14); \
+INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (97111,97101,'LOT7-C1','2026-11-01','2026-10-15'),(97114,97103,'LOT7-C3','2026-11-03','2026-10-15'),(97115,97103,'LOT7-C4','2026-11-04','2026-10-15'),(97113,97102,'LOT7-A1','2026-12-01','2026-10-15');"
+vcase() { # $1=描述 $2=期望值（| 连接） $3=额外夹具 $4=聚合表达式
+  local got
+  got=$(psql -q -t -A -c "BEGIN; $_vseed $3 SELECT $4; ROLLBACK;" 2>&1 | tail -1)
+  [ "$got" = "$2" ] && ok "$1 → $got" || bad "$1 → $got，期望 $2"
+}
+vcase "07 视图：冷藏 SKU 候选 = 冷藏可用位（7711/7712/7714）；LOCKED 7713 与常温位 7715 都不进" \
+  "7711|7712|7714" "" "string_agg(location_id::text,'|' ORDER BY location_id) FROM v_location_sku_candidate WHERE sku_id=97101 AND zone_id=7711"
+vcase "07 视图：常温 SKU 候选只有常温位 7715（四个冷藏位全不进）" \
+  "7715" "" "string_agg(location_id::text,'|' ORDER BY location_id) FROM v_location_sku_candidate WHERE sku_id=97102 AND zone_id=7712"
+vcase "07 视图：mix_sku=false 的 7714 已有别的冷藏 SKU 的货 → 本 SKU 不进候选" \
+  "7711|7712" "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (97141,1,7714,97103,97114,'KG',5000);" \
+  "string_agg(location_id::text,'|' ORDER BY location_id) FROM v_location_sku_candidate WHERE sku_id=97101 AND zone_id=7711"
+vcase "07 视图：mix_sku=false 的 7714 已有同 SKU 的货 → 仍在候选且 has_same_sku=1" \
+  "1" "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (97142,1,7714,97101,97111,'KG',5000);" \
+  "has_same_sku FROM v_location_sku_candidate WHERE sku_id=97101 AND location_id=7714"
+vcase "07 视图：mix_sku=true 的 7711 有别的冷藏 SKU 的货也照样进候选" \
+  "7711" "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (97143,1,7711,97103,97114,'KG',5000);" \
+  "string_agg(location_id::text,'|' ORDER BY location_id) FROM v_location_sku_candidate WHERE sku_id=97101 AND location_id=7711"
+vcase "07 视图：max_lots=2 的 7714 已放 2 个批次 → lot_cnt=2 且 has_lot_slot=0" \
+  "2/2/0" "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (97144,1,7714,97103,97114,'KG',1000),(97145,1,7714,97103,97115,'KG',1000);" \
+  "lot_cnt::text || '/' || max_lots::text || '/' || has_lot_slot::text FROM v_location_sku_candidate WHERE sku_id=97103 AND location_id=7714"
+vcase "07 视图：7714 只有 1 个批次 → lot_cnt=1 且 has_lot_slot=1" \
+  "1/1" "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (97146,1,7714,97103,97114,'KG',1000);" \
+  "lot_cnt::text || '/' || has_lot_slot::text FROM v_location_sku_candidate WHERE sku_id=97103 AND location_id=7714"
 expect_block "§4.6② 业务层幂等（source_system+source_order_no 重复）" \
   "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (2,'OBT2',1,'SALE','MALL','M-2026-001','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'CREATED','2026-10-16');" \
   "uq_obo_src"
@@ -2609,8 +2659,9 @@ echo "=== 2z. pg_temp 劫持（#2 第九轮）：search_path 必须显式写 pg_
 # 能建同名临时表盖住 public 的真表。所以 'pg_catalog, public' 不够，必须 'pg_catalog, public, pg_temp'（pg_temp 显式且最后）。
 # SQLite 没有对应攻击面：没有 schema 搜索路径，TEMP 表只对本连接可见，触发器体里的表名在建触发器时就绑到 main（不跟会话走），verify_sqlite.py 不加对应用例。
 # 目录断言：public 里所有带 search_path 设置的函数（含退供增量自带的 5 个，米雪儿已按本规则写）都必须正好是 pg_catalog, public, pg_temp。
+# docs/07（本分支）新增 5 个 PL/pgSQL 触发器函数（trg_rt_forward、trg_rtl_forward、trg_rpd_forward、trg_mo_forward、trg_mol_forward）→ 86 → 91。
 R=$(psql -t -A -c "SELECT count(*) FILTER (WHERE c <> 'search_path=pg_catalog, public, pg_temp') || '/' || count(*) FROM (SELECT unnest(p.proconfig) c FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace) s WHERE c LIKE 'search_path=%'")
-[ "$R" = "0/86" ] && ok "pg_temp 目录断言：86 个固定 search_path 的函数都显式以 pg_temp 结尾（不合规/总数 = $R）" || bad "pg_temp 目录断言：不合规/总数 = $R（期望 0/86）"
+[ "$R" = "0/91" ] && ok "pg_temp 目录断言：91 个固定 search_path 的函数都显式以 pg_temp 结尾（不合规/总数 = $R）" || bad "pg_temp 目录断言：不合规/总数 = $R（期望 0/91）"
 # 通用断言（不限函数个数）：public 下任何函数只要设了 search_path，pg_temp 必须是最后一项
 R=$(psql -t -A -c "SELECT count(*) FILTER (WHERE c !~ ',\s*pg_temp\s*$') || '/' || count(*) || '#' || COALESCE(string_agg(proname, ',') FILTER (WHERE c !~ ',\s*pg_temp\s*$'), '') FROM (SELECT p.proname, c FROM pg_proc p, unnest(p.proconfig) c WHERE p.pronamespace = 'public'::regnamespace AND c LIKE 'search_path=%') s")
 [ "${R%%/*}" = "0" ] && ok "pg_temp 末位断言：public 下设了 search_path 的函数 pg_temp 都在最后（缺/总 = ${R%%#*}）" || bad "pg_temp 末位断言：缺/总 = ${R%%#*}，函数：${R#*#}"
@@ -2662,7 +2713,7 @@ echo "  → fixed/mut：02[$A0 | $A1] 09[$B0 | $B1] 11[$C0 | $C1] 12[$D0 | $D1]"
 [ "$B0" = "scrap_line_locked" ] && ok "pg_temp 劫持 09 trg_scrl_draft_only：临时表 scrap_order 把已取消单伪造成 DRAFT，函数仍读 public → $B0" || bad "09 pg_temp 劫持：$B0（期望 scrap_line_locked）"
 [ "$C0" = "PT_PASSED" ] && ok "pg_temp 劫持 11 trg_outbox_order_guard：临时表 outbox_event 伪造同 biz_key 更早的 PENDING 行想卡住投递，函数仍读 public，真实事件照常进 SENDING（$C0）" || bad "11 pg_temp 劫持：$C0（期望正常放行 PT_PASSED）"
 [ "$D0" = "approval_code_warehouse_mismatch" ] && ok "pg_temp 劫持 12 trg_apr_insert：临时表 warehouse 把仓 1 编码伪造成 PTFAKE，函数仍读 public → $D0" || bad "12 pg_temp 劫持：$D0（期望 approval_code_warehouse_mismatch）"
-[ "$PC1" = "4/86" ] && ok "变异：四个函数去掉 pg_temp 后目录断言变红（$PC1）" || bad "变异目录断言没变红：$PC1（期望 4/86）"
+[ "$PC1" = "4/91" ] && ok "变异：四个函数去掉 pg_temp 后目录断言变红（$PC1）" || bad "变异目录断言没变红：$PC1（期望 4/91）"
 [ "$A1" != "$A0" ] && ok "变异：trg_mvk_line_kind 去掉 pg_temp 后临时表劫持生效（$A1）" || bad "变异没变红：trg_mvk_line_kind 去掉 pg_temp 后仍是 $A1"
 [ "$B1" != "$B0" ] && ok "变异：trg_scrl_draft_only 去掉 pg_temp 后临时表劫持生效（$B1）" || bad "变异没变红：trg_scrl_draft_only 去掉 pg_temp 后仍是 $B1"
 [ "$C1" != "$C0" ] && ok "变异：trg_outbox_order_guard 去掉 pg_temp 后临时表劫持生效（$C1）" || bad "变异没变红：trg_outbox_order_guard 去掉 pg_temp 后仍是 $C1"
