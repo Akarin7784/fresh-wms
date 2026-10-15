@@ -1,6 +1,6 @@
 -- =============================================================================
 -- 09_scrap.sql —— 第 9 篇 效期与损耗（PR #4，米雪儿接手）自有 DDL
--- 加载顺序：08_count.sql 之后、11_integration.sql 之前。不改别篇文件；本篇没有跨篇 ALTER。
+-- 加载顺序：08_count.sql 之后、11_integration.sql 之前。不改别篇文件；跨篇 ALTER 只有文末对第 10 篇 supplier_return 的外键与超期守卫（README 登记）。
 -- 基线 #2 6008032：convert_hold(hold_id, qty, to_hold_type, to_source, op_key) 支持部分转换；可售期到期（SELL_EXPIRED）按 02（6008032）§表 SCRAP_PENDING 行：直接 hold(SCRAP_PENDING)（op_key=SELLEXP:{lot_id}:{date}，operator_id=0），不走 convert_hold，也不走 place_hold（place_hold 只收 PROCESSING / LIVE_HOLD）。
 -- 记账型来源（record_only）：PROCESS_LOSS（第 17 篇，原料已随报工 consume_process_hold 扣过）、LIVE_DEATH / LIVE_SHRINK（第 18 篇 consume_live_hold 直接扣，Doro P1）
 --   —— 报损单只记账：不冻结（hold_id=0）、行 ledger_mode=NONE、过账不调 post_out。
@@ -11,7 +11,7 @@ CREATE TABLE scrap_order (
     id              BIGINT          PRIMARY KEY,
     code            VARCHAR(64)     NOT NULL,   -- SCR-{仓}-{节点}-{作业日}-{序号}
     warehouse_id    BIGINT          NOT NULL,
-    source_type     VARCHAR(24)     NOT NULL,   -- 取值见 ck_scr_src_type；SELL_EXPIRED：可售天数到期扫描（source_id=lot_id，来源键 SELL_EXPIRED:{lot_id}:{date}，落库 source_id=lot_id + source_date=作业日，见 uq_scr_source；冻结 op_key SELLEXP:{lot_id}:{date}）；RETURN_HANDOVER：04 交接，source_id=待回库记录 id；RETURN_QC：10 质检不合格，source_id=inbound_line.id
+    source_type     VARCHAR(24)     NOT NULL,   -- 取值见 ck_scr_src_type；SELL_EXPIRED：可售天数到期扫描（source_id=lot_id，来源键 SELL_EXPIRED:{lot_id}:{date}，落库 source_id=lot_id + source_date=作业日，见 uq_scr_source；冻结 op_key SELLEXP:{lot_id}:{date}）；RETURN_HANDOVER：04 交接，source_id=待回库记录 id；RETURN_QC：10 质检不合格，source_id=inbound_line.id；SUPPLIER_RETURN：10 退供超期未提，source_id=supplier_return.id，reason_code=PICKUP_OVERDUE
     source_id       BIGINT          NOT NULL DEFAULT 0,
     source_date     DATE            NOT NULL DEFAULT '1970-01-01',   -- 00 §6.4 D3：按日去重白名单（SELL_EXPIRED / LIVE_SHRINK）写仓库作业日；其余来源固定 '1970-01-01'
     reason_code     VARCHAR(24)     NOT NULL,   -- 取值见 ck_scr_reason
@@ -39,15 +39,16 @@ CREATE TABLE scrap_order (
     CONSTRAINT ck_scr_appr   CHECK (status NOT IN ('APPROVED','POSTED') OR (approver_id IS NOT NULL AND approved_at IS NOT NULL)
                                     OR (record_only AND status = 'POSTED' AND approver_id IS NULL AND approved_at IS NULL)),
     CONSTRAINT ck_scr_posted CHECK (status <> 'POSTED' OR posted_at IS NOT NULL),
-    CONSTRAINT ck_scr_src_type CHECK (source_type IN ('EXPIRY_SCAN','SELL_EXPIRED','MANUAL','RETURN_QC','RETURN_HANDOVER','COUNT','EXCEPTION','LIVE_DEATH','LIVE_SHRINK','PROCESS_LOSS')),
+    CONSTRAINT ck_scr_src_type CHECK (source_type IN ('EXPIRY_SCAN','SELL_EXPIRED','MANUAL','RETURN_QC','RETURN_HANDOVER','COUNT','EXCEPTION','LIVE_DEATH','LIVE_SHRINK','PROCESS_LOSS','SUPPLIER_RETURN')),
     -- 00 §6.4 D3（大肥鱼定）：按日去重白名单 SELL_EXPIRED / LIVE_SHRINK 的 source_date = work_date；其余来源（含 LIVE_DEATH）固定 '1970-01-01'
     CONSTRAINT ck_scr_src_date CHECK (CASE WHEN source_type IN ('SELL_EXPIRED','LIVE_SHRINK') THEN source_date = work_date ELSE source_date = '1970-01-01' END),
     CONSTRAINT ck_scr_reason CHECK (reason_code IN ('EXPIRED','NEAR_EXPIRY','SELL_EXPIRED','DAMAGED','QC_REJECT','NATURAL_LOSS','OTHER',
-                                                  'TRIM','DRIP','WEIGH_DIFF','DEFECT','LIVE_DEATH')),
+                                                  'TRIM','DRIP','WEIGH_DIFF','DEFECT','LIVE_DEATH','PICKUP_OVERDUE')),
     -- 加工损耗原因只给 PROCESS_LOSS 用；PROCESS_LOSS 只收这 4 个（17 process_output.loss_reason 一一对应，不再映射成 NATURAL_LOSS）
     CONSTRAINT ck_scr_reason_src CHECK (
         (source_type = 'PROCESS_LOSS') = (reason_code IN ('TRIM','DRIP','WEIGH_DIFF','DEFECT'))
         AND (reason_code <> 'LIVE_DEATH' OR source_type = 'LIVE_DEATH')
+        AND (reason_code <> 'PICKUP_OVERDUE' OR source_type = 'SUPPLIER_RETURN')   -- 第 10 篇退供超期未提（Alex 定案）
     ),
     -- PROCESS_LOSS 作废（17 损耗改原因/改数量）挂 17 冲回键 void_ref=PRCR:…，不走 SCRAP_MISREPORT
     CONSTRAINT ck_scr_void_ref CHECK (void_ref IS NULL OR (source_type = 'PROCESS_LOSS' AND status = 'VOIDED' AND void_ref LIKE 'PRCR:%'))
@@ -222,3 +223,82 @@ CREATE TRIGGER trg_scrl_no_trunc  BEFORE TRUNCATE ON scrap_line  FOR EACH STATEM
 -- 授权（I4）：不给 DELETE/TRUNCATE，作废走状态
 GRANT SELECT, INSERT, UPDATE ON scrap_order, scrap_line TO wms_app;                                           -- @pg-only
 
+
+-- -----------------------------------------------------------------------------
+-- 跨篇 ALTER（第 10 篇 supplier_return，README 登记）：退供超期未提 → 本篇报损单 + 02 原语 hold(SCRAP_PENDING)
+--   supplier_return 在 10_returns.sql 建，scrap_order 在本文件建，所以外键和守卫写在这里。
+--   AWAITING_PICKUP → OVERDUE_SCRAP 时必须已有：本篇报损单（source_type=SUPPLIER_RETURN，source_id=退供单 id，reason_code=PICKUP_OVERDUE，未驳回/取消）
+--   和该单下的 SCRAP_PENDING 冻结（02 hold：source_type=SCRAP，source_id=报损单 id，op_key=SRTO:{退供单 id}，同库存行，HELD，冻结量 = 退供数量）。
+--   其他状态不能转入 OVERDUE_SCRAP，INSERT 也不能直接写 OVERDUE_SCRAP。错误 srtn_overdue_no_scrap_hold（23514）。
+--   进入 OVERDUE_SCRAP 后终态：status / scrap_order_id / overdue_at / stock_id / qty_milli 不可改（srtn_overdue_immutable），防转超期后换挂报损单绕过冻结校验。
+--   op_key 由守卫按 'SRTO:' || id 精确比较（大小写敏感、无前导零、无空白）；重放 hold 撞 02 uq_hold_op，重放转超期 WHERE status='AWAITING_PICKUP' 影响 0 行。
+-- -----------------------------------------------------------------------------
+-- 一张退供单最多挂一张报损单、一张报损单最多挂一张退供单（并发转超期只成一张，含已取消/驳回的旧单：uq_scr_source 放过它们，本索引不放）
+CREATE UNIQUE INDEX uq_scr_srtn ON scrap_order(source_id) WHERE source_type = 'SUPPLIER_RETURN';
+CREATE UNIQUE INDEX uq_srtn_scrap ON supplier_return(scrap_order_id) WHERE scrap_order_id IS NOT NULL;
+-- 退供报损单的来源守卫（小玛丽 pr03 B1 同类：条件更新 0 行静默成功）：
+--   INSERT：来源退供单必须正处于 AWAITING_PICKUP（srtn_scrap_not_awaiting），已提货 / 未进待提货的不能开报损单。
+--   之后任何「向前」迁移（提交 / 审批 / 过账；CANCELLED、REJECTED 除外）都要求退供单已是 OVERDUE_SCRAP 且 scrap_order_id 指向本单
+--   （srtn_scrap_orphan）。服务端转超期的条件更新若影响 0 行却照样提交，留下的报损单只能取消（同事务 release_scrap_hold），永远过不了账。
+--   服务端仍须按 00 §6.7 检查 rowcount、0 行返回 40930 并回滚整个事务；库层这条只兜底「不会因此误报损出账」。
+CREATE FUNCTION trg_scr_srtn() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
+BEGIN   -- @pg-only
+    IF NEW.source_type = 'SUPPLIER_RETURN' THEN   -- @pg-only
+        IF TG_OP = 'INSERT' AND NOT EXISTS (SELECT 1 FROM supplier_return r WHERE r.id = NEW.source_id AND r.status = 'AWAITING_PICKUP') THEN   -- @pg-only
+            RAISE EXCEPTION 'srtn_scrap_not_awaiting' USING ERRCODE = '23514';   -- @pg-only
+        END IF;   -- @pg-only
+        IF TG_OP = 'UPDATE' AND NEW.status IS DISTINCT FROM OLD.status AND NEW.status NOT IN ('CANCELLED','REJECTED')   -- @pg-only
+           AND NOT EXISTS (SELECT 1 FROM supplier_return r WHERE r.id = NEW.source_id AND r.status = 'OVERDUE_SCRAP' AND r.scrap_order_id = NEW.id) THEN   -- @pg-only
+            RAISE EXCEPTION 'srtn_scrap_orphan' USING ERRCODE = '23514';   -- @pg-only
+        END IF;   -- @pg-only
+    END IF;   -- @pg-only
+    RETURN NEW;   -- @pg-only
+END $$;   -- @pg-only
+CREATE TRIGGER trg_scr_srtn BEFORE INSERT OR UPDATE ON scrap_order FOR EACH ROW EXECUTE FUNCTION trg_scr_srtn();   -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_scr_srtn_ins BEFORE INSERT ON scrap_order
+-- @sqlite-only WHEN NEW.source_type = 'SUPPLIER_RETURN' AND NOT EXISTS (SELECT 1 FROM supplier_return r WHERE r.id = NEW.source_id AND r.status = 'AWAITING_PICKUP')
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'srtn_scrap_not_awaiting'); END;
+-- @sqlite-only CREATE TRIGGER trg_scr_srtn_upd BEFORE UPDATE ON scrap_order
+-- @sqlite-only WHEN NEW.source_type = 'SUPPLIER_RETURN' AND NEW.status IS NOT OLD.status AND NEW.status NOT IN ('CANCELLED','REJECTED')
+-- @sqlite-only   AND NOT EXISTS (SELECT 1 FROM supplier_return r WHERE r.id = NEW.source_id AND r.status = 'OVERDUE_SCRAP' AND r.scrap_order_id = NEW.id)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'srtn_scrap_orphan'); END;
+ALTER TABLE supplier_return ADD CONSTRAINT fk_srtn_scrap FOREIGN KEY (scrap_order_id) REFERENCES scrap_order(id);   -- @pg-only
+CREATE FUNCTION trg_srtn_overdue() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
+BEGIN   -- @pg-only
+    IF NEW.status = 'OVERDUE_SCRAP' AND (TG_OP = 'INSERT' OR OLD.status <> 'OVERDUE_SCRAP') THEN   -- @pg-only
+        IF TG_OP = 'INSERT' OR OLD.status <> 'AWAITING_PICKUP'   -- @pg-only
+           OR NOT EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = NEW.scrap_order_id AND o.source_type = 'SUPPLIER_RETURN'   -- @pg-only
+                          AND o.source_id = NEW.id AND o.reason_code = 'PICKUP_OVERDUE' AND o.status NOT IN ('REJECTED','CANCELLED'))   -- @pg-only
+           OR NOT EXISTS (SELECT 1 FROM stock_hold h WHERE h.hold_type = 'SCRAP_PENDING' AND h.source_type = 'SCRAP'   -- @pg-only
+                          AND h.source_id = NEW.scrap_order_id AND h.stock_id = NEW.stock_id AND h.op_key = 'SRTO:' || NEW.id   -- @pg-only
+                          AND h.status = 'HELD' AND h.hold_qty_milli = NEW.qty_milli) THEN   -- @pg-only
+            RAISE EXCEPTION 'srtn_overdue_no_scrap_hold' USING ERRCODE = '23514';   -- @pg-only
+        END IF;   -- @pg-only
+    END IF;   -- @pg-only
+    IF TG_OP = 'UPDATE' AND OLD.status = 'OVERDUE_SCRAP' AND (NEW.status IS DISTINCT FROM OLD.status   -- @pg-only
+       OR NEW.id IS DISTINCT FROM OLD.id OR NEW.scrap_order_id IS DISTINCT FROM OLD.scrap_order_id   -- @pg-only
+       OR NEW.overdue_at IS DISTINCT FROM OLD.overdue_at OR NEW.stock_id IS DISTINCT FROM OLD.stock_id   -- @pg-only
+       OR NEW.qty_milli IS DISTINCT FROM OLD.qty_milli) THEN   -- @pg-only
+        RAISE EXCEPTION 'srtn_overdue_immutable' USING ERRCODE = '23514';   -- @pg-only
+    END IF;   -- @pg-only
+    RETURN NEW;   -- @pg-only
+END $$;   -- @pg-only
+CREATE TRIGGER trg_srtn_overdue BEFORE INSERT OR UPDATE ON supplier_return FOR EACH ROW EXECUTE FUNCTION trg_srtn_overdue();   -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_srtn_overdue_ins BEFORE INSERT ON supplier_return
+-- @sqlite-only WHEN NEW.status = 'OVERDUE_SCRAP'
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'srtn_overdue_no_scrap_hold'); END;
+-- @sqlite-only CREATE TRIGGER trg_srtn_overdue BEFORE UPDATE ON supplier_return
+-- @sqlite-only WHEN NEW.status = 'OVERDUE_SCRAP' AND OLD.status <> 'OVERDUE_SCRAP' AND (OLD.status <> 'AWAITING_PICKUP'
+-- @sqlite-only   OR NOT EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = NEW.scrap_order_id AND o.source_type = 'SUPPLIER_RETURN'
+-- @sqlite-only       AND o.source_id = NEW.id AND o.reason_code = 'PICKUP_OVERDUE' AND o.status NOT IN ('REJECTED','CANCELLED'))
+-- @sqlite-only   OR NOT EXISTS (SELECT 1 FROM stock_hold h WHERE h.hold_type = 'SCRAP_PENDING' AND h.source_type = 'SCRAP'
+-- @sqlite-only       AND h.source_id = NEW.scrap_order_id AND h.stock_id = NEW.stock_id AND h.op_key = 'SRTO:' || NEW.id
+-- @sqlite-only       AND h.status = 'HELD' AND h.hold_qty_milli = NEW.qty_milli))
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'srtn_overdue_no_scrap_hold'); END;
+-- @sqlite-only CREATE TRIGGER trg_srtn_overdue_lock BEFORE UPDATE ON supplier_return
+-- @sqlite-only WHEN OLD.status = 'OVERDUE_SCRAP' AND (NEW.status IS NOT OLD.status OR NEW.id IS NOT OLD.id OR NEW.scrap_order_id IS NOT OLD.scrap_order_id
+-- @sqlite-only   OR NEW.overdue_at IS NOT OLD.overdue_at OR NEW.stock_id IS NOT OLD.stock_id OR NEW.qty_milli IS NOT OLD.qty_milli)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'srtn_overdue_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_srtn_scrap_fk BEFORE UPDATE ON supplier_return
+-- @sqlite-only WHEN NEW.scrap_order_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = NEW.scrap_order_id)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'fk_srtn_scrap'); END;

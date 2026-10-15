@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 60 处 DEFAULT now()、7 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
---   3. 方言专属行：删除 769 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 489 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 865 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 552 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -1153,9 +1153,118 @@ CREATE TRIGGER trg_rbr_no_del BEFORE DELETE ON return_blind_receipt BEGIN SELECT
 CREATE TRIGGER trg_rbr_no_replace BEFORE INSERT ON return_blind_receipt
 WHEN EXISTS (SELECT 1 FROM return_blind_receipt b WHERE b.id = NEW.id OR b.code = NEW.code OR b.op_key = NEW.op_key)
 BEGIN SELECT RAISE(ABORT, 'rbr_immutable'); END;
+-- -----------------------------------------------------------------------------
+-- 第 10 篇：退供应商（supplier_return，SRN）—— Alex 定案
+--   R1 原因只限 QUALITY（质量）/ RECALL（召回）/ WRONG_DELIVERY（错送）；SLOW_MOVING（滞销）不退，合同另有约定的除外（contract_ref 必填）。
+--   R2 处置方式必填：RETURN 退供 / SCRAP 报废 / DISCOUNT 折价 / EXCHANGE 换货；食安问题（food_safety）只能 RETURN 或 SCRAP。
+--      召回（RECALL）一律食安；合同允许的滞销（SLOW_MOVING）一律非食安，四种处置都可以（Doro 定）。
+--   R3 提货时限（只对 RETURN）：T = ready_at（货备好、通知供应商的时刻，UTC），生鲜 FRESH T+24h、冷冻 FROZEN T+7d、常温 STANDARD T+15d；
+--      pickup_deadline_at 建单时按 temp_class 写定，库里校验；按时提货 picked_up_at ≤ 截止。temp_class 按 sku 温区映射，库层 trg_srtn_temp 核对（见下）。
+--   R4 超期未提 → 第 9 篇报损单（source_type=SUPPLIER_RETURN，source_id=本表 id，reason_code=PICKUP_OVERDUE），同事务调 02 原语
+--      hold(SCRAP_PENDING)（source_type=SCRAP，source_id=报损单 id，operator_id=0，op_key=SRTO:{supplier_return.id}），状态 AWAITING_PICKUP → OVERDUE_SCRAP。
+--      报损单外键与「必须先有冻结」的守卫在 09_scrap.sql（scrap_order 在 10 之后建），见 README 跨篇 ALTER 登记。
+-- 时间（小玛丽 pr03 B2/B3/N5 同类问题，本篇预先修）：
+--   ck_srtn_ts：五个时间列（含 created_at）只收整秒、规范格式。PG TIMESTAMP 拒小数秒（= date_trunc('second')）；SQLite 要求恰好 'YYYY-MM-DD HH:MM:SS'
+--   （length = 19 且 datetime(x) 原样返回）：'2026/10/30 10:00'、'zzzz'、'T' 分隔、'+08:00' 偏移、小数秒、2 月 30 日一律拒。
+--   PG 的 TIMESTAMP 在解析时直接丢掉偏移（'…08:00:00+08:00' 存成 08:00），库里看不到原串；约定：接口只收不带偏移的 UTC 串，服务端校验，
+--   非属主写入的服务端时间一律被 trg_srtn_zclock 覆盖成库时钟，偏移进不来；属主写入自行保证 UTC。
+--   服务端时间（Doro 定）：ready_at、picked_up_at、overdue_at、created_at 都是服务端产生的时间（created_at：小玛丽终审 N1）。
+--   search_path（小玛丽终审 B1）：本增量新增的函数一律 SET search_path = pg_catalog, public, pg_temp，pg_temp 显式放最后，防 wms_app 用临时表冒充真表。
+--   PG：trg_srtn_zclock（BEFORE）对非表属主写入强制覆盖成 date_trunc('second', now() AT TIME ZONE 'UTC')（00 时间约定，Doro：不用裸 now()，与会话 TimeZone 无关），pickup_deadline_at 随之由触发器推出；
+--   SQLite（不能改 NEW）：先由 ck_srtn_ts 拒非 ISO，再由 trg_srtn_clock_ins / _upd 要求与 datetime('now') 相差 ≤ 300 秒（按 strftime('%s') 整秒比，不按文本序）。
+--   所有时间比较按整秒：PG TIMESTAMP 原生比较（ck_srtn_ts 保证整秒）；SQLite 一律 strftime('%s', x) 数值比较。ready_at / pickup_deadline_at 建单后任何人不可改（srtn_time_immutable）。非属主只能以 OPEN 建单（srtn_insert_open_only）。
+--   表属主（迁移/种子角色）不受时钟窗口约束，同第 11 篇 trg_outbox_insert_pending 的属主口径；SQLite 没有角色，时钟触发器对所有写入生效。
+-- -----------------------------------------------------------------------------
+CREATE TABLE supplier_return (
+    id                  BIGINT          PRIMARY KEY,
+    code                VARCHAR(64)     NOT NULL,      -- SRN-{仓}-{节点}-{作业日}-{序号}
+    warehouse_id        BIGINT          NOT NULL,
+    supplier_id         BIGINT          NOT NULL,
+    stock_id            BIGINT          NOT NULL,
+    sku_id              BIGINT          NOT NULL,
+    lot_id              BIGINT          NOT NULL,
+    qty_milli           BIGINT          NOT NULL,
+    reason_code         VARCHAR(24)     NOT NULL,
+    contract_ref        VARCHAR(64),                   -- 滞销退货的合同条款号
+    food_safety         BOOLEAN         NOT NULL DEFAULT false,
+    disposition         VARCHAR(16)     NOT NULL,
+    temp_class          VARCHAR(16)     NOT NULL,
+    ready_at            TIMESTAMP       NOT NULL,      -- 提货时限起点 T（UTC）
+    pickup_deadline_at  TIMESTAMP,                     -- 只有 RETURN 有
+    status              VARCHAR(16)     NOT NULL DEFAULT 'OPEN',
+    picked_up_at        TIMESTAMP,
+    overdue_at          TIMESTAMP,                     -- 超期扫描转报损的时刻
+    scrap_order_id      BIGINT,                        -- 超期转的报损单（09）
+    created_by          BIGINT          NOT NULL,
+    version             BIGINT          NOT NULL DEFAULT 0,
+    created_at          TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT uq_srtn_code      UNIQUE (code),
+    CONSTRAINT ck_srtn_qty       CHECK (qty_milli > 0 AND qty_milli = CAST(qty_milli AS BIGINT)),
+    CONSTRAINT ck_srtn_reason    CHECK (reason_code IN ('QUALITY','RECALL','WRONG_DELIVERY','SLOW_MOVING')),
+    CONSTRAINT ck_srtn_slow      CHECK (reason_code <> 'SLOW_MOVING' OR (contract_ref IS NOT NULL AND length(contract_ref) > 0)),
+    CONSTRAINT ck_srtn_disp      CHECK (disposition IN ('RETURN','SCRAP','DISCOUNT','EXCHANGE')),
+    CONSTRAINT ck_srtn_recall_fs CHECK (reason_code <> 'RECALL' OR food_safety),   -- 召回一律食安 → 只能 RETURN / SCRAP（ck_srtn_fsafe）
+    CONSTRAINT ck_srtn_slow_fs   CHECK (reason_code <> 'SLOW_MOVING' OR NOT food_safety),   -- 合同滞销不是食安，四种处置都可以
+    CONSTRAINT ck_srtn_fsafe     CHECK (NOT food_safety OR disposition IN ('RETURN','SCRAP')),
+    CONSTRAINT ck_srtn_temp      CHECK (temp_class IN ('FRESH','FROZEN','STANDARD')),
+    CONSTRAINT ck_srtn_deadline  CHECK (CASE WHEN COALESCE(disposition, '') <> 'RETURN' THEN pickup_deadline_at IS NULL WHEN temp_class = 'FRESH' THEN COALESCE(CAST(strftime('%s', pickup_deadline_at) AS INTEGER) = CAST(strftime('%s', ready_at) AS INTEGER) + 86400, false) WHEN temp_class = 'FROZEN' THEN COALESCE(CAST(strftime('%s', pickup_deadline_at) AS INTEGER) = CAST(strftime('%s', ready_at) AS INTEGER) + 604800, false) ELSE COALESCE(CAST(strftime('%s', pickup_deadline_at) AS INTEGER) = CAST(strftime('%s', ready_at) AS INTEGER) + 1296000, false) END),
+    CONSTRAINT ck_srtn_status    CHECK (status IN ('OPEN','AWAITING_PICKUP','PICKED_UP','OVERDUE_SCRAP','DISPOSED','CANCELLED')),
+    CONSTRAINT ck_srtn_st_disp   CHECK (status NOT IN ('AWAITING_PICKUP','PICKED_UP','OVERDUE_SCRAP') OR disposition = 'RETURN'),
+    CONSTRAINT ck_srtn_picked    CHECK ((status = 'PICKED_UP') = (picked_up_at IS NOT NULL) AND (picked_up_at IS NULL OR CAST(strftime('%s', picked_up_at) AS INTEGER) <= CAST(strftime('%s', pickup_deadline_at) AS INTEGER))),
+    CONSTRAINT ck_srtn_ts        CHECK ((length(ready_at) = 19 AND datetime(ready_at) IS ready_at) AND (pickup_deadline_at IS NULL OR (length(pickup_deadline_at) = 19 AND datetime(pickup_deadline_at) IS pickup_deadline_at)) AND (picked_up_at IS NULL OR (length(picked_up_at) = 19 AND datetime(picked_up_at) IS picked_up_at)) AND (overdue_at IS NULL OR (length(overdue_at) = 19 AND datetime(overdue_at) IS overdue_at)) AND (length(created_at) = 19 AND datetime(created_at) IS created_at)),
+    CONSTRAINT ck_srtn_overdue   CHECK ((status = 'OVERDUE_SCRAP') = (overdue_at IS NOT NULL) AND (status = 'OVERDUE_SCRAP') = (scrap_order_id IS NOT NULL) AND (overdue_at IS NULL OR CAST(strftime('%s', overdue_at) AS INTEGER) > CAST(strftime('%s', pickup_deadline_at) AS INTEGER)))
+);
+-- 超期扫描：WHERE status = 'AWAITING_PICKUP' AND pickup_deadline_at < :now
+CREATE INDEX ix_srtn_due ON supplier_return(warehouse_id, status, pickup_deadline_at);
+
+-- 温区 → 退供提货时限类别（Doro 定）：sku.temperature_required FROZEN → FROZEN（T+7d）；CHILLED → FRESH（T+24h）；
+--   AMBIENT → STANDARD（T+15d），AMBIENT 且 sku.return_as_fresh（常温生鲜，如常温果蔬）→ FRESH。其他温区值一律拒（未定义映射）。
+--   跨篇 ALTER（第 1 篇 sku，README 登记）：return_as_fresh 只允许常温 SKU（ck_sku_rtn_fresh）。
+--   库层校验：trg_srtn_temp 在建单 / 改 sku_id、temp_class 时按 sku 当前值核对；建单后 temp_class 是快照，SKU 主数据之后再改不回溯。
+ALTER TABLE sku ADD COLUMN return_as_fresh BOOLEAN NOT NULL DEFAULT false CONSTRAINT ck_sku_rtn_fresh CHECK (NOT return_as_fresh OR temperature_required = 'AMBIENT');
+CREATE TRIGGER trg_srtn_temp_ins BEFORE INSERT ON supplier_return
+WHEN NOT EXISTS (SELECT 1 FROM sku k WHERE k.id = NEW.sku_id AND NEW.temp_class = CASE WHEN k.temperature_required = 'FROZEN' THEN 'FROZEN'
+  WHEN k.temperature_required = 'CHILLED' THEN 'FRESH' WHEN k.temperature_required = 'AMBIENT' AND k.return_as_fresh THEN 'FRESH'
+  WHEN k.temperature_required = 'AMBIENT' THEN 'STANDARD' END)
+BEGIN SELECT RAISE(ABORT, 'srtn_temp_class_mismatch'); END;
+CREATE TRIGGER trg_srtn_temp_upd BEFORE UPDATE OF sku_id, temp_class ON supplier_return
+WHEN NOT EXISTS (SELECT 1 FROM sku k WHERE k.id = NEW.sku_id AND NEW.temp_class = CASE WHEN k.temperature_required = 'FROZEN' THEN 'FROZEN'
+  WHEN k.temperature_required = 'CHILLED' THEN 'FRESH' WHEN k.temperature_required = 'AMBIENT' AND k.return_as_fresh THEN 'FRESH'
+  WHEN k.temperature_required = 'AMBIENT' THEN 'STANDARD' END)
+BEGIN SELECT RAISE(ABORT, 'srtn_temp_class_mismatch'); END;
+-- 时钟窗口 + 时间列只写一次（见表头注释）。触发器名带 z：PG 同表 BEFORE 触发器按名字顺序执行，让业务守卫（temp / overdue）先报
+    -- 服务端时间（Doro 定）：非属主写入一律由库时钟覆盖，调用方传什么都不算；截止随 ready_at 同步推出
+-- 状态机（同 09 trg_scr_forward 口径，对所有角色生效，含表属主）：
+--   OPEN → AWAITING_PICKUP / CANCELLED；OPEN → DISPOSED 只限非 RETURN 处置；AWAITING_PICKUP → PICKED_UP / OVERDUE_SCRAP；
+--   PICKED_UP / OVERDUE_SCRAP / DISPOSED / CANCELLED 为终态。非法迁移 srtn_state_forward_only。
+--   PICKED_UP 后 picked_up_at 不可改（srtn_time_immutable，见 trg_srtn_zclock / trg_srtn_time_lock）。
+CREATE TRIGGER trg_srtn_forward BEFORE UPDATE OF status ON supplier_return
+WHEN NEW.status IS NOT OLD.status AND NOT ((OLD.status = 'OPEN' AND NEW.status IN ('AWAITING_PICKUP','CANCELLED'))
+  OR (OLD.status = 'OPEN' AND NEW.status = 'DISPOSED' AND OLD.disposition <> 'RETURN')
+  OR (OLD.status = 'AWAITING_PICKUP' AND NEW.status IN ('PICKED_UP','OVERDUE_SCRAP')))
+BEGIN SELECT RAISE(ABORT, 'srtn_state_forward_only'); END;
+CREATE TRIGGER trg_srtn_time_lock BEFORE UPDATE ON supplier_return
+WHEN NEW.ready_at IS NOT OLD.ready_at OR NEW.pickup_deadline_at IS NOT OLD.pickup_deadline_at OR NEW.created_at IS NOT OLD.created_at
+  OR (NEW.status IS OLD.status AND OLD.picked_up_at IS NOT NULL AND NEW.picked_up_at IS NOT OLD.picked_up_at)
+BEGIN SELECT RAISE(ABORT, 'srtn_time_immutable'); END;
+CREATE TRIGGER trg_srtn_ins_open BEFORE INSERT ON supplier_return
+WHEN NEW.status IS NOT 'OPEN'
+BEGIN SELECT RAISE(ABORT, 'srtn_insert_open_only'); END;
+CREATE TRIGGER trg_srtn_clock_ins BEFORE INSERT ON supplier_return
+WHEN strftime('%s', NEW.ready_at) IS NULL OR abs(CAST(strftime('%s', NEW.ready_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300
+  OR strftime('%s', NEW.created_at) IS NULL OR abs(CAST(strftime('%s', NEW.created_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300
+BEGIN SELECT RAISE(ABORT, 'srtn_clock_skew'); END;
+CREATE TRIGGER trg_srtn_clock_upd BEFORE UPDATE ON supplier_return
+WHEN (NEW.picked_up_at IS NOT OLD.picked_up_at AND NEW.picked_up_at IS NOT NULL
+      AND (strftime('%s', NEW.picked_up_at) IS NULL OR abs(CAST(strftime('%s', NEW.picked_up_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300))
+  OR (NEW.overdue_at IS NOT OLD.overdue_at AND NEW.overdue_at IS NOT NULL
+      AND (strftime('%s', NEW.overdue_at) IS NULL OR abs(CAST(strftime('%s', NEW.overdue_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300))
+BEGIN SELECT RAISE(ABORT, 'srtn_clock_skew'); END;
+-- 授权：不给整表 UPDATE。建单后可写的只有状态推进相关列；ready_at / pickup_deadline_at / temp_class / sku_id / stock_id / qty_milli /
+-- reason_code / food_safety / disposition 等受守卫的列不给 wms_app 直接 UPDATE（改错走取消重建）
 -- =============================================================================
 -- 09_scrap.sql —— 第 9 篇 效期与损耗（PR #4，米雪儿接手）自有 DDL
--- 加载顺序：08_count.sql 之后、11_integration.sql 之前。不改别篇文件；本篇没有跨篇 ALTER。
+-- 加载顺序：08_count.sql 之后、11_integration.sql 之前。不改别篇文件；跨篇 ALTER 只有文末对第 10 篇 supplier_return 的外键与超期守卫（README 登记）。
 -- 基线 #2 6008032：convert_hold(hold_id, qty, to_hold_type, to_source, op_key) 支持部分转换；可售期到期（SELL_EXPIRED）按 02（6008032）§表 SCRAP_PENDING 行：直接 hold(SCRAP_PENDING)（op_key=SELLEXP:{lot_id}:{date}，operator_id=0），不走 convert_hold，也不走 place_hold（place_hold 只收 PROCESSING / LIVE_HOLD）。
 -- 记账型来源（record_only）：PROCESS_LOSS（第 17 篇，原料已随报工 consume_process_hold 扣过）、LIVE_DEATH / LIVE_SHRINK（第 18 篇 consume_live_hold 直接扣，Doro P1）
 --   —— 报损单只记账：不冻结（hold_id=0）、行 ledger_mode=NONE、过账不调 post_out。
@@ -1166,7 +1275,7 @@ CREATE TABLE scrap_order (
     id              BIGINT          PRIMARY KEY,
     code            VARCHAR(64)     NOT NULL,   -- SCR-{仓}-{节点}-{作业日}-{序号}
     warehouse_id    BIGINT          NOT NULL,
-    source_type     VARCHAR(24)     NOT NULL,   -- 取值见 ck_scr_src_type；SELL_EXPIRED：可售天数到期扫描（source_id=lot_id，来源键 SELL_EXPIRED:{lot_id}:{date}，落库 source_id=lot_id + source_date=作业日，见 uq_scr_source；冻结 op_key SELLEXP:{lot_id}:{date}）；RETURN_HANDOVER：04 交接，source_id=待回库记录 id；RETURN_QC：10 质检不合格，source_id=inbound_line.id
+    source_type     VARCHAR(24)     NOT NULL,   -- 取值见 ck_scr_src_type；SELL_EXPIRED：可售天数到期扫描（source_id=lot_id，来源键 SELL_EXPIRED:{lot_id}:{date}，落库 source_id=lot_id + source_date=作业日，见 uq_scr_source；冻结 op_key SELLEXP:{lot_id}:{date}）；RETURN_HANDOVER：04 交接，source_id=待回库记录 id；RETURN_QC：10 质检不合格，source_id=inbound_line.id；SUPPLIER_RETURN：10 退供超期未提，source_id=supplier_return.id，reason_code=PICKUP_OVERDUE
     source_id       BIGINT          NOT NULL DEFAULT 0,
     source_date     DATE            NOT NULL DEFAULT '1970-01-01',   -- 00 §6.4 D3：按日去重白名单（SELL_EXPIRED / LIVE_SHRINK）写仓库作业日；其余来源固定 '1970-01-01'
     reason_code     VARCHAR(24)     NOT NULL,   -- 取值见 ck_scr_reason
@@ -1193,15 +1302,16 @@ CREATE TABLE scrap_order (
     CONSTRAINT ck_scr_appr   CHECK (status NOT IN ('APPROVED','POSTED') OR (approver_id IS NOT NULL AND approved_at IS NOT NULL)
                                     OR (record_only AND status = 'POSTED' AND approver_id IS NULL AND approved_at IS NULL)),
     CONSTRAINT ck_scr_posted CHECK (status <> 'POSTED' OR posted_at IS NOT NULL),
-    CONSTRAINT ck_scr_src_type CHECK (source_type IN ('EXPIRY_SCAN','SELL_EXPIRED','MANUAL','RETURN_QC','RETURN_HANDOVER','COUNT','EXCEPTION','LIVE_DEATH','LIVE_SHRINK','PROCESS_LOSS')),
+    CONSTRAINT ck_scr_src_type CHECK (source_type IN ('EXPIRY_SCAN','SELL_EXPIRED','MANUAL','RETURN_QC','RETURN_HANDOVER','COUNT','EXCEPTION','LIVE_DEATH','LIVE_SHRINK','PROCESS_LOSS','SUPPLIER_RETURN')),
     -- 00 §6.4 D3（大肥鱼定）：按日去重白名单 SELL_EXPIRED / LIVE_SHRINK 的 source_date = work_date；其余来源（含 LIVE_DEATH）固定 '1970-01-01'
     CONSTRAINT ck_scr_src_date CHECK (CASE WHEN source_type IN ('SELL_EXPIRED','LIVE_SHRINK') THEN source_date = work_date ELSE source_date = '1970-01-01' END),
     CONSTRAINT ck_scr_reason CHECK (reason_code IN ('EXPIRED','NEAR_EXPIRY','SELL_EXPIRED','DAMAGED','QC_REJECT','NATURAL_LOSS','OTHER',
-                                                  'TRIM','DRIP','WEIGH_DIFF','DEFECT','LIVE_DEATH')),
+                                                  'TRIM','DRIP','WEIGH_DIFF','DEFECT','LIVE_DEATH','PICKUP_OVERDUE')),
     -- 加工损耗原因只给 PROCESS_LOSS 用；PROCESS_LOSS 只收这 4 个（17 process_output.loss_reason 一一对应，不再映射成 NATURAL_LOSS）
     CONSTRAINT ck_scr_reason_src CHECK (
         (source_type = 'PROCESS_LOSS') = (reason_code IN ('TRIM','DRIP','WEIGH_DIFF','DEFECT'))
         AND (reason_code <> 'LIVE_DEATH' OR source_type = 'LIVE_DEATH')
+        AND (reason_code <> 'PICKUP_OVERDUE' OR source_type = 'SUPPLIER_RETURN')   -- 第 10 篇退供超期未提（Alex 定案）
     ),
     -- PROCESS_LOSS 作废（17 损耗改原因/改数量）挂 17 冲回键 void_ref=PRCR:…，不走 SCRAP_MISREPORT
     CONSTRAINT ck_scr_void_ref CHECK (void_ref IS NULL OR (source_type = 'PROCESS_LOSS' AND status = 'VOIDED' AND void_ref LIKE 'PRCR:%'))
@@ -1296,6 +1406,48 @@ WHEN NEW.hold_id <> 0 AND OLD.hold_id = 0
       AND h.status = 'HELD' AND h.hold_qty_milli - h.released_qty_milli = NEW.scrap_qty_milli)
 BEGIN SELECT RAISE(ABORT, 'scrap_line_hold_mismatch'); END;
 -- 授权（I4）：不给 DELETE/TRUNCATE，作废走状态
+-- -----------------------------------------------------------------------------
+-- 跨篇 ALTER（第 10 篇 supplier_return，README 登记）：退供超期未提 → 本篇报损单 + 02 原语 hold(SCRAP_PENDING)
+--   supplier_return 在 10_returns.sql 建，scrap_order 在本文件建，所以外键和守卫写在这里。
+--   AWAITING_PICKUP → OVERDUE_SCRAP 时必须已有：本篇报损单（source_type=SUPPLIER_RETURN，source_id=退供单 id，reason_code=PICKUP_OVERDUE，未驳回/取消）
+--   和该单下的 SCRAP_PENDING 冻结（02 hold：source_type=SCRAP，source_id=报损单 id，op_key=SRTO:{退供单 id}，同库存行，HELD，冻结量 = 退供数量）。
+--   其他状态不能转入 OVERDUE_SCRAP，INSERT 也不能直接写 OVERDUE_SCRAP。错误 srtn_overdue_no_scrap_hold（23514）。
+--   进入 OVERDUE_SCRAP 后终态：status / scrap_order_id / overdue_at / stock_id / qty_milli 不可改（srtn_overdue_immutable），防转超期后换挂报损单绕过冻结校验。
+--   op_key 由守卫按 'SRTO:' || id 精确比较（大小写敏感、无前导零、无空白）；重放 hold 撞 02 uq_hold_op，重放转超期 WHERE status='AWAITING_PICKUP' 影响 0 行。
+-- -----------------------------------------------------------------------------
+-- 一张退供单最多挂一张报损单、一张报损单最多挂一张退供单（并发转超期只成一张，含已取消/驳回的旧单：uq_scr_source 放过它们，本索引不放）
+CREATE UNIQUE INDEX uq_scr_srtn ON scrap_order(source_id) WHERE source_type = 'SUPPLIER_RETURN';
+CREATE UNIQUE INDEX uq_srtn_scrap ON supplier_return(scrap_order_id) WHERE scrap_order_id IS NOT NULL;
+-- 退供报损单的来源守卫（小玛丽 pr03 B1 同类：条件更新 0 行静默成功）：
+--   INSERT：来源退供单必须正处于 AWAITING_PICKUP（srtn_scrap_not_awaiting），已提货 / 未进待提货的不能开报损单。
+--   之后任何「向前」迁移（提交 / 审批 / 过账；CANCELLED、REJECTED 除外）都要求退供单已是 OVERDUE_SCRAP 且 scrap_order_id 指向本单
+--   （srtn_scrap_orphan）。服务端转超期的条件更新若影响 0 行却照样提交，留下的报损单只能取消（同事务 release_scrap_hold），永远过不了账。
+--   服务端仍须按 00 §6.7 检查 rowcount、0 行返回 40930 并回滚整个事务；库层这条只兜底「不会因此误报损出账」。
+CREATE TRIGGER trg_scr_srtn_ins BEFORE INSERT ON scrap_order
+WHEN NEW.source_type = 'SUPPLIER_RETURN' AND NOT EXISTS (SELECT 1 FROM supplier_return r WHERE r.id = NEW.source_id AND r.status = 'AWAITING_PICKUP')
+BEGIN SELECT RAISE(ABORT, 'srtn_scrap_not_awaiting'); END;
+CREATE TRIGGER trg_scr_srtn_upd BEFORE UPDATE ON scrap_order
+WHEN NEW.source_type = 'SUPPLIER_RETURN' AND NEW.status IS NOT OLD.status AND NEW.status NOT IN ('CANCELLED','REJECTED')
+  AND NOT EXISTS (SELECT 1 FROM supplier_return r WHERE r.id = NEW.source_id AND r.status = 'OVERDUE_SCRAP' AND r.scrap_order_id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'srtn_scrap_orphan'); END;
+CREATE TRIGGER trg_srtn_overdue_ins BEFORE INSERT ON supplier_return
+WHEN NEW.status = 'OVERDUE_SCRAP'
+BEGIN SELECT RAISE(ABORT, 'srtn_overdue_no_scrap_hold'); END;
+CREATE TRIGGER trg_srtn_overdue BEFORE UPDATE ON supplier_return
+WHEN NEW.status = 'OVERDUE_SCRAP' AND OLD.status <> 'OVERDUE_SCRAP' AND (OLD.status <> 'AWAITING_PICKUP'
+  OR NOT EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = NEW.scrap_order_id AND o.source_type = 'SUPPLIER_RETURN'
+      AND o.source_id = NEW.id AND o.reason_code = 'PICKUP_OVERDUE' AND o.status NOT IN ('REJECTED','CANCELLED'))
+  OR NOT EXISTS (SELECT 1 FROM stock_hold h WHERE h.hold_type = 'SCRAP_PENDING' AND h.source_type = 'SCRAP'
+      AND h.source_id = NEW.scrap_order_id AND h.stock_id = NEW.stock_id AND h.op_key = 'SRTO:' || NEW.id
+      AND h.status = 'HELD' AND h.hold_qty_milli = NEW.qty_milli))
+BEGIN SELECT RAISE(ABORT, 'srtn_overdue_no_scrap_hold'); END;
+CREATE TRIGGER trg_srtn_overdue_lock BEFORE UPDATE ON supplier_return
+WHEN OLD.status = 'OVERDUE_SCRAP' AND (NEW.status IS NOT OLD.status OR NEW.id IS NOT OLD.id OR NEW.scrap_order_id IS NOT OLD.scrap_order_id
+  OR NEW.overdue_at IS NOT OLD.overdue_at OR NEW.stock_id IS NOT OLD.stock_id OR NEW.qty_milli IS NOT OLD.qty_milli)
+BEGIN SELECT RAISE(ABORT, 'srtn_overdue_immutable'); END;
+CREATE TRIGGER trg_srtn_scrap_fk BEFORE UPDATE ON supplier_return
+WHEN NEW.scrap_order_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = NEW.scrap_order_id)
+BEGIN SELECT RAISE(ABORT, 'fk_srtn_scrap'); END;
 -- -----------------------------------------------------------------------------
 -- 幂等 / 集成 / 审计
 -- -----------------------------------------------------------------------------
