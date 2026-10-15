@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 16 处 DEFAULT now()、60 处 DEFAULT (now() AT TIME ZONE 'UTC') / (date_trunc('second', now() AT TIME ZONE 'UTC')) → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
---   3. 方言专属行：删除 1405 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 857 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 1453 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 884 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -2297,7 +2297,9 @@ CREATE TABLE sys_user (
     last_login_at   TIMESTAMP,
     created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- 00 §6.8：UTC 整秒
     deleted_at      TIMESTAMP,
-    CONSTRAINT uq_user_name UNIQUE (username)
+    CONSTRAINT uq_user_name UNIQUE (username),
+    -- 00 §6.8：本篇自有表的时间列一律 UTC 整秒（镜鉴第二轮时间加固；与 12b 的 *_zclock 覆盖配套）
+    CONSTRAINT ck_user_ts CHECK ((created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(created_at) IS created_at AND substr(created_at, 12, 2) <= '23') AND (last_login_at IS NULL OR (last_login_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(last_login_at) IS last_login_at AND substr(last_login_at, 12, 2) <= '23')) AND (deleted_at IS NULL OR (deleted_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(deleted_at) IS deleted_at AND substr(deleted_at, 12, 2) <= '23')))
 );
 CREATE INDEX ix_user_openid ON sys_user(mp_openid) WHERE mp_openid IS NOT NULL;
 
@@ -2335,7 +2337,8 @@ CREATE TABLE api_credential (
     status           VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
     ip_whitelist     VARCHAR(256),
     last_used_at     TIMESTAMP,
-    CONSTRAINT uq_api_key UNIQUE (api_key)
+    CONSTRAINT uq_api_key UNIQUE (api_key),
+    CONSTRAINT ck_api_ts CHECK (last_used_at IS NULL OR (last_used_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(last_used_at) IS last_used_at AND substr(last_used_at, 12, 2) <= '23'))
 );
 -- Doro 裁定：audit_log.actor_id → sys_user(id)。SQLite 由 11 写进 CREATE TABLE；PG 在 sys_user 建好后由此处补（不搬文件、不改加载顺序）
 -- =============================================================================
@@ -2437,9 +2440,11 @@ CREATE TABLE approval_request (
         AND substr(code, -16) GLOB '-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]'
         AND (substr(code, -11, 2) GLOB '0[1-9]' OR substr(code, -11, 2) GLOB '1[0-2]')
         AND (substr(code, -9, 2) GLOB '0[1-9]' OR substr(code, -9, 2) GLOB '[12][0-9]' OR substr(code, -9, 2) GLOB '3[01]')),
-    -- SCRAP_MISREPORT 审批人：质检主管或中心运维（是否真持有由 trg_apr_final / trg_apr_role 查 sys_user_role）
+    -- SCRAP_MISREPORT 审批人不再限角色：改由权限点 scrap.misreport.approve 判定（trg_apr_final 的权限点分支）。
+    -- 依 Chief 裁决：00 §6.6 是三层校验（权限点 + 数据权限 + 强制边界），13 篇前端也按权限点渲染按钮，
+    -- 只走角色会让「前端渲染 vs 后端拒绝」永远对不上。本 CHECK 退化为格式兜底（角色非空由 ck_apr_pair 管）。
     CONSTRAINT ck_apr_scrap_roles CHECK (approval_type <> 'SCRAP_MISREPORT'
-        OR first_approver_id IS NULL OR first_approver_role IN ('QC_SUPERVISOR','CENTER_OPS'))
+        OR first_approver_id IS NULL OR first_approver_role IS NOT NULL)
 );
 CREATE TABLE user_device_binding (
     id                  BIGINT       PRIMARY KEY,
@@ -2516,9 +2521,10 @@ BEGIN SELECT RAISE(ABORT, 'approval_code_warehouse_mismatch'); END;
 CREATE TRIGGER trg_apr_insert_role BEFORE INSERT ON approval_request
 WHEN NEW.approval_type = 'SCRAP_MISREPORT' AND NOT EXISTS (
     SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
+     JOIN sys_role_perm rp ON rp.role_id = r.id JOIN sys_permission p ON p.id = rp.perm_id
      JOIN sys_user_warehouse uw ON uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id
-     WHERE ur.user_id = NEW.requested_by AND r.code = 'WH_SUPERVISOR')
-BEGIN SELECT RAISE(ABORT, 'approval_role_not_held'); END;
+     WHERE ur.user_id = NEW.requested_by AND p.code = 'scrap.misreport.request')
+BEGIN SELECT RAISE(ABORT, 'approval_perm_not_held'); END;
 CREATE TRIGGER trg_apr_final BEFORE UPDATE ON approval_request
 WHEN OLD.status IN ('APPROVED','REJECTED','EXPIRED','WITHDRAWN')
   OR NEW.payload_hash IS NOT OLD.payload_hash OR NEW.payload_json IS NOT OLD.payload_json
@@ -2573,10 +2579,12 @@ BEGIN SELECT RAISE(ABORT, 'approval_perm_not_held'); END;
 CREATE TRIGGER trg_apr_scrap_role BEFORE UPDATE ON approval_request
 WHEN NEW.approval_type = 'SCRAP_MISREPORT' AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL
   AND NOT EXISTS (SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
+        JOIN sys_role_perm rp ON rp.role_id = r.id JOIN sys_permission p ON p.id = rp.perm_id
         WHERE ur.user_id = NEW.first_approver_id AND r.code = NEW.first_approver_role
           AND (r.code = 'CENTER_OPS' OR EXISTS (SELECT 1 FROM sys_user_warehouse uw
-               WHERE uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id)))
-BEGIN SELECT RAISE(ABORT, 'approval_role_not_held'); END;
+               WHERE uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id))
+          AND p.code = 'scrap.misreport.approve')
+BEGIN SELECT RAISE(ABORT, 'approval_perm_not_held'); END;
 
 -- ===== 小赵 I3 + S1：设备绑定 INSERT 只能 PENDING；REVOKED 终态；身份列不可改；激活必须有本绑定的已通过 DEVICE_BIND 审批，审批人 ≠ 使用人 =====
 CREATE TRIGGER trg_udb_no_replace BEFORE INSERT ON user_device_binding
@@ -2763,6 +2771,36 @@ CREATE TRIGGER trg_sys_user_warehouse_edge_ro_del BEFORE DELETE ON sys_user_ware
 
 -- 授权（PG）
 -- docs/12 新表 wms_app 最小授权：不给 DELETE/TRUNCATE；离线令牌只能写吊销时间；审批只能改决策相关列
+-- ===== 第 12 篇时间加固第二轮（镜鉴实测：B3 遗漏的 4 个时间列；00 §6.8）=====
+-- 第一轮覆盖 approval_request / user_device_binding / offline_token / device_reconnect 四张表；
+-- 本篇自有表里 sys_user.created_at / sys_user.last_login_at / sys_user.deleted_at / api_credential.last_used_at
+-- 仍可被 wms_app 直接倒填（实测：传 '2000-01-01 00:00:00' 原样落库），此处补齐。
+-- PG：非属主写入由库覆盖为 date_trunc('second', now() AT TIME ZONE 'UTC')；表属主（迁移/种子角色）豁免，同第一轮 *_zclock 口径。
+-- SQLite：不能改 NEW，改为拒收——与 now 相差 > 300 s（*_clock_skew）、或非法整秒格式（ck_user_ts / ck_api_ts）。
+-- 两库同一条口径：INSERT 时 last_login_at / deleted_at / last_used_at 必须为 NULL（新用户没登录过、不是停用态、凭证没用过）。
+CREATE TRIGGER trg_user_ins_time_set BEFORE INSERT ON sys_user
+WHEN NEW.last_login_at IS NOT NULL OR NEW.deleted_at IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'sys_user_insert_time_set'); END;
+CREATE TRIGGER trg_user_clock_ins BEFORE INSERT ON sys_user
+WHEN NOT COALESCE(NEW.created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.created_at) IS NEW.created_at AND substr(NEW.created_at, 12, 2) <= '23' AND abs(CAST(strftime('%s', NEW.created_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) <= 300, 0)
+BEGIN SELECT RAISE(ABORT, 'sys_user_clock_skew'); END;
+CREATE TRIGGER trg_user_created_immutable BEFORE UPDATE ON sys_user
+WHEN NEW.created_at IS NOT OLD.created_at
+BEGIN SELECT RAISE(ABORT, 'sys_user_created_at_immutable'); END;
+CREATE TRIGGER trg_user_deleted_immutable BEFORE UPDATE ON sys_user
+WHEN NEW.deleted_at IS NOT OLD.deleted_at AND NEW.deleted_at IS NULL
+BEGIN SELECT RAISE(ABORT, 'sys_user_deleted_at_immutable'); END;
+CREATE TRIGGER trg_user_clock_upd BEFORE UPDATE ON sys_user
+WHEN (NEW.last_login_at IS NOT OLD.last_login_at AND NEW.last_login_at IS NOT NULL AND NOT COALESCE(NEW.last_login_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.last_login_at) IS NEW.last_login_at AND substr(NEW.last_login_at, 12, 2) <= '23' AND abs(CAST(strftime('%s', NEW.last_login_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) <= 300, 0))
+  OR (NEW.deleted_at IS NOT OLD.deleted_at AND NEW.deleted_at IS NOT NULL AND NOT COALESCE(NEW.deleted_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.deleted_at) IS NEW.deleted_at AND substr(NEW.deleted_at, 12, 2) <= '23' AND abs(CAST(strftime('%s', NEW.deleted_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) <= 300, 0))
+BEGIN SELECT RAISE(ABORT, 'sys_user_clock_skew'); END;
+
+CREATE TRIGGER trg_api_ins_time_set BEFORE INSERT ON api_credential
+WHEN NEW.last_used_at IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'api_credential_insert_time_set'); END;
+CREATE TRIGGER trg_api_clock_upd BEFORE UPDATE ON api_credential
+WHEN NEW.last_used_at IS NOT OLD.last_used_at AND NEW.last_used_at IS NOT NULL AND NOT COALESCE(NEW.last_used_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.last_used_at) IS NEW.last_used_at AND substr(NEW.last_used_at, 12, 2) <= '23' AND abs(CAST(strftime('%s', NEW.last_used_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) <= 300, 0)
+BEGIN SELECT RAISE(ABORT, 'api_credential_clock_skew'); END;
 -- =============================================================================
 -- 加工中心（docs/17，米雪儿）：BOM / 出成率、加工单、原料领用（含 LIVE_TANK 池位）、报工产出、损耗、批次追溯、冲回
 --   数量一律 *_qty_milli（00 §6.3）；出成率、容差一律万分比整数 *_bp（10000 = 100%）。

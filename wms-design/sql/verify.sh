@@ -2085,19 +2085,23 @@ expect_block "12 非计划切换只有一人确认就 APPROVED" \
   "UPDATE approval_request SET status='APPROVED', decided_at='2026-10-15 09:30' WHERE id=3;" "ck_apr_done"
 expect_allow "12 I5 正向：中心运维第二确认 → APPROVED" \
   "BEGIN; UPDATE approval_request SET status='APPROVED', second_approver_id=203, second_approver_role='CENTER_OPS', second_approved_at='2026-10-15 09:30', decided_at='2026-10-15 09:30' WHERE id=3; COMMIT;"
+# SCRAP_MISREPORT 权限点化（Chief 裁决：以权限点为准）：发起 scrap.misreport.request、审批 scrap.misreport.approve。
+# 授权：role 1 = WH_SUPERVISOR 持发起；role 2 = CENTER_OPS、role 3 = QC_SUPERVISOR 持审批。
+seed "INSERT INTO sys_permission (id,code,name,module) VALUES (16,'scrap.misreport.request','报损误报回转发起','12'),(17,'scrap.misreport.approve','报损误报回转审批','12');"
+seed "INSERT INTO sys_role_perm (role_id,perm_id) VALUES (1,16),(2,17),(3,17);"
 expect_block "12 SM 发起人不是本仓仓库主管（只有 CENTER_OPS）" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (23,'APR-WHSH01-20261015-000023','SCRAP_MISREPORT',1,'SCRAP_ORDER','9009','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',203,NULL);" "approval_role_not_held"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (23,'APR-WHSH01-20261015-000023','SCRAP_MISREPORT',1,'SCRAP_ORDER','9009','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',203,NULL);" "approval_perm_not_held"
 expect_block "12 SM 发起人是质检主管而非仓库主管" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (24,'APR-WHSH01-20261015-000024','SCRAP_MISREPORT',1,'SCRAP_ORDER','9010','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',205,NULL);" "approval_role_not_held"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (24,'APR-WHSH01-20261015-000024','SCRAP_MISREPORT',1,'SCRAP_ORDER','9010','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',205,NULL);" "approval_perm_not_held"
 seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (5,'APR-WHSH01-20261015-000005','SCRAP_MISREPORT',1,'SCRAP_ORDER','9001','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',202,NULL);"
 expect_block "12 SM 发起人自己审批（202 兼 CENTER_OPS 也不行）" \
   "UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='CENTER_OPS', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=5;" "ck_apr_sod"
 expect_block "12 SM 审批角色写成仓库主管（另一主管 206 不具审批权）" \
-  "UPDATE approval_request SET status='APPROVED', first_approver_id=206, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=5;" "ck_apr_scrap_roles"
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=206, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=5;" "approval_perm_not_held"
 expect_block "12 SM 审批人不持有 QC_SUPERVISOR 却写质检主管" \
-  "UPDATE approval_request SET status='APPROVED', first_approver_id=204, first_approver_role='QC_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=5;" "approval_role_not_held"
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=204, first_approver_role='QC_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=5;" "approval_perm_not_held"
 expect_block "12 SM 质检主管不在本仓" \
-  "UPDATE approval_request SET status='APPROVED', first_approver_id=207, first_approver_role='QC_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=5;" "approval_role_not_held"
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=207, first_approver_role='QC_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=5;" "approval_perm_not_held"
 expect_allow "12 SM 正向：本仓质检主管审批" \
   "BEGIN; UPDATE approval_request SET status='APPROVED', first_approver_id=205, first_approver_role='QC_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=5; COMMIT;"
 seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (6,'APR-WHSH01-20261015-000006','SCRAP_MISREPORT',1,'SCRAP_ORDER','9002','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',206,NULL);"
@@ -2604,7 +2608,7 @@ echo "=== 2z. pg_temp 劫持（#2 第九轮）：search_path 必须显式写 pg_
 # SQLite 没有对应攻击面：没有 schema 搜索路径，TEMP 表只对本连接可见，触发器体里的表名在建触发器时就绑到 main（不跟会话走），verify_sqlite.py 不加对应用例。
 # 目录断言：public 里所有带 search_path 设置的函数（含退供增量自带的 5 个，米雪儿已按本规则写）都必须正好是 pg_catalog, public, pg_temp。
 R=$(psql -t -A -c "SELECT count(*) FILTER (WHERE c <> 'search_path=pg_catalog, public, pg_temp') || '/' || count(*) FROM (SELECT unnest(p.proconfig) c FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace) s WHERE c LIKE 'search_path=%'")
-[ "$R" = "0/84" ] && ok "pg_temp 目录断言：84 个固定 search_path 的函数都显式以 pg_temp 结尾（不合规/总数 = $R）" || bad "pg_temp 目录断言：不合规/总数 = $R（期望 0/84）"
+[ "$R" = "0/86" ] && ok "pg_temp 目录断言：86 个固定 search_path 的函数都显式以 pg_temp 结尾（不合规/总数 = $R）" || bad "pg_temp 目录断言：不合规/总数 = $R（期望 0/86）"
 # 通用断言（不限函数个数）：public 下任何函数只要设了 search_path，pg_temp 必须是最后一项
 R=$(psql -t -A -c "SELECT count(*) FILTER (WHERE c !~ ',\s*pg_temp\s*$') || '/' || count(*) || '#' || COALESCE(string_agg(proname, ',') FILTER (WHERE c !~ ',\s*pg_temp\s*$'), '') FROM (SELECT p.proname, c FROM pg_proc p, unnest(p.proconfig) c WHERE p.pronamespace = 'public'::regnamespace AND c LIKE 'search_path=%') s")
 [ "${R%%/*}" = "0" ] && ok "pg_temp 末位断言：public 下设了 search_path 的函数 pg_temp 都在最后（缺/总 = ${R%%#*}）" || bad "pg_temp 末位断言：缺/总 = ${R%%#*}，函数：${R#*#}"
@@ -2656,7 +2660,7 @@ echo "  → fixed/mut：02[$A0 | $A1] 09[$B0 | $B1] 11[$C0 | $C1] 12[$D0 | $D1]"
 [ "$B0" = "scrap_line_locked" ] && ok "pg_temp 劫持 09 trg_scrl_draft_only：临时表 scrap_order 把已取消单伪造成 DRAFT，函数仍读 public → $B0" || bad "09 pg_temp 劫持：$B0（期望 scrap_line_locked）"
 [ "$C0" = "PT_PASSED" ] && ok "pg_temp 劫持 11 trg_outbox_order_guard：临时表 outbox_event 伪造同 biz_key 更早的 PENDING 行想卡住投递，函数仍读 public，真实事件照常进 SENDING（$C0）" || bad "11 pg_temp 劫持：$C0（期望正常放行 PT_PASSED）"
 [ "$D0" = "approval_code_warehouse_mismatch" ] && ok "pg_temp 劫持 12 trg_apr_insert：临时表 warehouse 把仓 1 编码伪造成 PTFAKE，函数仍读 public → $D0" || bad "12 pg_temp 劫持：$D0（期望 approval_code_warehouse_mismatch）"
-[ "$PC1" = "4/84" ] && ok "变异：四个函数去掉 pg_temp 后目录断言变红（$PC1）" || bad "变异目录断言没变红：$PC1（期望 4/84）"
+[ "$PC1" = "4/86" ] && ok "变异：四个函数去掉 pg_temp 后目录断言变红（$PC1）" || bad "变异目录断言没变红：$PC1（期望 4/86）"
 [ "$A1" != "$A0" ] && ok "变异：trg_mvk_line_kind 去掉 pg_temp 后临时表劫持生效（$A1）" || bad "变异没变红：trg_mvk_line_kind 去掉 pg_temp 后仍是 $A1"
 [ "$B1" != "$B0" ] && ok "变异：trg_scrl_draft_only 去掉 pg_temp 后临时表劫持生效（$B1）" || bad "变异没变红：trg_scrl_draft_only 去掉 pg_temp 后仍是 $B1"
 [ "$C1" != "$C0" ] && ok "变异：trg_outbox_order_guard 去掉 pg_temp 后临时表劫持生效（$C1）" || bad "变异没变红：trg_outbox_order_guard 去掉 pg_temp 后仍是 $C1"
@@ -3658,6 +3662,41 @@ expect_block "06 拒绝：fk_bxl_box 箱明细挂不存在的箱" "INSERT INTO p
 mut06 "fk_bxl_box" "pack_box_line" "INSERT INTO pack_box_line (id,box_id,sku_id,lot_id,qty_milli,uom) VALUES (9202,999999,1,0,1000,'KG');"
 expect_block "06 拒绝：fk_bxl_sku 箱明细挂不存在的 SKU" "INSERT INTO pack_box_line (id,box_id,sku_id,lot_id,qty_milli,uom) VALUES (9203,9201,999999,0,1000,'KG');" "fk_bxl_sku"
 mut06 "fk_bxl_sku" "pack_box_line" "INSERT INTO pack_box_line (id,box_id,sku_id,lot_id,qty_milli,uom) VALUES (9203,9201,999999,0,1000,'KG');"
+echo "=== 2g-12t. 第 12 篇时间加固第二轮：正向放行 + 反向按名拦截 + 变异（两库对称）==="
+# 三件套：① 正向（非属主写入被库覆盖成 now）② 反向（按错误名精确命中）③ 变异（去掉守卫后原被拒语句必须通过）
+# 触发器只对非属主生效（属主 = 迁移/种子角色，有意豁免），所以全部用 SET LOCAL ROLE wms_app。
+R=$(psql -t -A -c "BEGIN; SET LOCAL ROLE wms_app; INSERT INTO sys_user (id,username,password_hash,created_at) VALUES (779901,'t12t1','x','2000-01-01 00:00:00'); SELECT 'TS#' || (created_at = date_trunc('second', now() AT TIME ZONE 'UTC'))::text FROM sys_user WHERE id = 779901; ROLLBACK;" | grep '^TS#')
+[ "$R" = "TS#true" ] && ok "12t 正向：wms_app 建号 created_at 传 2000 → 由库写为 now" || bad "12t 正向 created_at 未被库写：$R"
+R=$(psql -t -A -c "BEGIN; SET LOCAL ROLE wms_app; INSERT INTO sys_user (id,username,password_hash) VALUES (779902,'t12t2','x'); UPDATE sys_user SET last_login_at = date_trunc('second', now() AT TIME ZONE 'UTC') WHERE id = 779902; SELECT 'TS#' || (last_login_at = date_trunc('second', now() AT TIME ZONE 'UTC'))::text FROM sys_user WHERE id = 779902; ROLLBACK;" | grep '^TS#')
+[ "$R" = "TS#true" ] && ok "12t 正向：wms_app 写登录时间 = now → 通过且与库值一致" || bad "12t 正向 last_login_at：$R"
+R=$(psql -t -A -c "BEGIN; SET LOCAL ROLE wms_app; INSERT INTO sys_user (id,username,password_hash) VALUES (779903,'t12t3','x'); UPDATE sys_user SET deleted_at = date_trunc('second', now() AT TIME ZONE 'UTC') WHERE id = 779903; SELECT 'TS#' || (deleted_at = date_trunc('second', now() AT TIME ZONE 'UTC'))::text FROM sys_user WHERE id = 779903; ROLLBACK;" | grep '^TS#')
+[ "$R" = "TS#true" ] && ok "12t 正向：wms_app 写停用时间 = now → 通过；trg_user_status_bump 同步升 perm_version" || bad "12t 正向 deleted_at：$R"
+expect_block "12t 反向：INSERT sys_user 带 last_login_at（新用户没登录过）" "BEGIN; SET LOCAL ROLE wms_app; INSERT INTO sys_user (id,username,password_hash,last_login_at) VALUES (779904,'t12t4','x','2000-01-01 00:00:00'); ROLLBACK;" "sys_user_insert_time_set"
+expect_block "12t 反向：INSERT sys_user 带 deleted_at（新用户不是停用态）" "BEGIN; SET LOCAL ROLE wms_app; INSERT INTO sys_user (id,username,password_hash,deleted_at) VALUES (779905,'t12t5','x','2000-01-01 00:00:00'); ROLLBACK;" "sys_user_insert_time_set"
+expect_block "12t 反向：UPDATE sys_user 改建号时间（created_at 不可改）" "BEGIN; SET LOCAL ROLE wms_app; INSERT INTO sys_user (id,username,password_hash) VALUES (779906,'t12t6','x'); UPDATE sys_user SET created_at = '2000-01-01 00:00:00' WHERE id = 779906; ROLLBACK;" "sys_user_created_at_immutable"
+expect_block "12t 反向：UPDATE sys_user 清空停用时间（停用是事实，不可回退）" "BEGIN; SET LOCAL ROLE wms_app; INSERT INTO sys_user (id,username,password_hash) VALUES (779907,'t12t7','x'); UPDATE sys_user SET deleted_at = date_trunc('second', now() AT TIME ZONE 'UTC') WHERE id = 779907; UPDATE sys_user SET deleted_at = NULL WHERE id = 779907; ROLLBACK;" "sys_user_deleted_at_immutable"
+expect_block "12t 反向：INSERT api_credential 带 last_used_at（新凭证没用过）" "BEGIN; SET LOCAL ROLE wms_app; INSERT INTO api_credential (id,api_key,secret_encrypted,source_system,last_used_at) VALUES (779908,'K779908','s','ERP','2000-01-01 00:00:00'); ROLLBACK;" "api_credential_insert_time_set"
+expect_block "12t 反向：属主建号 created_at 带小数秒（属主豁免覆盖，但整秒 CHECK 仍管）" "INSERT INTO sys_user (id,username,password_hash,created_at) VALUES (779909,'t12t9','x','2026-10-15 08:00:00.5');" "ck_user_ts"
+R=$(psql -t -A <<MUT12T | grep '^MUT#'
+BEGIN;
+DROP TRIGGER trg_user_zclock ON sys_user;
+SET LOCAL ROLE wms_app;
+INSERT INTO sys_user (id,username,password_hash,last_login_at) VALUES (779911,'t12tm1','x','2000-01-01 00:00:00');
+SELECT 'MUT#PASSED';
+ROLLBACK;
+MUT12T
+)
+[ "$R" = "MUT#PASSED" ] && ok "变异：去掉 trg_user_zclock 后带 last_login_at 的 INSERT 通过（断言能抓到）" || bad "变异没变红：trg_user_zclock → $R"
+R=$(psql -t -A <<MUT12T | grep '^MUT#'
+BEGIN;
+DROP TRIGGER trg_api_zclock ON api_credential;
+SET LOCAL ROLE wms_app;
+INSERT INTO api_credential (id,api_key,secret_encrypted,source_system,last_used_at) VALUES (779912,'K779912','s','ERP','2000-01-01 00:00:00');
+SELECT 'MUT#PASSED';
+ROLLBACK;
+MUT12T
+)
+[ "$R" = "MUT#PASSED" ] && ok "变异：去掉 trg_api_zclock 后带 last_used_at 的 INSERT 通过（断言能抓到）" || bad "变异没变红：trg_api_zclock → $R"
 echo "=== 汇总 ==="
 echo "  通过 $pass 项 / 失败 $fail 项"
 cleanup

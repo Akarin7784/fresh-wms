@@ -2123,13 +2123,17 @@ expect_block_tx('12 I5 第二确认人不持有 CENTER_OPS', ["UPDATE approval_r
 expect_block_tx('12 第二确认人 = 第一确认人', ["UPDATE approval_request SET second_approver_id=202, second_approver_role='CENTER_OPS', second_approved_at=datetime('now') WHERE id=3"], 'ck_apr_dual')
 expect_block_tx('12 非计划切换只有一人确认就 APPROVED', ["UPDATE approval_request SET status='APPROVED', decided_at=datetime('now') WHERE id=3"], 'ck_apr_done')
 expect_allow_tx('12 I5 正向：中心运维第二确认 → APPROVED', ["UPDATE approval_request SET status='APPROVED', second_approver_id=203, second_approver_role='CENTER_OPS', second_approved_at=datetime('now'), decided_at=datetime('now') WHERE id=3"])
-expect_block_tx('12 SM 发起人不是本仓仓库主管（只有 CENTER_OPS）', ["INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (23,'APR-WHSH01-20261015-000023','SCRAP_MISREPORT',1,'SCRAP_ORDER','9009','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',203,NULL)"], 'approval_role_not_held')
-expect_block_tx('12 SM 发起人是质检主管而非仓库主管', ["INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (24,'APR-WHSH01-20261015-000024','SCRAP_MISREPORT',1,'SCRAP_ORDER','9010','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',205,NULL)"], 'approval_role_not_held')
+# SCRAP_MISREPORT 权限点化（Chief 裁决：以权限点为准）：发起 scrap.misreport.request、审批 scrap.misreport.approve。
+# 授权：role 1 = WH_SUPERVISOR 持发起；role 2 = CENTER_OPS、role 3 = QC_SUPERVISOR 持审批。
+conn.execute("INSERT INTO sys_permission (id,code,name,module) VALUES (16,'scrap.misreport.request','报损误报回转发起','12'),(17,'scrap.misreport.approve','报损误报回转审批','12')")
+edge_sync("INSERT INTO sys_role_perm (role_id,perm_id) VALUES (1,16),(2,17),(3,17)")
+expect_block_tx('12 SM 发起人不是本仓仓库主管（只有 CENTER_OPS）', ["INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (23,'APR-WHSH01-20261015-000023','SCRAP_MISREPORT',1,'SCRAP_ORDER','9009','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',203,NULL)"], 'approval_perm_not_held')
+expect_block_tx('12 SM 发起人是质检主管而非仓库主管', ["INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (24,'APR-WHSH01-20261015-000024','SCRAP_MISREPORT',1,'SCRAP_ORDER','9010','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',205,NULL)"], 'approval_perm_not_held')
 conn.execute("INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (5,'APR-WHSH01-20261015-000005','SCRAP_MISREPORT',1,'SCRAP_ORDER','9001','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',202,NULL)")
 expect_block_tx('12 SM 发起人自己审批（202 兼 CENTER_OPS 也不行）', ["UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='CENTER_OPS', first_approved_at=datetime('now'), decided_at=datetime('now') WHERE id=5"], 'ck_apr_sod')
-expect_block_tx('12 SM 审批角色写成仓库主管（另一主管 206 不具审批权）', ["UPDATE approval_request SET status='APPROVED', first_approver_id=206, first_approver_role='WH_SUPERVISOR', first_approved_at=datetime('now'), decided_at=datetime('now') WHERE id=5"], 'ck_apr_scrap_roles')
-expect_block_tx('12 SM 审批人不持有 QC_SUPERVISOR 却写质检主管', ["UPDATE approval_request SET status='APPROVED', first_approver_id=204, first_approver_role='QC_SUPERVISOR', first_approved_at=datetime('now'), decided_at=datetime('now') WHERE id=5"], 'approval_role_not_held')
-expect_block_tx('12 SM 质检主管不在本仓', ["UPDATE approval_request SET status='APPROVED', first_approver_id=207, first_approver_role='QC_SUPERVISOR', first_approved_at=datetime('now'), decided_at=datetime('now') WHERE id=5"], 'approval_role_not_held')
+expect_block_tx('12 SM 审批角色写成仓库主管（另一主管 206 不具审批权）', ["UPDATE approval_request SET status='APPROVED', first_approver_id=206, first_approver_role='WH_SUPERVISOR', first_approved_at=datetime('now'), decided_at=datetime('now') WHERE id=5"], 'approval_perm_not_held')
+expect_block_tx('12 SM 审批人不持有 QC_SUPERVISOR 却写质检主管', ["UPDATE approval_request SET status='APPROVED', first_approver_id=204, first_approver_role='QC_SUPERVISOR', first_approved_at=datetime('now'), decided_at=datetime('now') WHERE id=5"], 'approval_perm_not_held')
+expect_block_tx('12 SM 质检主管不在本仓', ["UPDATE approval_request SET status='APPROVED', first_approver_id=207, first_approver_role='QC_SUPERVISOR', first_approved_at=datetime('now'), decided_at=datetime('now') WHERE id=5"], 'approval_perm_not_held')
 expect_allow_tx('12 SM 正向：本仓质检主管审批', ["UPDATE approval_request SET status='APPROVED', first_approver_id=205, first_approver_role='QC_SUPERVISOR', first_approved_at=datetime('now'), decided_at=datetime('now') WHERE id=5"])
 conn.execute("INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (6,'APR-WHSH01-20261015-000006','SCRAP_MISREPORT',1,'SCRAP_ORDER','9002','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',206,NULL)")
 expect_allow_tx('12 SM 正向：中心运维审批', ["UPDATE approval_request SET status='APPROVED', first_approver_id=203, first_approver_role='CENTER_OPS', first_approved_at=datetime('now'), decided_at=datetime('now') WHERE id=6"])
@@ -3959,6 +3963,51 @@ expect_block_tx("06 拒绝：fk_bxl_box 箱明细挂不存在的箱", ["INSERT I
 _m06_fk("fk_bxl_box", ["INSERT INTO pack_box_line (id,box_id,sku_id,lot_id,qty_milli,uom) VALUES (9202,999999,1,0,1000,'KG')"])
 expect_block_tx("06 拒绝：fk_bxl_sku 箱明细挂不存在的 SKU", ["INSERT INTO pack_box_line (id,box_id,sku_id,lot_id,qty_milli,uom) VALUES (9203,9201,999999,0,1000,'KG')"], "FOREIGN KEY constraint failed")
 _m06_fk("fk_bxl_sku", ["INSERT INTO pack_box_line (id,box_id,sku_id,lot_id,qty_milli,uom) VALUES (9203,9201,999999,0,1000,'KG')"])
+print("=== 2g-12t. 第 12 篇时间加固第二轮：正向放行 + 反向按名拦截 + 变异（两库对称）===")
+# 三件套：① 正向（窗口内时间落库）② 反向（按错误名精确命中）③ 变异（去掉守卫后原被拒语句必须通过）
+expect_allow_tx("12t 正向：建号 created_at = datetime('now') → 通过",
+                ["INSERT INTO sys_user (id,username,password_hash,created_at) VALUES (779901,'t12t1','x',datetime('now'))"])
+expect_allow_tx("12t 正向：写登录时间 = datetime('now') → 通过",
+                ["INSERT INTO sys_user (id,username,password_hash) VALUES (779902,'t12t2','x')",
+                 "UPDATE sys_user SET last_login_at = datetime('now') WHERE id = 779902"])
+expect_allow_tx("12t 正向：写停用时间 = datetime('now') → 通过",
+                ["INSERT INTO sys_user (id,username,password_hash) VALUES (779903,'t12t3','x')",
+                 "UPDATE sys_user SET deleted_at = datetime('now') WHERE id = 779903"])
+expect_block_tx("12t 反向：INSERT sys_user 带 last_login_at（新用户没登录过）",
+                ["INSERT INTO sys_user (id,username,password_hash,last_login_at) VALUES (779904,'t12t4','x','2000-01-01 00:00:00')"],
+                "sys_user_insert_time_set")
+expect_block_tx("12t 反向：INSERT sys_user 带 deleted_at（新用户不是停用态）",
+                ["INSERT INTO sys_user (id,username,password_hash,deleted_at) VALUES (779905,'t12t5','x','2000-01-01 00:00:00')"],
+                "sys_user_insert_time_set")
+expect_block_tx("12t 反向：UPDATE sys_user 改建号时间（created_at 不可改）",
+                ["INSERT INTO sys_user (id,username,password_hash) VALUES (779906,'t12t6','x')",
+                 "UPDATE sys_user SET created_at = '2000-01-01 00:00:00' WHERE id = 779906"],
+                "sys_user_created_at_immutable")
+expect_block_tx("12t 反向：UPDATE sys_user 清空停用时间（停用是事实，不可回退）",
+                ["INSERT INTO sys_user (id,username,password_hash) VALUES (779907,'t12t7','x')",
+                 "UPDATE sys_user SET deleted_at = datetime('now') WHERE id = 779907",
+                 "UPDATE sys_user SET deleted_at = NULL WHERE id = 779907"],
+                "sys_user_deleted_at_immutable")
+expect_block_tx("12t 反向：INSERT sys_user created_at 与 now 相差 > 300 s（时钟偏移）",
+                ["INSERT INTO sys_user (id,username,password_hash,created_at) VALUES (779908,'t12t8','x','2000-01-01 00:00:00')"],
+                "sys_user_clock_skew")
+expect_block_tx("12t 反向：INSERT api_credential 带 last_used_at（新凭证没用过）",
+                ["INSERT INTO api_credential (id,api_key,secret_encrypted,source_system,last_used_at) VALUES (779909,'K779909','s','ERP','2000-01-01 00:00:00')"],
+                "api_credential_insert_time_set")
+for _tg12t, _sql12t in [
+    ("trg_user_ins_time_set", "INSERT INTO sys_user (id,username,password_hash,last_login_at) VALUES (779911,'t12tm1','x','2000-01-01 00:00:00')"),
+    ("trg_api_ins_time_set", "INSERT INTO api_credential (id,api_key,secret_encrypted,source_system,last_used_at) VALUES (779912,'K779912','s','ERP','2000-01-01 00:00:00')"),
+]:
+    conn.execute("SAVEPOINT mut12t")
+    conn.execute(f"DROP TRIGGER {_tg12t}")
+    _passed12t = False
+    try:
+        conn.execute(_sql12t)
+        _passed12t = True
+    except sqlite3.Error:
+        _passed12t = False
+    conn.execute("ROLLBACK TO mut12t"); conn.execute("RELEASE mut12t")
+    ok(f"变异：去掉 {_tg12t} 后原被拒语句通过（断言能抓到）") if _passed12t else bad(f"变异没变红：{_tg12t}")
 print("=== 汇总 ===")
 print(f"  通过 {passed} 项 / 失败 {failed} 项")
 conn.close()
