@@ -42,6 +42,7 @@ SCHEMA_PARTS = (
     "11_integration.sql",
     "12_auth.sql",
     "12b_auth_audit.sql",
+    "16_delivery.sql",
     "17_processing.sql",
     "18_live.sql",
     "90_available_view.sql",
@@ -201,7 +202,7 @@ NI = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='index' AND sql
 NV = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='view'").fetchone()[0]
 print(f"  → 表 {NT} 张 / 手工建索引 {NI} 个 / 视图 {NV} 个")
 # 期望值：main 8ed5f0c 为 38 表；docs/02 新增 stock_hold、stock_recon_alert、stock_movement_key、stock_ledger_line → 42 表（PG 分区子表不计）。改表数必须同步改这里和 verify.sh
-EXPECT_TABLES, EXPECT_VIEWS= 84, 3  # 第 7 篇 +replenish_task、replenish_task_line、replenish_demand、move_order、move_order_line（84 表）+ v_location_sku_candidate（3 视图）。第 12 篇 +device_reconnect；docs/03 +5 表； 退供 +supplier_return； docs/12 +3；第 10 篇 +exception_code、exception_case、return_reservation、return_reservation_line、return_blind_receipt；第 9 篇 +scrap_order、scrap_line；第 17 篇 +8 张 process_*；docs/18 加 9 表 + v_live_death_in_transit
+EXPECT_TABLES, EXPECT_VIEWS= 93, 3  # 第 16 篇 +9 表（waybill、delivery_stop、delivery_order、pod_op、pod_line、pod_correction、pod_tolerance_config、delivery_return、delivery_return_line）→ 93 表；视图仍 3（第 7 篇 +replenish_* 与 v_location_sku_candidate、第 18 篇 v_live_death_in_transit）。第 12 篇 +device_reconnect；docs/03 +5 表； 退供 +supplier_return； docs/12 +3；第 10 篇 +exception_code、exception_case、return_reservation、return_reservation_line、return_blind_receipt；第 9 篇 +scrap_order、scrap_line；第 17 篇 +8 张 process_*；docs/18 加 9 表
 ok(f"表数 = {NT}（期望 {EXPECT_TABLES}）") if NT == EXPECT_TABLES else bad(f"表数 = {NT}，期望 {EXPECT_TABLES}")
 ok(f"视图数 = {NV}") if NV == EXPECT_VIEWS else bad(f"视图数 = {NV}，期望 {EXPECT_VIEWS}")
 
