@@ -154,6 +154,106 @@ CREATE TABLE sku_unit (
 -- 它会成为 sku_unit 上第一把 BEFORE UPDATE 锁，按 00 §6.10 第 5 条必须把 sku_unit 移出 REPLACE_OK、
 -- 补 no-REPLACE 守卫与 2z3b 样本，属独立治理改动，见 docs/01-主数据.md §12 Q8。
 
+-- -----------------------------------------------------------------------------
+-- 01 增量（2026-10-16）：台账五表——供应商 / 客户（门店）/ 车辆 / 司机 / 设备
+-- 设计见 docs/01-主数据.md §4.11–§4.15；跨篇 FK 只落 lot.supplier_id（Chief 裁定，见 §4.16）
+-- 放在 lot 之前：lot.supplier_id 要内联声明 REFERENCES supplier(id)（PG 要求父表先建）
+-- -----------------------------------------------------------------------------
+
+CREATE TABLE supplier (
+    id                          BIGINT       PRIMARY KEY,
+    code                        VARCHAR(32)  NOT NULL,
+    name                        VARCHAR(128) NOT NULL,
+    status                      VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
+    contact_name                VARCHAR(64),
+    contact_phone               VARCHAR(32),
+    food_safety_license_no      VARCHAR(64),
+    food_safety_license_expiry  DATE,
+    created_at                  TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
+    updated_at                  TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
+    CONSTRAINT uq_supplier_code UNIQUE (code),
+    CONSTRAINT ck_supplier_status CHECK (status IN ('ACTIVE','DISABLED')),
+    -- 供应商编码 A-Z0-9、2–32 位；与 ck_wh_code 同一条写法（嵌套 replace 去合法字符，两库通用，不用正则）
+    CONSTRAINT ck_supplier_code CHECK (length(code) BETWEEN 2 AND 32 AND replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(code,'A',''),'B',''),'C',''),'D',''),'E',''),'F',''),'G',''),'H',''),'I',''),'J',''),'K',''),'L',''),'M',''),'N',''),'O',''),'P',''),'Q',''),'R',''),'S',''),'T',''),'U',''),'V',''),'W',''),'X',''),'Y',''),'Z',''),'0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9','') = '')
+);
+CREATE INDEX ix_supplier_status ON supplier(status);
+
+CREATE TABLE customer (
+    id                  BIGINT       PRIMARY KEY,
+    code                VARCHAR(32)  NOT NULL,
+    name                VARCHAR(128) NOT NULL,
+    store_type          VARCHAR(16)  NOT NULL DEFAULT 'STORE',
+    status              VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
+    contact_name        VARCHAR(64),
+    contact_phone       VARCHAR(32),
+    address             VARCHAR(256),
+    delivery_window     VARCHAR(64),
+    created_at          TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
+    updated_at          TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
+    CONSTRAINT uq_customer_code UNIQUE (code),
+    CONSTRAINT ck_customer_type CHECK (store_type IN ('STORE','MALL','OTHER')),
+    CONSTRAINT ck_customer_status CHECK (status IN ('ACTIVE','DISABLED'))
+);
+CREATE INDEX ix_customer_status_type ON customer(status, store_type);
+
+CREATE TABLE vehicle (
+    id              BIGINT       PRIMARY KEY,
+    plate_no        VARCHAR(16)  NOT NULL,
+    vehicle_type    VARCHAR(16)  NOT NULL DEFAULT 'VAN',
+    temp_min_c10    INTEGER,                 -- 车厢可保温区间下限，0.1 ℃；两列同空或同填且下限 < 上限
+    temp_max_c10    INTEGER,
+    capacity_kg     BIGINT,
+    status          VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
+    created_at      TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
+    updated_at      TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
+    CONSTRAINT uq_vehicle_plate UNIQUE (plate_no),
+    CONSTRAINT ck_vehicle_type CHECK (vehicle_type IN ('VAN','TRUCK','REFRIGERATED','OTHER')),
+    CONSTRAINT ck_vehicle_status CHECK (status IN ('ACTIVE','DISABLED')),
+    -- 车牌不做格式 CHECK（各省规则不一，服务层归一大小写与空白）
+    CONSTRAINT ck_vehicle_temp CHECK (
+        (temp_min_c10 IS NULL AND temp_max_c10 IS NULL)
+        OR (temp_min_c10 IS NOT NULL AND temp_max_c10 IS NOT NULL AND temp_min_c10 < temp_max_c10)),
+    CONSTRAINT ck_vehicle_cap CHECK (capacity_kg IS NULL OR capacity_kg > 0)
+);
+CREATE INDEX ix_vehicle_status_type ON vehicle(status, vehicle_type);
+
+CREATE TABLE driver (
+    id              BIGINT       PRIMARY KEY,
+    name            VARCHAR(64)  NOT NULL,
+    phone           VARCHAR(20)  NOT NULL,
+    cert_no         VARCHAR(64),
+    cert_expiry     DATE,                    -- 证照到期日；过期由服务层在排车 / 登录时拦（42220，CHECK 不能用 now()）
+    status          VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
+    created_at      TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
+    updated_at      TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
+    CONSTRAINT uq_driver_phone UNIQUE (phone),
+    CONSTRAINT ck_driver_status CHECK (status IN ('ACTIVE','DISABLED')),
+    -- 手机号 = 11 位纯数字（两库通用写法，不用正则）
+    CONSTRAINT ck_driver_phone CHECK (length(phone) = 11 AND replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(phone,'0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9','') = '')
+);
+CREATE INDEX ix_driver_status ON driver(status);
+
+CREATE TABLE device (
+    id                  BIGINT       PRIMARY KEY,
+    device_instance_id  VARCHAR(64)  NOT NULL,
+    device_type         VARCHAR(16)  NOT NULL DEFAULT 'PDA',
+    warehouse_id        BIGINT       NOT NULL REFERENCES warehouse(id),
+    status              VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
+    last_seen_at        TIMESTAMP,
+    created_at          TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
+    updated_at          TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
+    CONSTRAINT uq_device_instance UNIQUE (device_instance_id),
+    CONSTRAINT ck_device_type CHECK (device_type IN ('PDA','SCANNER','PRINTER','SCALE','OTHER')),
+    CONSTRAINT ck_device_status CHECK (status IN ('ACTIVE','DISABLED','LOST')),
+    -- 设备实例号禁空串与全空白串（与 05 ck_pt_device 同口径）
+    CONSTRAINT ck_device_instance CHECK (btrim(device_instance_id, E' \t\r\n\v\f') <> ''),  -- @pg-only
+-- @sqlite-only     CONSTRAINT ck_device_instance CHECK (trim(device_instance_id, ' ' || char(9) || char(10) || char(11) || char(12) || char(13)) <> ''),
+    -- LOST 之后允许留 last_seen_at；不强制 NOT NULL（老设备可能从未心跳）
+    CONSTRAINT ck_device_seen CHECK (last_seen_at IS NULL OR last_seen_at >= created_at)
+);
+CREATE INDEX ix_device_wh_status ON device(warehouse_id, status);
+
+
 CREATE TABLE lot (
     id                  BIGINT       PRIMARY KEY,
     sku_id              BIGINT       NOT NULL REFERENCES sku(id),
@@ -161,7 +261,7 @@ CREATE TABLE lot (
     production_date     DATE,                           -- 日历日（04 I5）
     expiry_date         DATE         NOT NULL,          -- FEFO 排序键；日历日，禁发期按仓库时区自然日计算（04 I5）
     receive_date        DATE         NOT NULL,          -- #2 第十一轮：纯日期（收货自然日），不带时间；00 §6.8
-    supplier_id         BIGINT,
+    supplier_id         BIGINT       CONSTRAINT fk_lot_supplier REFERENCES supplier(id),   -- 01 增量：台账落库后补外键（其余跨篇 FK 见 docs/01 §4.16 的排队）
     origin_batch        VARCHAR(64),
     quality_status      VARCHAR(16)  NOT NULL DEFAULT 'QUALIFIED',
     remaining_life_days SMALLINT     NOT NULL DEFAULT 9999,  -- 冗余，定时刷新
@@ -205,4 +305,16 @@ CREATE TRIGGER trg_lot_sell_deadline BEFORE UPDATE ON lot FOR EACH ROW EXECUTE F
 -- @sqlite-only CREATE TRIGGER trg_location_no_replace_code BEFORE INSERT ON location WHEN EXISTS (SELECT 1 FROM location x WHERE x.warehouse_id = NEW.warehouse_id AND x.code = NEW.code) BEGIN SELECT RAISE(ABORT, 'master_duplicate: location.warehouse_id, location.code'); END;
 -- @sqlite-only CREATE TRIGGER trg_sku_no_replace BEFORE INSERT ON sku WHEN EXISTS (SELECT 1 FROM sku x WHERE x.id = NEW.id) BEGIN SELECT RAISE(ABORT, 'master_duplicate: sku.id'); END;
 -- @sqlite-only CREATE TRIGGER trg_sku_no_replace_code BEFORE INSERT ON sku WHEN EXISTS (SELECT 1 FROM sku x WHERE x.code = NEW.code) BEGIN SELECT RAISE(ABORT, 'master_duplicate: sku.code'); END;
+-- 01 增量：台账五表逐唯一键防 REPLACE（00 §6.10）：PK 与业务唯一键各一把
+-- @sqlite-only CREATE TRIGGER trg_supplier_no_replace BEFORE INSERT ON supplier WHEN EXISTS (SELECT 1 FROM supplier x WHERE x.id = NEW.id) BEGIN SELECT RAISE(ABORT, 'master_duplicate: supplier.id'); END;
+-- @sqlite-only CREATE TRIGGER trg_supplier_no_replace_code BEFORE INSERT ON supplier WHEN EXISTS (SELECT 1 FROM supplier x WHERE x.code = NEW.code) BEGIN SELECT RAISE(ABORT, 'master_duplicate: supplier.code'); END;
+-- @sqlite-only CREATE TRIGGER trg_customer_no_replace BEFORE INSERT ON customer WHEN EXISTS (SELECT 1 FROM customer x WHERE x.id = NEW.id) BEGIN SELECT RAISE(ABORT, 'master_duplicate: customer.id'); END;
+-- @sqlite-only CREATE TRIGGER trg_customer_no_replace_code BEFORE INSERT ON customer WHEN EXISTS (SELECT 1 FROM customer x WHERE x.code = NEW.code) BEGIN SELECT RAISE(ABORT, 'master_duplicate: customer.code'); END;
+-- @sqlite-only CREATE TRIGGER trg_vehicle_no_replace BEFORE INSERT ON vehicle WHEN EXISTS (SELECT 1 FROM vehicle x WHERE x.id = NEW.id) BEGIN SELECT RAISE(ABORT, 'master_duplicate: vehicle.id'); END;
+-- @sqlite-only CREATE TRIGGER trg_vehicle_no_replace_plate BEFORE INSERT ON vehicle WHEN EXISTS (SELECT 1 FROM vehicle x WHERE x.plate_no = NEW.plate_no) BEGIN SELECT RAISE(ABORT, 'master_duplicate: vehicle.plate_no'); END;
+-- @sqlite-only CREATE TRIGGER trg_driver_no_replace BEFORE INSERT ON driver WHEN EXISTS (SELECT 1 FROM driver x WHERE x.id = NEW.id) BEGIN SELECT RAISE(ABORT, 'master_duplicate: driver.id'); END;
+-- @sqlite-only CREATE TRIGGER trg_driver_no_replace_phone BEFORE INSERT ON driver WHEN EXISTS (SELECT 1 FROM driver x WHERE x.phone = NEW.phone) BEGIN SELECT RAISE(ABORT, 'master_duplicate: driver.phone'); END;
+-- @sqlite-only CREATE TRIGGER trg_device_no_replace BEFORE INSERT ON device WHEN EXISTS (SELECT 1 FROM device x WHERE x.id = NEW.id) BEGIN SELECT RAISE(ABORT, 'master_duplicate: device.id'); END;
+-- @sqlite-only CREATE TRIGGER trg_device_no_replace_instance BEFORE INSERT ON device WHEN EXISTS (SELECT 1 FROM device x WHERE x.device_instance_id = NEW.device_instance_id) BEGIN SELECT RAISE(ABORT, 'master_duplicate: device.device_instance_id'); END;
 GRANT SELECT, INSERT, UPDATE ON warehouse, zone, location, sku, sku_barcode, sku_unit, lot TO wms_app;  -- @pg-only
+GRANT SELECT, INSERT, UPDATE ON supplier, customer, vehicle, driver, device TO wms_app;  -- @pg-only
