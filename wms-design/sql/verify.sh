@@ -783,7 +783,16 @@ expect_block "10 L3 DELETE 已取消异常单" "DELETE FROM exception_case WHERE
 expect_allow "10 质检单来源 SCRAP_MISREPORT（第 9 篇交接 / 质检误报回转）" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8010,'RTN-10',1,'RETURN','SCRAP_MISREPORT','APR-WHSH01-20261015-000001','CREATED','2026-10-15');"
 expect_block "10 质检单来源拼错（SCRAP_MISREPORTX）" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8011,'RTN-11',1,'RETURN','SCRAP_MISREPORTX','APR-WHSH01-20261015-000002','CREATED','2026-10-15');" "ck_inb_rtn_src"
 expect_allow "10 异常单来源 SCRAP_MISREPORT" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (142,'EXC-142',1,'RETURN_COUNT_DIFF','SCRAP_MISREPORT','APR-WHSH01-20261015-000001','0000000000000000000000000000000000000000000000000000000000000084',1,1,0,0,0,'2026-10-15 12:00:00',7);"
-expect_block "10 L3 PG TRUNCATE 异常单（超级用户 / 迁移脚本）" "TRUNCATE exception_case;" "exc_no_delete"
+# 叠加 #16 的 fk_dretl_exc（delivery_return_line → exception_case）后，PG 会先以外键拒绝 TRUNCATE（报错不再是 exc_no_delete）；
+# 两种拦法都算通过，再核对行数未变（与 02 §C5、12 的 TRUNCATE 断言同一写法）
+_EXC0=$(psql -t -A -c "SELECT count(*) FROM exception_case")
+OUT=$(psql_capture "TRUNCATE exception_case;")
+case "$OUT" in
+  *"exc_no_delete"*|*"cannot truncate a table referenced in a foreign key constraint"*) ok "10 L3 PG TRUNCATE 异常单被拦（守卫或 #16 外键）";;
+  *) bad "10 L3 TRUNCATE 异常单未被拦：$OUT";;
+esac
+_EXC1=$(psql -t -A -c "SELECT count(*) FROM exception_case")
+[ "$_EXC1" = "$_EXC0" ] && ok "10 TRUNCATE 异常单：行数不变（$_EXC0）" || bad "10 TRUNCATE 异常单后行数变化：$_EXC0 → $_EXC1"
 expect_allow "10 STORE_RETURN 门店退货回仓 RTN" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8002,'RTN-2',1,'RETURN','STORE_RETURN','ST01:R-001','CREATED','2026-10-15');"
 expect_block "10 STORE_RETURN 之外的未登记退货来源" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8003,'RTN-3',1,'RETURN','WHATEVER','X-1','CREATED','2026-10-15');" "ck_inb_rtn_src"
 expect_allow "10 非退货入库单不受退货来源 CHECK 约束" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8004,'PO-1',1,'PURCHASE','ERP_X','PO-001','CREATED','2026-10-15');"
