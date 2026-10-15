@@ -10,7 +10,7 @@
 | 技术栈 | Vue 3 + TypeScript + Vite + Vant，H5 打包；PDA 用 WebView 壳或自带浏览器，壳能力（扫码广播、蓝牙打印、电子秤）走 `bridge/` 适配层 |
 | 状态 | 新稿（界面，2026-10-15）。从 `docs/frontend-detail-design` 搬运后按当前 main 逐条重核 |
 
-> **引用口径**：凡接口路径、权限点、错误码，以「已合 main」的 02/03/04/09/10/11/18 与 00 为准；05/06/12/17 尚未合并，正文引用处一律标「（草稿）」，定稿后以定稿为准。旧稿里的业务码用法全部重核过，差异见 §1.3。
+> **引用口径**：凡接口路径、权限点、错误码，以「已合 main」的 02/03/04/09/10/11/18 与 00 为准；05/06/12/17 尚未合并，正文引用处一律标「（草稿）」，定稿后以定稿为准。旧稿里的业务码用法全部重核过，差异见 §1.3。**本篇引用 00 §6.4 / §6.5 的权威定义，12 篇正文定稿后如有差异以 12 篇为准。**
 
 ---
 
@@ -46,8 +46,8 @@
 | Δ3 | `paused_actions` 写「三个」「八个值」 | **九个值**（含 `LIVE_WEIGH_OUT`） | 00 §6.6.2 已登记 9 个；11 篇、14 旧稿的「八个」是旧口径 |
 | Δ4 | `40312` 提示显示 `detail.rule` | 只认 **`detail.reason`** | 00 §6.4 `SOD_VIOLATION` 明确不再使用 `detail.rule` |
 | Δ5 | 上架权限点写 `inbound.putaway.execute` | `inbound.putaway` | 03 §7 / §10 |
-| Δ6 | 盲收 / 预约收货路径当成已定 | 保留流程，接口标「待第 10 篇」（§9.11、Q2） | main 的 03/10 均无 `/inbound/returns/blind`、`/returns/reservations/{id}/receive` |
-| Δ7 | 示例里 `client_time` 用 `2026-10-15T02:13:41Z` | 客户端时间统一 `YYYY-MM-DD HH:MM:SS` UTC 整秒 | 00 §6.8 第 4 条；带 `T`/`Z` 或小数秒在 SQLite 侧被拒 → 40003 |
+| Δ6 | 盲收 / 预约收货路径当成已定 | 保留流程，给出前端消费契约（§6.2），后端侧待登记 | main 的 03/10 均无 `/inbound/returns/blind`、`/returns/reservations/{id}/receive` |
+| Δ7 | 旧稿示例的 `client_time` 用带 `T`/`Z` 的 ISO 写法 | 客户端时间统一 `YYYY-MM-DD HH:MM:SS` UTC 整秒 | 00 §6.8 第 4 条；带 `T`/`Z` 或小数秒在 SQLite 侧被拒 → 40003 |
 | Δ8 | 「PDA 心跳」被当成已知接口 | 路径待定（Q7） | 00 §6.6.2 只说「`/me` 和终端心跳响应」，未定路径 |
 
 ---
@@ -69,7 +69,7 @@
 | P11 | 复核员 | 集货（扫箱码 + 集货位） | `/pack/:orderCode` | `POST /boxes/{code}/stage`；42215 温区不符 |
 | P12 | 复核员 | 封箱后丢箱/破损，发起箱作废申请 | 箱详情 | `POST /pack/boxes/{box_id}/void-request`；审批在后台（13 篇） |
 | P13 | 仓管员 | 收货登记、上架扫码 | `/receive`、`/putaway` | `POST /inbound/lines/{id}/receipts`、`POST /inbound/receipts/{id}/putaways`（03 §7，已合 main） |
-| P14 | 仓管员 | 盲收登记（无预约到货） | `/receive/blind` | 接口待第 10 篇（Q2）；流程见 §9.11 |
+| P14 | 仓管员 | 盲收登记（无预约到货） | `/receive/blind` | 契约见 §6.2；后端侧待 10 篇补登记 |
 | P15 | 仓管员 | 设备不可用时用纸质单，恢复联网后纸单补录 | `/offline/paper` | `POST /offline/paper-records`（11 §7，已合 main）；24 h 窗口 |
 | P16 | 加工/活鲜作业员 | 领料、成品入库、损耗登记、巡池、死亡登记、出池称重 | `/processing/*`、`/live/*` | 17 / 18；是否可离线见 Q8 |
 
@@ -94,8 +94,8 @@ Hash 路由（WebView 兼容）。权限点为渲染依据，实际以服务端�
 | `/pack/boxes/:boxId` | 箱详情、申请作废、看审批状态 | `pack.box.void.request`（申请）/ `outbound.order.view`（查看） | 需在线 |
 | `/return/:returnRecordId` | 待回库确认（扫原库位）/ 就近放回到位确认 | 原拣货人 | 需在线（状态以服务端为准） |
 | `/receive` | 收货登记 | `inbound.receive` | 可离线（入 outbox） |
-| `/receive/blind` | 盲收登记 | 待第 10 篇（Q2） | 可离线（入 outbox） |
-| `/receive/reservations` | 退货预约收货 | 待第 10 篇（Q2） | 待定 |
+| `/receive/blind` | 盲收登记 | `inbound.return.blind`（契约见 §6.2） | 可离线（入 outbox） |
+| `/receive/reservations` | 退货预约收货 | `returns.reservation.receive` / `.view`（契约见 §6.2） | 可离线（入 outbox） |
 | `/putaway` | 上架扫码 | `inbound.putaway` | 可离线（入 outbox） |
 | `/move` | 同仓移库；跨仓调拨 | `inventory.move.execute`（待第 7 篇定名） | 同仓可离线；跨仓置灰 |
 | `/offline/paper` | 纸单补录（恢复联网后 24 h 内） | `offline.paper.backfill` | 必须在线 |
@@ -172,8 +172,8 @@ Hash 路由（WebView 兼容）。权限点为渲染依据，实际以服务端�
 | 集货 | 扫箱码 + 集货位 | *`POST /api/v1/boxes/{code}/stage`* | 四元键 |
 | 箱作废 | 申请作废 / 查箱详情 | `POST /api/v1/pack/boxes/{box_id}/void-request`、`GET /api/v1/pack/boxes/{box_id}`（00 §6.6.1 / 草稿 06） | `Idempotency-Key` |
 | 收货 | 收货登记 | `POST /api/v1/inbound/lines/{id}/receipts`（03 §7，已合 main） | `op_key` / 四元组 |
-| 收货 | 盲收登记 | 待第 10 篇（Q2） | `Idempotency-Key` |
-| 收货 | 退货预约收货 | 待第 10 篇（Q2） | `Idempotency-Key` |
+| 收货 | 盲收登记 | `POST /api/v1/inbound/returns/blind`（契约见 §6.2） | `Idempotency-Key` + 四元组 |
+| 收货 | 退货预约收货 | `POST /api/v1/returns/reservations/{id}/receive`（契约见 §6.2） | `Idempotency-Key` |
 | 上架 | 上架扫码 | `POST /api/v1/inbound/receipts/{id}/putaways`（03 §7，已合 main） | `op_key` / 四元组 |
 | 纸单补录 | 提交 | `POST /api/v1/offline/paper-records` `{action_type, occurred_at, operator_id, payload, photo_ids[]}`（11 §7，已合 main） | `Idempotency-Key` |
 | 加工 | 领料 / 报工 / 冲回 | *`POST /api/v1/process/orders/{id}/issues`*、*`/reports`*、*`/reversals`*（草稿 17） | `issue_client_id` / `report_client_id` |
@@ -182,6 +182,37 @@ Hash 路由（WebView 兼容）。权限点为渲染依据，实际以服务端�
 | 活鲜 | 阈值下发包 | `GET /api/v1/live/pda-package?warehouse_code=`（18 §7） | — |
 | 写节点 | 取/重取写地址 | `GET /api/v1/warehouses/{warehouse_code}/write-endpoint` → `{endpoint, epoch}`（00 §9.1） | — |
 | 全局 | 每个写请求 | 头带 `X-Warehouse-Id`、`X-Write-Epoch`、`Idempotency-Key` | — |
+
+---
+
+### 6.2 盲收与退货预约收货的端上契约
+
+> 这两条接口在 main 的 03/10 篇里都没有定义。下面是**前端消费契约**：PDA 按此实现与 MSW mock，后端语义与落库由 03/10 篇定；字段名以后端定稿为准，形状有变本篇同步对齐。数量 3 位小数字符串，时间 UTC 整秒 `YYYY-MM-DD HH:MM:SS`。
+
+**盲收登记**（`POST /api/v1/inbound/returns/blind`，权限 `inbound.return.blind`）
+
+```json
+{ "sku_id": "7311000000000001", "qty": "12.500", "uom": "KG",
+  "reason_code": "STORE_BLIND", "container_code": "BX-000123", "store_code": "ST-001",
+  "photo_ids": [], "device_instance_id": "6f1c…", "op_seq": "7",
+  "client_occurred_at": "2026-10-15 02:31:00" }
+```
+
+- 必填：`sku_id`、`qty`、`reason_code`、`container_code`；`store_code`、`photo_ids` 可选；头带 `Idempotency-Key`、`X-Warehouse-Id`、`X-Write-Epoch`。
+- 响应 200：`{"receipt_id": "…", "inbound_order_id": "…", "inbound_order_code": "RTN-WHSH01-0003-20261015-000031", "exception_no": "EXC-…", "link_deadline_at": "2026-10-17 02:31:00"}`。`link_deadline_at` = 创建 + 48 h（UTC），前端**只读、不推算**（剩余 < 4 h 标橙、超时标红）。
+- 错误：`40001`（缺 `reason_code` / `container_code`，`detail` 带字段名）、`40010`（数量格式）、`40910`（`key_type` 按 00 §6.5）、`42221`（引用了已停用主数据）、`50304`（`RECEIVE` 暂停，`detail.action`）、`40111` / `40112`（设备与令牌）。
+- 离线：入 outbox（入队前做同样的必填校验），联网后按 §9.3 补交；补交成功才显示两个单号（§9.11）。
+
+**退货预约收货与查询**（`POST /api/v1/returns/reservations/{id}/receive`，权限 `returns.reservation.receive`；`GET /api/v1/returns/reservations`、`GET /api/v1/returns/reservations/{id}`，权限 `returns.reservation.view`）
+
+```json
+{ "lines": [ { "line_no": 1, "received_qty": "10.000", "location_code": "A01-02-03" } ] }
+```
+
+- 响应 200：`{"id": "…", "reservation_no": "…", "status": "RECEIVED", "inbound_order_code": "RTN-…", "lines": [{"line_no": 1, "received_qty": "10.000"}]}`；收货后该批进 `RETURN_QC` 冻结，PDA 只显示「待质检」，**不提供解冻**。
+- 列表入参 `store_code`、`status`、`cursor`；详情返回单头 `{id, reservation_no, store_code, outbound_order_id, status: CREATED|RECEIVED|CANCELLED, created_at}` 与行 `{line_no, sku_id, qty, reason_code, container_code, received_qty}`。
+- 错误：`40001`（行号/数量/库位缺失）、`40010`、`40930`（预约非 `CREATED`）、`40906`（库位被盘点冻结）、`42212`（扫到的库位与 `location_code` 不符）、`40910`、`50304`（`RECEIVE` 暂停）。
+- 离线：入 outbox，联网补交时由服务端判定预约状态（非 `CREATED` → `40930` 红条，刷新不重试）。
 
 ---
 
@@ -495,8 +526,8 @@ stateDiagram-v2
 
 ### 9.11 盲收登记、退货预约收货与纸单补录
 
-- **盲收**（无预约到货）：接口与权限点**待第 10 篇定**（Q2）。流程口径：body `{sku_id, qty, reason_code, container_code, store_code?, photo_ids[]}`（`qty` 三位小数字符串；`reason_code`、`container_code` 必填，`store_code` 可选），带 `Idempotency-Key`。前端必填校验：未选退货原因、未扫箱码时提交置灰并在字段下提示；服务端缺字段返回 `40001`，按 `detail` 字段名定位提示，不重试。响应返回**收货记录号**与自动生成的**异常单号**，结果页同时显示并提示「须在 48 小时内关联订单，超时升级主管」（48 h 口径待第 10 篇确认）。离线入 outbox（入队前同样做必填校验），联网补交后再显示两个单号。
-- **退货预约收货**：接口与权限点**待第 10 篇定**（Q2）。流程：扫/选预约单 → 核对行（`sku_id`、`qty`、`reason_code`、`container_code`）→ 提交 `{lines[{line_no, received_qty, location_code}]}`；预约非 `CREATED` 返回 `40930`，刷新不重试。收货后进 `RETURN_QC` 冻结，PDA 只显示「待质检」，不提供解冻。
+- **盲收**（无预约到货）：**契约见 §6.2**，权限点 `inbound.return.blind`。流程口径：body `{sku_id, qty, reason_code, container_code, store_code?, photo_ids[]}`（`qty` 三位小数字符串；`reason_code`、`container_code` 必填，`store_code` 可选），带 `Idempotency-Key`。前端必填校验：未选退货原因、未扫箱码时提交置灰并在字段下提示；服务端缺字段返回 `40001`，按 `detail` 字段名定位提示，不重试。响应返回**收货记录号**与自动生成的**异常单号**，结果页同时显示并提示「须在 48 小时内关联订单，超时升级主管」（48 h 口径由后端定）。离线入 outbox（入队前同样做必填校验），联网补交后再显示两个单号。
+- **退货预约收货**：**契约见 §6.2**，权限点 `returns.reservation.receive`。流程：扫/选预约单 → 核对行（`sku_id`、`qty`、`reason_code`、`container_code`）→ 提交 `{lines[{line_no, received_qty, location_code}]}`；预约非 `CREATED` 返回 `40930`，刷新不重试。收货后进 `RETURN_QC` 冻结，PDA 只显示「待质检」，不提供解冻。
 - **纸单兜底补录**（00 §6.6.1，审批类型 `PAPER_BACKFILL`）：设备不可用时现场用纸质单记录；恢复联网后由操作人（`offline.paper.backfill`）在 `/offline/paper` 提交 `POST /api/v1/offline/paper-records` `{action_type, occurred_at, operator_id, payload, photo_ids[]}`（`occurred_at` 按仓库时区录入、以 UTC 整秒提交；纸单照片必传），带 `Idempotency-Key`，生成待主管审批（`offline.paper.approve`）的审批单，申请人不能自批。
   - **24 小时时限**：必须在恢复联网后 24 h 内提交，超时服务端转异常单（10 篇）。入口显示「补录剩余 HH:MM」倒计时，只读服务端下发的 `backfill_deadline_at`（`/me` 与心跳返回，= 恢复联网 + 24 h；**前端不用设备时间推算**）。为 `null`（窗口已过或设备从未断网）时隐藏入口与倒计时；窗口期内一直显示（服务端无从得知是否还有未录入的纸单）；< 1 小时标红。已提交的补录记录仍可查看。
   - **补录本身必须在线，不进 outbox**。
@@ -550,8 +581,8 @@ stateDiagram-v2
 
 | # | 问题 | 依赖 | 影响 |
 |---|---|---|---|
-| Q1 | 第 12 篇 md 当前不在 main（`docs/12-权限与审计.md` 于 `7241e9f` 被删除，DDL 保留）；`/me` 响应示例也没有 00 §6.6.2 要求的 `paused` / `paused_actions` / `offline_deadline_at` / `backfill_deadline_at` | 12 篇定稿 | 登录、设备绑定、置灰与倒计时字段 |
-| Q2 | 盲收 `POST /inbound/returns/blind`、退货预约收货 `POST /returns/reservations/{id}/receive` 的路径、字段与权限点在 main 的 03/10 里都没有；48 h 关联订单口径也未定 | 03 / 10 篇 | `/receive/blind`、`/receive/reservations` |
+| Q1 | 第 12 篇 md 当前不在 main（`docs/12-权限与审计.md` 于 `7241e9f` 被删除，DDL 保留）；`/me` 响应示例也没有 00 §6.6.2 要求的 `paused` / `paused_actions` / `offline_deadline_at` / `backfill_deadline_at`（**00 §6.6.2 已定，本篇按它写全**） | 12 篇定稿 | 登录、设备绑定、置灰与倒计时字段；**本篇引用 00 §6.4/§6.5 的权威定义，12 篇定稿后如有差异以 12 篇为准** |
+| Q2 | 盲收与退货预约收货的**前端契约见 §6.2**；后端语义、字段与 48 h 口径由后端定 | 03 / 10 篇 | **后端侧待 03 / 10 篇补登记** |
 | Q3 | 拣货任务接口（含 `preload` 任务包格式、任务版本号字段、`seq` 与四元组里 `line_no` 的对应）以 05 草稿为临时依据，未合 main | 05 篇 | §6 全部任务行 |
 | Q4 | 离线回收阈值（原文 2 h）是否配置下发 | 00 / 05 | 重连提示 |
 | Q5 | PDA 壳选型及扫码事件 id、打印、电子秤接口 | 采购 / 05 | `bridge/` |
@@ -562,7 +593,7 @@ stateDiagram-v2
 | Q10 | 「交给主管」的接管流程（主管在 PDA 登录确认 / 后台接管）与审计字段 | 12 篇 | §9.3 |
 | Q11 | 同仓移库 / 跨仓调拨的权限点定名（旧稿用 `inventory.move.execute`，07 篇未定稿） | 07 篇 | `/move` |
 | Q12 | 共享 `utils/format.ts` 的方式（monorepo 包 / 复制） | 工程结构 | 13/14/15 共用 |
-| Q13 | 客户端时间格式：00 §6.8 要求 `YYYY-MM-DD HH:MM:SS`，05 草稿的 confirm 示例写 `2026-10-15T02:13:41Z` | 00 / 05 | 40003 误伤风险 |
+| Q13 | ~~客户端时间格式~~ **已裁决**：全按 00 §6.8 用 `YYYY-MM-DD HH:MM:SS` UTC 整秒；05 篇 confirm 示例带 `T`/`Z` 的 ISO 写法不采用，05 篇侧同步改 | 已关闭 | 40003 风险消除 |
 
 ---
 
