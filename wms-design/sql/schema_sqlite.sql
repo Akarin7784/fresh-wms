@@ -1,8 +1,8 @@
--- 本文件由 sql/verify_sqlite.py 从 schema_postgres.sql 机械生成，请勿手改。
+-- 本文件由 sql/verify_sqlite.py 从 sql/schema/*.sql 按加载顺序机械生成，请勿手改。
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
---   2. 48 处 DEFAULT now()、3 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
---   3. 方言专属行：删除 194 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 111 行 @sqlite-only（等价触发器）
+--   2. 39 处 DEFAULT now()、3 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
+--   3. 方言专属行：删除 180 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 65 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -14,7 +14,6 @@
 --  3. SQLite 差异见每张表末尾的 "-- [SQLite]" 注释，以及 §3.1 的十条规则。
 --  4. 所有主键由应用层生成（号段），不用数据库自增 —— 见 D1/R1。
 -- =============================================================================
-
 
 
 -- -----------------------------------------------------------------------------
@@ -149,7 +148,7 @@ CREATE TABLE lot (
     origin_batch        VARCHAR(64),
     quality_status      VARCHAR(16)  NOT NULL DEFAULT 'QUALIFIED',
     remaining_life_days SMALLINT     NOT NULL DEFAULT 9999,  -- 冗余，定时刷新
-    sell_deadline       DATE,                           -- 可售截止日 = COALESCE(production_date, receive_date 的日期) + sku.sell_days；sku.sell_days 为空时为 NULL（服务层建批次时写入，跨表不建 CHECK）
+    sell_deadline       DATE,                           -- 可售截止日 = COALESCE(production_date, receive_date 的日期) + sku.sell_days；sku.sell_days 为空时为 NULL。建档写入后不可改（trg_lot_sell_deadline：含 NULL→日期、改早、改晚、清空）
     cert_no             VARCHAR(64),                    -- 检疫合格证等
     created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     updated_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
@@ -158,7 +157,11 @@ CREATE TABLE lot (
 CREATE INDEX ix_lot_expiry ON lot(sku_id, expiry_date) WHERE quality_status = 'QUALIFIED';
 CREATE INDEX ix_lot_aging  ON lot(remaining_life_days, sku_id);
 -- [SQLite] 两个部分索引均支持；ix_lot_aging 支撑效期预警列表
-
+-- sell_deadline 建档固定、不回溯：其余列仍可更新，只有这一列（含 NULL）写入后不可改
+-- search_path 固定为 pg_catalog, public。IS DISTINCT FROM 用的 =(date,date) 来自 pg_catalog，调用方 schema 里的同名运算符不生效。
+CREATE TRIGGER trg_lot_sell_deadline BEFORE UPDATE ON lot
+WHEN NEW.sell_deadline IS NOT OLD.sell_deadline
+BEGIN SELECT RAISE(ABORT, 'sell_deadline_immutable'); END;
 -- -----------------------------------------------------------------------------
 -- 库存（核心）
 -- -----------------------------------------------------------------------------
@@ -181,7 +184,7 @@ CREATE TABLE stock (
     allocated_qty_milli     BIGINT          NOT NULL DEFAULT 0,   -- 已分配未拣（= ALLOCATE 占用汇总）
     reserved_qty_milli      BIGINT          NOT NULL DEFAULT 0,   -- 已预占（= RESERVE 占用汇总）
     quality_hold_qty_milli  BIGINT          NOT NULL DEFAULT 0,   -- 质检/盘点冻结（= QUALITY + RETURN_QC 冻结汇总）
-    hold_qty_milli        BIGINT          NOT NULL DEFAULT 0,   -- 冻结（= MANUAL + RETURN_PENDING + SCRAP_PENDING 冻结汇总），从 available 扣除，FEFO 分不到
+    hold_qty_milli        BIGINT          NOT NULL DEFAULT 0,   -- 冻结（= MANUAL + RETURN_PENDING + SCRAP_PENDING + PROCESSING + LIVE_HOLD 冻结汇总），从 available 扣除，FEFO 分不到
 
     ledger_seq              BIGINT          NOT NULL DEFAULT 0,   -- 本行 on_hand 变更计数，与流水 stock_seq 一一对应（快照水位线）；期初/迁移行的第 1 条流水是 OPENING
     version                 BIGINT          NOT NULL DEFAULT 0,
@@ -256,11 +259,11 @@ CREATE INDEX ix_res_exp    ON stock_reservation(expires_at) WHERE status = 'RESE
 CREATE TABLE stock_hold (
     id                  BIGINT          PRIMARY KEY,
     stock_id            BIGINT          NOT NULL,
-    hold_type           VARCHAR(16)     NOT NULL,   -- QUALITY、RETURN_QC → stock.quality_hold_qty_milli；MANUAL、RETURN_PENDING、SCRAP_PENDING → stock.hold_qty_milli
+    hold_type           VARCHAR(16)     NOT NULL,   -- QUALITY、RETURN_QC → quality_hold；MANUAL、RETURN_PENDING、SCRAP_PENDING、PROCESSING、LIVE_HOLD → hold_qty
     reason_code         VARCHAR(24)     NOT NULL,   -- 见 ck_hold_reason；新增原因走迁移
-    source_type         VARCHAR(24)     NOT NULL,   -- INBOUND_QC/QC/COUNT/RETURN/EXCEPTION/MANUAL/RETURN_RECORD/SCRAP
+    source_type         VARCHAR(24)     NOT NULL,   -- INBOUND_QC/QC/COUNT/RETURN/EXCEPTION/MANUAL/RETURN_RECORD/SCRAP/PROCESS_ORDER/LIVE_TANK_HOLD
     source_id           BIGINT          NOT NULL DEFAULT 0,
-    op_key              VARCHAR(80)     NOT NULL,   -- RETURN_PENDING 固定为 RRH:{return_record_id}；convert_hold 新建的明细固定为 CVT:{原 hold_id}
+    op_key              VARCHAR(80)     NOT NULL,   -- RETURN_PENDING 固定 RRH:{return_record_id}；convert_hold 的 op_key 由调用方传入（全量常用 CVT:{原 hold_id}，部分用 CVT:{line_id}:{op_seq}）；PROCESSING 必须 PRCI:（大小写敏感）
     hold_qty_milli      BIGINT          NOT NULL,
     released_qty_milli  BIGINT          NOT NULL DEFAULT 0,
     status              VARCHAR(16)     NOT NULL DEFAULT 'HELD',      -- HELD/RELEASED，由余量决定
@@ -268,26 +271,30 @@ CREATE TABLE stock_hold (
     approval_type       VARCHAR(24),                -- 需要审批的转换才填：SCRAP_MISREPORT（SCRAP_PENDING → RETURN_QC 误报回转）
     approval_no         VARCHAR(64),                -- 审批单号
     is_reversal         BOOLEAN         NOT NULL DEFAULT false,  -- 误报回转明细（SCRAP_PENDING → RETURN_QC）显式标记，替代 op_key LIKE 'CVT:%' 识别（小赵 N1）
+    from_hold_id        BIGINT,                 -- convert_hold 子明细指向被转出的父冻结；一条父冻结可多次部分转出。I3e 按此汇总，不再用 op_key = 'CVT:' || id
     version             BIGINT          NOT NULL DEFAULT 0,
     created_at          TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     updated_at          TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT uq_hold_op UNIQUE (op_key),
-    CONSTRAINT ck_hold_type CHECK (hold_type IN ('QUALITY','RETURN_QC','MANUAL','RETURN_PENDING','SCRAP_PENDING')),
-    -- 一套方案：hold_type 是大类（决定计入哪一列），reason_code 是细分原因，二者成对约束
+    CONSTRAINT ck_hold_type CHECK (hold_type IN ('QUALITY','RETURN_QC','MANUAL','RETURN_PENDING','SCRAP_PENDING','PROCESSING','LIVE_HOLD')),
+    -- 一套方案：hold_type 是大类（决定计入哪一列），reason_code 是细分原因，二者成对约束。
+    -- PROCESSING / LIVE_HOLD 由本篇统一收进码表；#12/#13 不要再改这条 CHECK。
     CONSTRAINT ck_hold_reason CHECK (
-        hold_type NOT IN ('QUALITY','RETURN_QC','MANUAL','RETURN_PENDING','SCRAP_PENDING')      -- 类型非法交给 ck_hold_type 报，避免两条约束同时报
+        hold_type NOT IN ('QUALITY','RETURN_QC','MANUAL','RETURN_PENDING','SCRAP_PENDING','PROCESSING','LIVE_HOLD')      -- 类型非法交给 ck_hold_type 报，避免两条约束同时报
         OR (hold_type = 'QUALITY'        AND reason_code IN ('QC_PENDING','COUNT_LOCK'))
         OR (hold_type = 'RETURN_QC'      AND reason_code = 'RETURN_QC')     -- 退货待检（A3：系统冻结，只能由质检 release_qc_hold 释放）
         OR (hold_type = 'MANUAL'      AND reason_code IN ('DAMAGE','EXCEPTION','OTHER'))
         OR (hold_type = 'RETURN_PENDING' AND reason_code = 'RETURN_PENDING')
         OR (hold_type = 'SCRAP_PENDING'  AND reason_code = 'SCRAP')        -- 报损待处置（convert_hold 自 RETURN_PENDING 转入，docs/02 §7.1.1）
+        OR (hold_type = 'PROCESSING'     AND reason_code = 'PROCESSING')   -- 加工领料系统锁（第 17 篇 place_hold）
+        OR (hold_type = 'LIVE_HOLD'      AND reason_code = 'LIVE_HOLD')    -- 活鲜暂存系统锁（第 18 篇 place_hold）
     ),
     -- RETURN_PENDING 是系统冻结：必须挂在一条待回库记录上、operator_id=0；人工解冻接口拒绝它（应用层），只能由 confirm/resolve 同事务释放
     CONSTRAINT ck_hold_return CHECK (
         hold_type <> 'RETURN_PENDING'
         OR (source_type = 'RETURN_RECORD' AND source_id > 0 AND operator_id = 0)
     ),
-    -- SCRAP_PENDING 也是系统冻结：挂报损单（source_type=SCRAP）、operator_id=0；人工解冻拒绝（40933，应用层），只能由第 9 篇报损完成/撤销释放
+    -- SCRAP_PENDING 也是系统冻结：挂报损单 id（source_type=SCRAP，source_id=报损单 id，不是报损行 id）、operator_id=0；人工解冻拒绝（40933），只能由第 9 篇报损完成/撤销释放。不走 place_hold，继续用 hold(SCRAP_PENDING)
     -- RETURN_QC 系统冻结（A3）：挂质检单（source_type=QC，source_id=质检单 id）、operator_id=0；人工解冻拒绝（40933），只能由 release_qc_hold 释放
     CONSTRAINT ck_hold_retqc CHECK (
         hold_type <> 'RETURN_QC'
@@ -299,7 +306,8 @@ CREATE TABLE stock_hold (
         OR (is_reversal AND approval_type = 'SCRAP_MISREPORT' AND approval_no IS NOT NULL AND length(approval_no) > 0)
     ),
     -- 回转标记与类型/op_key 双向一致：只有 RETURN_QC 能是回转，RETURN_QC 的 CVT 明细必须标回转（防止不带审批伪造回转）
-    CONSTRAINT ck_hold_reversal_key CHECK (is_reversal = (hold_type = 'RETURN_QC' AND op_key LIKE 'CVT:%')),
+    -- LIKE 在 PG 区分大小写、在 SQLite 默认不区分；回转前缀用 GLOB（SQLite 区分大小写）对齐，避免 'cvt:' 在 SQLite 被当成回转
+    CONSTRAINT ck_hold_reversal_key CHECK (is_reversal = (hold_type = 'RETURN_QC' AND op_key GLOB 'CVT:*')),
     -- 审批单号格式 APR-{仓库编码}-{yyyyMMdd}-{6 位数字}；仓库编码字符集 [A-Z0-9]{2,16}（以第 1 篇 #8 为准）
     CONSTRAINT ck_hold_approval_no CHECK (approval_no IS NULL OR (
         length(approval_no) BETWEEN 22 AND 36 AND substr(approval_no, 1, 4) = 'APR-'
@@ -314,6 +322,18 @@ CREATE TABLE stock_hold (
         hold_type <> 'SCRAP_PENDING'
         OR (source_type = 'SCRAP' AND source_id > 0 AND operator_id = 0)
     ),
+    CONSTRAINT fk_hold_from FOREIGN KEY (from_hold_id) REFERENCES stock_hold(id),
+    CONSTRAINT ck_hold_from CHECK (from_hold_id IS NULL OR from_hold_id <> id),
+    -- PROCESSING：挂加工单、系统操作员、op_key 前缀 PRCI:（大小写敏感，同 CVT 的方言拆分）
+    CONSTRAINT ck_hold_process CHECK (
+        hold_type <> 'PROCESSING'
+        OR (source_type = 'PROCESS_ORDER' AND source_id > 0 AND operator_id = 0 AND op_key GLOB 'PRCI:*')
+    ),
+    -- LIVE_HOLD：挂活鲜暂养冻结单。不强制 op_key 前缀（第 18 篇没有规定前缀，强制会拒掉合法插入）
+    CONSTRAINT ck_hold_live CHECK (
+        hold_type <> 'LIVE_HOLD'
+        OR (source_type = 'LIVE_TANK_HOLD' AND source_id > 0 AND operator_id = 0)
+    ),
     CONSTRAINT ck_hold_int CHECK (
         hold_qty_milli = CAST(hold_qty_milli AS BIGINT)
         AND released_qty_milli = CAST(released_qty_milli AS BIGINT)
@@ -326,9 +346,12 @@ CREATE TABLE stock_hold (
 );
 CREATE INDEX ix_hold_stock ON stock_hold(stock_id, hold_type, status);
 CREATE UNIQUE INDEX uq_hold_return ON stock_hold(source_id) WHERE hold_type = 'RETURN_PENDING';
+-- 非唯一：一条父冻结可以多次部分转出，多条子明细共享同一个 from_hold_id
+CREATE INDEX ix_hold_from ON stock_hold(from_hold_id) WHERE from_hold_id IS NOT NULL;
 
--- 冻结部分释放的操作去重（A3，release_qc_hold）：一次释放一行，op_key 由质检行操作生成（如 QCR:{qc_line_id}:{op_no}），
--- 与质检行 qc_passed 累加、stock_hold 释放、stock.quality_hold 扣减同一事务；重放撞 uq_hr_op → 整个事务回滚，不重复解冻。只追加。
+-- 冻结部分释放的操作去重（A3，release_qc_hold / release_hold / release_live_hold）：一次释放一行，op_key 由调用方传入（质检如 QCR:{inbound_line_id}:{op_seq}；整池解锁如 LTH:{live_tank_hold_id}:{inspection_id}:{hold_id}），
+-- 与 inbound_line.qc_passed 累加、stock_hold 释放、stock.quality_hold 扣减同一事务；重放撞 uq_hr_op → 整个事务回滚，不重复解冻。只追加。
+-- 没有 qc_line 表。质检单 = inbound_order，质检行 = inbound_line（第 3/10 篇）。本表 source 不存行 id。
 CREATE TABLE stock_hold_release (
     id                  BIGINT          PRIMARY KEY,
     hold_id             BIGINT          NOT NULL,
@@ -384,9 +407,10 @@ CREATE TABLE stock_movement (
     op_no                       INT             NOT NULL DEFAULT 1,  -- 非 PDA：调用方在该行上的第几次操作（如分批收货）；PDA 恒 0
     leg                         SMALLINT        NOT NULL DEFAULT 1,  -- 同一操作的第几条腿：拣货/收货恒 1；移库/上架 1=出 2=入
     src_kind                    VARCHAR(8)      NOT NULL,   -- DOC / PDA
-    biz_type                    VARCHAR(24)     NOT NULL,   -- RECEIVE/PUTAWAY/PICK/REVERSE_PICK/SHIP/MOVE/ADJUST/COUNT/RETURN/SCRAP/CROSS_DOCK/OPENING
+    biz_type                    VARCHAR(24)     NOT NULL,   -- RECEIVE/PUTAWAY/PICK/REVERSE_PICK/SHIP/MOVE/ADJUST/COUNT/RETURN/SCRAP/CROSS_DOCK/OPENING/PROCESS_ISSUE/PROCESS_CONSUME/PROCESS_OUTPUT/PROCESS_REVERSE（无 CHECK，第 17 篇登记）
     direction                   SMALLINT        NOT NULL,   -- 1 入 / -1 出 / 0 纯事件（如 SHIP，不改 on_hand）
     stock_id                    BIGINT          NOT NULL,   -- 记账到哪一行库存，按行回放的依据
+    hold_id                     BIGINT,                     -- 冻结类流水指向单条 stock_hold；非冻结流水 NULL。I3f/I3g 按此对账，不按 stock 汇总
     stock_seq                   BIGINT          NOT NULL,   -- = 该次条件 UPDATE 后的 stock.ledger_seq；direction=0 时填当前 ledger_seq（不入链）
     warehouse_id                BIGINT          NOT NULL,
     location_id                 BIGINT          NOT NULL,
@@ -423,6 +447,7 @@ CREATE TABLE stock_movement (
     CONSTRAINT ck_mv_pos     CHECK (move_qty_milli > 0 AND on_hand_after_qty_milli >= 0),
     CONSTRAINT ck_mv_balance CHECK (on_hand_after_qty_milli = on_hand_before_qty_milli + move_qty_milli * direction),
     CONSTRAINT ck_mv_opening CHECK (biz_type <> 'OPENING' OR (direction = 1 AND stock_seq = 1 AND on_hand_before_qty_milli = 0)),
+    CONSTRAINT fk_mv_hold FOREIGN KEY (hold_id) REFERENCES stock_hold(id),
     -- 库层绑定（小赵 C2）：没有对应 key 行、或 key 行内容对不上，流水写不进去。
     -- 只列 NOT NULL 列：MATCH SIMPLE 下任一列为 NULL 会跳过整条外键检查；PDA 四元组由 ck_mv_kind / ck_mvk_kind + uq_mvk_pda_op 管。
     -- DEFERRABLE INITIALLY DEFERRED：提交时检查，同一事务内流水与 key 的写入顺序不限。
@@ -434,6 +459,7 @@ CREATE TABLE stock_movement (
 ;
 CREATE INDEX ix_mv_biz      ON stock_movement(biz_type, biz_no);
 CREATE INDEX ix_mv_stock    ON stock_movement(stock_id, stock_seq);
+CREATE INDEX ix_mv_hold     ON stock_movement(hold_id) WHERE hold_id IS NOT NULL;
 CREATE INDEX ix_mv_time     ON stock_movement(warehouse_id, occurred_at DESC);
 CREATE INDEX ix_mv_sku_time ON stock_movement(sku_id, occurred_at DESC);
 -- 数据量大：PG 侧按月 RANGE 分区（分区由运维任务提前一个月建好，DEFAULT 分区兜底）；SQLite 侧按月归档导出。
@@ -460,25 +486,35 @@ CREATE TABLE stock_ledger_line (
 );
 
 -- 去重表与归属表绑定：写入 key 时，该单据行的归属必须已存在、来源一致，PDA 行还必须是当前持有设备（两库各一份触发器，语义相同）
+-- search_path 固定为 pg_catalog, public。函数体里的 stock_ledger_line 不写 schema，在这条路径下只解析到 public；调用方把自己的 schema 放在前面也看不见。
 CREATE TRIGGER trg_mvk_line_kind BEFORE INSERT ON stock_movement_key
 WHEN NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = NEW.biz_no AND l.line_no = NEW.line_no AND l.src_kind = NEW.src_kind
                  AND (NEW.src_kind = 'DOC' OR l.owner_device_instance_id = NEW.device_instance_id))
 BEGIN SELECT RAISE(ABORT, 'ledger_line_owner_mismatch'); END;
 
 -- 归属行的来源不可改（小赵 C3）：src_kind / biz_no / line_no 写入后禁止 UPDATE，否则把 PDA 行改成 DOC 就能绕过互斥
+-- search_path 固定为 pg_catalog, public。函数体只比较 NEW/OLD，没有名字查找。
 CREATE TRIGGER trg_sll_immutable BEFORE UPDATE ON stock_ledger_line
 WHEN NEW.src_kind IS NOT OLD.src_kind OR NEW.biz_no IS NOT OLD.biz_no OR NEW.line_no IS NOT OLD.line_no
 BEGIN SELECT RAISE(ABORT, 'ledger_line_immutable'); END;
 
 -- 冻结明细写入后不可改（小赵 N1）：只放行释放路径要写的 released_qty_milli / status / version / updated_at。
--- 类型转换只走 convert_hold（关旧建新），任何路径都不需要改 hold_type；否则先把 SCRAP_PENDING 改成 MANUAL 就能绕过 40933
+-- 类型转换只走 convert_hold（关旧建新），任何路径都不需要改 hold_type；否则先把 SCRAP_PENDING 改成 MANUAL 就能绕过 40933。
+-- convert_hold 加锁顺序（docs/02 §7.1.1、§8.2；PG 与 SQLite 同一条）：
+--   先锁 stock 行（SELECT … WHERE id = :stock_id ORDER BY id），再锁 stock_hold（ORDER BY id），
+--   然后才改 released/status、插入子明细；跨列时最后改 stock 数量。
+--   同列转换不改 stock 数量和 version，也要先锁 stock，避免和 release/consume 交叉等锁。
+--   PG 在这两条 SELECT 上加 FOR UPDATE；SQLite 没有行锁，语句顺序相同，写事务用 BEGIN IMMEDIATE。
+-- search_path 固定为 pg_catalog, public。函数体只比较 NEW/OLD，没有名字查找。
 -- R2：冻结明细不可删除（wms_app 本就没有 DELETE/TRUNCATE 权限；这里兜底超级用户/迁移脚本，与流水表写法一致）
+-- search_path 固定为 pg_catalog, public。函数体只 RAISE，没有名字查找。
 -- stock_hold_release 只追加（A3）；TRUNCATE 也拦（小赵 S5）
 CREATE TRIGGER trg_hold_immutable BEFORE UPDATE ON stock_hold
 WHEN NEW.id IS NOT OLD.id OR NEW.stock_id IS NOT OLD.stock_id OR NEW.hold_type IS NOT OLD.hold_type OR NEW.reason_code IS NOT OLD.reason_code
   OR NEW.source_type IS NOT OLD.source_type OR NEW.source_id IS NOT OLD.source_id OR NEW.op_key IS NOT OLD.op_key
   OR NEW.hold_qty_milli IS NOT OLD.hold_qty_milli OR NEW.operator_id IS NOT OLD.operator_id OR NEW.created_at IS NOT OLD.created_at
   OR NEW.approval_type IS NOT OLD.approval_type OR NEW.approval_no IS NOT OLD.approval_no OR NEW.is_reversal IS NOT OLD.is_reversal
+  OR NEW.from_hold_id IS NOT OLD.from_hold_id
   OR NEW.released_qty_milli < OLD.released_qty_milli OR (OLD.status = 'RELEASED' AND NEW.status <> 'RELEASED')
 BEGIN SELECT RAISE(ABORT, 'hold_immutable'); END;
 -- R2（SQLite）：拒删除；REPLACE 冲突时删旧行在 recursive_triggers=OFF（默认，且是连接级开关）下不触发 DELETE 触发器，
@@ -489,6 +525,7 @@ WHEN EXISTS (SELECT 1 FROM stock_hold h WHERE h.id = NEW.id OR h.op_key = NEW.op
 BEGIN SELECT RAISE(ABORT, 'hold_duplicate'); END;
 
 -- 只追加：流水表与去重表禁止 UPDATE / DELETE。PG 侧收回应用角色权限 + 触发器（防超级用户/运维脚本误操作）；SQLite 侧触发器
+-- search_path 固定为 pg_catalog, public。函数体只用 TG_TABLE_NAME。
 -- TRUNCATE 不触发行级触发器，单独加语句级触发器拦（小赵 C5）；归档走 DETACH PARTITION，不用 TRUNCATE
 -- 应用角色授权清单（小赵 C3，docs/02 §4.9）：库存类表只给 SELECT/INSERT/UPDATE，不给 DELETE/TRUNCATE；
 -- stock_ledger_line 只能改换主相关列（第 5 篇改派/重新领取），来源与单据行由 trg_sll_immutable 再拦一道（防超级用户/迁移脚本）
@@ -534,7 +571,7 @@ CREATE TABLE stock_recon_alert (
     detected_at             TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     last_seen_at            TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT ck_recon_status CHECK (status IN ('OPEN','ACKED','RESOLVED')),
-    CONSTRAINT ck_recon_code CHECK (check_code IN ('I3a','I3b','I3c','I3d','I3e','I4','I5','SNAP','RR_HOLD_FAILED','RR_HOLD_MISMATCH','CHECK_BOX_MISMATCH','SHIP_EVENT_MISSING'))   -- 码表见 docs/02 §4.6；新增走迁移（小赵 C4）
+    CONSTRAINT ck_recon_code CHECK (check_code IN ('I3a','I3b','I3c','I3d','I3e','I4','I5','SNAP','RR_HOLD_FAILED','RR_HOLD_MISMATCH','CHECK_BOX_MISMATCH','SHIP_EVENT_MISSING','LIVE_COUNT_WEIGHT','LIVE_COUNT_LEDGER','LIVE_HOLD_MISMATCH','LIVE_INSPECT_OVERDUE'))   -- 码表见 docs/02 §4.6；活鲜四码见第 18 篇 §9 / Q6
 );
 CREATE INDEX ix_recon_open ON stock_recon_alert(warehouse_id, status, detected_at DESC);
 CREATE UNIQUE INDEX uq_recon_open ON stock_recon_alert(check_code, warehouse_id, stock_id) WHERE status <> 'RESOLVED';
@@ -542,7 +579,6 @@ CREATE UNIQUE INDEX uq_recon_open ON stock_recon_alert(check_code, warehouse_id,
 --   （PG 与 SQLite ≥ 3.24 写法相同；部分唯一索引作冲突目标时两库都要求带同样的 WHERE）
 
 -- 对账只告警不修数：本表只记录差异，任何修正必须走调整单（adjust_order）+ 审批生成新流水
-
 -- -----------------------------------------------------------------------------
 -- 单据
 -- -----------------------------------------------------------------------------
@@ -594,7 +630,6 @@ CREATE TABLE inbound_line (
     quality_status  VARCHAR(16),
     CONSTRAINT uq_inb_line UNIQUE (inbound_id, line_no)
 );
-
 CREATE TABLE outbound_order (
     id                      BIGINT          PRIMARY KEY,
     code                    VARCHAR(64)     NOT NULL,
@@ -695,7 +730,6 @@ CREATE TABLE outbound_line (
     CONSTRAINT uq_obo_line UNIQUE (outbound_id, line_no)
 );
 CREATE INDEX ix_obl_sku ON outbound_line(sku_id);
-
 CREATE TABLE wave (
     id                  BIGINT       PRIMARY KEY,
     code                VARCHAR(64)  NOT NULL,
@@ -766,7 +800,6 @@ CREATE TABLE pick_task_line (
     CONSTRAINT uq_ptl UNIQUE (pick_task_id, seq)
 );
 CREATE INDEX ix_ptl_loc ON pick_task_line(location_id, status);
-
 CREATE TABLE pack_box (
     id              BIGINT       PRIMARY KEY,
     code            VARCHAR(64)  NOT NULL,          -- 箱码，司机端逐箱扫
@@ -818,7 +851,6 @@ CREATE TABLE shipment_order (
     outbound_id BIGINT NOT NULL,
     PRIMARY KEY (shipment_id, outbound_id)
 );
-
 -- -----------------------------------------------------------------------------
 -- 盘点 / 调整
 -- -----------------------------------------------------------------------------
@@ -891,7 +923,6 @@ CREATE TABLE adjust_line (
     delta_qty       NUMERIC(14,3)   NOT NULL,   -- 正入负出
     CONSTRAINT ck_adj_delta CHECK (delta_qty <> 0)
 );
-
 -- -----------------------------------------------------------------------------
 -- 幂等 / 集成 / 审计
 -- -----------------------------------------------------------------------------
@@ -904,7 +935,7 @@ CREATE TABLE idempotency_record (
     created_at   TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- 一律存 UTC（P1）
     expires_at   TIMESTAMP    NOT NULL                -- UTC；写入后只许往后改（trg_idem_expiry_fwd，P2）
     -- 小赵 S1：SQLite 不约束时间类型，'garbage'、T 格式、整数都能写进去，按文本比较永远清不掉；限定为 'YYYY-MM-DD HH:MM:SS' 且是真实日期时间
-    , CONSTRAINT ck_idem_ts CHECK ((typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8)) AND (typeof(expires_at) = 'text' AND length(expires_at) = 19 AND expires_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(expires_at) = substr(expires_at, 1, 10) AND time(expires_at) = substr(expires_at, 12, 8)))
+    , CONSTRAINT ck_idem_ts CHECK ((typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) IS NOT NULL AND time(created_at) IS NOT NULL AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8) AND substr(created_at, 12, 2) <= '23') AND (typeof(expires_at) = 'text' AND length(expires_at) = 19 AND expires_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(expires_at) IS NOT NULL AND time(expires_at) IS NOT NULL AND date(expires_at) = substr(expires_at, 1, 10) AND time(expires_at) = substr(expires_at, 12, 8) AND substr(expires_at, 12, 2) <= '23'))
 );
 CREATE INDEX ix_idem_exp ON idempotency_record(expires_at);
 
@@ -938,20 +969,26 @@ CREATE TABLE outbox_event (
     created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- UTC
     sent_at         TIMESTAMP,                          -- UTC；写入后只许往后改（P2）
     CONSTRAINT ck_outbox_sent CHECK (status <> 'SENT' OR sent_at IS NOT NULL)   -- P3
-    , CONSTRAINT ck_outbox_ts CHECK ((typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8)) AND (typeof(next_retry_at) = 'text' AND length(next_retry_at) = 19 AND next_retry_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(next_retry_at) = substr(next_retry_at, 1, 10) AND time(next_retry_at) = substr(next_retry_at, 12, 8)) AND (sent_at IS NULL OR (typeof(sent_at) = 'text' AND length(sent_at) = 19 AND sent_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(sent_at) = substr(sent_at, 1, 10) AND time(sent_at) = substr(sent_at, 12, 8))))   -- 小赵 S1
+    , CONSTRAINT ck_outbox_ts CHECK ((typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) IS NOT NULL AND time(created_at) IS NOT NULL AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8) AND substr(created_at, 12, 2) <= '23') AND (typeof(next_retry_at) = 'text' AND length(next_retry_at) = 19 AND next_retry_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(next_retry_at) IS NOT NULL AND time(next_retry_at) IS NOT NULL AND date(next_retry_at) = substr(next_retry_at, 1, 10) AND time(next_retry_at) = substr(next_retry_at, 12, 8) AND substr(next_retry_at, 12, 2) <= '23') AND (sent_at IS NULL OR (typeof(sent_at) = 'text' AND length(sent_at) = 19 AND sent_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(sent_at) IS NOT NULL AND time(sent_at) IS NOT NULL AND date(sent_at) = substr(sent_at, 1, 10) AND time(sent_at) = substr(sent_at, 12, 8) AND substr(sent_at, 12, 2) <= '23')))   -- 小赵 S1
 );
 CREATE INDEX ix_outbox_pending ON outbox_event(status, next_retry_at);
 CREATE INDEX ix_outbox_bizkey  ON outbox_event(biz_key, id);   -- 同键串行发送
 
 -- 小赵 Q2：去重记录与 outbox 只能清理"已过期 / 已投递且过保留期"的行（两库触发器，条件与 purge_expired() 一致）
+-- search_path 固定为 pg_catalog, public。now()、interval、AT TIME ZONE 走 pg_catalog。
 CREATE TRIGGER trg_idem_purge_guard BEFORE DELETE ON idempotency_record WHEN NOT COALESCE(OLD.expires_at < datetime('now'), 0)
 BEGIN SELECT RAISE(ABORT, 'purge_not_allowed: idempotency_record'); END;
 CREATE TRIGGER trg_outbox_purge_guard BEFORE DELETE ON outbox_event WHEN NOT COALESCE(OLD.status = 'SENT' AND OLD.sent_at < datetime('now', '-7 days'), 0)
 BEGIN SELECT RAISE(ABORT, 'purge_not_allowed: outbox_event'); END;
 -- 九轮 P2：过期/投递时间写入后只许往后改，不许改早；created_at 不可改；SENT 是终态；sent_at 首次写入不得早于 created_at
--- 十六轮 R1 补洞：wms_app 只能以初始状态 PENDING（不带 sent_at）插入 outbox；SENT 只能经 UPDATE 写入（受 sent_at_not_now 约束）。
--- 种子/迁移用超级用户或迁移角色写入，不受此限
--- SQLite 没有角色：应用只能插入 PENDING（不带 sent_at）；验证脚本造 SENT 种子时临时 DROP 本触发器、写完重建（单独的种子路径）
+-- search_path 固定为 pg_catalog, public。now()、extract、interval、AT TIME ZONE 走 pg_catalog，调用方 schema 里的 now() 不生效。
+-- 不是 outbox_event 表属主的角色，只能以初始状态 PENDING（不带 sent_at）插入。SENT 只能经 UPDATE 写入（受 sent_at_not_now 约束）。
+-- wms_app 是 NOLOGIN，应用用的是继承它的登录角色，current_user 不是 wms_app，所以不能按角色名判断。
+-- 非属主插入非 PENDING、或带上 sent_at：直接拒绝（outbox_insert_not_pending），不把 status 改写成 PENDING。
+-- 表属主（建表的迁移角色）可以插入其他状态，种子和迁移走这条。
+-- search_path 固定为 pg_catalog, public。属主查询全部写在 pg_catalog。
+-- SQLite 没有角色：所有插入都按“非属主”处理，只能是 PENDING 且不带 sent_at，FAILED 同样拒绝。
+-- 验证脚本造 SENT 种子时临时 DROP 本触发器、写完重建（单独的种子路径）
 CREATE TRIGGER trg_outbox_insert_pending BEFORE INSERT ON outbox_event WHEN NEW.status IS NOT 'PENDING' OR NEW.sent_at IS NOT NULL
 BEGIN SELECT RAISE(ABORT, 'outbox_insert_not_pending'); END;
 CREATE TRIGGER trg_idem_expiry_fwd BEFORE UPDATE ON idempotency_record WHEN NEW.created_at IS NOT OLD.created_at OR NEW.expires_at < OLD.expires_at
@@ -996,7 +1033,6 @@ CREATE TABLE numbering_segment (
 -- 取号（号段预取，两库语义一致）：
 --   UPDATE numbering_segment SET next_value = next_value + step WHERE biz_prefix=? AND date_key=?
 --   然后 SELECT next_value - step 作为本段起点。多实例安全，不依赖 Redis 持久化。
-
 -- -----------------------------------------------------------------------------
 -- 权限（RBAC + 数据权限）
 -- -----------------------------------------------------------------------------
@@ -1049,7 +1085,6 @@ CREATE TABLE api_credential (
     last_used_at     TIMESTAMP,
     CONSTRAINT uq_api_key UNIQUE (api_key)
 );
-
 -- -----------------------------------------------------------------------------
 -- 视图：可用量（避免每个查询手写减法，也避免算错）
 -- -----------------------------------------------------------------------------
@@ -1086,264 +1121,9 @@ WHERE s.on_hand_qty_milli > 0 AND l.status = 'AVAILABLE' AND l.deleted_at IS NUL
 -- [SQLite] 视图支持一致；now() 在 SQLite 侧用 datetime('now')，故未在本文件使用
 
 
-
 -- ============================================================
--- wms_app 授权清单（其余表，docs/02 §4.4.4）：public 下每张表/视图都必须对 wms_app 有显式授权，
--- verify.sh 按 pg_class 逐表检查，缺一张就失败。新增表必须在这里（或表旁）写 GRANT，按需最小授权；不给 TRUNCATE。
+-- 清理角色与 purge_expired()。各表的 wms_app GRANT 写在该表所在的篇文件末尾，
+-- 后续篇章只加自己的 sql/schema/NN_*.sql，不要再改一份总 GRANT。
 -- ============================================================
 -- 清理只能经 purge_expired()：属主 wms_purge_owner（非超级用户、NOLOGIN，只有这两张表的 SELECT/DELETE），
 -- 调用方 wms_cleaner 只有 EXECUTE，对表没有任何权限；删除条件写死在函数里，不接受参数
--- ============================================================
--- docs/18 活鲜暂存（双数量：重量 *_qty_milli 走第 2 篇账；尾数 *_count 走本篇 live_count_ledger）
--- 温度一律 *_c10（0.1 ℃ 整数，与 PR #8 温区口径一致）；时间存 UTC
--- ============================================================
--- SKU 活鲜参数（按 SKU）：称重容差、日死亡率阈值、日失重容差，单位 bp（万分之一）
-CREATE TABLE sku_live_param (
-    sku_id                  BIGINT   PRIMARY KEY,
-    weigh_tolerance_bp      INT      NOT NULL DEFAULT 300,   -- PM 2：默认 3%
-    death_rate_threshold_bp INT      NOT NULL DEFAULT 500,   -- PM 3：默认 5%（池日死亡率）
-    shrink_tolerance_bp     INT      NOT NULL DEFAULT 100,   -- PM 7：每日失重容差；默认值待定（§12）
-    version                 INT      NOT NULL DEFAULT 0,
-    updated_by              BIGINT,
-    updated_at              TIMESTAMP NOT NULL DEFAULT (datetime('now')),
-    CONSTRAINT ck_slp_bp CHECK (weigh_tolerance_bp BETWEEN 0 AND 10000 AND death_rate_threshold_bp BETWEEN 0 AND 10000 AND shrink_tolerance_bp BETWEEN 0 AND 10000)
-    , CONSTRAINT ck_slp_ts CHECK ((typeof(updated_at) = 'text' AND length(updated_at) = 19 AND updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(updated_at) = substr(updated_at, 1, 10) AND time(updated_at) = substr(updated_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
-);
-CREATE TRIGGER trg_slp_upd BEFORE UPDATE ON sku_live_param WHEN NEW.sku_id <> OLD.sku_id BEGIN SELECT RAISE(ABORT, 'slp_immutable'); END;
-CREATE TRIGGER trg_slp_del BEFORE DELETE ON sku_live_param BEGIN SELECT RAISE(ABORT, 'slp_immutable'); END;
-CREATE TRIGGER trg_slp_dup BEFORE INSERT ON sku_live_param
-WHEN EXISTS (SELECT 1 FROM sku_live_param x WHERE x.sku_id = NEW.sku_id)
-BEGIN SELECT RAISE(ABORT, 'slp_duplicate'); END;
-
--- 暂养池扩展（PM 5）：库位 location_type='LIVE_TANK' 的 1:1 扩展；一池一 SKU，可多批次
-CREATE TABLE live_tank (
-    location_id             BIGINT   PRIMARY KEY,           -- = location.id（location_type='LIVE_TANK'，应用层校验）
-    warehouse_id            BIGINT   NOT NULL,
-    sku_id                  BIGINT   NOT NULL,              -- 一池一 SKU
-    water_volume_l          BIGINT   NOT NULL,              -- 水体积（升）
-    temp_controlled         BOOLEAN  NOT NULL DEFAULT true,
-    temp_min_c10            INT      NOT NULL,              -- 告警下限（0.1 ℃）
-    temp_max_c10            INT      NOT NULL,              -- 告警上限
-    temp_severe_min_c10     INT      NOT NULL,              -- 严重下限：一次即锁池
-    temp_severe_max_c10     INT      NOT NULL,              -- 严重上限
-    do_min_x100             INT      NOT NULL,              -- 溶解氧告警下限（mg/L ×100）
-    do_severe_min_x100      INT      NOT NULL,
-    ph_min_x100             INT      NOT NULL,
-    ph_max_x100             INT      NOT NULL,
-    inspect_interval_min    INT      NOT NULL DEFAULT 120,  -- 巡检频率（分钟）
-    status                  VARCHAR(16) NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE/DISABLED（锁池走 live_tank_hold，不在这里）
-    version                 INT      NOT NULL DEFAULT 0,
-    updated_at              TIMESTAMP NOT NULL DEFAULT (datetime('now')),
-    CONSTRAINT ck_lt_status CHECK (status IN ('ACTIVE','DISABLED')),
-    CONSTRAINT ck_lt_volume CHECK (water_volume_l > 0),
-    CONSTRAINT ck_lt_temp CHECK (temp_severe_min_c10 <= temp_min_c10 AND temp_min_c10 < temp_max_c10 AND temp_max_c10 <= temp_severe_max_c10),
-    CONSTRAINT ck_lt_do CHECK (do_severe_min_x100 >= 0 AND do_severe_min_x100 <= do_min_x100),
-    CONSTRAINT ck_lt_ph CHECK (ph_min_x100 >= 0 AND ph_min_x100 < ph_max_x100 AND ph_max_x100 <= 1400),
-    CONSTRAINT ck_lt_interval CHECK (inspect_interval_min BETWEEN 10 AND 1440)
-    , CONSTRAINT ck_lt_ts CHECK ((typeof(updated_at) = 'text' AND length(updated_at) = 19 AND updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(updated_at) = substr(updated_at, 1, 10) AND time(updated_at) = substr(updated_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
-);
-CREATE TRIGGER trg_lt_upd BEFORE UPDATE ON live_tank WHEN NEW.location_id <> OLD.location_id OR NEW.warehouse_id <> OLD.warehouse_id OR NEW.sku_id <> OLD.sku_id BEGIN SELECT RAISE(ABORT, 'lt_immutable'); END;
-CREATE TRIGGER trg_lt_del BEFORE DELETE ON live_tank BEGIN SELECT RAISE(ABORT, 'lt_immutable'); END;
-CREATE TRIGGER trg_lt_dup BEFORE INSERT ON live_tank
-WHEN EXISTS (SELECT 1 FROM live_tank x WHERE x.location_id = NEW.location_id)
-BEGIN SELECT RAISE(ABORT, 'lt_duplicate'); END;
-
--- 尾数余额（PM 1）：与 stock 行 1:1；重量仍在 stock.on_hand_qty_milli（第 2 篇），这里只存只数
--- count > 0 ⇒ 对应 stock 重量 > 0（触发器；第 2 篇改重量时由巡检 LIVE_COUNT_WEIGHT 兜底）
-CREATE TABLE live_stock_count (
-    stock_id        BIGINT   PRIMARY KEY,
-    location_id     BIGINT   NOT NULL,
-    lot_id          BIGINT   NOT NULL,
-    on_hand_count   BIGINT   NOT NULL DEFAULT 0,
-    version         INT      NOT NULL DEFAULT 0,
-    updated_at      TIMESTAMP NOT NULL DEFAULT (datetime('now')),
-    CONSTRAINT ck_lsc_count CHECK (on_hand_count >= 0)
-    , CONSTRAINT ck_lsc_ts CHECK ((typeof(updated_at) = 'text' AND length(updated_at) = 19 AND updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(updated_at) = substr(updated_at, 1, 10) AND time(updated_at) = substr(updated_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
-);
-CREATE TRIGGER trg_lsc_upd BEFORE UPDATE ON live_stock_count WHEN NEW.stock_id <> OLD.stock_id OR NEW.location_id <> OLD.location_id OR NEW.lot_id <> OLD.lot_id BEGIN SELECT RAISE(ABORT, 'lsc_immutable'); END;
-CREATE TRIGGER trg_lsc_del BEFORE DELETE ON live_stock_count BEGIN SELECT RAISE(ABORT, 'lsc_immutable'); END;
-CREATE TRIGGER trg_lsc_dup BEFORE INSERT ON live_stock_count WHEN EXISTS (SELECT 1 FROM live_stock_count x WHERE x.stock_id = NEW.stock_id) BEGIN SELECT RAISE(ABORT, 'lsc_duplicate'); END;
-CREATE TRIGGER trg_lsc_w_ins BEFORE INSERT ON live_stock_count WHEN NEW.on_hand_count > 0 AND COALESCE((SELECT on_hand_qty_milli FROM stock WHERE id = NEW.stock_id), 0) <= 0 BEGIN SELECT RAISE(ABORT, 'live_count_without_weight'); END;
-CREATE TRIGGER trg_lsc_w_upd BEFORE UPDATE ON live_stock_count WHEN NEW.on_hand_count > 0 AND COALESCE((SELECT on_hand_qty_milli FROM stock WHERE id = NEW.stock_id), 0) <= 0 BEGIN SELECT RAISE(ABORT, 'live_count_without_weight'); END;
-
--- 尾数流水（只追加）：每笔只数变动一行，与第 2 篇重量流水 stock_movement 同事务、同 biz 键
-CREATE TABLE live_count_ledger (
-    id              BIGINT       PRIMARY KEY,
-    stock_id        BIGINT       NOT NULL,
-    biz_type        VARCHAR(16)  NOT NULL,   -- RECEIVE/WEIGH_OUT/DEATH/COUNT_ADJ/MOVE_IN/MOVE_OUT/PROCESS_OUT
-    biz_no          VARCHAR(64)  NOT NULL,
-    line_no         INT          NOT NULL DEFAULT 1,
-    delta_count     BIGINT       NOT NULL,
-    count_before    BIGINT       NOT NULL,
-    count_after     BIGINT       NOT NULL,
-    movement_id     BIGINT,                  -- 对应重量流水（第 2 篇 stock_movement）；纯只数盘点调整可空
-    created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
-    CONSTRAINT uq_lcl_biz UNIQUE (biz_type, biz_no, line_no, stock_id),
-    CONSTRAINT ck_lcl_type CHECK (biz_type IN ('RECEIVE','WEIGH_OUT','DEATH','COUNT_ADJ','MOVE_IN','MOVE_OUT','PROCESS_OUT')),
-    CONSTRAINT ck_lcl_math CHECK (delta_count <> 0 AND count_before >= 0 AND count_after >= 0 AND count_after = count_before + delta_count)
-    , CONSTRAINT ck_lcl_ts CHECK ((typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
-);
-CREATE TRIGGER trg_lcl_upd BEFORE UPDATE ON live_count_ledger BEGIN SELECT RAISE(ABORT, 'append_only'); END;
-CREATE TRIGGER trg_lcl_del BEFORE DELETE ON live_count_ledger BEGIN SELECT RAISE(ABORT, 'append_only'); END;
-CREATE TRIGGER trg_lcl_dup BEFORE INSERT ON live_count_ledger
-WHEN EXISTS (SELECT 1 FROM live_count_ledger x WHERE x.id = NEW.id OR (x.biz_type = NEW.biz_type AND x.biz_no = NEW.biz_no AND x.line_no = NEW.line_no AND x.stock_id = NEW.stock_id))
-BEGIN SELECT RAISE(ABORT, 'lcl_duplicate'); END;
-
--- 巡检记录（PM 4，只追加）：PDA 离线可录，键 (device_instance_id, client_op_id)
-CREATE TABLE live_inspection (
-    id                  BIGINT       PRIMARY KEY,
-    warehouse_id        BIGINT       NOT NULL,
-    location_id         BIGINT       NOT NULL,
-    device_instance_id  VARCHAR(64)  NOT NULL,
-    client_op_id        VARCHAR(64)  NOT NULL,
-    inspector_id        BIGINT       NOT NULL,
-    inspected_at        TIMESTAMP    NOT NULL,    -- 现场时间（UTC）
-    temp_c10            INT          NOT NULL,
-    do_x100             INT          NOT NULL,
-    ph_x100             INT          NOT NULL,
-    result              VARCHAR(8)   NOT NULL,    -- NORMAL/ALARM/SEVERE（服务端按 live_tank 阈值判定，不信客户端）
-    consecutive_breach  INT          NOT NULL DEFAULT 0,  -- 含本次的连续超标次数（NORMAL 为 0）
-    is_recheck          BOOLEAN      NOT NULL DEFAULT false,  -- 锁池后的复检
-    created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
-    CONSTRAINT uq_li_op UNIQUE (device_instance_id, client_op_id),
-    CONSTRAINT ck_li_result CHECK (result IN ('NORMAL','ALARM','SEVERE')),
-    CONSTRAINT ck_li_breach CHECK ((result = 'NORMAL' AND consecutive_breach = 0) OR (result <> 'NORMAL' AND consecutive_breach >= 1)),
-    CONSTRAINT ck_li_range CHECK (do_x100 >= 0 AND ph_x100 BETWEEN 0 AND 1400)
-    , CONSTRAINT ck_li_ts CHECK ((typeof(inspected_at) = 'text' AND length(inspected_at) = 19 AND inspected_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(inspected_at) = substr(inspected_at, 1, 10) AND time(inspected_at) = substr(inspected_at, 12, 8)) AND (typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
-);
-CREATE INDEX ix_li_tank ON live_inspection(location_id, inspected_at);
-CREATE TRIGGER trg_li_upd BEFORE UPDATE ON live_inspection BEGIN SELECT RAISE(ABORT, 'append_only'); END;
-CREATE TRIGGER trg_li_del BEFORE DELETE ON live_inspection BEGIN SELECT RAISE(ABORT, 'append_only'); END;
-CREATE TRIGGER trg_li_dup BEFORE INSERT ON live_inspection
-WHEN EXISTS (SELECT 1 FROM live_inspection x WHERE x.id = NEW.id OR (x.device_instance_id = NEW.device_instance_id AND x.client_op_id = NEW.client_op_id))
-BEGIN SELECT RAISE(ABORT, 'li_duplicate'); END;
-
--- 池级锁（PM 4）：2 次连续超标或 1 次严重 → ACTIVE；复检合格 → RELEASED（系统释放）。
--- 同一池同时至多一条 ACTIVE；状态单向；对应每个 stock 行的第 2 篇 stock_hold(hold_type=LIVE_HOLD, source_type=LIVE_TANK_HOLD, source_id=本表 id)
-CREATE TABLE live_tank_hold (
-    id                      BIGINT       PRIMARY KEY,
-    warehouse_id            BIGINT       NOT NULL,
-    location_id             BIGINT       NOT NULL,
-    reason                  VARCHAR(24)  NOT NULL,    -- CONSECUTIVE_BREACH/SEVERE
-    trigger_inspection_id   BIGINT       NOT NULL,
-    status                  VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE/RELEASED
-    release_inspection_id   BIGINT,
-    released_at             TIMESTAMP,
-    created_at              TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
-    CONSTRAINT ck_lth_reason CHECK (reason IN ('CONSECUTIVE_BREACH','SEVERE')),
-    CONSTRAINT ck_lth_status CHECK (status IN ('ACTIVE','RELEASED')),
-    CONSTRAINT ck_lth_release CHECK ((status = 'ACTIVE' AND release_inspection_id IS NULL AND released_at IS NULL)
-                                  OR (status = 'RELEASED' AND release_inspection_id IS NOT NULL AND released_at IS NOT NULL))
-    , CONSTRAINT ck_lth_ts CHECK ((released_at IS NULL OR (typeof(released_at) = 'text' AND length(released_at) = 19 AND released_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(released_at) = substr(released_at, 1, 10) AND time(released_at) = substr(released_at, 12, 8))) AND (typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
-);
-CREATE UNIQUE INDEX uq_lth_active ON live_tank_hold(location_id) WHERE status = 'ACTIVE';
-CREATE TRIGGER trg_lth_ins BEFORE INSERT ON live_tank_hold WHEN NEW.status <> 'ACTIVE' BEGIN SELECT RAISE(ABORT, 'lth_state'); END;
-CREATE TRIGGER trg_lth_closed BEFORE UPDATE ON live_tank_hold WHEN OLD.status <> 'ACTIVE' BEGIN SELECT RAISE(ABORT, 'lth_closed'); END;
-CREATE TRIGGER trg_lth_upd BEFORE UPDATE ON live_tank_hold WHEN OLD.status = 'ACTIVE' AND (NEW.location_id <> OLD.location_id OR NEW.reason <> OLD.reason OR NEW.trigger_inspection_id <> OLD.trigger_inspection_id OR NEW.warehouse_id <> OLD.warehouse_id OR NEW.created_at <> OLD.created_at) BEGIN SELECT RAISE(ABORT, 'lth_immutable'); END;
-CREATE TRIGGER trg_lth_rel BEFORE UPDATE OF status ON live_tank_hold WHEN OLD.status = 'ACTIVE' AND NEW.status = 'RELEASED' AND NOT EXISTS (SELECT 1 FROM live_inspection i WHERE i.id = NEW.release_inspection_id AND i.location_id = NEW.location_id AND i.is_recheck AND i.result = 'NORMAL') BEGIN SELECT RAISE(ABORT, 'lth_recheck_required'); END;
-CREATE TRIGGER trg_lth_del BEFORE DELETE ON live_tank_hold BEGIN SELECT RAISE(ABORT, 'lth_immutable'); END;
-CREATE TRIGGER trg_lth_dup BEFORE INSERT ON live_tank_hold WHEN EXISTS (SELECT 1 FROM live_tank_hold x WHERE x.id = NEW.id OR (x.location_id = NEW.location_id AND x.status = 'ACTIVE')) BEGIN SELECT RAISE(ABORT, 'lth_duplicate'); END;
-
--- 出池称重（PM 1/2，只追加）：键 (task_id, weigh_client_id)（§12 待定）；存毛重、皮重、净重；净重 = 毛 − 皮
--- 超容差 → result=REJECTED, result_code='42217'，不入账；ACCEPTED 才扣重量（实际净重）和只数（实际只数）
-CREATE TABLE live_weigh (
-    id                  BIGINT       PRIMARY KEY,
-    warehouse_id        BIGINT       NOT NULL,
-    task_id             BIGINT       NOT NULL,       -- 第 5 篇 pick_task.id
-    line_no             INT          NOT NULL,
-    weigh_client_id     VARCHAR(64)  NOT NULL,       -- 客户端每次称重生成（UUID）
-    device_instance_id  VARCHAR(64)  NOT NULL,
-    scale_id            VARCHAR(64),                 -- 蓝牙秤/台秤编号；手输为空
-    reading_source      VARCHAR(8)   NOT NULL,       -- SCALE/MANUAL
-    location_id         BIGINT       NOT NULL,
-    stock_id            BIGINT       NOT NULL,
-    sku_id              BIGINT       NOT NULL,
-    lot_id              BIGINT       NOT NULL,
-    gross_qty_milli     BIGINT       NOT NULL,
-    tare_qty_milli      BIGINT       NOT NULL,
-    net_qty_milli       BIGINT       NOT NULL,
-    qty_count           BIGINT       NOT NULL,
-    planned_qty_milli   BIGINT       NOT NULL,
-    deviation_bp        INT          NOT NULL,       -- |net − planned| / planned × 10000（向上取整）
-    result              VARCHAR(8)   NOT NULL,       -- ACCEPTED/REJECTED
-    result_code         CHAR(5),
-    movement_id         BIGINT,                      -- ACCEPTED 的重量流水
-    weighed_by          BIGINT       NOT NULL,
-    weighed_at          TIMESTAMP    NOT NULL,       -- UTC
-    created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
-    CONSTRAINT uq_lw_key UNIQUE (task_id, weigh_client_id),
-    CONSTRAINT ck_lw_src CHECK (reading_source IN ('SCALE','MANUAL') AND (reading_source = 'MANUAL' OR scale_id IS NOT NULL)),
-    CONSTRAINT ck_lw_qty CHECK (gross_qty_milli >= 0 AND tare_qty_milli >= 0 AND net_qty_milli >= 0 AND qty_count >= 0
-                                AND net_qty_milli = gross_qty_milli - tare_qty_milli AND planned_qty_milli > 0 AND deviation_bp >= 0),
-    CONSTRAINT ck_lw_dual CHECK (qty_count = 0 OR net_qty_milli > 0),
-    CONSTRAINT ck_lw_result CHECK ((result = 'ACCEPTED' AND result_code IS NULL AND movement_id IS NOT NULL)
-                                OR (result = 'REJECTED' AND result_code IS NOT NULL AND movement_id IS NULL))
-    , CONSTRAINT ck_lw_ts CHECK ((typeof(weighed_at) = 'text' AND length(weighed_at) = 19 AND weighed_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(weighed_at) = substr(weighed_at, 1, 10) AND time(weighed_at) = substr(weighed_at, 12, 8)) AND (typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
-);
-CREATE TRIGGER trg_lw_upd BEFORE UPDATE ON live_weigh BEGIN SELECT RAISE(ABORT, 'append_only'); END;
-CREATE TRIGGER trg_lw_del BEFORE DELETE ON live_weigh BEGIN SELECT RAISE(ABORT, 'append_only'); END;
-CREATE TRIGGER trg_lw_dup BEFORE INSERT ON live_weigh
-WHEN EXISTS (SELECT 1 FROM live_weigh x WHERE x.id = NEW.id OR (x.task_id = NEW.task_id AND x.weigh_client_id = NEW.weigh_client_id))
-BEGIN SELECT RAISE(ABORT, 'lw_duplicate'); END;
-
--- 死亡登记（PM 3，只追加）：同时扣重量和只数；生成第 9 篇报损单 source_type=LIVE_DEATH（uq_scr_source 去重）
--- 当日该池死亡率超 SKU 阈值时必须带 LIVE_DEATH_OVER 审批单号（应用层判定，库层只校验格式）；LIVE_HOLD 期间允许
-CREATE TABLE live_death (
-    id                  BIGINT       PRIMARY KEY,
-    warehouse_id        BIGINT       NOT NULL,
-    location_id         BIGINT       NOT NULL,
-    stock_id            BIGINT       NOT NULL,
-    lot_id              BIGINT       NOT NULL,
-    work_date           DATE         NOT NULL,
-    device_instance_id  VARCHAR(64)  NOT NULL,
-    client_op_id        VARCHAR(64)  NOT NULL,
-    death_count         BIGINT       NOT NULL,
-    death_qty_milli     BIGINT       NOT NULL,
-    day_rate_bp         INT          NOT NULL,       -- 含本次的池当日死亡率（只数口径）
-    approval_no         VARCHAR(64),                 -- 超阈值时必填，APR-{仓库编码}-{yyyyMMdd}-{6 位}
-    scrap_order_id      BIGINT,
-    reported_by         BIGINT       NOT NULL,
-    reported_at         TIMESTAMP    NOT NULL,
-    created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
-    CONSTRAINT uq_ld_op UNIQUE (device_instance_id, client_op_id),
-    CONSTRAINT ck_ld_qty CHECK (death_count > 0 AND death_qty_milli > 0 AND day_rate_bp BETWEEN 0 AND 10000),
-    CONSTRAINT ck_ld_apr CHECK (approval_no IS NULL OR (approval_no LIKE 'APR-%' AND length(approval_no) BETWEEN 22 AND 36))
-    , CONSTRAINT ck_ld_ts CHECK ((typeof(reported_at) = 'text' AND length(reported_at) = 19 AND reported_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(reported_at) = substr(reported_at, 1, 10) AND time(reported_at) = substr(reported_at, 12, 8)) AND (typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
-);
-CREATE TRIGGER trg_ld_upd BEFORE UPDATE ON live_death BEGIN SELECT RAISE(ABORT, 'append_only'); END;
-CREATE TRIGGER trg_ld_del BEFORE DELETE ON live_death BEGIN SELECT RAISE(ABORT, 'append_only'); END;
-CREATE TRIGGER trg_ld_dup BEFORE INSERT ON live_death
-WHEN EXISTS (SELECT 1 FROM live_death x WHERE x.id = NEW.id OR (x.device_instance_id = NEW.device_instance_id AND x.client_op_id = NEW.client_op_id))
-BEGIN SELECT RAISE(ABORT, 'ld_duplicate'); END;
-
--- 日失重结算（PM 7，只追加，权威库上的日终作业，§12 待定）：键 (location_id, lot_id, work_date)
--- 容差内 → 第 9 篇 LIVE_SHRINK 损耗单（uq_scr_source 3 列去重，source_id=本表 id，source_date=work_date）；超容差 → 第 8 篇盘点差异
-CREATE TABLE live_shrink_settlement (
-    id                  BIGINT       PRIMARY KEY,
-    warehouse_id        BIGINT       NOT NULL,
-    location_id         BIGINT       NOT NULL,
-    lot_id              BIGINT       NOT NULL,
-    stock_id            BIGINT       NOT NULL,
-    work_date           DATE         NOT NULL,
-    book_qty_milli      BIGINT       NOT NULL,       -- 结算前账面重量
-    measured_qty_milli  BIGINT       NOT NULL,       -- 抽称推算重量
-    shrink_qty_milli    BIGINT       NOT NULL,       -- = book − measured（只计重量，不动只数）
-    shrink_bp           INT          NOT NULL,
-    tolerance_bp        INT          NOT NULL,       -- 结算时的 SKU shrink_tolerance_bp 快照
-    outcome             VARCHAR(16)  NOT NULL,       -- LOSS/VARIANCE/NONE
-    scrap_order_id      BIGINT,
-    count_order_id      BIGINT,
-    created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
-    CONSTRAINT uq_lss_day UNIQUE (location_id, lot_id, work_date),
-    CONSTRAINT ck_lss_qty CHECK (book_qty_milli >= 0 AND measured_qty_milli >= 0 AND shrink_qty_milli = book_qty_milli - measured_qty_milli AND shrink_bp >= 0 AND tolerance_bp BETWEEN 0 AND 10000),
-    CONSTRAINT ck_lss_outcome CHECK ((outcome = 'NONE' AND shrink_qty_milli <= 0 AND scrap_order_id IS NULL AND count_order_id IS NULL)
-                                  OR (outcome = 'LOSS' AND shrink_qty_milli > 0 AND shrink_bp <= tolerance_bp AND scrap_order_id IS NOT NULL AND count_order_id IS NULL)
-                                  OR (outcome = 'VARIANCE' AND shrink_qty_milli > 0 AND shrink_bp > tolerance_bp AND count_order_id IS NOT NULL AND scrap_order_id IS NULL))
-    , CONSTRAINT ck_lss_ts CHECK ((typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
-);
-CREATE TRIGGER trg_lss_upd BEFORE UPDATE ON live_shrink_settlement BEGIN SELECT RAISE(ABORT, 'append_only'); END;
-CREATE TRIGGER trg_lss_del BEFORE DELETE ON live_shrink_settlement BEGIN SELECT RAISE(ABORT, 'append_only'); END;
-CREATE TRIGGER trg_lss_dup BEFORE INSERT ON live_shrink_settlement
-WHEN EXISTS (SELECT 1 FROM live_shrink_settlement x WHERE x.id = NEW.id OR (x.location_id = NEW.location_id AND x.lot_id = NEW.lot_id AND x.work_date = NEW.work_date))
-BEGIN SELECT RAISE(ABORT, 'lss_duplicate'); END;
-
