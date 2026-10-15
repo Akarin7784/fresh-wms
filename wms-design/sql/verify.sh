@@ -13,14 +13,31 @@ set -uo pipefail
 export PGTZ=UTC   # 九轮 P1：时间列一律按 UTC 存，写入端会话固定 UTC（清理/守卫本身不依赖会话时区）
 cd "$(dirname "$0")/.."
 
-SCHEMA=sql/schema_postgres.sql
+SCHEMA_DIR=sql/schema
+SCHEMA_PARTS=(
+  00_preamble.sql
+  01_master.sql
+  02_inventory.sql
+  03_inbound.sql
+  04_outbound.sql
+  05_picking.sql
+  06_pack_ship.sql
+  08_count.sql
+  10_returns.sql
+  09_scrap.sql
+  11_integration.sql
+  12_auth.sql
+  12b_auth_audit.sql
+  90_available_view.sql
+  99_grants.sql
+)
 # 期望值：main 8ed5f0c 为 38 表 / 99 索引 / 1 视图。docs/02 新增 stock_hold、stock_recon_alert、
 # stock_movement_key、stock_ledger_line → 42 表 / 114 索引（含 PK、UNIQUE 自动索引和分区父表上的分区索引；
-# 分区子表及其继承来的索引不计）/ 1 视图。二轮 C2 加 uq_mvk_mv（外键被引用键）→ 115；A3 加 stock_hold_release（PK、uq_hr_op、ix_hr_hold）→ 43 表 / 118。改 DDL 必须同步改这里。
+# 分区子表及其继承来的索引不计）/ 1 视图。二轮 C2 加 uq_mvk_mv（外键被引用键）→ 115；A3 加 stock_hold_release（PK、uq_hr_op、ix_hr_hold）→ 43 表 / 118。ix_hold_from（from_hold_id 部分索引，非唯一）→ 119。ix_mv_hold（hold_id 部分索引）→ 120。改 DDL 必须同步改这里。
 # 必须用新建的空库跑（DROP SCHEMA public 重建会丢 wms_app 的 USAGE；schema 里已 GRANT USAGE 兜底，小赵 C6）。
-# docs/17 +8 表 / +29 索引（8 PK + 12 UNIQUE + uq_pbom_active/uq_prc_apr/uq_prco_lot + 6 普通）；base 7dbd566 = 43 / 118
-EXPECT_TABLES=51
-EXPECT_INDEXES=147
+# docs/12 的 DDL 在 12b_auth_audit.sql：在 43 表 / 119 索引上增加 user_device_binding、offline_token、approval_request（3 主键 + uq_offline_jti + uq_apr_code + uq_audit_node_seq + 7 个显式索引）→ 46 表 / 132 索引；合入 1d907031（#2 第四轮 ix_mv_hold，43/120）后 → 46 表 / 133 索引（PG16.15 实测）。以 PG 实测为准。
+EXPECT_TABLES=53
+EXPECT_INDEXES=155
 EXPECT_VIEWS=1
 
 CTR=wms-pg-verify
@@ -30,35 +47,87 @@ pass=0; fail=0
 ok()   { echo "  ✓ $1"; pass=$((pass+1)); }
 bad()  { echo "  ✗ $1"; fail=$((fail+1)); }
 
-if [ ! -f "$SCHEMA" ]; then
-  echo "  ✗ 找不到 $SCHEMA"; exit 1
-fi
+for _part in "${SCHEMA_PARTS[@]}"; do
+  if [ ! -f "$SCHEMA_DIR/$_part" ]; then
+    echo "  ✗ 找不到 $SCHEMA_DIR/$_part"; exit 1
+  fi
+done
+SCHEMA=$(mktemp)
+trap 'rm -f "$SCHEMA"' EXIT
+cat "${SCHEMA_PARTS[@]/#/$SCHEMA_DIR/}" > "$SCHEMA"
 
 if [ -n "${PGHOST:-}" ]; then
   MODE=env
   command -v psql >/dev/null 2>&1 || { echo "  ✗ 设置了 PGHOST 但本机没有 psql 客户端"; exit 1; }
   export PGPORT="${PGPORT:-5432}" PGUSER="${PGUSER:-postgres}" PGDATABASE="${PGDATABASE:-postgres}"
-  psql() { command psql -X "$@" 2>&1; }
+  # stderr 保持独立。需要按错误文本断言的调用点自己合并（psql_capture）。
+  # -v ON_ERROR_STOP=1 放在包装里，等价于每次会话 \set ON_ERROR_STOP on。
+  psql() { command psql -X -v ON_ERROR_STOP=1 "$@"; }
   cleanup() { :; }
   echo "=== 0. 直连 PG：$PGUSER@$PGHOST:$PGPORT/$PGDATABASE ==="
-  for _ in $(seq 1 30); do command psql -X -t -A -c "SELECT 1" >/dev/null 2>&1 && break; sleep 1; done
+  conn_err=$(mktemp)
+  ready=0
+  for _ in $(seq 1 30); do
+    if psql -t -A -c "SELECT 1" >/dev/null 2>"$conn_err"; then ready=1; break; fi
+    sleep 1
+  done
+  if [ "$ready" != 1 ]; then
+    echo "  ✗ 连不上 $PGUSER@$PGHOST:$PGPORT/$PGDATABASE（psql 退出码非 0）"
+    cat "$conn_err"
+    rm -f "$conn_err"
+    exit 1
+  fi
+  rm -f "$conn_err"
 else
   MODE=docker
   command -v docker >/dev/null 2>&1 || { echo "  ✗ 未设置 PGHOST，且本机没有 docker，无法验证 PG 侧"; exit 1; }
-  psql() { docker exec -i "$CTR" psql -X -U postgres -d postgres "$@" 2>&1; }
+  # 与直连分支一样：每次 psql 都开 ON_ERROR_STOP，就绪检查看退出码，不看文本。
+  psql() { docker exec -i "$CTR" psql -X -v ON_ERROR_STOP=1 -U postgres -d postgres "$@"; }
   cleanup() { docker rm -f "$CTR" >/dev/null 2>&1; }
   echo "=== 0. 启动一次性 PG16 容器（回退模式）==="
   docker rm -f "$CTR" >/dev/null 2>&1
   docker run -d --name "$CTR" -e POSTGRES_PASSWORD=verify -p $PORT:5432 postgres:16-alpine >/dev/null
-  for _ in $(seq 1 60); do docker exec "$CTR" pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
+  ready=0
+  for _ in $(seq 1 60); do
+    if docker exec "$CTR" pg_isready -U postgres >/dev/null 2>&1; then ready=1; break; fi
+    sleep 1
+  done
+  if [ "$ready" != 1 ]; then
+    echo "  ✗ PG16 容器未就绪"
+    cleanup
+    exit 1
+  fi
+  if ! psql -t -A -c "SELECT 1" >/dev/null; then
+    echo "  ✗ docker 分支 psql SELECT 1 退出码非 0（ON_ERROR_STOP 已开）"
+    cleanup
+    exit 1
+  fi
 fi
 
 echo "=== 1. 建表（ON_ERROR_STOP，任何语法/方言错误直接失败）==="
-SCHEMA_OUT=$(psql -v ON_ERROR_STOP=1 -q < "$SCHEMA")
-if [ -n "$SCHEMA_OUT" ]; then
-  bad "schema 执行报错"; echo "$SCHEMA_OUT" | head -20; cleanup; exit 1
+SCHEMA_ERR=$(mktemp)
+SCHEMA_OUT=$(psql -q < "$SCHEMA" 2>"$SCHEMA_ERR")
+SCHEMA_RC=$?
+if [ "$SCHEMA_RC" != 0 ] || [ -s "$SCHEMA_ERR" ] || [ -n "$SCHEMA_OUT" ]; then
+  bad "schema 执行报错（退出 $SCHEMA_RC）"
+  echo "--- stdout ---"; printf '%s\n' "$SCHEMA_OUT" | head -20
+  echo "--- stderr ---"; head -20 "$SCHEMA_ERR"
+  rm -f "$SCHEMA_ERR"; cleanup; exit 1
 fi
-ok "schema_postgres.sql 在 PG16 全量执行通过（无任何告警输出）"
+rm -f "$SCHEMA_ERR"
+ok "sql/schema/*.sql 在 PG16 按序全量执行通过（退出码 0，stdout/stderr 都空）"
+
+# 把 stdout 和 stderr 拼在一起，并带回 psql 的退出码。
+# 调用方要自己接 $?：这里不能写 `|| true`，否则连不上库（退出码非 0）会被当成成功。
+psql_capture() {
+  local errf out rc
+  errf=$(mktemp)
+  out=$(psql -q -c "$1" 2>"$errf")
+  rc=$?
+  printf '%s\n%s' "$out" "$(cat "$errf")"
+  rm -f "$errf"
+  return "$rc"
+}
 
 T=$(psql -t -A -c "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p') AND NOT c.relispartition")
 I=$(psql -t -A -c "SELECT count(*) FROM pg_indexes i JOIN pg_class c ON c.relname=i.tablename JOIN pg_namespace n ON n.oid=c.relnamespace AND n.nspname=i.schemaname WHERE i.schemaname='public' AND NOT c.relispartition")
@@ -69,24 +138,37 @@ echo "  → 表 $T 张 / 索引 $I 个 / 视图 $V 个"
 [ "$V" = "$EXPECT_VIEWS" ]   && ok "视图数 = $V" || bad "视图数 = $V，期望 $EXPECT_VIEWS"
 
 # 小赵 S4：按期望权限矩阵逐表核对 wms_app（表、分区父表、视图、物化视图；序列查 USAGE），多给、少给、漏表都失败
-EXPECT_PRIVS="adjust_line:SELECT,INSERT,UPDATE adjust_order:SELECT,INSERT,UPDATE api_credential:SELECT,INSERT,UPDATE audit_log:SELECT,INSERT count_line:SELECT,INSERT,UPDATE count_order:SELECT,INSERT,UPDATE idempotency_record:SELECT,INSERT,UPDATE inbound_line:SELECT,INSERT,UPDATE inbound_message:SELECT,INSERT,UPDATE inbound_order:SELECT,INSERT,UPDATE location:SELECT,INSERT,UPDATE lot:SELECT,INSERT,UPDATE numbering_segment:SELECT,INSERT,UPDATE outbound_line:SELECT,INSERT,UPDATE outbound_order:SELECT,INSERT,UPDATE outbox_event:SELECT,INSERT,UPDATE pack_box:SELECT,INSERT,UPDATE pack_box_line:SELECT,INSERT,UPDATE pick_task:SELECT,INSERT,UPDATE pick_task_line:SELECT,INSERT,UPDATE process_bom:SELECT,INSERT,UPDATE process_bom_line:SELECT,INSERT,UPDATE process_issue:SELECT,INSERT,UPDATE process_lot_trace:SELECT,INSERT process_order:SELECT,INSERT,UPDATE process_output:SELECT,INSERT,UPDATE process_report:SELECT,INSERT process_reversal:SELECT,INSERT shipment:SELECT,INSERT,UPDATE shipment_order:SELECT,INSERT,UPDATE sku:SELECT,INSERT,UPDATE sku_barcode:SELECT,INSERT,UPDATE sku_unit:SELECT,INSERT,UPDATE stock:SELECT,INSERT,UPDATE stock_hold:SELECT,INSERT stock_hold_release:SELECT,INSERT stock_ledger_line:SELECT,INSERT stock_movement:SELECT,INSERT stock_movement_key:SELECT,INSERT stock_recon_alert:SELECT,INSERT,UPDATE stock_reservation:SELECT,INSERT,UPDATE stock_snapshot_daily:SELECT,INSERT sys_permission:SELECT,INSERT,UPDATE sys_role:SELECT,INSERT,UPDATE sys_role_perm:SELECT,INSERT,UPDATE sys_user:SELECT,INSERT,UPDATE sys_user_role:SELECT,INSERT,UPDATE sys_user_warehouse:SELECT,INSERT,UPDATE v_stock_available:SELECT warehouse:SELECT,INSERT,UPDATE wave:SELECT,INSERT,UPDATE zone:SELECT,INSERT,UPDATE"
+EXPECT_PRIVS="adjust_line:SELECT,INSERT,UPDATE adjust_order:SELECT,INSERT,UPDATE api_credential:SELECT,INSERT,UPDATE approval_request:SELECT,INSERT audit_log:SELECT,INSERT count_line:SELECT,INSERT,UPDATE count_order:SELECT,INSERT,UPDATE exception_case:SELECT,INSERT,UPDATE exception_code:SELECT,INSERT,UPDATE idempotency_record:SELECT,INSERT,UPDATE inbound_line:SELECT,INSERT,UPDATE inbound_message:SELECT,INSERT,UPDATE inbound_order:SELECT,INSERT,UPDATE location:SELECT,INSERT,UPDATE lot:SELECT,INSERT,UPDATE numbering_segment:SELECT,INSERT,UPDATE offline_token:SELECT,INSERT outbound_line:SELECT,INSERT,UPDATE outbound_order:SELECT,INSERT,UPDATE outbox_event:SELECT,INSERT,UPDATE pack_box:SELECT,INSERT,UPDATE pack_box_line:SELECT,INSERT,UPDATE pick_task:SELECT,INSERT,UPDATE pick_task_line:SELECT,INSERT,UPDATE return_blind_receipt:SELECT,INSERT return_reservation:SELECT,INSERT,UPDATE return_reservation_line:SELECT,INSERT,UPDATE scrap_line:SELECT,INSERT,UPDATE scrap_order:SELECT,INSERT,UPDATE shipment:SELECT,INSERT,UPDATE shipment_order:SELECT,INSERT,UPDATE sku:SELECT,INSERT,UPDATE sku_barcode:SELECT,INSERT,UPDATE sku_unit:SELECT,INSERT,UPDATE stock:SELECT,INSERT,UPDATE stock_hold:SELECT,INSERT stock_hold_release:SELECT,INSERT stock_ledger_line:SELECT,INSERT stock_movement:SELECT,INSERT stock_movement_key:SELECT,INSERT stock_recon_alert:SELECT,INSERT,UPDATE stock_reservation:SELECT,INSERT,UPDATE stock_snapshot_daily:SELECT,INSERT sys_permission:SELECT,INSERT,UPDATE sys_role:SELECT,INSERT,UPDATE sys_role_perm:SELECT,INSERT,UPDATE sys_user:SELECT,INSERT,UPDATE sys_user_role:SELECT,INSERT,UPDATE sys_user_warehouse:SELECT,INSERT,UPDATE user_device_binding:SELECT,INSERT v_stock_available:SELECT warehouse:SELECT,INSERT,UPDATE wave:SELECT,INSERT,UPDATE zone:SELECT,INSERT,UPDATE"
 ACT=$(psql -t -A -c "SELECT string_agg(x, ' ' ORDER BY x) FROM (SELECT c.relname || ':' || COALESCE(NULLIF(concat_ws(',', CASE WHEN c.relkind='S' THEN (CASE WHEN has_sequence_privilege('wms_app', c.oid, 'USAGE') THEN 'USAGE' END) ELSE (CASE WHEN has_table_privilege('wms_app', c.oid, 'SELECT') THEN 'SELECT' END) END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'INSERT') THEN 'INSERT' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'UPDATE') THEN 'UPDATE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'DELETE') THEN 'DELETE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'TRUNCATE') THEN 'TRUNCATE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'REFERENCES') THEN 'REFERENCES' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'TRIGGER') THEN 'TRIGGER' END), ''), 'NONE') AS x FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','S') AND NOT c.relispartition) t")
 if [ "$ACT" = "$EXPECT_PRIVS" ]; then ok "S4 wms_app 权限矩阵与期望逐表一致（$(echo "$ACT" | wc -w) 个对象，含 TRIGGER/REFERENCES；列级 UPDATE 另测）"
 else bad "S4 wms_app 权限矩阵不符：$(diff <(echo "$EXPECT_PRIVS" | tr ' ' '\n') <(echo "$ACT" | tr ' ' '\n') | grep '^[<>]' | tr '\n' ' ')"; fi
 echo "=== 2. 库层不变量断言（§4.1 I1–I5 + §2.2 SoD + §4.6 幂等）==="
-seed() { psql -v ON_ERROR_STOP=1 -q -c "$1" >/dev/null || { echo "  ✗ seed 失败，立即退出：$1"; exit 2; }; }   # 种子任何一步失败都立即非零退出
+seed() { psql -q -c "$1" >/dev/null || { echo "  ✗ seed 失败，立即退出：$1"; exit 2; }; }   # 种子任何一步失败都立即非零退出；错误留在 stderr
+assert_n() {  # $1 描述  $2 SQL  $3 期望行数。计数语句本身失败也立即退出，不当成 0 行。
+  local n
+  n=$(psql -t -A -q -c "$2") || { echo "  ✗ 计数失败：$1"; exit 2; }
+  n=$(printf '%s' "$n" | tr -d '[:space:]')
+  [ "$n" = "$3" ] && ok "$1 = $n" || bad "$1 = $n，期望 $3"
+}
 seed "INSERT INTO warehouse (id,code,name,cutoff_time,work_date_offset) VALUES (1,'WHSH01','上海青浦仓','20:00',-1);"
 seed "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (1,1,'Z-C1','冷藏拣货区','CHILLED','PICK'),(2,1,'Z-C2','冷藏存储区','CHILLED','STORAGE');"
 seed "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (1,1,1,'A01-02-03','BIN',2,'A010'),(2,1,1,'A01-03-01','BIN',2,'A020'),(3,1,2,'B02-01-05','PALLET',8,'B010');"
 seed "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life) VALUES (1,'SKU-APPLE','山东红富士 80#','KG','CHILLED',30,10);"
 seed "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date,quality_status,remaining_life_days) VALUES (1,1,'LOT-1008','2026-10-25','2026-10-08','QUALIFIED',10),(2,1,'LOT-1012','2026-10-29','2026-10-12','QUALIFIED',14),(3,1,'LOT-1014','2026-10-31','2026-10-14','QUALIFIED',16);"
 seed "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,allocated_qty_milli) VALUES (11,1,1,1,2,'KG',50000,0),(12,1,2,1,1,'KG',30000,10000),(13,1,3,1,3,'KG',200000,0),(14,1,3,1,1,'KG',80000,0);"
+assert_n "主数据种子 warehouse" "SELECT count(*) FROM warehouse" 1
+assert_n "主数据种子 zone" "SELECT count(*) FROM zone" 2
+assert_n "主数据种子 location" "SELECT count(*) FROM location" 3
+assert_n "主数据种子 sku" "SELECT count(*) FROM sku" 1
+assert_n "主数据种子 lot" "SELECT count(*) FROM lot" 3
+assert_n "主数据种子 stock" "SELECT count(*) FROM stock" 4
 
 expect_block() {  # $1 描述  $2 SQL  $3 期望命中的约束名（或错误片段）
   # 注意：不要用 `psql | grep -q`。grep -q 命中即退出会触发 SIGPIPE，
   # 在 set -o pipefail 下会把"确实拦截了"误判成"未拦截"。先捕获再匹配。
   # 只认"指定约束"拦下：被别的约束/语法错误拦下 = 这条断言没测到它声称测的东西。
-  local out; out=$(psql -q -c "$2")
+  # 错误在 stderr，必须用 psql_capture，不能只看 stdout。
+  local out; out=$(psql_capture "$2")
   # 约束名按 PG 报错里的 "name" 带引号精确匹配（避免 ck_res 误命中 ck_res_int）；含空格的 $3 视为错误片段子串匹配
   local pat="\"$3\""; case "$3" in *" "*) pat="$3";; esac
   case "$out" in
@@ -96,14 +178,26 @@ expect_block() {  # $1 描述  $2 SQL  $3 期望命中的约束名（或错误�
   esac
 }
 expect_allow() {  # $1 描述  $2 SQL —— 参数顺序与 expect_block 保持一致
-  local out; out=$(psql -q -c "$2")
-  case "$out" in *ERROR*) bad "$1 → 被误拦：$out";; *) ok "$1 → 通过";; esac
+  # 失败条件有两条，缺一不可：
+  #   1. psql 退出码非 0（ON_ERROR_STOP 下语句失败，以及连不上库，都走这里）
+  #   2. 输出里出现 error:，不区分大小写。连不上时是小写 "psql: error:"，
+  #      语句失败时是大写 "ERROR:"；只匹配大写会把连不上当成通过。
+  local out rc low
+  out=$(psql_capture "$2")
+  rc=$?
+  low=$(printf '%s' "$out" | tr '[:upper:]' '[:lower:]' | tr '\n' ' ')
+  if [ "$rc" != 0 ] || [ "${low#*error:}" != "$low" ]; then
+    bad "$1 → 被误拦（退出 $rc）：$out"
+  else
+    ok "$1 → 通过"
+  fi
 }
 
 expect_block "I2 超占（allocated>on_hand）" \
   "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,allocated_qty_milli) VALUES (900,1,1,1,1,'KG',10000,99000);" \
   "ck_stock_nonneg"
 seed "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (1,'OBT1',1,'SALE','MALL','M-2026-001','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'CREATED','2026-10-16');"
+assert_n "种子 outbound_order" "SELECT count(*) FROM outbound_order" 1
 expect_block "§4.6② 业务层幂等（source_system+source_order_no 重复）" \
   "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (2,'OBT2',1,'SALE','MALL','M-2026-001','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'CREATED','2026-10-16');" \
   "uq_obo_src"
@@ -131,6 +225,7 @@ expect_block "04 I4 非法出库单状态" \
   "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (5,'OBT5',1,'SALE','MALL','M-2026-005','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'ALLOCATING','2026-10-16');" \
   "ck_obo_status"
 seed "INSERT INTO outbound_line (id,outbound_id,line_no,sku_id,order_qty_milli,picked_qty_milli,uom) VALUES (1,1,1,1,10000,5000,'KG');"
+assert_n "种子 outbound_line" "SELECT count(*) FROM outbound_line" 1
 expect_block "04 D4 回冲超过拣出（reversed > picked）" \
   "UPDATE outbound_line SET reversed_qty_milli = 6000 WHERE id = 1;" \
   "ck_obl_reversed"
@@ -270,11 +365,11 @@ expect_allow "C4 正向：check_code='CHECK_BOX_MISMATCH'、'SHIP_EVENT_MISSING'
 expect_allow "convert_hold 准备：stock 40 被 RETURN_PENDING 冻满（available=0）" \
   "BEGIN; INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (40,1,2,1,3,'KG',5000,5000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (30,40,'RETURN_PENDING','RETURN_PENDING','RETURN_RECORD',601,'RRH:601',5000,0,'HELD',0); COMMIT;"
 expect_allow "convert_hold：available=0 时 RETURN_PENDING → SCRAP_PENDING/SCRAP（source_id = 报损单 9001）" \
-  "BEGIN; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 30 AND status = 'HELD' AND released_qty_milli = 0; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (31,40,'SCRAP_PENDING','SCRAP','SCRAP',9001,'CVT:30',5000,0,'HELD',0); COMMIT;"
+  "BEGIN; SELECT id FROM stock WHERE id = 40 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id = 30 ORDER BY id FOR UPDATE; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 30 AND status = 'HELD' AND released_qty_milli = 0; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,from_hold_id) VALUES (31,40,'SCRAP_PENDING','SCRAP','SCRAP',9001,'CVT:30',5000,0,'HELD',0,30); COMMIT;"
 expect_block "convert_hold 重试：CVT:30 已存在（幂等，由 uq_hold_op 兜底）" \
   "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (32,40,'SCRAP_PENDING','SCRAP','SCRAP',9001,'CVT:30',5000,0,'HELD',0); COMMIT;" \
   "uq_hold_op"
-R=$(psql -t -A -c "SELECT s.hold_qty_milli||'/'||v.available_qty_milli||'/'||(SELECT COALESCE(SUM(hold_qty_milli - released_qty_milli),0) FROM stock_hold WHERE stock_id=40 AND status='HELD' AND hold_type IN ('MANUAL','RETURN_PENDING','SCRAP_PENDING')) FROM stock s JOIN v_stock_available v ON v.stock_id=s.id WHERE s.id=40")
+R=$(psql -t -A -c "SELECT s.hold_qty_milli||'/'||v.available_qty_milli||'/'||(SELECT COALESCE(SUM(hold_qty_milli - released_qty_milli),0) FROM stock_hold WHERE stock_id=40 AND status='HELD' AND hold_type IN ('MANUAL','RETURN_PENDING','SCRAP_PENDING','PROCESSING','LIVE_HOLD')) FROM stock s JOIN v_stock_available v ON v.stock_id=s.id WHERE s.id=40")
 [ "$R" = "5000/0/5000" ] && ok "convert_hold 后 hold_qty/available/明细余量 = $R（冻结总量不变）" || bad "convert_hold 后 = $R（期望 5000/0/5000）"
 R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED' WHERE id = 30 AND status = 'HELD' AND released_qty_milli = 0")
 [ "$R" = "UPDATE 0" ] && ok "convert_hold 并发第二个：关闭原冻结 rowcount=0" || bad "重复关闭：$R"
@@ -289,7 +384,7 @@ expect_block "N1 改冻结明细数量 hold_qty_milli" \
 expect_block "N1 改冻结来源 source_type/source_id" \
   "BEGIN; UPDATE stock_hold SET source_type='MANUAL', source_id=0 WHERE id=31; COMMIT;" \
   "hold_immutable"
-OUT=$(psql -q -c "SET ROLE wms_app; UPDATE stock_hold SET hold_type='MANUAL', reason_code='DAMAGE', operator_id=7 WHERE id=31;")
+OUT=$(psql_capture "SET ROLE wms_app; UPDATE stock_hold SET hold_type='MANUAL', reason_code='DAMAGE', operator_id=7 WHERE id=31;")
 case "$OUT" in *"permission denied for table stock_hold"*) ok "N1 wms_app 对 stock_hold.hold_type 无 UPDATE 列权限";; *) bad "wms_app 改 hold_type 未被拒：$OUT";; esac
 R=$(psql -t -A -c "BEGIN; UPDATE stock_hold SET released_qty_milli = released_qty_milli + 1000, version = version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = 31 AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 1000; UPDATE stock SET hold_qty_milli = hold_qty_milli - 1000, version = version + 1 WHERE id = 40 AND hold_qty_milli >= 1000; SELECT s.hold_qty_milli||'/'||h.released_qty_milli||'/'||h.status FROM stock s JOIN stock_hold h ON h.stock_id=s.id WHERE h.id=31; ROLLBACK;" | grep '/')
 [ "$R" = "4000/1000/HELD" ] && ok "N1 正常释放仍可：SCRAP_PENDING 释放 1000 + stock.hold_qty −1000 → $R（事务内验证后回滚）" || bad "N1 正常释放 = $R（期望 4000/1000/HELD）"
@@ -303,12 +398,12 @@ R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = hold_qty_milli, st
 [ "$R" = "UPDATE 0" ] && ok "release_scrap_hold 非 SCRAP_PENDING 冻结 rowcount=0（→ 40930）" || bad "非报损冻结被释放：$R"
 expect_block "R1 已释放冻结改回 HELD（released 清零）" "BEGIN; UPDATE stock_hold SET released_qty_milli = 0, status = 'HELD' WHERE id = 30; COMMIT;" "hold_immutable"
 expect_block "R1 释放量减少（5000→1000）" "BEGIN; UPDATE stock_hold SET released_qty_milli = 1000, status = 'HELD' WHERE id = 30; COMMIT;" "hold_immutable"
-OUT=$(psql -q -c "SET ROLE wms_app; UPDATE stock_hold SET released_qty_milli = 0, status = 'HELD' WHERE id = 30;")
+OUT=$(psql_capture "SET ROLE wms_app; UPDATE stock_hold SET released_qty_milli = 0, status = 'HELD' WHERE id = 30;")
 case "$OUT" in *"hold_immutable"*) ok "R1 wms_app 改回 HELD 被触发器拦（列级授权放行了这两列，靠触发器）";; *) bad "wms_app 改回 HELD 未被拦：$OUT";; esac
 expect_block "R2 超级用户 DELETE 冻结明细" "BEGIN; DELETE FROM stock_hold WHERE id = 31; COMMIT;" "hold_immutable"
-OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM stock_hold WHERE id = 31;")
+OUT=$(psql_capture "SET ROLE wms_app; DELETE FROM stock_hold WHERE id = 31;")
 case "$OUT" in *"permission denied for table stock_hold"*) ok "R2 wms_app DELETE stock_hold → permission denied";; *) bad "wms_app DELETE 未被拒：$OUT";; esac
-OUT=$(psql -q -c "TRUNCATE stock_hold CASCADE;")   # 有 fk_hr_hold 后不带 CASCADE 会先报外键；CASCADE 时两表触发器都拦
+OUT=$(psql_capture "TRUNCATE stock_hold CASCADE;")   # 有 fk_hr_hold 后不带 CASCADE 会先报外键；CASCADE 时两表触发器都拦
 case "$OUT" in *"hold_immutable"*) ok "R2 超级用户 TRUNCATE stock_hold 被语句级触发器拦";; *) bad "TRUNCATE 未被拦：$OUT";; esac
 R=$(psql -t -A -c "SELECT hold_type||'/'||status||'/'||released_qty_milli FROM stock_hold WHERE id=31")
 [ "$R" = "SCRAP_PENDING/HELD/0" ] && ok "R2 绕过尝试后 id=31 仍为 $R" || bad "id=31 被改成 $R"
@@ -318,18 +413,18 @@ expect_block "报损冻结不能再用 MANUAL/SCRAP（只能 SCRAP_PENDING）" \
 expect_block "SCRAP_PENDING 必须挂报损单且为系统冻结" \
   "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (34,40,'SCRAP_PENDING','SCRAP','RETURN_RECORD',601,'H34',1000,0,'HELD',7); COMMIT;" \
   "ck_hold_scrap"
-OUT=$(psql -q -c "TRUNCATE stock_movement_key CASCADE;")
+OUT=$(psql_capture "TRUNCATE stock_movement_key CASCADE;")
 case "$OUT" in *"append_only_violation"*) ok "C5 超级用户 TRUNCATE 去重表被语句级触发器拦下";; *) bad "TRUNCATE 未被拦：$OUT";; esac
-OUT=$(psql -q -c "TRUNCATE stock_movement;")
+OUT=$(psql_capture "TRUNCATE stock_movement;")
 case "$OUT" in *"append_only_violation"*) ok "C5 超级用户 TRUNCATE 流水表被拦";; *) bad "TRUNCATE 流水未被拦：$OUT";; esac
-OUT=$(psql -q -c "SET ROLE wms_app; UPDATE stock_ledger_line SET src_kind='DOC' WHERE biz_no='PK2';")
+OUT=$(psql_capture "SET ROLE wms_app; UPDATE stock_ledger_line SET src_kind='DOC' WHERE biz_no='PK2';")
 case "$OUT" in *"permission denied"*) ok "C3 wms_app 无 stock_ledger_line.src_kind 列的 UPDATE 权限";; *) bad "wms_app 改 src_kind 未被拒：$OUT";; esac
 XP1=$(psql -t -A -c "SELECT count(*) FROM stock_movement WHERE biz_no='XP1'")
 XPP=$(psql -t -A -c "SELECT count(DISTINCT tableoid) FROM stock_movement WHERE biz_no='XP1' OR id=4")
 [ "$XP1" = "1" ] && ok "跨分区去重：被拦那笔随事务回滚（XP1 只有 1 条；样本流水分布在 $XPP 个分区）" || bad "XP1 流水 $XP1 条"
-OUT=$(psql -q -c "SET ROLE wms_app; UPDATE stock_movement SET remark='x' WHERE id=4;")
+OUT=$(psql_capture "SET ROLE wms_app; UPDATE stock_movement SET remark='x' WHERE id=4;")
 case "$OUT" in *"permission denied for table stock_movement"*) ok "只追加：应用角色 wms_app 无 UPDATE 权限";; *) bad "wms_app UPDATE 未被拒：$OUT";; esac
-OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM stock_movement_key WHERE movement_id=4;")
+OUT=$(psql_capture "SET ROLE wms_app; DELETE FROM stock_movement_key WHERE movement_id=4;")
 case "$OUT" in *"permission denied for table stock_movement_key"*) ok "只追加：应用角色 wms_app 无 DELETE 权限";; *) bad "wms_app DELETE 未被拒：$OUT";; esac
 
 echo "=== 2f. A3 RETURN_QC 系统冻结、release_qc_hold、QUALITY/RETURN_QC → SCRAP_PENDING ==="
@@ -341,36 +436,36 @@ expect_allow "A3 release_qc_hold 释放 1000（去重行 + 明细 + stock 同事
 expect_block "A3 release_qc_hold 重放同一 op_key（不重复解冻）" "BEGIN; INSERT INTO stock_hold_release (id,hold_id,op_key,qty_milli) VALUES (2,50,'QCR:7001:1',1000); UPDATE stock_hold SET released_qty_milli = released_qty_milli + 1000, status = CASE WHEN released_qty_milli + 1000 = hold_qty_milli THEN 'RELEASED' ELSE 'HELD' END, version = version + 1 WHERE id = 50 AND hold_type = 'RETURN_QC' AND source_type = 'QC' AND source_id = 7001 AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 1000; UPDATE stock SET quality_hold_qty_milli = quality_hold_qty_milli - 1000, version = version + 1 WHERE id = 41 AND quality_hold_qty_milli >= 1000; COMMIT;" "uq_hr_op"
 R=$(psql -t -A -c "SELECT h.released_qty_milli||'/'||s.quality_hold_qty_milli FROM stock_hold h JOIN stock s ON s.id=h.stock_id WHERE h.id=50")
 [ "$R" = "1000/8000" ] && ok "A3 重放后 已释放/quality_hold = $R（只释放一次）" || bad "A3 重放后 = $R（期望 1000/8000）"
-expect_allow "A3 convert_hold QUALITY → SCRAP_PENDING（跨列：同事务 quality_hold −q、hold_qty +q）" "BEGIN; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 51 AND status = 'HELD' AND released_qty_milli = 0; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (52,41,'SCRAP_PENDING','SCRAP','SCRAP',9101,'CVT:51',3000,0,'HELD',0); UPDATE stock SET quality_hold_qty_milli = quality_hold_qty_milli - 3000, hold_qty_milli = hold_qty_milli + 3000, version = version + 1 WHERE id = 41 AND quality_hold_qty_milli >= 3000; COMMIT;"
+expect_allow "A3 convert_hold QUALITY → SCRAP_PENDING（跨列：同事务 quality_hold −q、hold_qty +q）" "BEGIN; SELECT id FROM stock WHERE id = 41 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id = 51 ORDER BY id FOR UPDATE; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 51 AND status = 'HELD' AND released_qty_milli = 0; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,from_hold_id) VALUES (52,41,'SCRAP_PENDING','SCRAP','SCRAP',9101,'CVT:51',3000,0,'HELD',0,51); UPDATE stock SET quality_hold_qty_milli = quality_hold_qty_milli - 3000, hold_qty_milli = hold_qty_milli + 3000, version = version + 1 WHERE id = 41 AND quality_hold_qty_milli >= 3000; COMMIT;"
 R=$(psql -t -A -c "SELECT quality_hold_qty_milli||'/'||hold_qty_milli||'/'||(on_hand_qty_milli-allocated_qty_milli-reserved_qty_milli-quality_hold_qty_milli-hold_qty_milli) FROM stock WHERE id=41")
 [ "$R" = "5000/3000/1000" ] && ok "A3 QUALITY 转后 quality/hold/available = $R（冻结总量 8000 与可用量不变）" || bad "A3 QUALITY 转后 = $R（期望 5000/3000/1000）"
-expect_allow "A3 convert_hold RETURN_QC 剩余 5000 → SCRAP_PENDING" "BEGIN; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 50 AND status = 'HELD' AND released_qty_milli = 1000; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (53,41,'SCRAP_PENDING','SCRAP','SCRAP',9102,'CVT:50',5000,0,'HELD',0); UPDATE stock SET quality_hold_qty_milli = quality_hold_qty_milli - 5000, hold_qty_milli = hold_qty_milli + 5000, version = version + 1 WHERE id = 41 AND quality_hold_qty_milli >= 5000; COMMIT;"
+expect_allow "A3 convert_hold RETURN_QC 剩余 5000 → SCRAP_PENDING" "BEGIN; SELECT id FROM stock WHERE id = 41 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id = 50 ORDER BY id FOR UPDATE; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 50 AND status = 'HELD' AND released_qty_milli = 1000; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,from_hold_id) VALUES (53,41,'SCRAP_PENDING','SCRAP','SCRAP',9102,'CVT:50',5000,0,'HELD',0,50); UPDATE stock SET quality_hold_qty_milli = quality_hold_qty_milli - 5000, hold_qty_milli = hold_qty_milli + 5000, version = version + 1 WHERE id = 41 AND quality_hold_qty_milli >= 5000; COMMIT;"
 R=$(psql -t -A -c "SELECT quality_hold_qty_milli||'/'||hold_qty_milli||'/'||(on_hand_qty_milli-allocated_qty_milli-reserved_qty_milli-quality_hold_qty_milli-hold_qty_milli) FROM stock WHERE id=41")
 [ "$R" = "0/8000/1000" ] && ok "A3 RETURN_QC 转后 quality/hold/available = $R（冻结总量 8000 与可用量不变）" || bad "A3 RETURN_QC 转后 = $R（期望 0/8000/1000）"
 expect_block "A3 stock_hold_release 只追加（UPDATE）" "BEGIN; UPDATE stock_hold_release SET qty_milli = 2000 WHERE op_key = 'QCR:7001:1'; COMMIT;" "hold_immutable"
 echo "=== 2f2. 小赵五轮 Q1/S5/S6 stock_hold_release；Q2 去重记录与 outbox 清理 ==="
 expect_block "S6 释放记录挂不存在的冻结（外键）" "BEGIN; INSERT INTO stock_hold_release (id,hold_id,op_key,qty_milli) VALUES (4,999999,'QCR:x:1',1); COMMIT;" "fk_hr_hold"
-OUT=$(psql -q -c "TRUNCATE stock_hold_release;")
+OUT=$(psql_capture "TRUNCATE stock_hold_release;")
 case "$OUT" in *"hold_immutable"*) ok "S5 超级用户 TRUNCATE stock_hold_release 被语句级触发器拦";; *) bad "TRUNCATE stock_hold_release 未被拦：$OUT";; esac
-R=$(psql -t -A -c "SELECT count(*) FROM (SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.released_qty_milli <> COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id = h.id), 0) + COALESCE((SELECT c.hold_qty_milli FROM stock_hold c WHERE c.op_key = 'CVT:' || h.id), 0)) t")
+R=$(psql -t -A -c "SELECT count(*) FROM (SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.released_qty_milli <> COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id = h.id), 0) + COALESCE((SELECT SUM(c.hold_qty_milli) FROM stock_hold c WHERE c.from_hold_id = h.id), 0)) t")
 [ "$R" = "0" ] && ok "S6 I3e 对账：RETURN_QC 已释放 = Σ释放记录 + 转报损量（无差异行）" || bad "I3e 差异行 $R"
-R=$(psql -t -A -c "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (55,41,'RETURN_QC','RETURN_QC','QC',7003,'RQC:7003',2000,0,'HELD',0); UPDATE stock_hold SET released_qty_milli = 500, version = version + 1 WHERE id = 55; SELECT 'ids=' || string_agg(id::text, ',') FROM (SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.released_qty_milli <> COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id = h.id), 0) + COALESCE((SELECT c.hold_qty_milli FROM stock_hold c WHERE c.op_key = 'CVT:' || h.id), 0)) t; ROLLBACK;" | grep '^ids=')
+R=$(psql -t -A -c "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (55,41,'RETURN_QC','RETURN_QC','QC',7003,'RQC:7003',2000,0,'HELD',0); UPDATE stock_hold SET released_qty_milli = 500, version = version + 1 WHERE id = 55; SELECT 'ids=' || string_agg(id::text, ',') FROM (SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.released_qty_milli <> COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id = h.id), 0) + COALESCE((SELECT SUM(c.hold_qty_milli) FROM stock_hold c WHERE c.from_hold_id = h.id), 0)) t; ROLLBACK;" | grep '^ids=')
 [ "$R" = "ids=55" ] && ok "S6 I3e 反向：绕过释放记录直接 UPDATE 释放 → 对账查出 hold 55" || bad "I3e 未查出：$R"
 expect_allow "Q2 准备：去重记录（未过期/已过期）+ outbox（PENDING / 8 天前 SENT / 刚 SENT）" "BEGIN; INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,expires_at) VALUES ('live','h','{}',200,now()+interval '1 day'),('dead','h','{}',200,now()-interval '1 hour'); INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at) VALUES (8801,'t','k','{}','PENDING',NULL),(8802,'t','k','{}','SENT',now()-interval '8 days'),(8803,'t','k','{}','SENT',now()); COMMIT;"
-OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM idempotency_record WHERE idem_key='dead';")
+OUT=$(psql_capture "SET ROLE wms_app; DELETE FROM idempotency_record WHERE idem_key='dead';")
 case "$OUT" in *"permission denied for table idempotency_record"*) ok "Q2 wms_app DELETE idempotency_record → permission denied";; *) bad "wms_app DELETE idem 未被拒：$OUT";; esac
-OUT=$(psql -q -c "SET ROLE wms_app; DELETE FROM outbox_event WHERE id=8802;")
+OUT=$(psql_capture "SET ROLE wms_app; DELETE FROM outbox_event WHERE id=8802;")
 case "$OUT" in *"permission denied for table outbox_event"*) ok "Q2 wms_app DELETE outbox_event → permission denied";; *) bad "wms_app DELETE outbox 未被拒：$OUT";; esac
-OUT=$(psql -q -c "SET ROLE wms_app; TRUNCATE outbox_event;")
+OUT=$(psql_capture "SET ROLE wms_app; TRUNCATE outbox_event;")
 case "$OUT" in *"permission denied"*) ok "Q2 wms_app TRUNCATE outbox_event → permission denied";; *) bad "wms_app TRUNCATE 未被拒：$OUT";; esac
-OUT=$(psql -q -c "SET ROLE wms_cleaner; DELETE FROM idempotency_record WHERE idem_key='dead';")
+OUT=$(psql_capture "SET ROLE wms_cleaner; DELETE FROM idempotency_record WHERE idem_key='dead';")
 case "$OUT" in *"permission denied for table idempotency_record"*) ok "Q2 wms_cleaner 直接 DELETE → permission denied（只能 EXECUTE 函数）";; *) bad "wms_cleaner 直接 DELETE 未被拒：$OUT";; esac
-OUT=$(psql -q -c "SET ROLE wms_app; SELECT * FROM purge_expired();")
+OUT=$(psql_capture "SET ROLE wms_app; SELECT * FROM purge_expired();")
 case "$OUT" in *"permission denied for function purge_expired"*) ok "Q2 wms_app 调 purge_expired() → permission denied";; *) bad "wms_app 调函数未被拒：$OUT";; esac
 expect_block "Q2 超级用户删未过期去重记录（触发器兜底）" "BEGIN; DELETE FROM idempotency_record WHERE idem_key='live'; COMMIT;" "purge_not_allowed: idempotency_record"
 expect_block "Q2 超级用户删 PENDING 事件" "BEGIN; DELETE FROM outbox_event WHERE id=8801; COMMIT;" "purge_not_allowed: outbox_event"
 expect_block "Q2 超级用户删刚投递（未过保留期）事件" "BEGIN; DELETE FROM outbox_event WHERE id=8803; COMMIT;" "purge_not_allowed: outbox_event"
-OUT=$(psql -q -c "TRUNCATE idempotency_record;")
+OUT=$(psql_capture "TRUNCATE idempotency_record;")
 case "$OUT" in *"purge_not_allowed"*) ok "Q2 超级用户 TRUNCATE idempotency_record 被拦";; *) bad "TRUNCATE idem 未被拦：$OUT";; esac
 R=$(psql -t -A -c "SELECT p.prosecdef::text || '/' || array_to_string(p.proconfig, ',') || '/' || r.rolsuper::text || '/' || r.rolname || '/' || has_function_privilege('public', p.oid, 'EXECUTE')::text FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner WHERE p.proname = 'purge_expired'")
 [ "$R" = "true/search_path=pg_catalog, public/false/wms_purge_owner/false" ] && ok "Q2 purge_expired：SECURITY DEFINER、固定 search_path、属主非超级用户、PUBLIC 无 EXECUTE（$R）" || bad "purge_expired 属性：$R"
@@ -407,7 +502,45 @@ expect_allow "R1 补洞正向：wms_app 以 PENDING 插入（不带 sent_at）" 
 expect_block "R1 PENDING → SENT 时 sent_at 写成 1 小时前" "BEGIN; SET LOCAL ROLE wms_app; UPDATE outbox_event SET status='SENT', sent_at=(now() AT TIME ZONE 'UTC') - interval '1 hour' WHERE id=8801; ROLLBACK;" "sent_at_not_now"
 expect_block "R1 PENDING → SENT 时 sent_at 写成 1 小时后" "BEGIN; SET LOCAL ROLE wms_app; UPDATE outbox_event SET status='SENT', sent_at=(now() AT TIME ZONE 'UTC') + interval '1 hour' WHERE id=8801; ROLLBACK;" "sent_at_not_now"
 expect_allow "R1 正向：PENDING → SENT 写当前 UTC（容差内 +3 秒）" "BEGIN; SET LOCAL ROLE wms_app; UPDATE outbox_event SET status='SENT', sent_at=(now() AT TIME ZONE 'UTC') + interval '3 seconds' WHERE id=8801; ROLLBACK;"
-psql -q -c "INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,created_at,expires_at) VALUES ('tz_live12h','h','{}',200,now() AT TIME ZONE 'UTC',(now() AT TIME ZONE 'UTC') + interval '12 hours'),('tz_dead','h','{}',200,now() AT TIME ZONE 'UTC',(now() AT TIME ZONE 'UTC') - interval '1 hour');" >/dev/null
+echo "=== 2f2c. search_path 钉死；登录角色劫持同名对象；非属主插入 FAILED ==="
+# #2 定义的 10 个函数。proconfig 要正好是 search_path=pg_catalog, public（与 purge_expired 已有断言同一写法）。
+R=$(psql -t -A -c "SELECT count(*)::text || '/' || (count(*) FILTER (WHERE p.proconfig = ARRAY['search_path=pg_catalog, public']::text[]))::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname IN ('purge_expired','trg_append_only','trg_expiry_forward','trg_hold_immutable','trg_hold_no_delete','trg_lot_sell_deadline','trg_mvk_line_kind','trg_outbox_insert_pending','trg_purge_guard','trg_sll_immutable')")
+[ "$R" = "10/10" ] && ok "#2 的 10 个函数 proconfig 都是 search_path=pg_catalog, public（$R）" || bad "search_path 目录：$R（期望 10/10）"
+# 角色是集群级的。CREATE ROLE 不能放进事务。已有就改属性，避免第二次跑 verify 撞“角色已存在”。
+if [ "$(psql -t -A -c "SELECT count(*) FROM pg_roles WHERE rolname = 'wms_login_test'" | tr -d '[:space:]')" != "1" ]; then
+  seed "CREATE ROLE wms_login_test LOGIN INHERIT"
+fi
+seed "ALTER ROLE wms_login_test LOGIN INHERIT"
+seed "GRANT wms_app TO wms_login_test"
+R=$(psql -t -A -c "SELECT r.rolname || '/' || r.rolcanlogin::text || '/' || pg_has_role('wms_login_test', 'wms_app', 'member')::text FROM pg_roles r WHERE r.rolname = 'wms_login_test'")
+[ "$R" = "wms_login_test/true/true" ] && ok "wms_login_test 是登录角色，且继承 wms_app（后面的语句只 SET ROLE 到它，不再 SET ROLE wms_app）" || bad "登录角色：$R"
+# 劫持对象放在 hijack，不进 public，避免改 S4 的表权限矩阵。要让同名对象赢，会话必须把 hijack 放在 pg_catalog 前面；函数自己的 search_path 会盖住这条会话设置。
+seed "DROP SCHEMA IF EXISTS hijack CASCADE"
+seed "$(cat <<'SQL'
+CREATE SCHEMA hijack AUTHORIZATION wms_login_test;
+CREATE TABLE hijack.stock_ledger_line (biz_no varchar(64), line_no int, src_kind varchar(8), owner_device_instance_id varchar(64));
+INSERT INTO hijack.stock_ledger_line (biz_no, line_no, src_kind, owner_device_instance_id) VALUES ('HIJACK', 1, 'DOC', NULL);
+CREATE FUNCTION hijack.now() RETURNS timestamptz LANGUAGE sql STABLE AS $$ SELECT '2000-01-01 00:00:00+00'::timestamptz $$;
+CREATE FUNCTION hijack.date_eq_always(date, date) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$ SELECT true $$;
+CREATE OPERATOR hijack.= (FUNCTION = hijack.date_eq_always, LEFTARG = date, RIGHTARG = date);
+SQL
+)"
+expect_block "劫持同名表打 trg_mvk_line_kind（登录角色把 hijack 放在 pg_catalog 前）" \
+  "SET ROLE wms_login_test; SET search_path = hijack, pg_catalog, public; INSERT INTO public.stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,stock_id,stock_seq,direction,occurred_at) VALUES (99001,'HIJ:1:D1:1','HIJACK',1,1,1,'DOC',11,99001,0,'2026-10-15 00:00:00');" \
+  "ledger_line_owner_mismatch"
+expect_block "劫持同名 now() 打 trg_expiry_forward（登录角色把 hijack 放在 pg_catalog 前）" \
+  "SET ROLE wms_login_test; SET search_path = hijack, pg_catalog, public; UPDATE public.outbox_event SET status='SENT', sent_at='2000-01-01' WHERE id=8801;" \
+  "sent_at_not_now"
+expect_block "劫持同名 =(date,date) 打 trg_lot_sell_deadline（登录角色把 hijack 放在 pg_catalog 前）" \
+  "SET ROLE wms_login_test; SET search_path = hijack, pg_catalog, public; UPDATE public.lot SET sell_deadline = '2026-12-15' WHERE id = 1;" \
+  "sell_deadline_immutable"
+# 应用连接的 current_user 是登录角色本身，不会再 SET ROLE wms_app。这里只 SET ROLE 到登录角色。
+expect_block "继承 wms_app 的登录角色不 SET ROLE wms_app，插入 status=FAILED" \
+  "SET ROLE wms_login_test; INSERT INTO outbox_event (id,topic,biz_key,payload,status) VALUES (8899,'t','k','{}','FAILED');" \
+  "outbox_insert_not_pending"
+expect_allow "同一登录角色插入 PENDING（不带 sent_at）" \
+  "BEGIN; SET LOCAL ROLE wms_login_test; INSERT INTO outbox_event (id,topic,biz_key,payload) VALUES (8898,'t','k','{}'); ROLLBACK;"
+seed "INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,created_at,expires_at) VALUES ('tz_live12h','h','{}',200,now() AT TIME ZONE 'UTC',(now() AT TIME ZONE 'UTC') + interval '12 hours'),('tz_dead','h','{}',200,now() AT TIME ZONE 'UTC',(now() AT TIME ZONE 'UTC') - interval '1 hour');"
 # POSIX 记号相反：Etc/GMT-8 = UTC+8，Etc/GMT+10 = UTC-10，Etc/GMT-14 = UTC+14（小赵 P1 的复现时区）
 TZR=""
 for Z in Etc/GMT-8 Etc/GMT+10 Etc/GMT-14; do
@@ -419,19 +552,22 @@ expect_block "P1 会话时区 +14 下超级用户删还剩 12 小时的记录（
 R=$(psql -t -A -c "SET TimeZone='Etc/GMT-14'; SET ROLE wms_cleaner; SELECT 'n=' || idem_deleted FROM purge_expired();" | grep '^n=')
 R2=$(psql -t -A -c "SELECT string_agg(idem_key, ',' ORDER BY idem_key) FROM idempotency_record WHERE idem_key LIKE 'tz_%'")
 [ "$R/$R2" = "n=1/tz_live12h" ] && ok "P1 +14 时区实删后 tz_live12h 仍在（$R/$R2）" || bad "P1 +14 实删：$R/$R2"
+
 echo "=== 2f3. 误报回转 SCRAP_PENDING → RETURN_QC（SCRAP_MISREPORT 审批）==="
+seed "CREATE TABLE IF NOT EXISTS approval_request (     id BIGINT PRIMARY KEY,     code VARCHAR(64) NOT NULL,     CONSTRAINT uq_apr_code UNIQUE (code) ); INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (90,'W1','x','20:00'),(91,'Z9Z9Z9Z9Z9Z9Z9Z9','x','20:00') ON CONFLICT (id) DO NOTHING; INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (5001,'APR-WHSH01-20261015-000001','CANCEL_AFTER_PICK',1,'HOLD','5001','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01'), (5002,'APR-WHSH01-20261015-000002','CANCEL_AFTER_PICK',1,'HOLD','5002','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01'), (5003,'APR-WHSH01-20261015-000003','CANCEL_AFTER_PICK',1,'HOLD','5003','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01'), (5004,'APR-WHSH01-20261015-000004','CANCEL_AFTER_PICK',1,'HOLD','5004','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01'), (5009,'APR-WHSH01-20261015-000009','CANCEL_AFTER_PICK',1,'HOLD','5009','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01'), (5099,'APR-WHSH01-20261015-000099','CANCEL_AFTER_PICK',1,'HOLD','5099','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01'), (5123,'APR-WHSH01-20261015-000123','CANCEL_AFTER_PICK',1,'HOLD','5123','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01'), (5999,'APR-WHSH01-20261231-999999','CANCEL_AFTER_PICK',1,'HOLD','5999','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01'), (5160,'APR-Z9Z9Z9Z9Z9Z9Z9Z9-20260101-000000','CANCEL_AFTER_PICK',91,'HOLD','5160','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01'), (5011,'APR-W1-20261015-000001','CANCEL_AFTER_PICK',90,'HOLD','5011','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01'), (5000,'APR-WHSH01-20260101-000000','CANCEL_AFTER_PICK',1,'HOLD','5000','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01'), (5029,'APR-WHSH01-20280229-000001','CANCEL_AFTER_PICK',1,'HOLD','5029','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01') ON CONFLICT (code) DO NOTHING;"
+assert_n "审批号底数：合法 APR 写入 approval_request" "SELECT count(*) FROM approval_request" 12
 R=$(psql -t -A -c "SELECT quality_hold_qty_milli||'/'||hold_qty_milli||'/'||(on_hand_qty_milli-allocated_qty_milli-reserved_qty_milli-quality_hold_qty_milli-hold_qty_milli) FROM stock WHERE id=41")
 [ "$R" = "0/8000/1000" ] && ok "误报回转前 quality/hold/available = $R" || bad "误报回转前 = $R（期望 0/8000/1000）"
 expect_block "误报回转缺审批单号（→ 应用层 40930，库层 ck_hold_approval 兜底）" "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no,is_reversal) VALUES (57,41,'RETURN_QC','RETURN_QC','QC',7011,'CVT:53',5000,0,'HELD',0,NULL,NULL,true); COMMIT;" "ck_hold_approval"
 expect_block "误报回转审批类型不是 SCRAP_MISREPORT" "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no,is_reversal) VALUES (59,41,'RETURN_QC','RETURN_QC','QC',7011,'CVT:53',5000,0,'HELD',0,'OTHER','APR-WHSH01-20261015-000002',true); COMMIT;" "ck_hold_approval"
 expect_block "非误报回转的明细不能挂审批（MANUAL + SCRAP_MISREPORT）" "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no) VALUES (60,41,'MANUAL','DAMAGE','MANUAL',0,'H60',1000,0,'HELD',7,'SCRAP_MISREPORT','APR-WHSH01-20261015-000003'); COMMIT;" "ck_hold_approval"
-expect_allow "误报回转：SCRAP_PENDING 52（3000）→ RETURN_QC 56，挂新质检单 7010 + 审批 APR-WHSH01-20261015-000001；hold −q、quality +q" "BEGIN; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 52 AND hold_type = 'SCRAP_PENDING' AND status = 'HELD' AND released_qty_milli = 0; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no,is_reversal) VALUES (56,41,'RETURN_QC','RETURN_QC','QC',7010,'CVT:52',3000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH01-20261015-000001',true); UPDATE stock SET hold_qty_milli = hold_qty_milli - 3000, quality_hold_qty_milli = quality_hold_qty_milli + 3000, version = version + 1 WHERE id = 41 AND hold_qty_milli >= 3000; COMMIT;"
+expect_allow "误报回转：SCRAP_PENDING 52（3000）→ RETURN_QC 56，挂新质检单 7010 + 审批 APR-WHSH01-20261015-000001；hold −q、quality +q" "BEGIN; SELECT id FROM stock WHERE id = 41 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id = 52 ORDER BY id FOR UPDATE; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 52 AND hold_type = 'SCRAP_PENDING' AND status = 'HELD' AND released_qty_milli = 0; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no,is_reversal,from_hold_id) VALUES (56,41,'RETURN_QC','RETURN_QC','QC',7010,'CVT:52',3000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH01-20261015-000001',true,52); UPDATE stock SET hold_qty_milli = hold_qty_milli - 3000, quality_hold_qty_milli = quality_hold_qty_milli + 3000, version = version + 1 WHERE id = 41 AND hold_qty_milli >= 3000; COMMIT;"
 R=$(psql -t -A -c "SELECT quality_hold_qty_milli||'/'||hold_qty_milli||'/'||(on_hand_qty_milli-allocated_qty_milli-reserved_qty_milli-quality_hold_qty_milli-hold_qty_milli) FROM stock WHERE id=41")
 [ "$R" = "3000/5000/1000" ] && ok "误报回转后 quality/hold/available = $R（冻结总量 8000、可用量 1000 不变）" || bad "误报回转后 = $R（期望 3000/5000/1000）"
 expect_block "误报回转后审批单号不可改" "BEGIN; UPDATE stock_hold SET approval_no = 'APR-WHSH01-20261015-000099' WHERE id = 56; COMMIT;" "hold_immutable"
-R=$(psql -t -A -c "SELECT count(*) FROM (SELECT h.id FROM stock_hold h WHERE h.is_reversal AND NOT EXISTS (SELECT 1 FROM stock_hold o WHERE 'CVT:' || o.id = h.op_key AND o.hold_type = 'SCRAP_PENDING' AND o.status = 'RELEASED' AND o.stock_id = h.stock_id) UNION ALL SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.released_qty_milli <> COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id = h.id), 0) + COALESCE((SELECT c.hold_qty_milli FROM stock_hold c WHERE c.op_key = 'CVT:' || h.id), 0)) t")
+R=$(psql -t -A -c "SELECT count(*) FROM (SELECT h.id FROM stock_hold h WHERE h.is_reversal AND NOT EXISTS (SELECT 1 FROM stock_hold o WHERE o.id = h.from_hold_id AND o.hold_type = 'SCRAP_PENDING' AND o.status = 'RELEASED' AND o.stock_id = h.stock_id) UNION ALL SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.released_qty_milli <> COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id = h.id), 0) + COALESCE((SELECT SUM(c.hold_qty_milli) FROM stock_hold c WHERE c.from_hold_id = h.id), 0)) t")
 [ "$R" = "0" ] && ok "I3e（含误报回转口径）无差异行" || bad "I3e 差异 $R"
-R=$(psql -t -A -c "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no,is_reversal) VALUES (58,41,'RETURN_QC','RETURN_QC','QC',7012,'CVT:999',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH01-20261015-000004',true); SELECT 'ids=' || string_agg(id::text, ',') FROM (SELECT h.id FROM stock_hold h WHERE h.is_reversal AND NOT EXISTS (SELECT 1 FROM stock_hold o WHERE 'CVT:' || o.id = h.op_key AND o.hold_type = 'SCRAP_PENDING' AND o.status = 'RELEASED' AND o.stock_id = h.stock_id) UNION ALL SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.released_qty_milli <> COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id = h.id), 0) + COALESCE((SELECT c.hold_qty_milli FROM stock_hold c WHERE c.op_key = 'CVT:' || h.id), 0)) t; ROLLBACK;" | grep '^ids=')
+R=$(psql -t -A -c "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no,is_reversal) VALUES (58,41,'RETURN_QC','RETURN_QC','QC',7012,'CVT:999',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH01-20261015-000004',true); SELECT 'ids=' || string_agg(id::text, ',') FROM (SELECT h.id FROM stock_hold h WHERE h.is_reversal AND NOT EXISTS (SELECT 1 FROM stock_hold o WHERE o.id = h.from_hold_id AND o.hold_type = 'SCRAP_PENDING' AND o.status = 'RELEASED' AND o.stock_id = h.stock_id) UNION ALL SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.released_qty_milli <> COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id = h.id), 0) + COALESCE((SELECT SUM(c.hold_qty_milli) FROM stock_hold c WHERE c.from_hold_id = h.id), 0)) t; ROLLBACK;" | grep '^ids=')
 [ "$R" = "ids=58" ] && ok "I3e 反向：RETURN_QC 声称回转自不存在的 SCRAP_PENDING 999→ 查出 58" || bad "I3e 未查出：$R"
 echo "=== 2f4. 审批单号格式 ck_hold_approval_no：APR-{仓库编码}-{yyyyMMdd}-{6位数字} ==="
 expect_block "审批单号格式反向：仓库编码小写" "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no,is_reversal) VALUES (70,41,'RETURN_QC','RETURN_QC','QC',7100,'CVT:870',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-whsh01-20261015-000001',true); ROLLBACK;" "ck_hold_approval_no"
@@ -462,141 +598,509 @@ expect_block "N1 RETURN_QC 的 CVT 明细未标回转（不带审批伪造回转
 R=$(psql -t -A -c "SELECT count(*) FROM stock_hold WHERE id >= 70 AND id < 100")
 [ "$R" = "0" ] && ok "审批单号格式用例全部回滚，无残留明细" || bad "审批单号格式用例残留 $R 行"
 echo "=== 2c. docs/02 40906：库位锁定写进扣减原语的 WHERE ==="
-psql -q -c "UPDATE location SET status='LOCKED' WHERE id=3;" >/dev/null
+seed "UPDATE location SET status='LOCKED' WHERE id=3;"
 DEDUCT="UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 13 AND on_hand_qty_milli - allocated_qty_milli - reserved_qty_milli - quality_hold_qty_milli - hold_qty_milli >= 1000 AND EXISTS (SELECT 1 FROM location l WHERE l.id = stock.location_id AND l.status <> 'LOCKED');"
 R=$(psql -t -A -c "$DEDUCT")
 [ "$R" = "UPDATE 0" ] && ok "库位 LOCKED：扣减 rowcount=0" || bad "锁定库位仍扣减：$R"
-psql -q -c "UPDATE location SET status='AVAILABLE' WHERE id=3;" >/dev/null
+seed "UPDATE location SET status='AVAILABLE' WHERE id=3;"
 R=$(psql -t -A -c "$DEDUCT")
 [ "$R" = "UPDATE 1" ] && ok "库位解锁后 rowcount=1" || bad "解锁后：$R"
-psql -q -c "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli + 1000, ledger_seq = ledger_seq - 1 WHERE id = 13;" >/dev/null
+seed "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli + 1000, ledger_seq = ledger_seq - 1 WHERE id = 13;"
 echo "=== 2c2. post_in：REVERSE_PICK 放行库位锁（盘点期间流水），其他来源仍拦 ==="
-psql -q -c "UPDATE location SET status='LOCKED' WHERE id=3;" >/dev/null
+seed "UPDATE location SET status='LOCKED' WHERE id=3;"
 R=$(psql -t -A -c "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli + 1000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 13 AND ('REVERSE_PICK' = 'REVERSE_PICK' OR EXISTS (SELECT 1 FROM location l WHERE l.id = stock.location_id AND l.status <> 'LOCKED'))")
 [ "$R" = "UPDATE 1" ] && ok "库位 LOCKED：REVERSE_PICK 入账 rowcount=1" || bad "REVERSE_PICK 被锁拦：$R"
 R=$(psql -t -A -c "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli + 1000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 13 AND ('RECEIVE' = 'REVERSE_PICK' OR EXISTS (SELECT 1 FROM location l WHERE l.id = stock.location_id AND l.status <> 'LOCKED'))")
 [ "$R" = "UPDATE 0" ] && ok "库位 LOCKED：RECEIVE 入账 rowcount=0（→ 40906）" || bad "RECEIVE 未被锁拦：$R"
 R=$(psql -t -A -c "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli + 1000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 13 AND ('MOVE' = 'REVERSE_PICK' OR EXISTS (SELECT 1 FROM location l WHERE l.id = stock.location_id AND l.status <> 'LOCKED'))")
 [ "$R" = "UPDATE 0" ] && ok "库位 LOCKED：MOVE 目标腿 rowcount=0" || bad "MOVE 未被锁拦：$R"
-psql -q -c "UPDATE location SET status='AVAILABLE' WHERE id=3; UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq - 1 WHERE id = 13;" >/dev/null
+seed "UPDATE location SET status='AVAILABLE' WHERE id=3; UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq - 1 WHERE id = 13;"
 
 echo "=== 2d. Q7：PG 写入 bigint 的取整行为（QA 在 PG16.14 实测，已关闭）==="
 # 临时表只活在一个会话里：建表、插入、查询必须在同一次 psql 调用（小赵 C1）
-Q7=$(psql -q -t -A -c "CREATE TEMP TABLE q7 (v BIGINT); INSERT INTO q7 VALUES (3.5), (2.5), (2.5::float8); SELECT string_agg(v::text, ',' ORDER BY ctid) FROM q7;")
+Q7=$(psql -q -t -A -c "CREATE TEMP TABLE q7 (v BIGINT); INSERT INTO q7 VALUES (3.5), (2.5), (2.5::float8); SELECT string_agg(v::text, ',' ORDER BY ctid) FROM q7;") || { echo "  ✗ Q7 语句失败"; exit 2; }
 [ "$Q7" = "4,3,2" ] && ok "numeric 3.5→4、2.5→3（四舍五入），float8 2.5→2（银行家舍入）→ 应用层只绑定整数" \
                   || bad "Q7 取整结果 = $Q7（期望 4,3,2）"
 
-echo "=== 2h. docs/17 加工中心：BOM 快照、PROCESSING 冻结、领用冲回、报工业务键、守恒/出成率、保质期上限、双向追溯 ==="
-expect_allow "17 BOM 草稿（三文鱼分切，出成率 45%–55%）" "INSERT INTO process_bom (id,warehouse_id,code,bom_version,name,yield_min_bp,yield_max_bp,created_by) VALUES (1701,1,'BOM-SALMON',1,'三文鱼分切',4500,5500,8);"
-expect_block "17 BOM 出成率下限 > 上限" "INSERT INTO process_bom (id,warehouse_id,code,bom_version,name,yield_min_bp,yield_max_bp,created_by) VALUES (1709,1,'BOM-X',1,'x',6000,5000,8);" "ck_pbom_yield"
-expect_block "17 BOM 守恒容差超 10%" "INSERT INTO process_bom (id,warehouse_id,code,bom_version,name,yield_min_bp,yield_max_bp,created_by,balance_tol_bp) VALUES (1709,1,'BOM-X',1,'x',4000,5000,8,1001);" "ck_pbom_tol"
-expect_allow "17 BOM 行：原料 / 成品 / 副产品" "INSERT INTO process_bom_line (id,bom_id,line_no,line_role,sku_id,std_qty_milli) VALUES (17011,1701,1,'INPUT',1701,10000000),(17012,1701,2,'FINISHED',1702,5000000),(17013,1701,3,'BYPRODUCT',1703,2000000);"
-expect_block "17 BOM 同角色同 SKU 重复" "INSERT INTO process_bom_line (id,bom_id,line_no,line_role,sku_id,std_qty_milli) VALUES (17014,1701,4,'INPUT',1701,1000);" "uq_pboml_sku"
-expect_block "17 BOM 行角色非法" "INSERT INTO process_bom_line (id,bom_id,line_no,line_role,sku_id,std_qty_milli) VALUES (17014,1701,4,'WASTE',1704,1000);" "ck_pboml_role"
-expect_block "17 BOM 生效缺 activated_at" "UPDATE process_bom SET status='ACTIVE' WHERE id=1701;" "ck_pbom_act"
-expect_allow "17 BOM 生效" "UPDATE process_bom SET status='ACTIVE', activated_at='2026-10-15 01:00:00' WHERE id=1701;"
-expect_block "17 BOM 生效后不能加行" "INSERT INTO process_bom_line (id,bom_id,line_no,line_role,sku_id,std_qty_milli) VALUES (17015,1701,5,'BYPRODUCT',1705,1000);" "bom_frozen"
-expect_block "17 BOM 生效后不能改行" "UPDATE process_bom_line SET std_qty_milli=1 WHERE id=17012;" "bom_frozen"
-expect_block "17 BOM 生效后不能删行" "DELETE FROM process_bom_line WHERE id=17013;" "bom_frozen"
-expect_block "17 同编码第二个 ACTIVE 版本" "INSERT INTO process_bom (id,warehouse_id,code,bom_version,name,yield_min_bp,yield_max_bp,created_by,status,activated_at) VALUES (1702,1,'BOM-SALMON',2,'v2',4500,5500,8,'ACTIVE','2026-10-15 02:00:00');" "uq_pbom_active"
-expect_allow "17 同编码新版本草稿" "INSERT INTO process_bom (id,warehouse_id,code,bom_version,name,yield_min_bp,yield_max_bp,created_by) VALUES (1702,1,'BOM-SALMON',2,'v2',4600,5600,8);"
-expect_allow "17 加工单 CREATED" "INSERT INTO process_order (id,warehouse_id,code,work_date,bom_id,process_location_id,planned_input_qty_milli,created_by) VALUES (1710,1,'PRC-SH01-0001-20261015-000001','2026-10-15',1701,1790,10000000,8);"
-expect_block "17 加工单号重复" "INSERT INTO process_order (id,warehouse_id,code,work_date,bom_id,process_location_id,planned_input_qty_milli,created_by) VALUES (1719,1,'PRC-SH01-0001-20261015-000001','2026-10-15',1701,1790,1,8);" "uq_prc_code"
-expect_block "17 下达缺 BOM 快照" "UPDATE process_order SET status='RELEASED', released_at='2026-10-15 02:00:00' WHERE id=1710;" "ck_prc_snapshot"
-expect_allow "17 下达带快照" "UPDATE process_order SET status='RELEASED', released_at='2026-10-15 02:00:00', bom_code='BOM-SALMON', bom_version=1, bom_snapshot='[{\"role\":\"INPUT\",\"sku\":1701}]', yield_min_bp=4500, yield_max_bp=5500, balance_tol_bp=50, version=version+1 WHERE id=1710 AND status='CREATED';"
-expect_block "17 下达后改快照出成率上限" "UPDATE process_order SET yield_max_bp=9000 WHERE id=1710;" "process_order_frozen"
-expect_block "17 下达后改 BOM 快照内容" "UPDATE process_order SET bom_snapshot='[]' WHERE id=1710;" "process_order_frozen"
-expect_block "17 快照出成率区间非法" "INSERT INTO process_order (id,warehouse_id,code,work_date,bom_id,process_location_id,planned_input_qty_milli,created_by,yield_min_bp,yield_max_bp) VALUES (1719,1,'PRC-X','2026-10-15',1701,1790,1,8,6000,5000);" "ck_prc_yrange"
-expect_allow "17 领用：存储位整箱原料 6 KG" "INSERT INTO process_issue (id,warehouse_id,process_order_id,line_no,op_key,src_location_id,src_location_type,src_stock_id,pc_stock_id,hold_id,sku_id,lot_id,lot_expiry_date,issue_qty_milli,issue_count,issued_by) VALUES (1720,1,1710,1,'PRCI:1720',3,'PALLET',13,1791,1730,1701,1,'2026-10-25',6000000,NULL,9);"
-expect_block "17 领用：LIVE_TANK 缺尾数" "INSERT INTO process_issue (id,warehouse_id,process_order_id,line_no,op_key,src_location_id,src_location_type,src_stock_id,pc_stock_id,hold_id,sku_id,lot_id,lot_expiry_date,issue_qty_milli,issue_count,issued_by) VALUES (1721,1,1710,2,'PRCI:1721',1799,'LIVE_TANK',1798,1792,1731,1701,2,'2026-10-20',4000000,NULL,9);" "ck_prci_live"
-expect_allow "17 领用：LIVE_TANK 活鲜池 4 KG / 12 尾（宰杀归加工）" "INSERT INTO process_issue (id,warehouse_id,process_order_id,line_no,op_key,src_location_id,src_location_type,src_stock_id,pc_stock_id,hold_id,sku_id,lot_id,lot_expiry_date,issue_qty_milli,issue_count,issued_by) VALUES (1721,1,1710,2,'PRCI:1721',1799,'LIVE_TANK',1798,1792,1731,1701,2,'2026-10-20',4000000,12,9);"
-expect_block "17 领用：非活鲜池带尾数" "INSERT INTO process_issue (id,warehouse_id,process_order_id,line_no,op_key,src_location_id,src_location_type,src_stock_id,pc_stock_id,hold_id,sku_id,lot_id,lot_expiry_date,issue_qty_milli,issue_count,issued_by) VALUES (1722,1,1710,3,'PRCI:1722',3,'PALLET',13,1791,1732,1701,1,'2026-10-25',1000,3,9);" "ck_prci_live"
-expect_block "17 领用：op_key 不是 PRCI:" "INSERT INTO process_issue (id,warehouse_id,process_order_id,line_no,op_key,src_location_id,src_location_type,src_stock_id,pc_stock_id,hold_id,sku_id,lot_id,lot_expiry_date,issue_qty_milli,issue_count,issued_by) VALUES (1722,1,1710,3,'ISS:1722',3,'PALLET',13,1791,1732,1701,1,'2026-10-25',1000,NULL,9);" "ck_prci_op"
-expect_block "17 领用：同 op_key 重放" "INSERT INTO process_issue (id,warehouse_id,process_order_id,line_no,op_key,src_location_id,src_location_type,src_stock_id,pc_stock_id,hold_id,sku_id,lot_id,lot_expiry_date,issue_qty_milli,issue_count,issued_by) VALUES (1722,1,1710,3,'PRCI:1720',3,'PALLET',13,1791,1732,1701,1,'2026-10-25',1000,NULL,9);" "uq_prci_op"
-expect_allow "17 PROCESSING 系统冻结（挂加工单、operator=0）" "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,operator_id) VALUES (1730,14,'PROCESSING','PROCESSING','PROCESS_ORDER',1710,'PRCI:1720',6000000,0);"
-expect_block "17 PROCESSING 人工冻结（operator≠0）" "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,operator_id) VALUES (1731,14,'PROCESSING','PROCESSING','PROCESS_ORDER',1710,'PRCI:1721',4000000,9);" "ck_hold_process"
-expect_block "17 PROCESSING 不挂加工单" "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,operator_id) VALUES (1731,14,'PROCESSING','PROCESSING','MANUAL',1710,'PRCI:1721',4000000,0);" "ck_hold_process"
-expect_block "17 PROCESSING 原因码不匹配" "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,operator_id) VALUES (1731,14,'PROCESSING','DAMAGE','PROCESS_ORDER',1710,'PRCI:1721',4000000,0);" "ck_hold_reason"
-expect_block "17 PROCESSING op_key 不是 PRCI:" "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,operator_id) VALUES (1731,14,'PROCESSING','PROCESSING','PROCESS_ORDER',1710,'X:1721',4000000,0);" "ck_hold_process"
-expect_allow "17 加工中心库位实物库存（6 KG 全部 PROCESSING 冻结）" "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (1791,1,1,1,3,'KG',6000000,6000000);"
-R=$(psql -t -A -c "SELECT COALESCE((SELECT available_qty_milli FROM v_stock_available WHERE stock_id=1791)::text,'none')")
-[ "$R" = "0" ] && ok "17 PROCESSING 不计入可用库存 = $R" || bad "17 PROCESSING 不计入可用库存 = $R（期望 0）"
-expect_allow "17 加工单进入 IN_PROGRESS，累计领用 10 KG" "UPDATE process_order SET status='IN_PROGRESS', issued_qty_milli=10000000, version=version+1 WHERE id=1710 AND status='RELEASED';"
-expect_block "17 领用行冲回 > 领用" "UPDATE process_issue SET reversed_qty_milli=6000001 WHERE id=1720;" "ck_prci_reverse"
-R=$(psql -t -A -c "UPDATE process_issue SET reversed_qty_milli=reversed_qty_milli+500000, version=version+1 WHERE id=1720 AND reversed_qty_milli+500000 <= issue_qty_milli")
-[ "$R" = "UPDATE 1" ] && ok "17 冲回 0.5 KG（条件更新命中） rowcount=1" || bad "17 冲回 0.5 KG（条件更新命中）：$R（期望 UPDATE 1）"
-R=$(psql -t -A -c "UPDATE process_issue SET reversed_qty_milli=reversed_qty_milli+5600000, version=version+1 WHERE id=1720 AND reversed_qty_milli+5600000 <= issue_qty_milli")
-[ "$R" = "UPDATE 0" ] && ok "17 再冲回 5.6 KG 超可冲回量 → 42214 OVER_REVERSE rowcount=0" || bad "17 再冲回 5.6 KG 超可冲回量 → 42214 OVER_REVERSE：$R（期望 UPDATE 0）"
-expect_block "17 单头冲回 > 领用" "UPDATE process_order SET reversed_qty_milli=10000001 WHERE id=1710;" "ck_prc_reverse"
-expect_allow "17 单头冲回 0.5 KG（净领用 9.5 KG）" "UPDATE process_order SET reversed_qty_milli=500000 WHERE id=1710;"
-expect_block "17 领用量不能回退" "UPDATE process_order SET issued_qty_milli=9000000 WHERE id=1710;" "process_order_frozen"
-expect_allow "17 报工 #1（report_client_id）" "INSERT INTO process_report (id,warehouse_id,process_order_id,report_client_id,request_hash,report_seq,is_final,response_http,response,reported_by) VALUES (1740,1,1710,'00000000-0000-4000-8000-000000001740','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,false,200,'{}',9);"
-expect_block "17 同单同 report_client_id 再建（应重放原结果）" "INSERT INTO process_report (id,warehouse_id,process_order_id,report_client_id,request_hash,report_seq,is_final,response_http,response,reported_by) VALUES (1741,1,1710,'00000000-0000-4000-8000-000000001740','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',2,false,200,'{}',9);" "uq_prcr_client"
-expect_allow "17 另一张单同 report_client_id 放行" "INSERT INTO process_report (id,warehouse_id,process_order_id,report_client_id,request_hash,report_seq,is_final,response_http,response,reported_by) VALUES (1741,1,1711,'00000000-0000-4000-8000-000000001740','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',1,false,200,'{}',9);"
-expect_block "17 报工序号重复" "INSERT INTO process_report (id,warehouse_id,process_order_id,report_client_id,request_hash,report_seq,is_final,response_http,response,reported_by) VALUES (1742,1,1710,'00000000-0000-4000-8000-000000001742','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,false,200,'{}',9);" "uq_prcr_seq"
-expect_block "17 report_client_id 不是 UUID" "INSERT INTO process_report (id,warehouse_id,process_order_id,report_client_id,request_hash,report_seq,is_final,response_http,response,reported_by) VALUES (1742,1,1710,'abc','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',2,false,200,'{}',9);" "ck_prcr_client"
-expect_block "17 报工缓存 409（只缓存成功）" "INSERT INTO process_report (id,warehouse_id,process_order_id,report_client_id,request_hash,report_seq,is_final,response_http,response,reported_by) VALUES (1742,1,1710,'00000000-0000-4000-8000-000000001742','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',2,false,409,'{}',9);" "ck_prcr_http"
-expect_block "17 报工记录不可改（重放恒定）" "UPDATE process_report SET request_hash='cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' WHERE id=1740;" "append_only_violation: process_report"
-expect_block "17 报工记录不可删" "DELETE FROM process_report WHERE id=1740;" "append_only_violation: process_report"
-expect_allow "17 成品 4.8 KG（毛 4.82 − 皮 0.02，到期 ≤ 最早原料到期）" "INSERT INTO process_output (id,warehouse_id,process_order_id,report_id,line_no,output_role,sku_id,lot_id,to_location_id,gross_qty_milli,tare_qty_milli,qty_milli,processed_at,expiry_date,sell_deadline,earliest_raw_expiry,scrap_order_id,loss_reason) VALUES (1750,1,1710,1740,1,'FINISHED',1702,1760,1,4820000,20000,4800000,'2026-10-15 03:00:00','2026-10-18','2026-10-17','2026-10-20',NULL,NULL);"
-expect_block "17 净重 ≠ 毛重 − 皮重" "INSERT INTO process_output (id,warehouse_id,process_order_id,report_id,line_no,output_role,sku_id,lot_id,to_location_id,gross_qty_milli,tare_qty_milli,qty_milli,processed_at,expiry_date,sell_deadline,earliest_raw_expiry,scrap_order_id,loss_reason) VALUES (1759,1,1710,1740,9,'FINISHED',1702,1769,1,4820000,20000,4810000,'2026-10-15 03:00:00','2026-10-18',NULL,'2026-10-20',NULL,NULL);" "ck_prco_net"
-expect_block "17 成品到期日晚于最早原料到期日" "INSERT INTO process_output (id,warehouse_id,process_order_id,report_id,line_no,output_role,sku_id,lot_id,to_location_id,gross_qty_milli,tare_qty_milli,qty_milli,processed_at,expiry_date,sell_deadline,earliest_raw_expiry,scrap_order_id,loss_reason) VALUES (1759,1,1710,1740,9,'FINISHED',1702,1769,1,1000,0,1000,'2026-10-15 03:00:00','2026-10-21',NULL,'2026-10-20',NULL,NULL);" "ck_prco_expiry"
-expect_block "17 可售截止晚于到期日" "INSERT INTO process_output (id,warehouse_id,process_order_id,report_id,line_no,output_role,sku_id,lot_id,to_location_id,gross_qty_milli,tare_qty_milli,qty_milli,processed_at,expiry_date,sell_deadline,earliest_raw_expiry,scrap_order_id,loss_reason) VALUES (1759,1,1710,1740,9,'FINISHED',1702,1769,1,1000,0,1000,'2026-10-15 03:00:00','2026-10-18','2026-10-19','2026-10-20',NULL,NULL);" "ck_prco_sell"
-expect_block "17 成品缺批次" "INSERT INTO process_output (id,warehouse_id,process_order_id,report_id,line_no,output_role,sku_id,lot_id,to_location_id,gross_qty_milli,tare_qty_milli,qty_milli,processed_at,expiry_date,sell_deadline,earliest_raw_expiry,scrap_order_id,loss_reason) VALUES (1759,1,1710,1740,9,'FINISHED',1702,NULL,1,1000,0,1000,'2026-10-15 03:00:00','2026-10-18',NULL,'2026-10-20',NULL,NULL);" "ck_prco_kind"
-expect_allow "17 副产品（鱼骨，独立 SKU 新批次）2 KG" "INSERT INTO process_output (id,warehouse_id,process_order_id,report_id,line_no,output_role,sku_id,lot_id,to_location_id,gross_qty_milli,tare_qty_milli,qty_milli,processed_at,expiry_date,sell_deadline,earliest_raw_expiry,scrap_order_id,loss_reason) VALUES (1751,1,1710,1740,2,'BYPRODUCT',1703,1761,1,2000000,0,2000000,'2026-10-15 03:00:00','2026-10-17',NULL,'2026-10-20',NULL,NULL);"
-expect_block "17 产出批次复用" "INSERT INTO process_output (id,warehouse_id,process_order_id,report_id,line_no,output_role,sku_id,lot_id,to_location_id,gross_qty_milli,tare_qty_milli,qty_milli,processed_at,expiry_date,sell_deadline,earliest_raw_expiry,scrap_order_id,loss_reason) VALUES (1759,1,1710,1740,9,'BYPRODUCT',1703,1761,1,1000,0,1000,'2026-10-15 03:00:00','2026-10-17',NULL,'2026-10-20',NULL,NULL);" "uq_prco_lot"
-expect_block "17 损耗不挂报损单" "INSERT INTO process_output (id,warehouse_id,process_order_id,report_id,line_no,output_role,sku_id,lot_id,to_location_id,gross_qty_milli,tare_qty_milli,qty_milli,processed_at,expiry_date,sell_deadline,earliest_raw_expiry,scrap_order_id,loss_reason) VALUES (1752,1,1710,1740,3,'LOSS',1701,NULL,NULL,2700000,0,2700000,'2026-10-15 03:00:00',NULL,NULL,NULL,NULL,'TRIM');" "ck_prco_kind"
-expect_block "17 损耗带批次" "INSERT INTO process_output (id,warehouse_id,process_order_id,report_id,line_no,output_role,sku_id,lot_id,to_location_id,gross_qty_milli,tare_qty_milli,qty_milli,processed_at,expiry_date,sell_deadline,earliest_raw_expiry,scrap_order_id,loss_reason) VALUES (1752,1,1710,1740,3,'LOSS',1701,1769,NULL,2700000,0,2700000,'2026-10-15 03:00:00',NULL,NULL,NULL,9001,'TRIM');" "ck_prco_kind"
-expect_block "17 损耗原因非法" "INSERT INTO process_output (id,warehouse_id,process_order_id,report_id,line_no,output_role,sku_id,lot_id,to_location_id,gross_qty_milli,tare_qty_milli,qty_milli,processed_at,expiry_date,sell_deadline,earliest_raw_expiry,scrap_order_id,loss_reason) VALUES (1752,1,1710,1740,3,'LOSS',1701,NULL,NULL,2700000,0,2700000,'2026-10-15 03:00:00',NULL,NULL,NULL,9001,'LOST');" "ck_prco_kind"
-expect_allow "17 损耗 2.7 KG → 第 9 篇报损单（PROCESS_LOSS）" "INSERT INTO process_output (id,warehouse_id,process_order_id,report_id,line_no,output_role,sku_id,lot_id,to_location_id,gross_qty_milli,tare_qty_milli,qty_milli,processed_at,expiry_date,sell_deadline,earliest_raw_expiry,scrap_order_id,loss_reason) VALUES (1752,1,1710,1740,3,'LOSS',1701,NULL,NULL,2700000,0,2700000,'2026-10-15 03:00:00',NULL,NULL,NULL,9001,'TRIM');"
-expect_block "17 产出净重不可改" "UPDATE process_output SET qty_milli=1 WHERE id=1750;" "process_output_immutable"
-expect_block "17 产出到期日不可改" "UPDATE process_output SET expiry_date='2026-10-19' WHERE id=1750;" "process_output_immutable"
-expect_block "17 产出行不可删" "DELETE FROM process_output WHERE id=1750;" "process_output_immutable"
-expect_block "17 产出冲回 > 产出" "UPDATE process_output SET reversed_qty_milli=4800001 WHERE id=1750;" "ck_prco_reverse"
-expect_allow "17 成品已全部分配（已出库链路）的库存行" "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,allocated_qty_milli) VALUES (1795,1,2,1,2,'KG',4800000,4800000);"
-R=$(psql -t -A -c "UPDATE stock SET on_hand_qty_milli=on_hand_qty_milli-1000, version=version+1 WHERE id=1795 AND on_hand_qty_milli-allocated_qty_milli-reserved_qty_milli-quality_hold_qty_milli-hold_qty_milli >= 1000")
-[ "$R" = "UPDATE 0" ] && ok "17 已分配/已出库成品不可冲回 → 42214 OVER_REVERSE rowcount=0" || bad "17 已分配/已出库成品不可冲回 → 42214 OVER_REVERSE：$R（期望 UPDATE 0）"
-expect_allow "17 追溯：成品 1760 ← 原料 1、2；副产 1761 ← 原料 1" "INSERT INTO process_lot_trace (id,warehouse_id,process_order_id,output_id,output_lot_id,issue_id,raw_lot_id) VALUES (1770,1,1710,1750,1760,1720,1),(1771,1,1710,1750,1760,1721,2),(1772,1,1710,1751,1761,1720,1);"
-expect_block "17 追溯重复" "INSERT INTO process_lot_trace (id,warehouse_id,process_order_id,output_id,output_lot_id,issue_id,raw_lot_id) VALUES (1773,1,1710,1750,1760,1720,1);" "uq_plt"
-expect_block "17 追溯自指" "INSERT INTO process_lot_trace (id,warehouse_id,process_order_id,output_id,output_lot_id,issue_id,raw_lot_id) VALUES (1773,1,1710,1750,1760,1720,1760);" "ck_plt_self"
-expect_allow "17 二级加工：成品 1760 作为原料 → 1780" "INSERT INTO process_lot_trace (id,warehouse_id,process_order_id,output_id,output_lot_id,issue_id,raw_lot_id) VALUES (1773,1,1712,1753,1780,1723,1760);"
-expect_block "17 追溯不可改" "UPDATE process_lot_trace SET raw_lot_id=3 WHERE id=1770;" "append_only_violation: process_lot_trace"
-R=$(psql -t -A -c "SELECT string_agg(raw_lot_id::text, ',' ORDER BY raw_lot_id) FROM process_lot_trace WHERE output_lot_id=1760")
-[ "$R" = "1,2" ] && ok "17 反查：成品 1760 的原料批次 = $R" || bad "17 反查：成品 1760 的原料批次 = $R（期望 1,2）"
-R=$(psql -t -A -c "WITH RECURSIVE f(lot) AS (SELECT output_lot_id FROM process_lot_trace WHERE raw_lot_id=1 UNION SELECT t.output_lot_id FROM process_lot_trace t JOIN f ON t.raw_lot_id=f.lot) SELECT string_agg(lot::text, ',' ORDER BY lot) FROM f")
-[ "$R" = "1760,1761,1780" ] && ok "17 召回正查（递归多级）：原料批次 1 → 全部下游批次 = $R" || bad "17 召回正查（递归多级）：原料批次 1 → 全部下游批次 = $R（期望 1760,1761,1780）"
-R=$(psql -t -A -c "WITH RECURSIVE b(lot) AS (SELECT raw_lot_id FROM process_lot_trace WHERE output_lot_id=1780 UNION SELECT t.raw_lot_id FROM process_lot_trace t JOIN b ON t.output_lot_id=b.lot) SELECT string_agg(lot::text, ',' ORDER BY lot) FROM b")
-[ "$R" = "1,2,1760" ] && ok "17 召回反查（递归多级）：成品 1780 → 全部上游批次 = $R" || bad "17 召回反查（递归多级）：成品 1780 → 全部上游批次 = $R（期望 1,2,1760）"
-expect_block "17 进行中产出超过净领用" "UPDATE process_order SET output_qty_milli=9600000 WHERE id=1710;" "ck_prc_cap"
-expect_block "17 完工守恒不平（9.5 ≠ 4.8+2.0+2.6）" "UPDATE process_order SET status='COMPLETED', output_qty_milli=4800000, byproduct_qty_milli=2000000, loss_qty_milli=2600000, yield_bp=5052, completed_at='2026-10-15 04:00:00' WHERE id=1710;" "ck_prc_balance"
-expect_block "17 完工出成率与净额不符（应用传 5100）" "UPDATE process_order SET status='COMPLETED', output_qty_milli=4800000, byproduct_qty_milli=2000000, loss_qty_milli=2700000, yield_bp=5100, completed_at='2026-10-15 04:00:00' WHERE id=1710;" "ck_prc_yield"
-expect_block "17 界内出成率不能转审批" "UPDATE process_order SET status='PENDING_APPROVAL', output_qty_milli=4800000, byproduct_qty_milli=2000000, loss_qty_milli=2700000, yield_bp=5052, approval_no='APR-WHSH01-20261015-000016' WHERE id=1710;" "ck_prc_dev"
-expect_block "17 完工缺 completed_at" "UPDATE process_order SET status='COMPLETED', output_qty_milli=4800000, byproduct_qty_milli=2000000, loss_qty_milli=2700000, yield_bp=5052 WHERE id=1710;" "ck_prc_done"
-R=$(psql -t -A -c "UPDATE process_order SET status='COMPLETED', output_qty_milli=4800000, byproduct_qty_milli=2000000, loss_qty_milli=2700000, yield_bp=5052, completed_at='2026-10-15 04:00:00', version=version+1 WHERE id=1710 AND status='IN_PROGRESS'")
-[ "$R" = "UPDATE 1" ] && ok "17 完工：守恒、出成率 50.52% 在界内（条件更新） rowcount=1" || bad "17 完工：守恒、出成率 50.52% 在界内（条件更新）：$R（期望 UPDATE 1）"
-expect_block "17 完工后单据只读" "UPDATE process_order SET loss_qty_milli=2700001 WHERE id=1710;" "process_order_frozen"
-expect_allow "17 偏差单 1711 下达" "INSERT INTO process_order (id,warehouse_id,code,work_date,bom_id,process_location_id,planned_input_qty_milli,created_by,status,released_at,bom_code,bom_version,bom_snapshot,yield_min_bp,yield_max_bp,balance_tol_bp,issued_qty_milli) VALUES (1711,1,'PRC-SH01-0001-20261015-000002','2026-10-15',1701,1790,1000000,8,'IN_PROGRESS','2026-10-15 02:00:00','BOM-SALMON',1,'[]',4500,5500,50,1000000);"
-expect_block "17 出成率 40% 越界直接完工（无审批）" "UPDATE process_order SET status='COMPLETED', output_qty_milli=400000, loss_qty_milli=600000, yield_bp=4000, completed_at='2026-10-15 04:00:00' WHERE id=1711;" "ck_prc_dev"
-expect_block "17 审批单号格式非法" "UPDATE process_order SET status='PENDING_APPROVAL', output_qty_milli=400000, loss_qty_milli=600000, yield_bp=4000, approval_no='APR-1' WHERE id=1711;" "ck_prc_apr"
-expect_block "17 审批单号日期不存在（2 月 30 日）" "UPDATE process_order SET status='PENDING_APPROVAL', output_qty_milli=400000, loss_qty_milli=600000, yield_bp=4000, approval_no='APR-WHSH01-20260230-000017' WHERE id=1711;" "ck_prc_apr"
-expect_allow "17 越界转 PROCESS_YIELD_DEVIATION 审批（202）" "UPDATE process_order SET status='PENDING_APPROVAL', output_qty_milli=400000, loss_qty_milli=600000, yield_bp=4000, approval_no='APR-WHSH01-20261015-000017' WHERE id=1711;"
-expect_allow "17 审批通过 → COMPLETED（保留审批单号）" "UPDATE process_order SET status='COMPLETED', completed_at='2026-10-15 05:00:00' WHERE id=1711;"
-expect_block "17 审批单号被第二张加工单复用" "INSERT INTO process_order (id,warehouse_id,code,work_date,bom_id,process_location_id,planned_input_qty_milli,created_by,approval_no) VALUES (1718,1,'PRC-SH01-0001-20261015-000008','2026-10-15',1701,1790,1,8,'APR-WHSH01-20261015-000017');" "uq_prc_apr"
-expect_allow "17 撤销单 1713（已领 1 KG、已全部冲回）" "INSERT INTO process_order (id,warehouse_id,code,work_date,bom_id,process_location_id,planned_input_qty_milli,created_by,status,released_at,bom_code,bom_version,bom_snapshot,yield_min_bp,yield_max_bp,balance_tol_bp,issued_qty_milli,reversed_qty_milli) VALUES (1713,1,'PRC-SH01-0001-20261015-000003','2026-10-15',1701,1790,1000000,8,'IN_PROGRESS','2026-10-15 02:00:00','BOM-SALMON',1,'[]',4500,5500,50,1000000,1000000);"
-expect_block "17 撤销缺原因" "UPDATE process_order SET status='CANCELLED' WHERE id=1713;" "ck_prc_cancel"
-expect_allow "17 撤销（领用全部冲回）" "UPDATE process_order SET status='CANCELLED', cancel_reason='设备故障' WHERE id=1713;"
-expect_allow "17 撤销单 1714（领用未冲回完）" "INSERT INTO process_order (id,warehouse_id,code,work_date,bom_id,process_location_id,planned_input_qty_milli,created_by,status,released_at,bom_code,bom_version,bom_snapshot,yield_min_bp,yield_max_bp,balance_tol_bp,issued_qty_milli,reversed_qty_milli) VALUES (1714,1,'PRC-SH01-0001-20261015-000004','2026-10-15',1701,1790,1000000,8,'IN_PROGRESS','2026-10-15 02:00:00','BOM-SALMON',1,'[]',4500,5500,50,1000000,400000);"
-expect_block "17 有未冲回领用不能撤销" "UPDATE process_order SET status='CANCELLED', cancel_reason='x' WHERE id=1714;" "ck_prc_cancel"
-expect_allow "17 领用冲回记录" "INSERT INTO process_reversal (id,warehouse_id,process_order_id,op_key,reversal_type,issue_id,output_id,qty_milli,reason,operator_id) VALUES (1790,1,1710,'PRCR:00000000-0000-4000-8000-000000001790','ISSUE',1720,NULL,500000,'多领',9);"
-expect_block "17 冲回同时挂领用和产出" "INSERT INTO process_reversal (id,warehouse_id,process_order_id,op_key,reversal_type,issue_id,output_id,qty_milli,reason,operator_id) VALUES (1791,1,1710,'PRCR:x1','ISSUE',1720,1750,1,'x',9);" "ck_prcv_type"
-expect_block "17 冲回 op_key 重放" "INSERT INTO process_reversal (id,warehouse_id,process_order_id,op_key,reversal_type,issue_id,output_id,qty_milli,reason,operator_id) VALUES (1791,1,1710,'PRCR:00000000-0000-4000-8000-000000001790','ISSUE',1720,NULL,500000,'多领',9);" "uq_prcv_op"
-expect_block "17 冲回记录不可删" "DELETE FROM process_reversal WHERE id=1790;" "append_only_violation: process_reversal"
-OUT=$(psql -q -c "SET ROLE wms_app; UPDATE process_report SET response='{}' WHERE id=1740;")
-case "$OUT" in *"permission denied for table process_report"*) ok "17 wms_app 对 process_report 无 UPDATE（报工只追加）";; *) bad "wms_app 改 process_report 未被拒：$OUT";; esac
+echo "=== 2g. docs/10 退货与异常：异常单 I1/I2、A2 键、FAILOVER_GAP、RTN milli、A1/A3/A4 ==="
+seed "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (1953,2,'LOT-RTN-1953','2026-10-31','2026-10-14');"   # #5 自有批次：避开 #2 N-1/N-2 库存行维度（uq_stock_dim）
+expect_allow "10 准备：异常码字典 RETURN_COUNT_DIFF / FAILOVER_GAP" "INSERT INTO exception_code (code,name,action,liability) VALUES ('RETURN_COUNT_DIFF','拒收回仓清点差异','ADJUST','CARRIER'),('FAILOVER_GAP','故障切换丢单','NONE','WAREHOUSE');"
+expect_allow "10 拒收回仓差异异常单（key=POD:1610:0，司机报 5000，仓点 4000）" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (100,'EXC-100',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','POD:1610:0','0000000000000000000000000000000000000000000000000000000000000001',1,1,5000,4000,-1000,'2026-10-15 12:00:00',7);"
+expect_block "10 同一来源业务键重复建异常单" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (101,'EXC-101',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','POD:1610:0','0000000000000000000000000000000000000000000000000000000000000002',1,1,5000,3000,-2000,'2026-10-15 12:00:00',7);" "uq_exc_src"
+expect_block "10 差异列必须 = 实点 − 声称" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (102,'EXC-102',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','POD:1612:0','0000000000000000000000000000000000000000000000000000000000000003',1,1,5000,4000,1000,'2026-10-15 12:00:00',7);" "ck_exc_diff"
+expect_block "10 I1 异常码不在字典（外键）" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (103,'EXC-103',1,'NO_SUCH_CODE','DELIVERY_RETURN','POD:1613:0','0000000000000000000000000000000000000000000000000000000000000004',1,1,5000,4000,-1000,'2026-10-15 12:00:00',7);" "exception_case_exception_code_fkey"
+expect_block "10 I1 来源类型非法" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (104,'EXC-104',1,'RETURN_COUNT_DIFF','BOGUS','X:1','0000000000000000000000000000000000000000000000000000000000000005',1,1,5000,4000,-1000,'2026-10-15 12:00:00',7);" "ck_exc_src_type"
+expect_block "10 source_hash 不是 64 位小写 hex" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (105,'EXC-105',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','POD:1614:0','h1',1,1,5000,4000,-1000,'2026-10-15 12:00:00',7);" "ck_exc_hash"
+expect_block "10 source_hash 大写" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (106,'EXC-106',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','POD:1615:0','AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',1,1,5000,4000,-1000,'2026-10-15 12:00:00',7);" "ck_exc_hash"
+expect_block "10 关闭异常必须有处置结论和处理人" "UPDATE exception_case SET status='RESOLVED' WHERE id=100;" "ck_exc_close"
+expect_block "10 异常单非法状态" "UPDATE exception_case SET status='DONE' WHERE id=100;" "ck_exc_status"
+expect_allow "10 OPEN → RESOLVED（ACCEPT_COUNT）" "UPDATE exception_case SET status='RESOLVED', resolution='ACCEPT_COUNT', closed_by=8 WHERE id=100;"
+expect_block "10 I2 RESOLVED 后改实点（同时改差异，ck_exc_diff 仍成立）" "UPDATE exception_case SET counted_qty_milli=5000, diff_qty_milli=0 WHERE id=100;" "exc_immutable"
+expect_block "10 I2 RESOLVED → OPEN" "UPDATE exception_case SET status='OPEN' WHERE id=100;" "exc_state_forward_only"
+expect_allow "10 RESOLVED → CLOSED" "UPDATE exception_case SET status='CLOSED', closed_at='2026-10-15 12:00:00' WHERE id=100;"
+expect_block "10 I2 CLOSED → OPEN" "UPDATE exception_case SET status='OPEN' WHERE id=100;" "exc_state_forward_only"
+expect_block "10 I2 CLOSED 后改声称数" "UPDATE exception_case SET claimed_qty_milli=4000, diff_qty_milli=0 WHERE id=100;" "exc_immutable"
+expect_allow "10 A2 首签差异单 POD:1611:0" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (110,'EXC-110',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','POD:1611:0','000000000000000000000000000000000000000000000000000000000000000a',1,1,5000,4000,-1000,'2026-10-15 12:00:00',7);"
+expect_allow "10 A2 更正后先取消旧单（X5）" "UPDATE exception_case SET status='CANCELLED' WHERE id=110;"
+expect_block "10 A2 已取消的旧键仍占位（uq_exc_src 不变，不能复用旧键）" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (111,'EXC-111',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','POD:1611:0','000000000000000000000000000000000000000000000000000000000000000b',1,1,5000,3000,-2000,'2026-10-15 12:00:00',7);" "uq_exc_src"
+expect_allow "10 A2 更正后新键 POD:1611:1 建单成功" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (112,'EXC-112',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','POD:1611:1','000000000000000000000000000000000000000000000000000000000000000c',1,1,5000,3000,-2000,'2026-10-15 12:00:00',7);"
+expect_block "10 I2 CANCELLED → OPEN" "UPDATE exception_case SET status='OPEN' WHERE id=110;" "exc_state_forward_only"
+expect_allow "10 FAILOVER_GAP 第一次故障 FG:1:ERP:SO-1" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (120,'EXC-120',1,'FAILOVER_GAP','FAILOVER_GAP','FG:1:ERP:SO-1','0000000000000000000000000000000000000000000000000000000000000014',1,1,0,0,0,'2026-10-15 12:00:00',7);"
+expect_allow "10 FAILOVER_GAP 同一单第二次故障 FG:2:ERP:SO-1 不撞键" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (121,'EXC-121',1,'FAILOVER_GAP','FAILOVER_GAP','FG:2:ERP:SO-1','0000000000000000000000000000000000000000000000000000000000000015',1,1,0,0,0,'2026-10-15 12:00:00',7);"
+expect_block "10 FAILOVER_GAP 同一次故障同一单重复" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (122,'EXC-122',1,'FAILOVER_GAP','FAILOVER_GAP','FG:1:ERP:SO-1','0000000000000000000000000000000000000000000000000000000000000016',1,1,0,0,0,'2026-10-15 12:00:00',7);" "uq_exc_src"
+expect_block "10 异常码字典责任方取值" "INSERT INTO exception_code (code,name,action,liability) VALUES ('X','x','NONE','NOBODY');" "ck_exc_liab"
+expect_allow "10 准备：RTN 单头 8001（第 3 篇 inbound_order，order_type=RETURN，source=WMS_DELIVERY）" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8001,'RTN-8001',1,'RETURN','WMS_DELIVERY','POD-1610','RECEIVING','2026-10-15');"
+expect_block "10 ALTER ck_inb_rtn_src：RETURN 单来源不在白名单" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8002,'RTN-8002',1,'RETURN','WMS','X-1','RECEIVING','2026-10-15');" "ck_inb_rtn_src"
+expect_allow "10 I3 RTN 行 milli 列（实点 4000；声称数在异常单 / 预约行，不在 inbound_line）" "INSERT INTO inbound_line (id,inbound_id,line_no,sku_id,uom,received_qty_milli) VALUES (8101,8001,1,2,'KG',4000);"
+expect_block "10 I3 质检合格+不合格 > 实点" "UPDATE inbound_line SET qc_passed_qty_milli=3000, qc_failed_qty_milli=1001 WHERE id=8101;" "ck_inbl_qc"
+expect_block "10 I3 负的实点" "INSERT INTO inbound_line (id,inbound_id,line_no,sku_id,uom,received_qty_milli) VALUES (8102,8001,2,2,'KG',-1);" "ck_inbl_qc"
+expect_allow "10 A3 准备：RTN 收货后 RETURN_QC 系统冻结 4000（source=QC/RTN 8001，operator=0）" "BEGIN; INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,quality_hold_qty_milli) VALUES (1960,1,3,2,1953,'KG',4000,4000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (60,1960,'RETURN_QC','RETURN_QC','QC',8001,'RQC:8101',4000,0,'HELD',0); COMMIT;"
+expect_block "10 A3 退货待检挂成 QUALITY 人工冻结（RETURN_QC 必须系统冻结）" "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (61,1960,'RETURN_QC','RETURN_QC','QC',8001,'RQC:8101b',1000,0,'HELD',7);" "ck_hold_retqc"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 60 AND status = 'HELD' AND hold_type IN ('QUALITY','MANUAL')")
+[ "$R" = "UPDATE 0" ] && ok "10 A3 人工解冻路径（只放行 QUALITY/MANUAL）对 RETURN_QC → 40933 rowcount=0" || bad "10 A3 人工解冻路径（只放行 QUALITY/MANUAL）对 RETURN_QC → 40933：$R（期望 UPDATE 0）"
+expect_allow "10 A4 质检合格：qc_passed +1000 与 release_qc_hold 1000 同事务、同 op_key QCR:8101:1" "BEGIN; UPDATE inbound_line SET qc_passed_qty_milli = qc_passed_qty_milli + 1000 WHERE id = 8101 AND qc_passed_qty_milli + qc_failed_qty_milli + 1000 <= received_qty_milli; INSERT INTO stock_hold_release (id,hold_id,op_key,qty_milli) VALUES (60,60,'QCR:8101:1',1000); UPDATE stock_hold SET released_qty_milli = released_qty_milli + 1000, version = version + 1 WHERE id = 60 AND hold_type = 'RETURN_QC' AND source_type = 'QC' AND source_id = 8001 AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 1000; UPDATE stock SET quality_hold_qty_milli = quality_hold_qty_milli - 1000, version = version + 1 WHERE id = 1960 AND quality_hold_qty_milli >= 1000; COMMIT;"
+expect_block "10 A4 重放同一 op_key（Key 过期后再提交）整事务回滚" "BEGIN; UPDATE inbound_line SET qc_passed_qty_milli = qc_passed_qty_milli + 1000 WHERE id = 8101 AND qc_passed_qty_milli + qc_failed_qty_milli + 1000 <= received_qty_milli; INSERT INTO stock_hold_release (id,hold_id,op_key,qty_milli) VALUES (61,60,'QCR:8101:1',1000); UPDATE stock_hold SET released_qty_milli = released_qty_milli + 1000, version = version + 1 WHERE id = 60 AND hold_type = 'RETURN_QC' AND source_type = 'QC' AND source_id = 8001 AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 1000; UPDATE stock SET quality_hold_qty_milli = quality_hold_qty_milli - 1000, version = version + 1 WHERE id = 1960 AND quality_hold_qty_milli >= 1000; COMMIT;" "uq_hr_op"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = released_qty_milli + 500, version = version + 1 WHERE id = 60 AND hold_type = 'RETURN_QC' AND source_type = 'QC' AND source_id = 8002 AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 500")
+[ "$R" = "UPDATE 0" ] && ok "10 A4 release_qc_hold 新签名：inbound_order_id 与冻结 source_id 不符（8002≠8001）→ 40930 rowcount=0" || bad "10 A4 release_qc_hold 新签名：inbound_order_id 与冻结 source_id 不符（8002≠8001）→ 40930：$R（期望 UPDATE 0）"
+R=$(psql -t -A -c "SELECT l.qc_passed_qty_milli||'/'||h.released_qty_milli||'/'||s.quality_hold_qty_milli FROM inbound_line l, stock_hold h, stock s WHERE l.id=8101 AND h.id=60 AND s.id=1960")
+[ "$R" = "1000/1000/3000" ] && ok "10 A4 重放后 qc_passed/已释放/quality_hold（只记一次、只解一次） = $R" || bad "10 A4 重放后 qc_passed/已释放/quality_hold（只记一次、只解一次） = $R（期望 1000/1000/3000）"
+expect_block "10 A1 不合格转 SCRAP_PENDING 不能挂质检来源（必须挂报损单）" "BEGIN; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 60 AND status = 'HELD' AND released_qty_milli = 1000; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (62,1960,'SCRAP_PENDING','SCRAP','QC',8001,'CVT:60:1',3000,0,'HELD',0); COMMIT;" "ck_hold_scrap"
+expect_allow "10 A1 先建 DRAFT 报损单 9201，再 convert_hold(qty=3000) RETURN_QC → SCRAP_PENDING（子明细 from_hold_id=60）（source=SCRAP/9201）" "BEGIN; UPDATE inbound_line SET qc_failed_qty_milli = qc_failed_qty_milli + 3000 WHERE id = 8101 AND qc_passed_qty_milli + qc_failed_qty_milli + 3000 <= received_qty_milli; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 60 AND status = 'HELD' AND released_qty_milli = 1000; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,from_hold_id) VALUES (63,1960,'SCRAP_PENDING','SCRAP','SCRAP',9201,'CVT:60:1',3000,0,'HELD',0,60); UPDATE stock SET quality_hold_qty_milli = quality_hold_qty_milli - 3000, hold_qty_milli = hold_qty_milli + 3000, version = version + 1 WHERE id = 1960 AND quality_hold_qty_milli >= 3000; COMMIT;"
+R=$(psql -t -A -c "SELECT quality_hold_qty_milli||'/'||hold_qty_milli||'/'||(on_hand_qty_milli-allocated_qty_milli-reserved_qty_milli-quality_hold_qty_milli-hold_qty_milli) FROM stock WHERE id=1960")
+[ "$R" = "0/3000/1000" ] && ok "10 A1 转后 quality/hold/available = $R" || bad "10 A1 转后 quality/hold/available = $R（期望 0/3000/1000）"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 63 AND status = 'HELD' AND hold_type IN ('QUALITY','MANUAL')")
+[ "$R" = "UPDATE 0" ] && ok "10 A1 人工解冻路径对转入的 SCRAP_PENDING → 40933 rowcount=0" || bad "10 A1 人工解冻路径对转入的 SCRAP_PENDING → 40933：$R（期望 UPDATE 0）"
+
+expect_allow "10 L1 准备：异常单 140 / 141（OPEN）" "BEGIN; INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (140,'EXC-140',1,'RETURN_COUNT_DIFF','MANUAL','M:140','0000000000000000000000000000000000000000000000000000000000000082',1,1,5000,4000,-1000,'2026-10-15 12:00:00',7); INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (141,'EXC-141',1,'RETURN_COUNT_DIFF','MANUAL','M:141','0000000000000000000000000000000000000000000000000000000000000083',1,1,5000,4000,-1000,'2026-10-15 12:00:00',7); COMMIT;"
+expect_block "10 L1 OPEN → CLOSED（跳过 RESOLVED）" "UPDATE exception_case SET status='CLOSED', resolution='ACCEPT_COUNT', closed_by=8 WHERE id=141;" "exc_state_forward_only"
+expect_allow "10 L1 OPEN → PROCESSING" "UPDATE exception_case SET status='PROCESSING', assignee_id=8 WHERE id=140;"
+expect_block "10 L1 PROCESSING → CLOSED（跳过 RESOLVED）" "UPDATE exception_case SET status='CLOSED', resolution='ACCEPT_COUNT', closed_by=8 WHERE id=140;" "exc_state_forward_only"
+expect_block "10 建议 1 处置结论取值非法" "UPDATE exception_case SET resolution='WHATEVER' WHERE id=141;" "ck_exc_resol"
+expect_block "10 建议 1 报损处置缺报损单号" "UPDATE exception_case SET status='RESOLVED', resolution='SCRAP', closed_by=8 WHERE id=140;" "ck_exc_resdoc"
+expect_allow "10 L1 PROCESSING → RESOLVED（SCRAP，带单号）" "UPDATE exception_case SET status='RESOLVED', resolution='SCRAP', resolution_doc='SCR-1', closed_by=8 WHERE id=140;"
+expect_block "10 L1 RESOLVED → PROCESSING（已解决不能退回）" "UPDATE exception_case SET status='PROCESSING' WHERE id=140;" "exc_state_forward_only"
+expect_block "10 L1 RESOLVED 后改实点（借道重开改数被堵）" "UPDATE exception_case SET counted_qty_milli=5000, diff_qty_milli=0 WHERE id=140;" "exc_immutable"
+expect_block "10 L2 RESOLVED 后改处置结论" "UPDATE exception_case SET resolution='NO_ACTION', resolution_doc=NULL WHERE id=140;" "exc_immutable"
+expect_block "10 L2 RESOLVED 后改责任方" "UPDATE exception_case SET liable_party='CARRIER' WHERE id=140;" "exc_immutable"
+expect_allow "10 L2 RESOLVED 下首次写 closed_at" "UPDATE exception_case SET closed_at='2026-10-15 13:00:00' WHERE id=140;"
+expect_block "10 L2 closed_at 只能写一次" "UPDATE exception_case SET closed_at='2026-10-16 13:00:00' WHERE id=140;" "exc_immutable"
+expect_block "10 L2 CLOSED 后改处置结论 / 清单号" "UPDATE exception_case SET resolution='NO_ACTION', resolution_doc=NULL WHERE id=100;" "exc_immutable"
+expect_block "10 L2 CLOSED 后改责任方" "UPDATE exception_case SET liable_party='CARRIER' WHERE id=100;" "exc_immutable"
+expect_block "10 L2 CLOSED 后改关闭人" "UPDATE exception_case SET closed_by=99 WHERE id=100;" "exc_immutable"
+expect_block "10 L2 CLOSED 后改仓库" "UPDATE exception_case SET warehouse_id=2 WHERE id=100;" "exc_immutable"
+expect_block "10 L2 CLOSED 后只改 version 也不行" "UPDATE exception_case SET version=version+1 WHERE id=100;" "exc_immutable"
+expect_block "10 L2 建单后改仓库（OPEN）" "UPDATE exception_case SET warehouse_id=2 WHERE id=141;" "exc_immutable"
+expect_block "10 L2 建单后改异常码" "UPDATE exception_case SET exception_code='FAILOVER_GAP' WHERE id=141;" "exc_immutable"
+expect_block "10 L2 建单后改上报人" "UPDATE exception_case SET reporter_id=99 WHERE id=141;" "exc_immutable"
+expect_block "10 L2 建单后改单号" "UPDATE exception_case SET code='EXC-X' WHERE id=141;" "exc_immutable"
+expect_block "10 L3 DELETE 已关闭异常单（去重键不能被释放）" "DELETE FROM exception_case WHERE id=100;" "exc_no_delete"
+expect_block "10 L3 DELETE 已取消异常单" "DELETE FROM exception_case WHERE id=110;" "exc_no_delete"
+expect_allow "10 质检单来源 SCRAP_MISREPORT（第 9 篇交接 / 质检误报回转）" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8010,'RTN-10',1,'RETURN','SCRAP_MISREPORT','APR-WHSH01-20261015-000001','CREATED','2026-10-15');"
+expect_block "10 质检单来源拼错（SCRAP_MISREPORTX）" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8011,'RTN-11',1,'RETURN','SCRAP_MISREPORTX','APR-WHSH01-20261015-000002','CREATED','2026-10-15');" "ck_inb_rtn_src"
+expect_allow "10 异常单来源 SCRAP_MISREPORT" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (142,'EXC-142',1,'RETURN_COUNT_DIFF','SCRAP_MISREPORT','APR-WHSH01-20261015-000001','0000000000000000000000000000000000000000000000000000000000000084',1,1,0,0,0,'2026-10-15 12:00:00',7);"
+expect_block "10 L3 PG TRUNCATE 异常单（超级用户 / 迁移脚本）" "TRUNCATE exception_case;" "exc_no_delete"
+expect_allow "10 STORE_RETURN 门店退货回仓 RTN" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8002,'RTN-2',1,'RETURN','STORE_RETURN','ST01:R-001','CREATED','2026-10-15');"
+expect_block "10 STORE_RETURN 之外的未登记退货来源" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8003,'RTN-3',1,'RETURN','WHATEVER','X-1','CREATED','2026-10-15');" "ck_inb_rtn_src"
+expect_allow "10 非退货入库单不受退货来源 CHECK 约束" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8004,'PO-1',1,'PURCHASE','ERP_X','PO-001','CREATED','2026-10-15');"
+expect_allow "10 STORE_RETURN 入库后 RETURN_QC 系统冻结（source=QC/RTN 8002）" "BEGIN; INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,quality_hold_qty_milli) VALUES (70,1,1,2,1953,'KG',2000,2000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (70,70,'RETURN_QC','RETURN_QC','QC',8002,'RQC:8201',2000,0,'HELD',0); COMMIT;"
+expect_block "10 STORE_RETURN 不走 RETURN_PENDING（挂质检来源被拦）" "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (71,70,'RETURN_PENDING','RETURN_PENDING','QC',8002,'X71',1000,0,'HELD',0);" "ck_hold_return"
+expect_block "10 STORE_RETURN 冻结不能是人工冻结（operator≠0）" "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (72,70,'RETURN_QC','RETURN_QC','QC',8002,'X72',1000,0,'HELD',7);" "ck_hold_retqc"
+expect_allow "10 STORE_RETURN 清点差异异常单（source_type=STORE_RETURN）" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (130,'EXC-130',1,'RETURN_COUNT_DIFF','STORE_RETURN','RTN-2:1','000000000000000000000000000000000000000000000000000000000000001e',2,3,3000,2000,-1000,'2026-10-15 12:00:00',7);"
+
+expect_allow "10 盲收 RTN 来源 STORE_BLIND" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8020,'RTN-20',1,'RETURN','STORE_BLIND','BRC-20261015-000001','CREATED','2026-10-15');"
+expect_block "10 RTN 来源拼错 STORE_BLINDX" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8021,'RTN-21',1,'RETURN','STORE_BLINDX','BRC-20261015-000009','CREATED','2026-10-15');" "ck_inb_rtn_src"
+expect_allow "10 盲收异常单（BLIND_RETURN，截止 = 建单 + 48h）" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id,created_at,link_deadline_at,liable_party) VALUES (150,'EXC-150',1,'RETURN_COUNT_DIFF','BLIND_RETURN','BRC:1','0000000000000000000000000000000000000000000000000000000000000000',1,0,0,3000,3000,'2026-10-17 10:00:00',7,'2026-10-15 10:00:00','2026-10-17 10:00:00','UNKNOWN');"
+expect_block "10 盲收异常单缺截止时间" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id,created_at,link_deadline_at,liable_party) VALUES (151,'EXC-151',1,'RETURN_COUNT_DIFF','BLIND_RETURN','BRC:2','0000000000000000000000000000000000000000000000000000000000000001',1,0,0,3000,3000,'2026-10-17 10:00:00',7,'2026-10-15 10:00:00',NULL,'UNKNOWN');" "ck_exc_blind"
+expect_block "10 盲收异常单截止 ≠ +48h" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id,created_at,link_deadline_at,liable_party) VALUES (151,'EXC-151',1,'RETURN_COUNT_DIFF','BLIND_RETURN','BRC:2','0000000000000000000000000000000000000000000000000000000000000001',1,0,0,3000,3000,'2026-10-17 10:00:00',7,'2026-10-15 10:00:00','2026-10-16 10:00:00','UNKNOWN');" "exc_blind_deadline"
+expect_block "10 liable_party 取值非法（SUPPLIER 不在四值内）" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id,created_at,link_deadline_at,liable_party) VALUES (151,'EXC-151',1,'RETURN_COUNT_DIFF','BLIND_RETURN','BRC:2','0000000000000000000000000000000000000000000000000000000000000001',1,0,0,3000,3000,'2026-10-17 10:00:00',7,'2026-10-15 10:00:00','2026-10-17 10:00:00','SUPPLIER');" "ck_exc_liable"
+R=$(psql -t -A -c "SELECT liable_party FROM exception_case WHERE id=100")
+[ "$R" = "UNKNOWN" ] && ok "10 liable_party 默认 UNKNOWN = $R" || bad "10 liable_party 默认 UNKNOWN = $R（期望 UNKNOWN）"
+expect_allow "10 liable_party 改为 STORE（处理中）" "UPDATE exception_case SET liable_party='STORE' WHERE id=150;"
+expect_allow "10 截止往后延（+24h，主管）" "UPDATE exception_case SET link_deadline_at='2026-10-18 10:00:00' WHERE id=150;"
+expect_block "10 截止往前改" "UPDATE exception_case SET link_deadline_at='2026-10-17 09:00:00' WHERE id=150;" "exc_deadline_backward"
+expect_block "10 截止清空" "UPDATE exception_case SET link_deadline_at=NULL WHERE id=150;" "exc_deadline_backward"
+expect_allow "10 盲收记录（容器码 + 原因码 + 照片）" "INSERT INTO return_blind_receipt (id,code,warehouse_id,sku_id,qty_milli,store_code,container_code,reason_code,photo_ids,rtn_inbound_id,exception_case_id,op_key,received_by) VALUES (1,'BRC-20261015-000001',1,1,3000,'ST001','CTN-001','DAMAGED','["F1","F2"]',8020,150,'IDEM-BLIND-1',7);"
+expect_block "10 盲收缺容器码" "INSERT INTO return_blind_receipt (id,code,warehouse_id,sku_id,qty_milli,store_code,reason_code,photo_ids,rtn_inbound_id,exception_case_id,op_key,received_by) VALUES (2,'BRC-20261015-000002',1,1,3000,'ST001','DAMAGED','[]',8020,150,'IDEM-BLIND-2',7);" "container_code"
+expect_block "10 盲收缺原因码" "INSERT INTO return_blind_receipt (id,code,warehouse_id,sku_id,qty_milli,store_code,container_code,photo_ids,rtn_inbound_id,exception_case_id,op_key,received_by) VALUES (2,'BRC-20261015-000002',1,1,3000,'ST001','CTN-002','[]',8020,150,'IDEM-BLIND-2',7);" "reason_code"
+expect_block "10 盲收容器码空串" "INSERT INTO return_blind_receipt (id,code,warehouse_id,sku_id,qty_milli,store_code,container_code,reason_code,photo_ids,rtn_inbound_id,exception_case_id,op_key,received_by) VALUES (2,'BRC-20261015-000002',1,1,3000,NULL,'','DAMAGED','[]',8020,150,'IDEM-BLIND-2',7);" "ck_rbr_ctn"
+expect_block "10 盲收原因码不在枚举" "INSERT INTO return_blind_receipt (id,code,warehouse_id,sku_id,qty_milli,store_code,container_code,reason_code,photo_ids,rtn_inbound_id,exception_case_id,op_key,received_by) VALUES (2,'BRC-20261015-000002',1,1,3000,NULL,'CTN-002','BROKEN','[]',8020,150,'IDEM-BLIND-2',7);" "ck_rbr_reason"
+expect_block "10 盲收同 op_key 重放" "INSERT INTO return_blind_receipt (id,code,warehouse_id,sku_id,qty_milli,store_code,container_code,reason_code,photo_ids,rtn_inbound_id,exception_case_id,op_key,received_by) VALUES (2,'BRC-20261015-000002',1,1,3000,NULL,'CTN-002','DAMAGED','[]',8020,150,'IDEM-BLIND-1',7);" "uq_rbr_op"
+expect_block "10 盲收记录不可改" "UPDATE return_blind_receipt SET qty_milli=1000 WHERE id=1;" "rbr_immutable"
+expect_block "10 盲收记录不可删" "DELETE FROM return_blind_receipt WHERE id=1;" "rbr_immutable"
+expect_allow "10 退货预约建单（门店 ST001）" "INSERT INTO return_reservation (id,code,warehouse_id,store_code,outbound_order_id,created_by) VALUES (1,'RSV-20261015-000001',1,'ST001',1,21);"
+expect_allow "10 预约行（原因码 + 容器码）" "INSERT INTO return_reservation_line (id,reservation_id,line_no,sku_id,qty_milli,reason_code,container_code) VALUES (1,1,1,1,2000,'QUALITY','CTN-101');"
+expect_block "10 预约行缺原因码" "INSERT INTO return_reservation_line (id,reservation_id,line_no,sku_id,qty_milli,container_code) VALUES (2,1,2,1,2000,'CTN-102');" "reason_code"
+expect_block "10 预约行缺容器码" "INSERT INTO return_reservation_line (id,reservation_id,line_no,sku_id,qty_milli,reason_code) VALUES (2,1,2,1,2000,'QUALITY');" "container_code"
+expect_block "10 预约行原因码非法" "INSERT INTO return_reservation_line (id,reservation_id,line_no,sku_id,qty_milli,reason_code,container_code) VALUES (2,1,2,1,2000,'NOPE','CTN-102');" "ck_rrsl_reason"
+expect_block "10 预约 RECEIVED 缺 RTN / 收货人" "UPDATE return_reservation SET status='RECEIVED' WHERE id=1;" "ck_rrsv_recv"
+expect_allow "10 收货写实点" "UPDATE return_reservation_line SET received_qty_milli=2000 WHERE id=1;"
+expect_block "10 实点只写一次" "UPDATE return_reservation_line SET received_qty_milli=1000 WHERE id=1;" "rrsl_locked"
+expect_block "10 预约门店不可改" "UPDATE return_reservation SET store_code='ST002' WHERE id=1;" "rrsv_immutable"
+expect_allow "10 预约收货 CREATED → RECEIVED（RTN 8010，随后挂 RETURN_QC）" "UPDATE return_reservation SET status='RECEIVED', rtn_inbound_id=8010, received_by=7, received_at='2026-10-15 11:00:00', version=version+1 WHERE id=1 AND status='CREATED';"
+expect_block "10 预约 RECEIVED → CANCELLED" "UPDATE return_reservation SET status='CANCELLED' WHERE id=1;" "rrsv_state_forward_only"
+expect_block "10 预约终态整行只读" "UPDATE return_reservation SET version=9 WHERE id=1;" "rrsv_immutable"
+expect_block "10 收货后再加预约行" "INSERT INTO return_reservation_line (id,reservation_id,line_no,sku_id,qty_milli,reason_code,container_code) VALUES (3,1,3,1,1000,'QUALITY','CTN-103');" "rrsl_locked"
+expect_block "10 收货后改预约行" "UPDATE return_reservation_line SET container_code='X' WHERE id=1;" "rrsl_locked"
+expect_block "10 预约不可删" "DELETE FROM return_reservation_line WHERE id=1;" "return_no_delete"
+expect_block "10 预约同号重复（SQLite 拦 REPLACE）" "INSERT INTO return_reservation (id,code,warehouse_id,store_code,outbound_order_id,created_by) VALUES (2,'RSV-20261015-000001',1,'ST001',1,21);" "uq_rrsv_code"
+R=$(psql -t -A -c "UPDATE return_reservation SET status='CANCELLED' WHERE id=1 AND status='CREATED'")
+[ "$R" = "UPDATE 0" ] && ok "10 预约 version 条件更新（旧状态 CREATED）0 行 rowcount=0" || bad "10 预约 version 条件更新（旧状态 CREATED）0 行：$R"
+
+echo "=== 2e-exc1. docs/10 × 17：加工损耗未获批部分转异常（source_type=PROCESS_LOSS）==="
+expect_allow "10 PROCESS_LOSS 准备：异常码 PROCESS_LOSS_UNSETTLED" "INSERT INTO exception_code (code,name,action,liability) VALUES ('PROCESS_LOSS_UNSETTLED','加工损耗未获批部分','ADJUST','WAREHOUSE');"
+expect_allow "10 PROCESS_LOSS：17 损耗行 1757 审批驳回/过期，未批 0.400 转异常（key=PRCL:1757）" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (1900,'EXC-1900',1,'PROCESS_LOSS_UNSETTLED','PROCESS_LOSS','PRCL:1757','0000000000000000000000000000000000000000000000000000000000000130',1,1,400,0,-400,'2026-10-15 12:00:00',0);"
+R=$(psql -q -t -A -c "BEGIN; WITH ins AS (INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (1911,'EXC-1911',1,'PROCESS_LOSS_UNSETTLED','PROCESS_LOSS','PRCL:1757','0000000000000000000000000000000000000000000000000000000000000911',1,1,400,0,-400,'2026-10-15 12:00:00',0) ON CONFLICT (source_key) WHERE source_type = 'PROCESS_LOSS' DO NOTHING RETURNING code), ob AS (INSERT INTO outbox_event (id,topic,biz_key,payload) SELECT 9911,'wms.process.loss_settled','PRC-SH01-20261015-000017','{\"result\":\"REJECTED\"}' FROM ins RETURNING id) SELECT COALESCE((SELECT code FROM ins),(SELECT code FROM exception_case WHERE source_type='PROCESS_LOSS' AND source_key='PRCL:1757')); COMMIT;")
+[ "$R" = "EXC-1900" ] && ok "10 PROCESS_LOSS 同一损耗行再次转异常（回调重放）→ 不报错，返回已有 exception_no $R，不写 outbox" || bad "10 PROCESS_LOSS 重放幂等返回：$R（期望 EXC-1900）"
+# 第二道保险（部分唯一索引 uq_exc_pl_key）单会话顺序模拟：主守卫（17 损耗行条件更新）若被绕过，两方都走到建单，后到者仍拿到同一 exception_no
+#（PG 两会话真并发竞态由小玛丽负责，不在本段）
+RA=$(psql -q -t -A -c "BEGIN; WITH ins AS (INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (1921,'EXC-1921',1,'PROCESS_LOSS_UNSETTLED','PROCESS_LOSS','PRCL:1758','0000000000000000000000000000000000000000000000000000000000000921',1,1,400,0,-400,'2026-10-15 12:00:00',0) ON CONFLICT (source_key) WHERE source_type = 'PROCESS_LOSS' DO NOTHING RETURNING code), ob AS (INSERT INTO outbox_event (id,topic,biz_key,payload) SELECT 9921,'wms.process.loss_settled','PRC-SH01-20261015-000017','{}' FROM ins RETURNING id) SELECT COALESCE((SELECT code FROM ins),(SELECT code FROM exception_case WHERE source_type='PROCESS_LOSS' AND source_key='PRCL:1758')); COMMIT;")
+RB=$(psql -q -t -A -c "BEGIN; WITH ins AS (INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (1922,'EXC-1922',1,'PROCESS_LOSS_UNSETTLED','PROCESS_LOSS','PRCL:1758','0000000000000000000000000000000000000000000000000000000000000922',1,1,400,0,-400,'2026-10-15 12:00:00',0) ON CONFLICT (source_key) WHERE source_type = 'PROCESS_LOSS' DO NOTHING RETURNING code), ob AS (INSERT INTO outbox_event (id,topic,biz_key,payload) SELECT 9922,'wms.process.loss_settled','PRC-SH01-20261015-000017','{}' FROM ins RETURNING id) SELECT COALESCE((SELECT code FROM ins),(SELECT code FROM exception_case WHERE source_type='PROCESS_LOSS' AND source_key='PRCL:1758')); COMMIT;")
+R=$(psql -t -A -c "SELECT (SELECT count(*) FROM exception_case WHERE source_type='PROCESS_LOSS' AND source_key='PRCL:1758') || '/' || (SELECT count(*) FROM outbox_event WHERE topic='wms.process.loss_settled' AND id IN (9911,9921,9922))")
+[ "$RA" = "EXC-1921" ] && [ "$RB" = "EXC-1921" ] && [ "$R" = "1/1" ] && ok "10×17 审批回调与过期任务处理同一损耗行（顺序模拟，索引兜底）：异常单 1 张、两方都返回 $RA、loss_settled 1 条" || bad "10×17 转异常兜底：A=$RA B=$RB 异常单/事件=$R（期望 EXC-1921 EXC-1921 1/1）"
+expect_block "10 PROCESS_LOSS source_key 不是 PRCL:{损耗行 id}" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (1902,'EXC-1902',1,'PROCESS_LOSS_UNSETTLED','PROCESS_LOSS','POD:1757:0','0000000000000000000000000000000000000000000000000000000000000132',1,1,400,0,-400,'2026-10-15 12:00:00',0);" "ck_exc_pl_key"
+expect_block "10 PROCESS_LOSS 缺 SKU" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (1903,'EXC-1903',1,'PROCESS_LOSS_UNSETTLED','PROCESS_LOSS','PRCL:1759','0000000000000000000000000000000000000000000000000000000000000133',0,1,400,0,-400,'2026-10-15 12:00:00',0);" "ck_exc_pl_key"
+expect_block "10 PROCESS_LOSS 键带前导零 PRCL:01757" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (1905,'EXC-1905',1,'PROCESS_LOSS_UNSETTLED','PROCESS_LOSS','PRCL:01757','0000000000000000000000000000000000000000000000000000000000000133',1,1,400,0,-400,'2026-10-15 12:00:00',0);" "ck_exc_pl_key"
+expect_block "10 PROCESS_LOSS 键为 0（PRCL:0）" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (1906,'EXC-1906',1,'PROCESS_LOSS_UNSETTLED','PROCESS_LOSS','PRCL:0','0000000000000000000000000000000000000000000000000000000000000133',1,1,400,0,-400,'2026-10-15 12:00:00',0);" "ck_exc_pl_key"
+expect_block "10 PROCESS_LOSS 键非纯数字 PRCL:17a" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (1907,'EXC-1907',1,'PROCESS_LOSS_UNSETTLED','PROCESS_LOSS','PRCL:17a','0000000000000000000000000000000000000000000000000000000000000133',1,1,400,0,-400,'2026-10-15 12:00:00',0);" "ck_exc_pl_key"
+
+echo "=== 2e-exc2. docs/10 × 18：活鲜死亡延迟扣减转异常（source_type=LIVE_DEATH，LDTH:{live_death.id}）==="
+expect_allow "10 LIVE_DEATH 准备：异常码 LIVE_DEATH_UNDEDUCTED" "INSERT INTO exception_code (code,name,action,liability) VALUES ('LIVE_DEATH_UNDEDUCTED','活鲜死亡延迟扣减失败','ADJUST','WAREHOUSE');"
+R=$(psql -q -t -A -c "BEGIN; WITH ins AS (INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (1931,'EXC-1931',1,'LIVE_DEATH_UNDEDUCTED','LIVE_DEATH','LDTH:1801','0000000000000000000000000000000000000000000000000000000000000931',1,1,1000,0,-1000,'2026-10-15 12:00:00',0) ON CONFLICT (source_key) WHERE source_type = 'LIVE_DEATH' DO NOTHING RETURNING code) SELECT COALESCE((SELECT code FROM ins),(SELECT code FROM exception_case WHERE source_type='LIVE_DEATH' AND source_key='LDTH:1801')); COMMIT;")
+[ "$R" = "EXC-1931" ] && ok "10 LIVE_DEATH：18 延迟扣减任务 deduct_status=EXCEPTION 转异常（LDTH:1801）→ $R" || bad "10 LIVE_DEATH 建单：$R"
+R=$(psql -q -t -A -c "BEGIN; WITH ins AS (INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (1932,'EXC-1932',1,'LIVE_DEATH_UNDEDUCTED','LIVE_DEATH','LDTH:1801','0000000000000000000000000000000000000000000000000000000000000932',1,1,1000,0,-1000,'2026-10-15 12:00:00',0) ON CONFLICT (source_key) WHERE source_type = 'LIVE_DEATH' DO NOTHING RETURNING code) SELECT COALESCE((SELECT code FROM ins),(SELECT code FROM exception_case WHERE source_type='LIVE_DEATH' AND source_key='LDTH:1801')); COMMIT;")
+[ "$R" = "EXC-1931" ] && ok "10 LIVE_DEATH 重放同一死亡登记 → 不报错，返回已有 $R" || bad "10 LIVE_DEATH 重放：$R（期望 EXC-1931）"
+R=$(psql -t -A -c "SELECT count(*) FROM exception_case WHERE source_type='LIVE_DEATH' AND source_key='LDTH:1801'")
+[ "$R" = "1" ] && ok "10 LIVE_DEATH 重放后异常单仍 1 张" || bad "10 LIVE_DEATH 异常单数 $R"
+R=$(psql -t -A -c "SELECT string_agg(c.relname||':'||i.indisunique||':'||pg_get_expr(i.indpred,i.indrelid),' ' ORDER BY c.relname) FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid WHERE c.relname IN ('uq_exc_ldth_key','uq_exc_pl_key') AND i.indrelid='public.exception_case'::regclass AND i.indnatts=1 AND i.indkey[0]=(SELECT attnum FROM pg_attribute WHERE attrelid='public.exception_case'::regclass AND attname='source_key')")
+[ "$R" = "uq_exc_ldth_key:true:((source_type)::text = 'LIVE_DEATH'::text) uq_exc_pl_key:true:((source_type)::text = 'PROCESS_LOSS'::text)" ] && ok "10 ON CONFLICT 仲裁索引按名存在：uq_exc_ldth_key / uq_exc_pl_key 为 source_key 单列部分唯一（重复键断言不再只靠 uq_exc_src）" || bad "10 uq_exc_ldth_key/uq_exc_pl_key 定义不符：$R"
+expect_block "10 LIVE_DEATH source_key 不是 LDTH:{live_death.id}" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (1933,'EXC-1933',1,'LIVE_DEATH_UNDEDUCTED','LIVE_DEATH','PRCL:1801','0000000000000000000000000000000000000000000000000000000000000933',1,1,1000,0,-1000,'2026-10-15 12:00:00',0);" "ck_exc_ldth_key"
+expect_block "10 LIVE_DEATH 缺 SKU" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (1934,'EXC-1934',1,'LIVE_DEATH_UNDEDUCTED','LIVE_DEATH','LDTH:1802','0000000000000000000000000000000000000000000000000000000000000934',0,1,1000,0,-1000,'2026-10-15 12:00:00',0);" "ck_exc_ldth_key"
+expect_block "10 LIVE_DEATH 键为 0（LDTH:0）" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (1935,'EXC-1935',1,'LIVE_DEATH_UNDEDUCTED','LIVE_DEATH','LDTH:0','0000000000000000000000000000000000000000000000000000000000000934',1,1,1000,0,-1000,'2026-10-15 12:00:00',0);" "ck_exc_ldth_key"
+expect_block "10 LIVE_DEATH 键带前导零 LDTH:007" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (1936,'EXC-1936',1,'LIVE_DEATH_UNDEDUCTED','LIVE_DEATH','LDTH:007','0000000000000000000000000000000000000000000000000000000000000934',1,1,1000,0,-1000,'2026-10-15 12:00:00',0);" "ck_exc_ldth_key"
+expect_block "10 LIVE_DEATH 旧前缀 LVD:1801" "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (1937,'EXC-1937',1,'LIVE_DEATH_UNDEDUCTED','LIVE_DEATH','LVD:1801','0000000000000000000000000000000000000000000000000000000000000934',1,1,1000,0,-1000,'2026-10-15 12:00:00',0);" "ck_exc_ldth_key"
+
+echo "=== 2e-exc3. search_path 固定（pg_catalog, public）：目录断言 + 同名表劫持 + 变异检查（PG）==="
+R=$(psql -q -t -A <<'HJSQL' | grep '^HJ#'
+BEGIN;
+
+CREATE SCHEMA hj_evil AUTHORIZATION wms_app;
+SET LOCAL ROLE wms_app;
+CREATE TABLE hj_evil.return_reservation (id BIGINT, status TEXT);
+INSERT INTO hj_evil.return_reservation VALUES (999999,'CREATED');
+SET LOCAL search_path = public;
+DO $hj$ BEGIN INSERT INTO public.return_reservation_line (id,reservation_id,line_no,sku_id,qty_milli,container_code) VALUES (19902,999999,1,1,2000,'CTN-HJ'); RAISE EXCEPTION 'HJ_OK'; EXCEPTION WHEN OTHERS THEN PERFORM set_config('hj.base', SQLERRM, true); END $hj$;
+SET LOCAL search_path = hj_evil, public;
+DO $hj$ BEGIN INSERT INTO public.return_reservation_line (id,reservation_id,line_no,sku_id,qty_milli,container_code) VALUES (19902,999999,1,1,2000,'CTN-HJ'); RAISE EXCEPTION 'HJ_OK'; EXCEPTION WHEN OTHERS THEN PERFORM set_config('hj.fixed', SQLERRM, true); END $hj$;
+RESET ROLE;
+SET LOCAL search_path = public;
+SELECT set_config('hj.cat0', (SELECT count(*) FILTER (WHERE NOT COALESCE(proconfig,'{}'::text[]) @> ARRAY['search_path=pg_catalog, public']) || '/' || count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('trg_exc_forward','trg_exc_no_delete','trg_exc_blind_ins','trg_rrsv_guard','trg_rrsl_guard','trg_rtn10_no_delete','trg_rbr_immutable')), true);
+ALTER FUNCTION public.trg_rrsl_guard() RESET search_path;
+SELECT set_config('hj.cat1', (SELECT count(*) FILTER (WHERE NOT COALESCE(proconfig,'{}'::text[]) @> ARRAY['search_path=pg_catalog, public']) || '/' || count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('trg_exc_forward','trg_exc_no_delete','trg_exc_blind_ins','trg_rrsv_guard','trg_rrsl_guard','trg_rtn10_no_delete','trg_rbr_immutable')), true);
+SET LOCAL ROLE wms_app;
+SET LOCAL search_path = hj_evil, public;
+DO $hj$ BEGIN INSERT INTO public.return_reservation_line (id,reservation_id,line_no,sku_id,qty_milli,container_code) VALUES (19902,999999,1,1,2000,'CTN-HJ'); RAISE EXCEPTION 'HJ_OK'; EXCEPTION WHEN OTHERS THEN PERFORM set_config('hj.mut', SQLERRM, true); END $hj$;
+RESET ROLE;
+SELECT 'HJ#' || current_setting('hj.base') || '#' || current_setting('hj.fixed') || '#' || current_setting('hj.mut') || '#' || current_setting('hj.cat0') || '#' || current_setting('hj.cat1');
+ROLLBACK;
+HJSQL
+)
+IFS='#' read -r _ HB HF HM HC0 HC1 <<< "$R"
+[ "$HC0" = "0/7" ] && ok "本 PR 新增/重定义的 7 个 PL/pgSQL 函数 proconfig 都含 search_path=pg_catalog, public（缺失/总数 = $HC0）" || bad "search_path 目录断言：缺失/总数 = $HC0（期望 0/7）"
+[ -n "$HB" ] && [ "$HF" = "$HB" ] && ok "劫持：wms_app 在自建 schema hj_evil 建同名表 return_reservation 并置于 search_path 首位，trg_rrsl_guard() 仍读 public（结果与无劫持一致：$HB）" || bad "劫持后行为改变：无劫持=$HB / 劫持=$HF"
+[ "$HC1" = "1/7" ] && [ "$HM" != "$HB" ] && ok "变异检查：RESET trg_rrsl_guard() 的 search_path 后，目录断言变红（$HC1）且劫持生效（$HM），两条断言都能抓到" || bad "变异检查没变红：目录=$HC1 劫持后=$HM 基准=$HB"
+echo "=== 2f. docs/09 效期与损耗：报损单状态前进、交接单不可撤回、来源/原因 CHECK、外键 ==="
+expect_allow "09 报损单建单（DRAFT，来源=效期扫描 501）" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (100,'SCR-1',1,'EXPIRY_SCAN',501,'EXPIRED','2026-10-15',7);"
+expect_block "09 同一来源重复建有效报损单" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (101,'SCR-2',1,'EXPIRY_SCAN',501,'EXPIRED','2026-10-15',7);" "uq_scr_source"
+expect_block "09 I3 来源类型非法" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (109,'SCR-9',1,'WHATEVER',9,'EXPIRED','2026-10-15',7);" "ck_scr_src_type"
+expect_block "09 I3 原因码非法" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (109,'SCR-9',1,'MANUAL',9,'ANY','2026-10-15',7);" "ck_scr_reason"
+expect_block "09 报损单非法状态值（建单）" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id,status) VALUES (109,'SCR-9',1,'MANUAL',9,'OTHER','2026-10-15',7,'DONE');" "ck_scr_status"
+expect_allow "09 DRAFT 单下加报损行" "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (100,100,1,14,1,1,5000,0,'POST_OUT');"
+expect_block "09 报损行数量 0" "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (101,100,2,14,1,1,0,0,'POST_OUT');" "ck_scrl_qty"
+expect_block "09 I3 报损行挂到不存在的报损单（外键）" "UPDATE scrap_line SET scrap_id=999 WHERE id=100;" "scrap_line_scrap_id_fkey"
+expect_block "09 I3 新增报损行挂到不存在的报损单" "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (103,999,1,14,1,1,1000,0,'POST_OUT');" "scrap_line_locked"
+expect_allow "09 S1 DRAFT → PENDING_APPROVAL" "UPDATE scrap_order SET status='PENDING_APPROVAL', version=version+1 WHERE id=100 AND status='DRAFT';"
+expect_block "09 I3 提交后不能再加行" "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (104,100,2,14,1,1,1000,0,'POST_OUT');" "scrap_line_locked"
+expect_block "09 I3 提交后不能改量" "UPDATE scrap_line SET scrap_qty_milli=4000 WHERE id=100;" "scrap_line_locked"
+expect_block "09 报损审批 SoD（审批人=申请人）" "UPDATE scrap_order SET approver_id=7, approved_at='2026-10-15 10:00:00', status='APPROVED' WHERE id=100;" "ck_scr_sod"
+expect_allow "09 S2 审批（审批人 8）" "UPDATE scrap_order SET approver_id=8, approved_at='2026-10-15 10:00:00', status='APPROVED' WHERE id=100 AND status='PENDING_APPROVAL';"
+expect_block "09 I3 APPROVED → DRAFT（跳回）" "UPDATE scrap_order SET status='DRAFT' WHERE id=100;" "scrap_state_forward_only"
+expect_allow "09 S3 APPROVED → POSTED" "UPDATE scrap_order SET status='POSTED', posted_at='2026-10-15 10:01:00' WHERE id=100 AND status='APPROVED';"
+expect_block "09 I3 POSTED → DRAFT" "UPDATE scrap_order SET status='DRAFT' WHERE id=100;" "scrap_state_forward_only"
+expect_block "09 I3 POSTED → CANCELLED" "UPDATE scrap_order SET status='CANCELLED' WHERE id=100;" "scrap_state_forward_only"
+expect_block "09 I3 POSTED 单下插 POST_OUT 且 hold_id=0 的行" "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (105,100,9,14,1,1,1000,0,'POST_OUT');" "scrap_line_locked"
+expect_block "09 报损单非法状态值（更新）" "UPDATE scrap_order SET status='DONE' WHERE id=100;" "scrap_state_forward_only"
+expect_allow "09 交接报损单 DRAFT（RETURN_HANDOVER，source_id=待回库 701）" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (102,'SCR-3',1,'RETURN_HANDOVER',701,'DAMAGED','2026-10-15',8);"
+expect_block "09 同一待回库记录重复交接报损" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (103,'SCR-4',1,'RETURN_HANDOVER',701,'DAMAGED','2026-10-15',8);" "uq_scr_source"
+expect_block "09 交接单不许取消（DRAFT → CANCELLED）" "UPDATE scrap_order SET status='CANCELLED' WHERE id=102;" "scrap_handover_no_revoke"
+expect_allow "09 交接单提交" "UPDATE scrap_order SET status='PENDING_APPROVAL' WHERE id=102 AND status='DRAFT';"
+expect_block "09 交接单不许撤回（PENDING_APPROVAL → DRAFT，→ 40930）" "UPDATE scrap_order SET status='DRAFT' WHERE id=102;" "scrap_handover_no_revoke"
+expect_block "09 交接单不许驳回到 REJECTED" "UPDATE scrap_order SET status='REJECTED' WHERE id=102;" "scrap_handover_no_revoke"
+expect_block "09 来源不可改（交接单改成 MANUAL 绕过）" "UPDATE scrap_order SET source_type='MANUAL' WHERE id=102;" "scrap_state_forward_only"
+expect_allow "09 准备：交接单 102 / 手工单 104 各挂一条 SCRAP_PENDING" "BEGIN; INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (80,1,1,2,4,'KG',4000,4000); INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (104,'SCR-5',1,'MANUAL',0,'DAMAGED','2026-10-15',7); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (80,80,'SCRAP_PENDING','SCRAP','SCRAP',102,'CVT:79',2000,0,'HELD',0); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (81,80,'SCRAP_PENDING','SCRAP','SCRAP',104,'SCRH:81',2000,0,'HELD',0); COMMIT;"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 80 AND hold_type = 'SCRAP_PENDING' AND source_type = 'SCRAP' AND source_id = 102 AND status = 'HELD' AND EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = 102 AND o.source_type NOT IN ('RETURN_HANDOVER','RETURN_QC'))")
+[ "$R" = "UPDATE 0" ] && ok "09 release_scrap_hold(REVOKED) 对交接单拒绝（→ 40930） rowcount=0" || bad "09 release_scrap_hold(REVOKED) 对交接单拒绝（→ 40930）：$R（期望 UPDATE 0）"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 81 AND hold_type = 'SCRAP_PENDING' AND source_type = 'SCRAP' AND source_id = 104 AND status = 'HELD' AND EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = 104 AND o.source_type NOT IN ('RETURN_HANDOVER','RETURN_QC'))")
+[ "$R" = "UPDATE 1" ] && ok "09 release_scrap_hold(REVOKED) 对手工单放行 rowcount=1" || bad "09 release_scrap_hold(REVOKED) 对手工单放行：$R（期望 UPDATE 1）"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 80 AND status = 'HELD' AND hold_type IN ('QUALITY','MANUAL')")
+[ "$R" = "UPDATE 0" ] && ok "09 人工解冻路径对 SCRAP_PENDING（→ 40933） rowcount=0" || bad "09 人工解冻路径对 SCRAP_PENDING（→ 40933）：$R（期望 UPDATE 0）"
+expect_allow "09 A1 质检不合格报损单 DRAFT（RETURN_QC，source_id=退货行 8101）" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (105,'SCR-6',1,'RETURN_QC',8101,'QC_REJECT','2026-10-15',9);"
+
+expect_block "09 Q8 交接单作废必须带 SCRAP_MISREPORT 审批单号" "UPDATE scrap_order SET status='VOIDED' WHERE id=102;" "ck_scr_void"
+expect_block "09 Q8 非交接单不能作废（手工单 104）" "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-WHSH01-20261015-000009' WHERE id=104;" "scrap_state_forward_only"
+expect_block "09 Q8 误报回转缺审批（ck_hold_approval）" "BEGIN; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 80 AND status = 'HELD' AND released_qty_milli = 0; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,is_reversal) VALUES (82,80,'RETURN_QC','RETURN_QC','QC',8301,'CVT:80',2000,0,'HELD',0,true); UPDATE stock SET hold_qty_milli = hold_qty_milli - 2000, quality_hold_qty_milli = quality_hold_qty_milli + 2000, version = version + 1 WHERE id = 80 AND hold_qty_milli >= 2000; UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-WHSH01-20261015-000001', version=version+1 WHERE id=102 AND status='PENDING_APPROVAL'; COMMIT;" "ck_hold_approval"
+expect_block "09 Q17 审批单号格式不对（APR-1）" "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-1' WHERE id=102;" "ck_scr_apr_fmt"
+expect_block "09 Q17 审批单号序号不足 6 位" "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-WHSH01-20261015-12345' WHERE id=102;" "ck_scr_apr_fmt"
+expect_block "09 Q17 审批单号仓库编码含小写" "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-whsh01-20261015-000001' WHERE id=102;" "ck_scr_apr_fmt"
+expect_block "09 Q17 审批单号日期不足 8 位" "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-WHSH01-2026101-000001' WHERE id=102;" "ck_scr_apr_fmt"
+expect_block "09 Q17 审批单号仓库编码只有 1 位" "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-S-20261015-000001' WHERE id=102;" "ck_scr_apr_fmt"
+expect_block "09 Q17 审批单号仓库编码超过 16 位" "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-ABCDEFGHIJKLMNOPQ-20261015-000001' WHERE id=102;" "ck_scr_apr_fmt"
+expect_allow "09 Q8 误报同一事务：convert_hold SCRAP_PENDING→RETURN_QC（CVT:80，审批 APR-1，新质检单 8301）+ 报损单 VOIDED" "BEGIN; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 80 AND status = 'HELD' AND released_qty_milli = 0; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no,is_reversal) VALUES (82,80,'RETURN_QC','RETURN_QC','QC',8301,'CVT:80',2000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH01-20261015-000001',true); UPDATE stock SET hold_qty_milli = hold_qty_milli - 2000, quality_hold_qty_milli = quality_hold_qty_milli + 2000, version = version + 1 WHERE id = 80 AND hold_qty_milli >= 2000; UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-WHSH01-20261015-000001', version=version+1 WHERE id=102 AND status='PENDING_APPROVAL'; COMMIT;"
+R=$(psql -t -A -c "SELECT hold_qty_milli||'/'||quality_hold_qty_milli FROM stock WHERE id=80")
+[ "$R" = "2000/2000" ] && ok "09 Q8 回转后 stock 80 hold/quality（跨列挪量，可用量不变） = $R" || bad "09 Q8 回转后 stock 80 hold/quality（跨列挪量，可用量不变） = $R（期望 2000/2000）"
+expect_block "09 K1 质检不合格单不许取消（DRAFT → CANCELLED，→ 40930）" "UPDATE scrap_order SET status='CANCELLED' WHERE id=105;" "scrap_handover_no_revoke"
+expect_allow "09 K1/K4 准备：质检单 105 挂 SCRAP_PENDING 3000，行数量 = 冻结量" "BEGIN; INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (81,1,1,2,5,'KG',3000,3000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (83,81,'SCRAP_PENDING','SCRAP','SCRAP',105,'CVT:84',3000,0,'HELD',0); INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (110,105,1,81,2,5,3000,83,'POST_OUT'); COMMIT;"
+expect_block "09 K4 带冻结的行数量 ≠ 冻结余量（建行）" "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (111,105,2,81,2,5,1000,83,'POST_OUT');" "scrap_line_hold_mismatch"
+expect_block "09 K4 交接 / 质检 DRAFT 改数量（5000→1 式）" "UPDATE scrap_line SET scrap_qty_milli=1 WHERE id=110;" "scrap_line_hold_locked"
+expect_block "09 K4 交接 / 质检 DRAFT 摘掉冻结（hold_id → 0）" "UPDATE scrap_line SET hold_id=0 WHERE id=110;" "scrap_line_hold_locked"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 83 AND hold_type = 'SCRAP_PENDING' AND source_type = 'SCRAP' AND source_id = 105 AND status = 'HELD' AND EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = 105 AND o.source_type NOT IN ('RETURN_HANDOVER','RETURN_QC'))")
+[ "$R" = "UPDATE 0" ] && ok "09 K1 release_scrap_hold(REVOKED) 对质检单拒绝（→ 40930） rowcount=0" || bad "09 K1 release_scrap_hold(REVOKED) 对质检单拒绝（→ 40930）：$R"
+expect_allow "09 K1 质检单提交" "UPDATE scrap_order SET status='PENDING_APPROVAL' WHERE id=105 AND status='DRAFT';"
+expect_block "09 K1 质检单不许撤回（→ DRAFT）" "UPDATE scrap_order SET status='DRAFT' WHERE id=105;" "scrap_handover_no_revoke"
+expect_block "09 K1 质检单不许驳回（→ REJECTED）" "UPDATE scrap_order SET status='REJECTED' WHERE id=105;" "scrap_handover_no_revoke"
+expect_allow "09 K1 质检判错只走 SCRAP_MISREPORT 作废（VOIDED，合法审批号）" "UPDATE scrap_order SET status='VOIDED', void_approval_no='APR-WHSH01-20261015-000002' WHERE id=105 AND status='PENDING_APPROVAL';"
+expect_block "09 K3 POSTED 单的行改 hold_id / ledger_mode" "UPDATE scrap_line SET hold_id=0, ledger_mode='NONE' WHERE id=100;" "scrap_line_locked"
+expect_block "09 K3 POSTED 单的行改成本" "UPDATE scrap_line SET cost_amount=1 WHERE id=100;" "scrap_line_locked"
+expect_block "09 K3 事后换申请人" "UPDATE scrap_order SET applicant_id=12 WHERE id=100;" "scrap_immutable"
+expect_block "09 K3 事后换审批人" "UPDATE scrap_order SET approver_id=13 WHERE id=100;" "scrap_immutable"
+expect_block "09 K3 过账时间改写" "UPDATE scrap_order SET posted_at='2026-10-16 00:00:00' WHERE id=100;" "scrap_immutable"
+expect_block "09 K3 终态改原因码" "UPDATE scrap_order SET reason_code='OTHER' WHERE id=100;" "scrap_immutable"
+expect_block "09 K3 改仓库" "UPDATE scrap_order SET warehouse_id=2 WHERE id=104;" "scrap_immutable"
+expect_block "09 S1 建单直接写 CANCELLED" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id,status) VALUES (120,'SCR-20',1,'RETURN_HANDOVER',720,'DAMAGED','2026-10-15',8,'CANCELLED');" "scrap_insert_draft_only"
+expect_block "09 S1 建单直接写 POSTED" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id,status) VALUES (121,'SCR-21',1,'MANUAL',0,'DAMAGED','2026-10-15',8,'POSTED');" "scrap_insert_draft_only"
+expect_allow "09 S1 手工单 104 提交" "UPDATE scrap_order SET status='PENDING_APPROVAL' WHERE id=104 AND status='DRAFT';"
+expect_block "09 S1 审批缺 approved_at" "UPDATE scrap_order SET approver_id=8, status='APPROVED' WHERE id=104;" "ck_scr_appr"
+expect_block "09 K2 DELETE 报损单" "DELETE FROM scrap_order WHERE id=102;" "scrap_no_delete"
+expect_block "09 K2 DELETE POSTED 单的行" "DELETE FROM scrap_line WHERE id=100;" "scrap_no_delete"
+expect_block "09 K2 PG TRUNCATE 报损行（超级用户 / 迁移脚本）" "TRUNCATE scrap_line;" "scrap_no_delete"
+expect_block "09 K2 PG TRUNCATE 报损单" "TRUNCATE scrap_order CASCADE;" "scrap_no_delete"
+expect_allow "09 sell_days 到期自动报损单（SELL_EXPIRED，批次 lot_id=601，系统建草稿）" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,source_date,reason_code,work_date,applicant_id) VALUES (130,'SCR-30',1,'SELL_EXPIRED',601,'2026-10-15','SELL_EXPIRED','2026-10-15',0);"
+expect_block "09 sell_days 同一批次同一天重复建单" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,source_date,reason_code,work_date,applicant_id) VALUES (131,'SCR-31',1,'SELL_EXPIRED',601,'2026-10-15','SELL_EXPIRED','2026-10-15',0);" "uq_scr_source"
+expect_allow "09 sell_days 同一批次次日余量（退货回仓后）再建一张" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,source_date,reason_code,work_date,applicant_id) VALUES (132,'SCR-32',1,'SELL_EXPIRED',601,'2026-10-16','SELL_EXPIRED','2026-10-16',0);"
+expect_allow "09 sell_days 来源与 EXPIRY_SCAN 同 source_id 互不干扰" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (133,'SCR-33',1,'EXPIRY_SCAN',601,'EXPIRED','2026-10-15',0);"
+expect_block "09 sell_days 来源拼错" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (131,'SCR-31',1,'SELL_DAY_EXPIRED',602,'SELL_EXPIRED','2026-10-15',0);" "ck_scr_src_type"
+expect_block "09 sell_days 原因码拼错" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,source_date,reason_code,work_date,applicant_id) VALUES (131,'SCR-31',1,'SELL_EXPIRED',602,'2026-10-15','SELL_DAYS','2026-10-15',0);" "ck_scr_reason"
+expect_block "09 D3 SELL_EXPIRED 缺 source_date（默认 1970-01-01）" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (134,'SCR-34',1,'SELL_EXPIRED',603,'SELL_EXPIRED','2026-10-15',0);" "ck_scr_src_date"
+expect_block "09 D3 SELL_EXPIRED source_date ≠ work_date" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,source_date,reason_code,work_date,applicant_id) VALUES (134,'SCR-34',1,'SELL_EXPIRED',603,'2026-10-14','SELL_EXPIRED','2026-10-15',0);" "ck_scr_src_date"
+expect_block "09 D3 非按日来源写了日期（EXPIRY_SCAN）" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,source_date,reason_code,work_date,applicant_id) VALUES (134,'SCR-34',1,'EXPIRY_SCAN',603,'2026-10-15','EXPIRED','2026-10-15',7);" "ck_scr_src_date"
+expect_block "09 D3 建单后改 source_date" "UPDATE scrap_order SET source_date='2026-10-17', work_date='2026-10-17' WHERE id=132;" "scrap_state_forward_only"
+expect_allow "09 D3 LIVE_SHRINK 批次 605 第一天" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,source_date,reason_code,work_date,applicant_id) VALUES (140,'SCR-40',1,'LIVE_SHRINK',605,'2026-10-15','NATURAL_LOSS','2026-10-15',0);"
+expect_allow "09 D3 LIVE_SHRINK 同批次次日再建" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,source_date,reason_code,work_date,applicant_id) VALUES (141,'SCR-41',1,'LIVE_SHRINK',605,'2026-10-16','NATURAL_LOSS','2026-10-16',0);"
+expect_block "09 D3 LIVE_SHRINK 同批次同日重复" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,source_date,reason_code,work_date,applicant_id) VALUES (142,'SCR-42',1,'LIVE_SHRINK',605,'2026-10-15','NATURAL_LOSS','2026-10-15',0);" "uq_scr_source"
+expect_block "09 D3 LIVE_SHRINK 缺 source_date" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,source_date,reason_code,work_date,applicant_id) VALUES (143,'SCR-43',1,'LIVE_SHRINK',606,'1970-01-01','NATURAL_LOSS','2026-10-15',0);" "ck_scr_src_date"
+expect_block "09 D3 LIVE_DEATH 写了日期（不按日）" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,source_date,reason_code,work_date,applicant_id) VALUES (144,'SCR-44',1,'LIVE_DEATH',607,'2026-10-15','OTHER','2026-10-15',0);" "ck_scr_src_date"
+expect_allow "09 sell_days 系统提交（DRAFT → PENDING_APPROVAL，S1 同事务冻结 SCRAP_PENDING 即下架）" "UPDATE scrap_order SET status='PENDING_APPROVAL' WHERE id=130 AND status='DRAFT';"
+expect_block "09 sell_days 系统单也要人审（审批人 = 申请人 0）" "UPDATE scrap_order SET approver_id=0, approved_at='2026-10-15 10:00:00', status='APPROVED' WHERE id=130;" "ck_scr_sod"
+expect_block "09 Q8 VOIDED 是终态（→ POSTED）" "UPDATE scrap_order SET status='POSTED' WHERE id=102;" "scrap_state_forward_only"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1 WHERE id = 82 AND status = 'HELD' AND hold_type IN ('QUALITY','MANUAL')")
+[ "$R" = "UPDATE 0" ] && ok "09 Q8 回转后的 RETURN_QC 不能人工解冻（→ 40933，只能 release_qc_hold） rowcount=0" || bad "09 Q8 回转后的 RETURN_QC 不能人工解冻（→ 40933，只能 release_qc_hold）：$R"
+
+echo "=== 2f2. docs/09 记账型来源 PROCESS_LOSS / LIVE_*（Doro P1）、加工原因码、PROCESS_LOSS 作废 ==="
+R=$(psql -t -A -c "SELECT CASE WHEN pg_get_constraintdef(oid) LIKE '%''PROCESS_LOSS''%' THEN 'Y' ELSE 'N' END FROM pg_constraint WHERE conname='ck_scr_src_type'")
+[ "$R" = "Y" ] && ok "09 ck_scr_src_type 含 PROCESS_LOSS（PG，对齐 00 §6.4 1d907031 登记）" || bad "09 ck_scr_src_type 缺 PROCESS_LOSS：$R"
+expect_allow "09 PROCESS_LOSS 报损单（17 损耗行 1752，TRIM，记账型）" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (150,'SCR-50',1,'PROCESS_LOSS',1752,'TRIM','2026-10-15',21);"
+R=$(psql -t -A -c "SELECT CASE WHEN record_only THEN 'Y' ELSE 'N' END FROM scrap_order WHERE id=150")
+[ "$R" = "Y" ] && ok "09 PROCESS_LOSS 自动推出 record_only = $R" || bad "09 PROCESS_LOSS 自动推出 record_only = $R（期望 Y）"
+expect_block "09 record_only 不能由应用写入（生成列）" "UPDATE scrap_order SET record_only=false WHERE id=150;" "column \"record_only\" can only be updated to DEFAULT"
+expect_block "09 PROCESS_LOSS 用通用原因码 NATURAL_LOSS" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (151,'SCR-51',1,'PROCESS_LOSS',1753,'NATURAL_LOSS','2026-10-15',21);" "ck_scr_reason_src"
+expect_block "09 手工报损用加工原因 TRIM" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (151,'SCR-51',1,'MANUAL',0,'TRIM','2026-10-15',21);" "ck_scr_reason_src"
+expect_block "09 PROCESS_LOSS 写了 source_date" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,source_date,reason_code,work_date,applicant_id) VALUES (151,'SCR-51',1,'PROCESS_LOSS',1753,'2026-10-15','TRIM','2026-10-15',21);" "ck_scr_src_date"
+expect_block "09 记账型单的行挂冻结（会扣第二次）" "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (150,150,1,11,1,1,2700,0,'POST_OUT');" "scrap_line_record_only"
+expect_allow "09 记账型行：hold_id=0、ledger_mode=NONE" "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (150,150,1,11,1,1,2700,0,'NONE');"
+expect_block "09 记账型行改成出账" "UPDATE scrap_line SET ledger_mode='POST_OUT' WHERE id=150;" "scrap_line_record_only"
+expect_block "09 普通单（手工）不能 DRAFT 直接 POSTED" "UPDATE scrap_order SET status='POSTED', posted_at='2026-10-15 10:00:00' WHERE id=104;" "scrap_state_forward_only"
+expect_allow "09 PROCESS_LOSS 容差内 DRAFT → POSTED（无人审、不出账）" "UPDATE scrap_order SET status='POSTED', posted_at='2026-10-15 10:00:00' WHERE id=150 AND status='DRAFT';"
+expect_block "09 PROCESS_LOSS 作废缺 void_ref" "UPDATE scrap_order SET status='VOIDED' WHERE id=150;" "ck_scr_void"
+expect_block "09 void_ref 不是 17 冲回键" "UPDATE scrap_order SET status='VOIDED', void_ref='X:1' WHERE id=150;" "ck_scr_void_ref"
+expect_allow "09 17 损耗改原因：POSTED → VOIDED（void_ref = PRCR 冲回键）" "UPDATE scrap_order SET status='VOIDED', void_ref='PRCR:1711:00000000-0000-4000-8000-000000001794' WHERE id=150 AND status='POSTED';"
+expect_block "09 VOIDED 后不能再 POSTED" "UPDATE scrap_order SET status='POSTED' WHERE id=150;" "scrap_state_forward_only"
+expect_allow "09 PROCESS_LOSS 超容差：DRAFT → PENDING_APPROVAL（随 17 PROCESS_YIELD_DEVIATION 合并审批）" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (152,'SCR-52',1,'PROCESS_LOSS',1758,'DEFECT','2026-10-15',21);"
+expect_allow "09 超容差单提交" "UPDATE scrap_order SET status='PENDING_APPROVAL' WHERE id=152 AND status='DRAFT';"
+expect_block "09 待审批的记账型单不能跳过审批直接 POSTED" "UPDATE scrap_order SET status='POSTED', posted_at='2026-10-15 10:00:00' WHERE id=152;" "scrap_state_forward_only"
+expect_allow "09 LIVE_DEATH 报损单（18 consume_live_hold 已扣，记账型）" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (153,'SCR-53',1,'LIVE_DEATH',1801,'LIVE_DEATH','2026-10-15',21);"
+expect_block "09 LIVE_DEATH 行挂冻结（双扣）" "INSERT INTO scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (153,153,1,11,1,1,800,0,'POST_OUT');" "scrap_line_record_only"
+expect_block "09 LIVE_DEATH 原因码用在效期扫描单" "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (154,'SCR-54',1,'EXPIRY_SCAN',1999,'LIVE_DEATH','2026-10-15',21);" "ck_scr_reason_src"
+echo "=== 2f3-sp. search_path 固定（pg_catalog, public）：目录断言 + 同名表劫持 + 变异检查（PG）==="
+R=$(psql -q -t -A <<'HJSQL' | grep '^HJ#'
+BEGIN;
+
+CREATE SCHEMA hj_evil AUTHORIZATION wms_app;
+SET LOCAL ROLE wms_app;
+CREATE TABLE hj_evil.scrap_order (id BIGINT, status TEXT, record_only BOOLEAN, source_type TEXT);
+INSERT INTO hj_evil.scrap_order VALUES (999999,'DRAFT',false,'MANUAL');
+SET LOCAL search_path = public;
+DO $hj$ BEGIN INSERT INTO public.scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (19901,999999,1,14,1,1,5000,0,'POST_OUT'); RAISE EXCEPTION 'HJ_OK'; EXCEPTION WHEN OTHERS THEN PERFORM set_config('hj.base', SQLERRM, true); END $hj$;
+SET LOCAL search_path = hj_evil, public;
+DO $hj$ BEGIN INSERT INTO public.scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (19901,999999,1,14,1,1,5000,0,'POST_OUT'); RAISE EXCEPTION 'HJ_OK'; EXCEPTION WHEN OTHERS THEN PERFORM set_config('hj.fixed', SQLERRM, true); END $hj$;
+RESET ROLE;
+SET LOCAL search_path = public;
+SELECT set_config('hj.cat0', (SELECT count(*) FILTER (WHERE NOT COALESCE(proconfig,'{}'::text[]) @> ARRAY['search_path=pg_catalog, public']) || '/' || count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('trg_scr_forward','trg_scr_ins_draft','trg_scrl_draft_only','trg_scr_no_delete')), true);
+ALTER FUNCTION public.trg_scrl_draft_only() RESET search_path;
+SELECT set_config('hj.cat1', (SELECT count(*) FILTER (WHERE NOT COALESCE(proconfig,'{}'::text[]) @> ARRAY['search_path=pg_catalog, public']) || '/' || count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('trg_scr_forward','trg_scr_ins_draft','trg_scrl_draft_only','trg_scr_no_delete')), true);
+SET LOCAL ROLE wms_app;
+SET LOCAL search_path = hj_evil, public;
+DO $hj$ BEGIN INSERT INTO public.scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (19901,999999,1,14,1,1,5000,0,'POST_OUT'); RAISE EXCEPTION 'HJ_OK'; EXCEPTION WHEN OTHERS THEN PERFORM set_config('hj.mut', SQLERRM, true); END $hj$;
+RESET ROLE;
+SELECT 'HJ#' || current_setting('hj.base') || '#' || current_setting('hj.fixed') || '#' || current_setting('hj.mut') || '#' || current_setting('hj.cat0') || '#' || current_setting('hj.cat1');
+ROLLBACK;
+HJSQL
+)
+IFS='#' read -r _ HB HF HM HC0 HC1 <<< "$R"
+[ "$HC0" = "0/4" ] && ok "本 PR 新增/重定义的 4 个 PL/pgSQL 函数 proconfig 都含 search_path=pg_catalog, public（缺失/总数 = $HC0）" || bad "search_path 目录断言：缺失/总数 = $HC0（期望 0/4）"
+[ -n "$HB" ] && [ "$HF" = "$HB" ] && ok "劫持：wms_app 在自建 schema hj_evil 建同名表 scrap_order 并置于 search_path 首位，trg_scrl_draft_only() 仍读 public（结果与无劫持一致：$HB）" || bad "劫持后行为改变：无劫持=$HB / 劫持=$HF"
+[ "$HC1" = "1/4" ] && [ "$HM" != "$HB" ] && ok "变异检查：RESET trg_scrl_draft_only() 的 search_path 后，目录断言变红（$HC1）且劫持生效（$HM），两条断言都能抓到" || bad "变异检查没变红：目录=$HC1 劫持后=$HM 基准=$HB"
 echo "=== 3. §5.6 盘点差异生成列（实盘 − 基准账面 − 期间流水）==="
 seed "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000);"
+assert_n "种子 count_line" "SELECT count(*) FROM count_line" 1
 D=$(psql -t -A -c "SELECT diff_qty_milli FROM count_line WHERE id=1")
 [ "$D" = "-2000" ] && ok "diff_qty_milli = $D（预期 -2000）" || bad "diff_qty_milli = $D（预期 -2000）"
+
+echo "=== 2g. 部分 convert_hold、PROCESSING/LIVE_HOLD、consume_process_hold、sell_deadline ==="
+expect_block "回转 op_key 小写 cvt: 两库都拒（ck_hold_reversal_key）" \
+  "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no,is_reversal) VALUES (130,41,'RETURN_QC','RETURN_QC','QC',7200,'cvt:52',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH01-20261015-000009',true); ROLLBACK;" \
+  "ck_hold_reversal_key"
+expect_allow "部分转换准备：stock 45 RETURN_QC 4000" \
+  "BEGIN; INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,quality_hold_qty_milli) VALUES (45,1,1,1,3,'KG',4000,4000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (110,45,'RETURN_QC','RETURN_QC','QC',7201,'RQC:7201',4000,0,'HELD',0); COMMIT;"
+expect_allow "convert_hold 部分 2000，调用方键 CVT:110:1" \
+  "BEGIN; SELECT id FROM stock WHERE id = 45 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id = 110 ORDER BY id FOR UPDATE; UPDATE stock_hold SET released_qty_milli = released_qty_milli + 2000, status = CASE WHEN released_qty_milli + 2000 = hold_qty_milli THEN 'RELEASED' ELSE 'HELD' END, version = version + 1 WHERE id = 110 AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 2000; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,from_hold_id) VALUES (111,45,'SCRAP_PENDING','SCRAP','SCRAP',9201,'CVT:110:1',2000,0,'HELD',0,110); UPDATE stock SET quality_hold_qty_milli = quality_hold_qty_milli - 2000, hold_qty_milli = hold_qty_milli + 2000, version = version + 1 WHERE id = 45 AND quality_hold_qty_milli >= 2000; COMMIT;"
+expect_allow "convert_hold 再转 500，另一键 CVT:110:2" \
+  "BEGIN; SELECT id FROM stock WHERE id = 45 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id = 110 ORDER BY id FOR UPDATE; UPDATE stock_hold SET released_qty_milli = released_qty_milli + 500, status = CASE WHEN released_qty_milli + 500 = hold_qty_milli THEN 'RELEASED' ELSE 'HELD' END, version = version + 1 WHERE id = 110 AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 500; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,from_hold_id) VALUES (112,45,'SCRAP_PENDING','SCRAP','SCRAP',9202,'CVT:110:2',500,0,'HELD',0,110); UPDATE stock SET quality_hold_qty_milli = quality_hold_qty_milli - 500, hold_qty_milli = hold_qty_milli + 500, version = version + 1 WHERE id = 45 AND quality_hold_qty_milli >= 500; COMMIT;"
+expect_block "同一调用方键 CVT:110:1 重放（uq_hold_op）" \
+  "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,from_hold_id) VALUES (113,45,'SCRAP_PENDING','SCRAP','SCRAP',9201,'CVT:110:1',2000,0,'HELD',0,110); ROLLBACK;" \
+  "uq_hold_op"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = released_qty_milli + 3000, version = version + 1 WHERE id = 110 AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 3000")
+[ "$R" = "UPDATE 0" ] && ok "超量部分转换 rowcount=0（→ 40905）" || bad "超量转换：$R"
+R=$(psql -t -A -c "SELECT h.released_qty_milli||'/'||h.status||'/'||(SELECT COALESCE(SUM(c.hold_qty_milli),0) FROM stock_hold c WHERE c.from_hold_id=h.id)||'/'||s.quality_hold_qty_milli||'/'||s.hold_qty_milli||'/'||(s.on_hand_qty_milli-s.allocated_qty_milli-s.reserved_qty_milli-s.quality_hold_qty_milli-s.hold_qty_milli) FROM stock_hold h JOIN stock s ON s.id=h.stock_id WHERE h.id=110")
+[ "$R" = "2500/HELD/2500/1500/2500/0" ] && ok "部分转换后 父释放/状态/子合计/quality/hold/available = $R" || bad "部分转换后 = $R（期望 2500/HELD/2500/1500/2500/0）"
+expect_block "from_hold_id 不可改" "BEGIN; UPDATE stock_hold SET from_hold_id = 50 WHERE id = 111; COMMIT;" "hold_immutable"
+R=$(psql -t -A -c "SELECT count(*) FROM (SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.released_qty_milli <> COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id = h.id), 0) + COALESCE((SELECT SUM(c.hold_qty_milli) FROM stock_hold c WHERE c.from_hold_id = h.id), 0)) t")
+[ "$R" = "0" ] && ok "I3e 部分转换后仍无差异（按 from_hold_id 汇总）" || bad "I3e 差异行 $R"
+expect_block "PROCESSING op_key 小写 prci:" \
+  "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (129,11,'PROCESSING','PROCESSING','PROCESS_ORDER',1,'prci:1',1000,0,'HELD',0); ROLLBACK;" \
+  "ck_hold_process"
+expect_block "PROCESSING operator 非 0（人工 hold 插不进去）" \
+  "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (128,11,'PROCESSING','PROCESSING','PROCESS_ORDER',1,'PRCI:badop',1000,0,'HELD',7); ROLLBACK;" \
+  "ck_hold_process"
+expect_block "LIVE_HOLD 来源不是 LIVE_TANK_HOLD" \
+  "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (127,11,'LIVE_HOLD','LIVE_HOLD','MANUAL',1,'LH:bad',1000,0,'HELD',0); ROLLBACK;" \
+  "ck_hold_live"
+expect_allow "place_hold PROCESSING：stock 46 冻满 5000" \
+  "BEGIN; INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (46,1,2,1,2,'KG',5000,5000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (120,46,'PROCESSING','PROCESSING','PROCESS_ORDER',8801,'PRCI:8801',5000,0,'HELD',0); COMMIT;"
+expect_allow "place_hold LIVE_HOLD：stock 47 冻满 3000" \
+  "BEGIN; INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (47,1,3,1,2,'KG',3000,3000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (121,47,'LIVE_HOLD','LIVE_HOLD','LIVE_TANK_HOLD',6601,'LH:6601',3000,0,'HELD',0); COMMIT;"
+R=$(psql -t -A -c "SELECT (SELECT available_qty_milli FROM v_stock_available WHERE stock_id=46)||'/'||(SELECT available_qty_milli FROM v_stock_available WHERE stock_id=47)")
+[ "$R" = "0/0" ] && ok "PROCESSING/LIVE_HOLD 可用量 = $R（都从 available 扣除，FEFO 分不到）" || bad "系统锁可用量 = $R（期望 0/0）"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED' WHERE id = 120 AND status = 'HELD' AND hold_type IN ('QUALITY','MANUAL')")
+[ "$R" = "UPDATE 0" ] && ok "PROCESSING 人工解冻 rowcount=0（→ 40933）" || bad "人工解冻了 PROCESSING：$R"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status = 'RELEASED' WHERE id = 121 AND status = 'HELD' AND hold_type IN ('QUALITY','MANUAL')")
+[ "$R" = "UPDATE 0" ] && ok "LIVE_HOLD 人工解冻 rowcount=0（→ 40933）" || bad "人工解冻了 LIVE_HOLD：$R"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = released_qty_milli + 500, version = version + 1 WHERE id = 121 AND hold_type = 'PROCESSING' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 500")
+[ "$R" = "UPDATE 0" ] && ok "release_hold 不释放 LIVE_HOLD（WHERE 限 PROCESSING，rowcount=0）" || bad "release_hold 误放了 LIVE_HOLD：$R"
+expect_allow "consume_process_hold 扣 2000（hold 与 on_hand 同一条 UPDATE，记 PROCESS_CONSUME）" \
+  "BEGIN; SELECT id FROM stock WHERE id=46 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id=120 ORDER BY id FOR UPDATE; UPDATE stock SET hold_qty_milli = hold_qty_milli - 2000, on_hand_qty_milli = on_hand_qty_milli - 2000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 46 AND hold_qty_milli >= 2000 AND on_hand_qty_milli >= 2000; UPDATE stock_hold SET released_qty_milli = released_qty_milli + 2000, status = CASE WHEN released_qty_milli + 2000 = hold_qty_milli THEN 'RELEASED' ELSE 'HELD' END, version = version + 1 WHERE id = 120 AND hold_type = 'PROCESSING' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 2000;  INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('PRC1',1,'DOC',NULL); INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,hold_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (200,'PRC1',1,1,1,'DOC','PROCESS_CONSUME',-1,46,120,1,1,2,1,2,NULL,NULL,NULL,NULL,2000,5000,3000,'2026-10-16','PRC1:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (200,'PRC1:1:D1:1','PRC1',1,1,1,'DOC',NULL,NULL,NULL,NULL,46,1,-1,'2026-10-16'); COMMIT;"
+R=$(psql -t -A -c "SELECT s.on_hand_qty_milli||'/'||s.hold_qty_milli||'/'||(s.on_hand_qty_milli-s.allocated_qty_milli-s.reserved_qty_milli-s.quality_hold_qty_milli-s.hold_qty_milli)||'/'||h.released_qty_milli||'/'||h.status||'/'||(SELECT count(*) FROM stock_movement WHERE stock_id=46 AND biz_type='PROCESS_CONSUME') FROM stock s JOIN stock_hold h ON s.id = h.stock_id AND h.id=120")
+[ "$R" = "3000/3000/0/2000/HELD/1" ] && ok "consume 2000 后 on_hand/hold/available/released/status/流水 = $R" || bad "consume 2000 = $R（期望 3000/3000/0/2000/HELD/1）"
+expect_allow "consume_process_hold 再扣 1000，另一幂等键" \
+  "BEGIN; SELECT id FROM stock WHERE id=46 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id=120 ORDER BY id FOR UPDATE; UPDATE stock SET hold_qty_milli = hold_qty_milli - 1000, on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 46 AND hold_qty_milli >= 1000 AND on_hand_qty_milli >= 1000; UPDATE stock_hold SET released_qty_milli = released_qty_milli + 1000, status = CASE WHEN released_qty_milli + 1000 = hold_qty_milli THEN 'RELEASED' ELSE 'HELD' END, version = version + 1 WHERE id = 120 AND hold_type = 'PROCESSING' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 1000;  INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,hold_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (201,'PRC1',1,2,1,'DOC','PROCESS_CONSUME',-1,46,120,2,1,2,1,2,NULL,NULL,NULL,NULL,1000,3000,2000,'2026-10-16','PRC1:1:D2:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (201,'PRC1:1:D2:1','PRC1',1,2,1,'DOC',NULL,NULL,NULL,NULL,46,2,-1,'2026-10-16'); COMMIT;"
+R=$(psql -t -A -c "SELECT s.on_hand_qty_milli||'/'||s.hold_qty_milli||'/'||(s.on_hand_qty_milli-s.allocated_qty_milli-s.reserved_qty_milli-s.quality_hold_qty_milli-s.hold_qty_milli)||'/'||h.released_qty_milli||'/'||(SELECT count(*) FROM stock_movement WHERE stock_id=46 AND biz_type='PROCESS_CONSUME') FROM stock s JOIN stock_hold h ON s.id = h.stock_id AND h.id=120")
+[ "$R" = "2000/2000/0/3000/2" ] && ok "consume 再扣 1000 后 = $R" || bad "第二次 consume = $R（期望 2000/2000/0/3000/2）"
+expect_block "consume 重放同一幂等键，整笔回滚（不二次扣减）" \
+  "BEGIN; SELECT id FROM stock WHERE id=46 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id=120 ORDER BY id FOR UPDATE; UPDATE stock SET hold_qty_milli = hold_qty_milli - 1000, on_hand_qty_milli = on_hand_qty_milli - 1000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 46 AND hold_qty_milli >= 1000 AND on_hand_qty_milli >= 1000; UPDATE stock_hold SET released_qty_milli = released_qty_milli + 1000, version = version + 1 WHERE id = 120 AND hold_type = 'PROCESSING' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 1000; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('PRC9',1,'DOC',NULL); INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,hold_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (202,'PRC9',1,1,1,'DOC','PROCESS_CONSUME',-1,46,120,9,1,2,1,2,NULL,NULL,NULL,NULL,1000,2000,1000,'2026-10-16','PRC1:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (202,'PRC1:1:D1:1','PRC9',1,1,1,'DOC',NULL,NULL,NULL,NULL,46,9,-1,'2026-10-16'); COMMIT;" \
+  "uq_mvk_idem"
+R=$(psql -t -A -c "SELECT s.on_hand_qty_milli||'/'||s.hold_qty_milli||'/'||h.released_qty_milli||'/'||(SELECT count(*) FROM stock_movement WHERE stock_id=46) FROM stock s JOIN stock_hold h ON s.id = h.stock_id AND h.id=120")
+[ "$R" = "2000/2000/3000/2" ] && ok "重放回滚后 on_hand/hold/released/流水 = $R" || bad "重放后 = $R（期望 2000/2000/3000/2）"
+R=$(psql -t -A -c "SELECT CASE WHEN h.released_qty_milli = COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id=h.id),0) + COALESCE((SELECT SUM(m.move_qty_milli) FROM stock_movement m WHERE m.hold_id=h.id AND m.biz_type='PROCESS_CONSUME' AND m.direction=-1),0) THEN '1' ELSE '0' END FROM stock_hold h WHERE h.id=120")
+[ "$R" = "1" ] && ok "I3f PROCESSING 已释放 = 释放记录 + PROCESS_CONSUME 流水" || bad "I3f = $R（期望 1）"
+expect_allow "同一 stock 两条 PROCESSING，只扣其中一条（stock 52 / hold 130、131）" \
+  "BEGIN; INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (52,1,3,2,1,'KG',2000,2000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (130,52,'PROCESSING','PROCESSING','PROCESS_ORDER',8810,'PRCI:8810',1000,0,'HELD',0),(131,52,'PROCESSING','PROCESSING','PROCESS_ORDER',8811,'PRCI:8811',1000,0,'HELD',0); SELECT id FROM stock WHERE id=52 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id IN (130,131) ORDER BY id FOR UPDATE; UPDATE stock SET hold_qty_milli = hold_qty_milli - 400, on_hand_qty_milli = on_hand_qty_milli - 400, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 52 AND hold_qty_milli >= 400 AND on_hand_qty_milli >= 400; UPDATE stock_hold SET released_qty_milli = released_qty_milli + 400, status = CASE WHEN released_qty_milli + 400 = hold_qty_milli THEN 'RELEASED' ELSE 'HELD' END, version = version + 1 WHERE id = 130 AND hold_type = 'PROCESSING' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 400; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('PRC2',1,'DOC',NULL); INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,hold_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (220,'PRC2',1,1,1,'DOC','PROCESS_CONSUME',-1,52,130,1,1,3,2,1,NULL,NULL,NULL,NULL,400,2000,1600,'2026-10-16','PRC2:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (220,'PRC2:1:D1:1','PRC2',1,1,1,'DOC',NULL,NULL,NULL,NULL,52,1,-1,'2026-10-16'); COMMIT;"
+R=$(psql -t -A -c "SELECT string_agg(h.id || ':' || CASE WHEN h.released_qty_milli = COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id=h.id),0) + COALESCE((SELECT SUM(m.move_qty_milli) FROM stock_movement m WHERE m.hold_id=h.id AND m.biz_type='PROCESS_CONSUME' AND m.direction=-1),0) THEN '1' ELSE '0' END, '/' ORDER BY h.id) FROM stock_hold h WHERE h.id IN (130,131)")
+[ "$R" = "130:1/131:1" ] && ok "I3f 按单条冻结对账，未扣的 131 不被 130 的流水算进去 = $R" || bad "I3f 双冻结 = $R（期望 130:1/131:1）"
+R=$(psql -t -A -c "SELECT CASE WHEN h.released_qty_milli = COALESCE((SELECT SUM(m.move_qty_milli) FROM stock_movement m WHERE m.stock_id=h.stock_id AND m.biz_type='PROCESS_CONSUME' AND m.direction=-1),0) THEN '1' ELSE '0' END FROM stock_hold h WHERE h.id=131")
+[ "$R" = "0" ] && ok "按 stock 汇总 PROCESS_CONSUME 会对不上未扣的那条 PROCESSING" || bad "按 stock 汇总居然对上了 131：$R"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = released_qty_milli + 3000, version = version + 1 WHERE id = 120 AND hold_type = 'PROCESSING' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 3000")
+[ "$R" = "UPDATE 0" ] && ok "consume 超过 PROCESSING 余量 rowcount=0（→ 40905）" || bad "超量 consume：$R"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = released_qty_milli + 100, version = version + 1 WHERE id = 121 AND hold_type = 'PROCESSING' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 100")
+[ "$R" = "UPDATE 0" ] && ok "consume_process_hold 不接受 LIVE_HOLD（rowcount=0）" || bad "LIVE_HOLD 被 consume：$R"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = released_qty_milli + 100, version = version + 1 WHERE id = 31 AND hold_type = 'PROCESSING' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 100")
+[ "$R" = "UPDATE 0" ] && ok "consume_process_hold 不接受 SCRAP_PENDING（rowcount=0）" || bad "非 PROCESSING 被 consume：$R"
+expect_allow "同池两条 LIVE_HOLD（stock 48/51，source 7701，sku 2，不进 FEFO）" \
+  "BEGIN; INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (48,1,1,2,1,'KG',2000,2000),(51,1,3,2,2,'KG',3500,3500); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (123,48,'LIVE_HOLD','LIVE_HOLD','LIVE_TANK_HOLD',7701,'LH:7701:48',2000,0,'HELD',0),(126,51,'LIVE_HOLD','LIVE_HOLD','LIVE_TANK_HOLD',7701,'LH:7701:51',3500,0,'HELD',0); COMMIT;"
+R=$(psql -t -A -c "BEGIN; SELECT id FROM stock WHERE id IN (SELECT stock_id FROM stock_hold WHERE hold_type='LIVE_HOLD' AND source_type='LIVE_TANK_HOLD' AND source_id=7701 AND status='HELD') ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE hold_type='LIVE_HOLD' AND source_type='LIVE_TANK_HOLD' AND source_id=7701 AND status='HELD' ORDER BY id FOR UPDATE; INSERT INTO stock_hold_release (id,hold_id,op_key,qty_milli) SELECT v.rid, h.id, 'LTH:7701:8801:' || h.id, h.hold_qty_milli - h.released_qty_milli FROM stock_hold h JOIN (SELECT 81 AS rid, 123 AS hid UNION ALL SELECT 82, 126) v ON h.id = v.hid WHERE h.hold_type='LIVE_HOLD' AND h.source_type='LIVE_TANK_HOLD' AND h.source_id=7701 AND h.status='HELD'; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status='RELEASED', version=version+1 WHERE id IN (123,126) AND hold_type='LIVE_HOLD' AND source_type='LIVE_TANK_HOLD' AND source_id=7701 AND status='HELD'; UPDATE stock SET hold_qty_milli = hold_qty_milli - (SELECT COALESCE(SUM(r.qty_milli),0) FROM stock_hold_release r JOIN stock_hold h ON h.id=r.hold_id WHERE h.stock_id=stock.id AND h.id IN (123,126) AND r.id IN (81,82)), version=version+1 WHERE id IN (48,51) AND hold_qty_milli >= (SELECT COALESCE(SUM(r.qty_milli),0) FROM stock_hold_release r JOIN stock_hold h ON h.id=r.hold_id WHERE h.stock_id=stock.id AND h.id IN (123,126) AND r.id IN (81,82)) AND 1=0; SELECT (SELECT count(*) FROM stock_hold_release WHERE op_key IN ('LTH:7701:8801:123','LTH:7701:8801:126')) || '/' || (SELECT count(*) FROM stock_hold WHERE source_type='LIVE_TANK_HOLD' AND source_id=7701 AND status='RELEASED') || '/' || (SELECT count(*) FROM stock WHERE id IN (48,51) AND hold_qty_milli=0); ROLLBACK;" | grep '/')
+[ "$R" = "2/2/0" ] && ok "release_live_hold 行数不一致 释放/明细/汇总 = $R，已回滚（→ 50010）" || bad "行数不一致 = $R（期望 2/2/0）"
+R=$(psql -t -A -c "SELECT (SELECT status FROM stock_hold WHERE id=123)||'/'||(SELECT status FROM stock_hold WHERE id=126)")
+[ "$R" = "HELD/HELD" ] && ok "行数不一致回滚后两条仍 HELD" || bad "回滚后状态 = $R"
+expect_allow "release_live_hold 整池释放 source 7701" \
+  "BEGIN; SELECT id FROM stock WHERE id IN (SELECT stock_id FROM stock_hold WHERE hold_type='LIVE_HOLD' AND source_type='LIVE_TANK_HOLD' AND source_id=7701 AND status='HELD') ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE hold_type='LIVE_HOLD' AND source_type='LIVE_TANK_HOLD' AND source_id=7701 AND status='HELD' ORDER BY id FOR UPDATE; INSERT INTO stock_hold_release (id,hold_id,op_key,qty_milli) SELECT v.rid, h.id, 'LTH:7701:8801:' || h.id, h.hold_qty_milli - h.released_qty_milli FROM stock_hold h JOIN (SELECT 81 AS rid, 123 AS hid UNION ALL SELECT 82, 126) v ON h.id = v.hid WHERE h.hold_type='LIVE_HOLD' AND h.source_type='LIVE_TANK_HOLD' AND h.source_id=7701 AND h.status='HELD'; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status='RELEASED', version=version+1 WHERE id IN (123,126) AND hold_type='LIVE_HOLD' AND source_type='LIVE_TANK_HOLD' AND source_id=7701 AND status='HELD'; UPDATE stock SET hold_qty_milli = hold_qty_milli - (SELECT COALESCE(SUM(r.qty_milli),0) FROM stock_hold_release r JOIN stock_hold h ON h.id=r.hold_id WHERE h.stock_id=stock.id AND h.id IN (123,126) AND r.id IN (81,82)), version=version+1 WHERE id IN (48,51) AND hold_qty_milli >= (SELECT COALESCE(SUM(r.qty_milli),0) FROM stock_hold_release r JOIN stock_hold h ON h.id=r.hold_id WHERE h.stock_id=stock.id AND h.id IN (123,126) AND r.id IN (81,82)); COMMIT;"
+R=$(psql -t -A -c "SELECT (SELECT count(*) FROM stock_hold_release WHERE op_key IN ('LTH:7701:8801:123','LTH:7701:8801:126'))||'/'||(SELECT count(*) FROM stock_hold WHERE source_type='LIVE_TANK_HOLD' AND source_id=7701 AND status='RELEASED')||'/'||(SELECT count(*) FROM stock WHERE id IN (48,51) AND hold_qty_milli=0)||'/'||(SELECT on_hand_qty_milli FROM stock WHERE id=48)||'/'||(SELECT hold_qty_milli FROM stock WHERE id=48)||'/'||(SELECT on_hand_qty_milli FROM stock WHERE id=51)||'/'||(SELECT hold_qty_milli FROM stock WHERE id=51)")
+[ "$R" = "2/2/2/2000/0/3500/0" ] && ok "整池释放 释放行/明细/汇总/两行 on_hand/hold = $R" || bad "整池释放 = $R（期望 2/2/2/2000/0/3500/0）"
+R=$(psql -t -A -c "SELECT count(*)||'/'||COALESCE(SUM(qty_milli),0) FROM stock_hold_release WHERE op_key IN ('LTH:7701:8801:123','LTH:7701:8801:126')")
+[ "$R" = "2/5500" ] && ok "release_live_hold 幂等：等值命中已有 op_key（合计 5500），直接返回不再写" || bad "幂等预查 = $R（期望 2/5500）"
+expect_block "release_live_hold 重放同一 op_key" \
+  "BEGIN; INSERT INTO stock_hold_release (id,hold_id,op_key,qty_milli) VALUES (83,123,'LTH:7701:8801:123',2000); ROLLBACK;" \
+  "uq_hr_op"
+R=$(psql -t -A -c "SELECT (SELECT count(*) FROM stock_hold_release WHERE op_key IN ('LTH:7701:8801:123','LTH:7701:8801:126'))||'/'||(SELECT on_hand_qty_milli FROM stock WHERE id=48)||'/'||(SELECT hold_qty_milli FROM stock WHERE id=48)||'/'||(SELECT on_hand_qty_milli FROM stock WHERE id=51)||'/'||(SELECT hold_qty_milli FROM stock WHERE id=51)")
+[ "$R" = "2/2000/0/3500/0" ] && ok "重放回滚后整池释放行数与在库不变 = $R" || bad "重放后整池 = $R"
+expect_allow "consume_live_hold 准备：stock 50 LIVE_HOLD 4000（source 7702）" \
+  "BEGIN; INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (50,1,2,2,1,'KG',4000,4000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (125,50,'LIVE_HOLD','LIVE_HOLD','LIVE_TANK_HOLD',7702,'LH:7702',4000,0,'HELD',0); COMMIT;"
+expect_allow "consume_live_hold 部分扣 1500（LIVE_DEATH，一条 SCRAP -1）" \
+  "BEGIN; SELECT id FROM stock WHERE id=50 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id=125 ORDER BY id FOR UPDATE; UPDATE stock SET hold_qty_milli = hold_qty_milli - 1500, on_hand_qty_milli = on_hand_qty_milli - 1500, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 50 AND hold_qty_milli >= 1500 AND on_hand_qty_milli >= 1500; UPDATE stock_hold SET released_qty_milli = released_qty_milli + 1500, status = CASE WHEN released_qty_milli + 1500 = hold_qty_milli THEN 'RELEASED' ELSE 'HELD' END, version = version + 1 WHERE id = 125 AND hold_type = 'LIVE_HOLD' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 1500;  INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('LD1',1,'DOC',NULL); INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,hold_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (210,'LD1',1,1,1,'DOC','SCRAP',-1,50,125,1,1,2,2,1,NULL,NULL,NULL,NULL,1500,4000,2500,'2026-10-16','LD1:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (210,'LD1:1:D1:1','LD1',1,1,1,'DOC',NULL,NULL,NULL,NULL,50,1,-1,'2026-10-16'); COMMIT;"
+R=$(psql -t -A -c "SELECT s.on_hand_qty_milli||'/'||s.hold_qty_milli||'/'||(s.on_hand_qty_milli-s.allocated_qty_milli-s.reserved_qty_milli-s.quality_hold_qty_milli-s.hold_qty_milli)||'/'||h.released_qty_milli||'/'||h.status||'/'||(SELECT count(*) FROM stock_movement WHERE stock_id=50 AND biz_type='SCRAP' AND direction=-1) FROM stock s JOIN stock_hold h ON s.id=h.stock_id AND h.id=125")
+[ "$R" = "2500/2500/0/1500/HELD/1" ] && ok "死亡一次只有一条 -1 流水，部分扣后 = $R" || bad "consume_live_hold = $R（期望 2500/2500/0/1500/HELD/1）"
+expect_block "consume_live_hold 重放同一幂等键" \
+  "BEGIN; SELECT id FROM stock WHERE id=50 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id=125 ORDER BY id FOR UPDATE; UPDATE stock SET hold_qty_milli = hold_qty_milli - 1500, on_hand_qty_milli = on_hand_qty_milli - 1500, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 50 AND hold_qty_milli >= 1500 AND on_hand_qty_milli >= 1500; UPDATE stock_hold SET released_qty_milli = released_qty_milli + 1500, version = version + 1 WHERE id = 125 AND hold_type = 'LIVE_HOLD' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 1500; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('LD9',1,'DOC',NULL); INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,hold_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (212,'LD9',1,1,1,'DOC','SCRAP',-1,50,125,9,1,2,2,1,NULL,NULL,NULL,NULL,1500,2500,1000,'2026-10-16','LD1:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (212,'LD1:1:D1:1','LD9',1,1,1,'DOC',NULL,NULL,NULL,NULL,50,9,-1,'2026-10-16'); COMMIT;" \
+  "uq_mvk_idem"
+R=$(psql -t -A -c "SELECT s.on_hand_qty_milli||'/'||s.hold_qty_milli||'/'||h.released_qty_milli||'/'||(SELECT count(*) FROM stock_movement WHERE stock_id=50 AND direction=-1) FROM stock s JOIN stock_hold h ON s.id=h.stock_id AND h.id=125")
+[ "$R" = "2500/2500/1500/1" ] && ok "死亡重放不二次扣减，仍一条 -1 流水 = $R" || bad "死亡重放后 = $R"
+expect_allow "consume_live_hold 再扣 500，另一幂等键" \
+  "BEGIN; SELECT id FROM stock WHERE id=50 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id=125 ORDER BY id FOR UPDATE; UPDATE stock SET hold_qty_milli = hold_qty_milli - 500, on_hand_qty_milli = on_hand_qty_milli - 500, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 50 AND hold_qty_milli >= 500 AND on_hand_qty_milli >= 500; UPDATE stock_hold SET released_qty_milli = released_qty_milli + 500, status = CASE WHEN released_qty_milli + 500 = hold_qty_milli THEN 'RELEASED' ELSE 'HELD' END, version = version + 1 WHERE id = 125 AND hold_type = 'LIVE_HOLD' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 500;  INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,hold_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (211,'LD1',1,2,1,'DOC','SCRAP',-1,50,125,2,1,2,2,1,NULL,NULL,NULL,NULL,500,2500,2000,'2026-10-16','LD1:1:D2:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (211,'LD1:1:D2:1','LD1',1,2,1,'DOC',NULL,NULL,NULL,NULL,50,2,-1,'2026-10-16'); COMMIT;"
+R=$(psql -t -A -c "SELECT s.on_hand_qty_milli||'/'||s.hold_qty_milli||'/'||(s.on_hand_qty_milli-s.allocated_qty_milli-s.reserved_qty_milli-s.quality_hold_qty_milli-s.hold_qty_milli)||'/'||h.released_qty_milli||'/'||(SELECT count(*) FROM stock_movement WHERE stock_id=50 AND direction=-1) FROM stock s JOIN stock_hold h ON s.id=h.stock_id AND h.id=125")
+[ "$R" = "2000/2000/0/2000/2" ] && ok "consume_live_hold 再扣 500 后 = $R" || bad "第二次 consume_live = $R（期望 2000/2000/0/2000/2）"
+R=$(psql -t -A -c "SELECT CASE WHEN h.released_qty_milli = COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id=h.id),0) + COALESCE((SELECT SUM(m.move_qty_milli) FROM stock_movement m WHERE m.hold_id=h.id AND m.biz_type='SCRAP' AND m.direction=-1),0) THEN '1' ELSE '0' END FROM stock_hold h WHERE h.id=125")
+[ "$R" = "1" ] && ok "I3g LIVE_HOLD 已释放 = 释放记录 + 本行 SCRAP 流水" || bad "I3g = $R（期望 1）"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = released_qty_milli + 3000, version = version + 1 WHERE id = 125 AND hold_type = 'LIVE_HOLD' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 3000")
+[ "$R" = "UPDATE 0" ] && ok "consume_live_hold 超量 rowcount=0（→ 40905）" || bad "超量 consume_live：$R"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = released_qty_milli + 100, version = version + 1 WHERE id = 120 AND hold_type = 'LIVE_HOLD' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 100")
+[ "$R" = "UPDATE 0" ] && ok "consume_live_hold 不接受 PROCESSING（rowcount=0）" || bad "PROCESSING 被 consume_live：$R"
+expect_allow "N-1 consume_process_hold：stock 53 冻结 3000，一次扣完并提交" \
+  "BEGIN; INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (53,1,1,2,3,'KG',3000,3000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (140,53,'PROCESSING','PROCESSING','PROCESS_ORDER',5301,'PRCI:5301',3000,0,'HELD',0); SELECT id FROM stock WHERE id=53 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id=140 ORDER BY id FOR UPDATE; UPDATE stock SET hold_qty_milli = hold_qty_milli - 3000, on_hand_qty_milli = on_hand_qty_milli - 3000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 53 AND hold_qty_milli >= 3000 AND on_hand_qty_milli >= 3000; UPDATE stock_hold SET released_qty_milli = released_qty_milli + 3000, status = CASE WHEN released_qty_milli + 3000 = hold_qty_milli THEN 'RELEASED' ELSE 'HELD' END, version = version + 1 WHERE id = 140 AND hold_type = 'PROCESSING' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 3000; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('PRC3',1,'DOC',NULL); INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,hold_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (230,'PRC3',1,1,1,'DOC','PROCESS_CONSUME',-1,53,140,1,1,1,2,3,NULL,NULL,NULL,NULL,3000,3000,0,'2026-10-16','PRC3:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (230,'PRC3:1:D1:1','PRC3',1,1,1,'DOC',NULL,NULL,NULL,NULL,53,1,-1,'2026-10-16'); COMMIT;"
+R=$(psql -t -A -c "BEGIN; SELECT id||'/'||move_qty_milli||'/'||on_hand_before_qty_milli||'/'||on_hand_after_qty_milli FROM stock_movement WHERE idempotency_key = 'PRC3:1:D1:1'; COMMIT;" | tr -d '\r' | grep '/')
+[ "$R" = "230/3000/3000/0" ] && ok "N-1 加工消耗重放：等值命中原流水，扣减之前就返回 = $R" || bad "N-1 加工预查 = $R（期望 230/3000/3000/0）"
+R=$(psql -t -A -c "SELECT s.version||'/'||s.on_hand_qty_milli||'/'||s.hold_qty_milli||'/'||h.released_qty_milli||'/'||h.status||'/'||(SELECT count(*) FROM stock_movement WHERE idempotency_key='PRC3:1:D1:1') FROM stock s JOIN stock_hold h ON h.id=140 WHERE s.id=53")
+[ "$R" = "1/0/0/3000/RELEASED/1" ] && ok "N-1 加工重放未再扣、未再记账 = $R" || bad "N-1 加工重放后 = $R（期望 1/0/0/3000/RELEASED/1）"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = released_qty_milli + 3000, version = version + 1 WHERE id = 140 AND hold_type = 'PROCESSING' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 3000")
+[ "$R" = "UPDATE 0" ] && ok "N-1 加工：跳过预查时余量扣减 rowcount=0（→ 40905），原语不得走到这一步" || bad "N-1 加工 40905 对照 = $R"
+expect_allow "N-1 consume_live_hold：stock 54 冻结 3000，一次扣完并提交" \
+  "BEGIN; INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (54,1,1,2,2,'KG',3000,3000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (141,54,'LIVE_HOLD','LIVE_HOLD','LIVE_TANK_HOLD',6602,'LH:6602',3000,0,'HELD',0); SELECT id FROM stock WHERE id=54 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id=141 ORDER BY id FOR UPDATE; UPDATE stock SET hold_qty_milli = hold_qty_milli - 3000, on_hand_qty_milli = on_hand_qty_milli - 3000, ledger_seq = ledger_seq + 1, version = version + 1 WHERE id = 54 AND hold_qty_milli >= 3000 AND on_hand_qty_milli >= 3000; UPDATE stock_hold SET released_qty_milli = released_qty_milli + 3000, status = CASE WHEN released_qty_milli + 3000 = hold_qty_milli THEN 'RELEASED' ELSE 'HELD' END, version = version + 1 WHERE id = 141 AND hold_type = 'LIVE_HOLD' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 3000; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('LD3',1,'DOC',NULL); INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,hold_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (231,'LD3',1,1,1,'DOC','SCRAP',-1,54,141,1,1,1,2,2,NULL,NULL,NULL,NULL,3000,3000,0,'2026-10-16','LD3:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (231,'LD3:1:D1:1','LD3',1,1,1,'DOC',NULL,NULL,NULL,NULL,54,1,-1,'2026-10-16'); COMMIT;"
+R=$(psql -t -A -c "BEGIN; SELECT id||'/'||move_qty_milli||'/'||on_hand_before_qty_milli||'/'||on_hand_after_qty_milli FROM stock_movement WHERE idempotency_key = 'LD3:1:D1:1'; COMMIT;" | tr -d '\r' | grep '/')
+[ "$R" = "231/3000/3000/0" ] && ok "N-1 活鲜消耗重放：等值命中原流水，扣减之前就返回 = $R" || bad "N-1 活鲜预查 = $R（期望 231/3000/3000/0）"
+R=$(psql -t -A -c "SELECT s.version||'/'||s.on_hand_qty_milli||'/'||s.hold_qty_milli||'/'||h.released_qty_milli||'/'||h.status||'/'||(SELECT count(*) FROM stock_movement WHERE idempotency_key='LD3:1:D1:1') FROM stock s JOIN stock_hold h ON h.id=141 WHERE s.id=54")
+[ "$R" = "1/0/0/3000/RELEASED/1" ] && ok "N-1 活鲜重放未再扣、未再记账 = $R" || bad "N-1 活鲜重放后 = $R（期望 1/0/0/3000/RELEASED/1）"
+R=$(psql -t -A -c "UPDATE stock_hold SET released_qty_milli = released_qty_milli + 3000, version = version + 1 WHERE id = 141 AND hold_type = 'LIVE_HOLD' AND status = 'HELD' AND hold_qty_milli - released_qty_milli >= 3000")
+[ "$R" = "UPDATE 0" ] && ok "N-1 活鲜：跳过预查时余量扣减 rowcount=0（→ 40905），原语不得走到这一步" || bad "N-1 活鲜 40905 对照 = $R"
+expect_allow "N-2 顺序：stock 61 整池释放一次后提交" \
+  "BEGIN; INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (61,1,3,2,3,'KG',3000,3000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (172,61,'LIVE_HOLD','LIVE_HOLD','LIVE_TANK_HOLD',7903,'LH:7903',3000,0,'HELD',0); SELECT id FROM stock WHERE id=61 ORDER BY id FOR UPDATE; SELECT id FROM stock_hold WHERE id=172 AND status='HELD' ORDER BY id FOR UPDATE; INSERT INTO stock_hold_release (id,hold_id,op_key,qty_milli) SELECT 193, h.id, 'LTH:7903:9003:' || h.id, h.hold_qty_milli - h.released_qty_milli FROM stock_hold h WHERE h.id=172 AND h.status='HELD'; UPDATE stock_hold SET released_qty_milli = hold_qty_milli, status='RELEASED', version=version+1 WHERE id=172 AND status='HELD'; UPDATE stock SET hold_qty_milli = hold_qty_milli - (SELECT COALESCE(SUM(r.qty_milli),0) FROM stock_hold_release r WHERE r.id=193), version=version+1 WHERE id=61 AND hold_qty_milli >= (SELECT COALESCE(SUM(r.qty_milli),0) FROM stock_hold_release r WHERE r.id=193); COMMIT;"
+R=$(psql -t -A -c "BEGIN; SELECT (SELECT count(*) FROM stock_hold WHERE id=172 AND status='HELD') || '/' || (SELECT id||':'||qty_milli FROM stock_hold_release WHERE op_key='LTH:7903:9003:172'); COMMIT;" | tr -d '\r' | grep '/')
+[ "$R" = "0/193:3000" ] && ok "N-2 顺序：第 1 步锁到 0 条 HELD 后重跑幂等查询，返回原释放 = $R" || bad "N-2 顺序重查 = $R（期望 0/193:3000）"
+R=$(psql -t -A -c "SELECT s.version||'/'||s.on_hand_qty_milli||'/'||s.hold_qty_milli||'/'||(SELECT count(*) FROM stock_hold_release WHERE hold_id=172)||'/'||h.version FROM stock s JOIN stock_hold h ON h.id=172 WHERE s.id=61")
+[ "$R" = "1/3000/0/1/1" ] && ok "N-2 顺序重放不插空释放、不抬 version = $R" || bad "N-2 顺序重放后 = $R（期望 1/3000/0/1/1）"
+expect_allow "ck_recon_code 活鲜四码可写入" \
+  "BEGIN; INSERT INTO stock_recon_alert (id,check_code,warehouse_id,stock_id,expected_qty_milli,actual_qty_milli) VALUES (9101,'LIVE_COUNT_WEIGHT',1,46,1,0),(9102,'LIVE_COUNT_LEDGER',1,46,1,0),(9103,'LIVE_HOLD_MISMATCH',1,47,1,0),(9104,'LIVE_INSPECT_OVERDUE',1,47,1,0); ROLLBACK;"
+expect_block "已有批次 sell_deadline 从 NULL 补写" "UPDATE lot SET sell_deadline = '2026-11-01' WHERE id = 1;" "sell_deadline_immutable"
+expect_allow "新建批次写入 sell_deadline" \
+  "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date,sell_deadline) VALUES (90,1,'LOT-SD','2026-12-01','2026-10-01','2026-11-01');"
+expect_block "sell_deadline 改早" "UPDATE lot SET sell_deadline = '2026-10-01' WHERE id = 90;" "sell_deadline_immutable"
+expect_block "sell_deadline 改晚" "UPDATE lot SET sell_deadline = '2026-12-15' WHERE id = 90;" "sell_deadline_immutable"
+expect_block "sell_deadline 清空" "UPDATE lot SET sell_deadline = NULL WHERE id = 90;" "sell_deadline_immutable"
+expect_allow "sell_deadline 不动时其余列可改" "UPDATE lot SET remaining_life_days = 12 WHERE id = 90;"
 
 echo "=== 4. §4.4 FEFO 候选池排序（出库禁发期 10 天）==="
 # 放在并发测试之前：并发测试会插入 id=999 的 lot-1008 库存行，干扰排序断言
@@ -622,12 +1126,12 @@ AV=$(psql -t -A -c "SELECT available_qty_milli FROM v_stock_available WHERE stoc
 [ "$AV" = "20000" ] && ok "available_qty_milli = 30000 − 10000 = $AV" || bad "可用量计算错误：$AV"
 
 echo "=== 5. §4.3 并发防超卖：50 个独立连接同时扣 3 KG，起始 100 KG ==="
-psql -q -c "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (999,1,1,1,1,'KG',100000);" >/dev/null
+seed "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (999,1,1,1,1,'KG',100000);"
 CT_DIR=$(mktemp -d)
 for _ in $(seq 1 50); do
   psql -t -A -c \
     "UPDATE stock SET on_hand_qty_milli = on_hand_qty_milli - 3000, ledger_seq = ledger_seq + 1, version = version + 1, updated_at = now() WHERE id = 999 AND on_hand_qty_milli >= 3000;" \
-    > "$CT_DIR/ct_$_.out" &
+    > "$CT_DIR/ct_$_.out" 2>&1 &
 done
 wait
 succ=$(grep -c 'UPDATE 1' "$CT_DIR"/ct_*.out 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
@@ -638,6 +1142,511 @@ echo "  → 成功 $succ / 拒绝 $rej / 剩余 $FINAL / version $VER"
 [ "$succ" = "33" ] && [ "$rej" = "17" ] && [ "$FINAL" = "1000" ] && [ "$VER" = "33" ] \
   && ok "无超卖、无负库存、无丢更新（33×3000 + 1000 = 100000 milli）" \
   || bad "并发结果偏离预期"
+
+echo "=== 5b. release_live_hold 与 consume_live_hold 并发：先锁再按余量写，不扣旁边的 MANUAL ==="
+expect_allow "并发底数：stock 60，LIVE_HOLD 3000 + MANUAL 2000" \
+  "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (60,1,2,2,2,'KG',5000,5000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (160,60,'LIVE_HOLD','LIVE_HOLD','LIVE_TANK_HOLD',7801,'LH:7801',3000,0,'HELD',0),(161,60,'MANUAL','DAMAGE','MANUAL',0,'HOLD:161',2000,0,'HELD',7);"
+REL_A=$(mktemp)
+REL_B=$(mktemp)
+psql >"$REL_A" 2>&1 <<'SQL' &
+BEGIN;
+SELECT id FROM stock WHERE id = 60 ORDER BY id FOR UPDATE;
+SELECT id FROM stock_hold WHERE stock_id = 60 ORDER BY id FOR UPDATE;
+SELECT pg_sleep(2);
+INSERT INTO stock_hold_release (id, hold_id, op_key, qty_milli)
+SELECT 181, h.id, 'LTH:7801:8901:' || h.id, h.hold_qty_milli - h.released_qty_milli
+  FROM stock_hold h
+ WHERE h.id = 160 AND h.hold_type = 'LIVE_HOLD' AND h.status = 'HELD';
+UPDATE stock_hold
+   SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1
+ WHERE id = 160 AND hold_type = 'LIVE_HOLD' AND status = 'HELD';
+UPDATE stock
+   SET hold_qty_milli = hold_qty_milli - (
+         SELECT COALESCE(SUM(r.qty_milli), 0) FROM stock_hold_release r WHERE r.id = 181 AND r.hold_id = 160),
+       version = version + 1
+ WHERE id = 60
+   AND hold_qty_milli >= (
+         SELECT COALESCE(SUM(r.qty_milli), 0) FROM stock_hold_release r WHERE r.id = 181 AND r.hold_id = 160);
+COMMIT;
+SQL
+APID=$!
+locked=0
+for _ in $(seq 1 50); do
+  n=$(psql -t -A -c "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND state = 'active' AND query LIKE '%pg_sleep%';")
+  n=$(printf '%s' "$n" | tr -d '[:space:]')
+  if [ -n "$n" ] && [ "$n" != "0" ]; then locked=1; break; fi
+  sleep 0.1
+done
+if [ "$locked" = "1" ]; then ok "释放会话已锁住库存行并停在 pg_sleep，消耗会话才开始"; else bad "没等到释放会话进入 pg_sleep"; echo "--- release ---"; cat "$REL_A"; fi
+psql >"$REL_B" 2>&1 <<'SQL'
+DO $$
+DECLARE
+  n_stock int;
+  n_hold int;
+BEGIN
+  PERFORM id FROM stock WHERE id = 60 ORDER BY id FOR UPDATE;
+  PERFORM id FROM stock_hold WHERE id IN (160, 161) ORDER BY id FOR UPDATE;
+  UPDATE stock
+     SET hold_qty_milli = hold_qty_milli - 1000,
+         on_hand_qty_milli = on_hand_qty_milli - 1000,
+         ledger_seq = ledger_seq + 1,
+         version = version + 1
+   WHERE id = 60 AND hold_qty_milli >= 1000 AND on_hand_qty_milli >= 1000;
+  GET DIAGNOSTICS n_stock = ROW_COUNT;
+  UPDATE stock_hold
+     SET released_qty_milli = released_qty_milli + 1000, version = version + 1
+   WHERE id = 160 AND hold_type = 'LIVE_HOLD' AND status = 'HELD'
+     AND hold_qty_milli - released_qty_milli >= 1000;
+  GET DIAGNOSTICS n_hold = ROW_COUNT;
+  IF n_stock <> 1 OR n_hold <> 1 THEN
+    RAISE EXCEPTION 'consume_skipped stock=% hold=%', n_stock, n_hold;
+  END IF;
+END
+$$;
+SQL
+BSTAT=$?
+wait "$APID"
+ASTAT=$?
+if [ "$ASTAT" = "0" ] && ! grep -q deadlock "$REL_A"; then
+  ok "并发释放会话提交成功，无死锁"
+else
+  bad "并发释放会话退出 $ASTAT"; echo "--- release ---"; cat "$REL_A"
+fi
+if [ "$BSTAT" != "0" ] && grep -q consume_skipped "$REL_B" && ! grep -q deadlock "$REL_B"; then
+  ok "并发消耗会话等到锁后发现 LIVE_HOLD 已释放，整笔回滚，无死锁"
+else
+  bad "并发消耗会话退出 $BSTAT"; echo "--- consume ---"; cat "$REL_B"
+fi
+R=$(psql -t -A -c "SELECT s.on_hand_qty_milli||'/'||s.hold_qty_milli||'/'||h160.status||'/'||h160.released_qty_milli||'/'||h161.status||'/'||(h161.hold_qty_milli - h161.released_qty_milli)||'/'||(SELECT qty_milli FROM stock_hold_release WHERE id=181) FROM stock s JOIN stock_hold h160 ON h160.id=160 JOIN stock_hold h161 ON h161.id=161 WHERE s.id=60")
+[ "$R" = "5000/2000/RELEASED/3000/HELD/2000/3000" ] && ok "并发后 on_hand/hold_qty/活鲜状态/已释放/MANUAL状态/MANUAL余量/释放量 = $R（MANUAL 2000 没被扣）" || bad "并发后 = $R（期望 5000/2000/RELEASED/3000/HELD/2000/3000）"
+rm -f "$REL_A" "$REL_B"
+
+echo "=== 5c. N-2 release_live_hold 同一 op_key 并发：锁到 0 条 HELD 就重查，不提交空释放、不抬 version ==="
+expect_allow "N-2 并发底数：stock 62（container 1）LIVE_HOLD 3000" \
+  "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,container_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (62,1,3,2,3,1,'KG',3000,3000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (171,62,'LIVE_HOLD','LIVE_HOLD','LIVE_TANK_HOLD',7902,'LH:7902',3000,0,'HELD',0);"
+REL_A=$(mktemp)
+REL_B=$(mktemp)
+psql >"$REL_A" 2>&1 <<'SQL' &
+BEGIN;
+SELECT id FROM stock WHERE id = 62 ORDER BY id FOR UPDATE;
+SELECT id FROM stock_hold WHERE id = 171 ORDER BY id FOR UPDATE;
+SELECT pg_sleep(2);
+INSERT INTO stock_hold_release (id, hold_id, op_key, qty_milli)
+SELECT 192, h.id, 'LTH:7902:9002:' || h.id, h.hold_qty_milli - h.released_qty_milli
+  FROM stock_hold h
+ WHERE h.id = 171 AND h.status = 'HELD';
+UPDATE stock_hold
+   SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1
+ WHERE id = 171 AND status = 'HELD';
+UPDATE stock
+   SET hold_qty_milli = hold_qty_milli - (
+         SELECT COALESCE(SUM(r.qty_milli), 0) FROM stock_hold_release r WHERE r.id = 192),
+       version = version + 1
+ WHERE id = 62
+   AND hold_qty_milli >= (
+         SELECT COALESCE(SUM(r.qty_milli), 0) FROM stock_hold_release r WHERE r.id = 192);
+COMMIT;
+SQL
+APID=$!
+locked=0
+for _ in $(seq 1 50); do
+  n=$(psql -t -A -c "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND state = 'active' AND query LIKE '%pg_sleep%';")
+  n=$(printf '%s' "$n" | tr -d '[:space:]')
+  if [ -n "$n" ] && [ "$n" != "0" ]; then locked=1; break; fi
+  sleep 0.1
+done
+if [ "$locked" = "1" ]; then ok "N-2 释放会话已持锁并停在 pg_sleep，重放会话才开始"; else bad "N-2 没等到释放会话进入 pg_sleep"; echo "--- release ---"; cat "$REL_A"; fi
+psql >"$REL_B" 2>&1 <<'SQL'
+DO $$
+DECLARE
+  n0 int;
+  n_held int;
+  n2 int;
+BEGIN
+  SELECT count(*) INTO n0 FROM stock_hold_release WHERE op_key = 'LTH:7902:9002:171';
+  PERFORM id FROM stock WHERE id = 62 ORDER BY id FOR UPDATE;
+  PERFORM id FROM stock_hold WHERE id = 171 AND status = 'HELD' ORDER BY id FOR UPDATE;
+  SELECT count(*) INTO n_held FROM stock_hold WHERE id = 171 AND status = 'HELD';
+  IF n_held <> 0 THEN
+    RAISE EXCEPTION 'held_still %', n_held;
+  END IF;
+  SELECT count(*) INTO n2 FROM stock_hold_release WHERE op_key = 'LTH:7902:9002:171';
+  IF n0 <> 0 OR n2 <> 1 THEN
+    RAISE EXCEPTION 'replay_bad n0=% held=% n2=%', n0, n_held, n2;
+  END IF;
+  RAISE NOTICE 'replay_return n0=% held=% releases=%', n0, n_held, n2;
+END
+$$;
+SQL
+BSTAT=$?
+wait "$APID"
+ASTAT=$?
+if [ "$ASTAT" = "0" ] && ! grep -q deadlock "$REL_A"; then
+  ok "N-2 并发释放会话提交成功，无死锁"
+else
+  bad "N-2 并发释放会话退出 $ASTAT"; echo "--- release ---"; cat "$REL_A"
+fi
+if [ "$BSTAT" = "0" ] && grep -q 'replay_return n0=0 held=0 releases=1' "$REL_B" && ! grep -q deadlock "$REL_B"; then
+  ok "N-2 重放会话等到锁后 HELD 为 0，重查到原释放并返回，无死锁"
+else
+  bad "N-2 重放会话退出 $BSTAT"; echo "--- replay ---"; cat "$REL_B"
+fi
+R=$(psql -t -A -c "SELECT s.version||'/'||s.on_hand_qty_milli||'/'||s.hold_qty_milli||'/'||h.status||'/'||h.version||'/'||(SELECT count(*) FROM stock_hold_release WHERE op_key='LTH:7902:9002:171')||'/'||(SELECT qty_milli FROM stock_hold_release WHERE id=192) FROM stock s JOIN stock_hold h ON h.id=171 WHERE s.id=62")
+[ "$R" = "1/3000/0/RELEASED/1/1/3000" ] && ok "N-2 并发后 version/on_hand/hold_qty/状态/明细 version/释放行数/释放量 = $R（没有第二次释放）" || bad "N-2 并发后 = $R（期望 1/3000/0/RELEASED/1/1/3000）"
+rm -f "$REL_A" "$REL_B"
+
+echo "=== 5d. convert_hold 与 consume_live_hold 并发：先锁 stock、停在 pg_sleep、再锁 stock_hold，不死锁 ==="
+# 睡眠放在两把锁中间：转换会话只持有 stock 行锁时，消耗会话按 release/consume 的顺序去锁同一行。
+# 若转换改回先锁 stock_hold，消耗会话会先拿到 stock、再去等 stock_hold，两边交叉等待，这里应报 deadlock。
+expect_allow "convert 并发底数：stock 63（container 2）RETURN_PENDING 3000 + LIVE_HOLD 2000" \
+  "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,container_id,uom,on_hand_qty_milli,hold_qty_milli) VALUES (63,1,1,2,1,2,'KG',5000,5000); INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (180,63,'RETURN_PENDING','RETURN_PENDING','RETURN_RECORD',963,'RRH:963',3000,0,'HELD',0),(181,63,'LIVE_HOLD','LIVE_HOLD','LIVE_TANK_HOLD',9631,'LH:9631',2000,0,'HELD',0);"
+REL_A=$(mktemp)
+REL_B=$(mktemp)
+psql >"$REL_A" 2>&1 <<'SQL' &
+BEGIN;
+SELECT id FROM stock WHERE id = 63 ORDER BY id FOR UPDATE;
+SELECT pg_sleep(2);
+SELECT id FROM stock_hold WHERE id = 180 ORDER BY id FOR UPDATE;
+UPDATE stock_hold
+   SET released_qty_milli = hold_qty_milli, status = 'RELEASED', version = version + 1
+ WHERE id = 180 AND status = 'HELD' AND released_qty_milli = 0;
+INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,from_hold_id)
+VALUES (182,63,'SCRAP_PENDING','SCRAP','SCRAP',9301,'CVT:180',3000,0,'HELD',0,180);
+COMMIT;
+SQL
+APID=$!
+locked=0
+for _ in $(seq 1 50); do
+  n=$(psql -t -A -c "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND state = 'active' AND query LIKE '%pg_sleep%';")
+  n=$(printf '%s' "$n" | tr -d '[:space:]')
+  if [ -n "$n" ] && [ "$n" != "0" ]; then locked=1; break; fi
+  sleep 0.1
+done
+if [ "$locked" = "1" ]; then ok "convert 会话已锁库存行并停在 pg_sleep，消耗会话才开始"; else bad "没等到 convert 会话进入 pg_sleep"; echo "--- convert ---"; cat "$REL_A"; fi
+psql >"$REL_B" 2>&1 <<'SQL'
+DO $$
+DECLARE
+  n_stock int;
+  n_hold int;
+BEGIN
+  PERFORM id FROM stock WHERE id = 63 ORDER BY id FOR UPDATE;
+  PERFORM id FROM stock_hold WHERE id IN (180, 181) ORDER BY id FOR UPDATE;
+  UPDATE stock
+     SET hold_qty_milli = hold_qty_milli - 1000,
+         on_hand_qty_milli = on_hand_qty_milli - 1000,
+         ledger_seq = ledger_seq + 1,
+         version = version + 1
+   WHERE id = 63 AND hold_qty_milli >= 1000 AND on_hand_qty_milli >= 1000;
+  GET DIAGNOSTICS n_stock = ROW_COUNT;
+  UPDATE stock_hold
+     SET released_qty_milli = released_qty_milli + 1000, version = version + 1
+   WHERE id = 181 AND hold_type = 'LIVE_HOLD' AND status = 'HELD'
+     AND hold_qty_milli - released_qty_milli >= 1000;
+  GET DIAGNOSTICS n_hold = ROW_COUNT;
+  IF n_stock <> 1 OR n_hold <> 1 THEN
+    RAISE EXCEPTION 'consume_skipped stock=% hold=%', n_stock, n_hold;
+  END IF;
+END
+$$;
+SQL
+BSTAT=$?
+wait "$APID"
+ASTAT=$?
+if [ "$ASTAT" = "0" ] && ! grep -q deadlock "$REL_A"; then
+  ok "并发 convert 会话提交成功，无死锁"
+else
+  bad "并发 convert 会话退出 $ASTAT"; echo "--- convert ---"; cat "$REL_A"
+fi
+if [ "$BSTAT" = "0" ] && ! grep -q deadlock "$REL_B"; then
+  ok "并发消耗会话按同一锁序等到库存行后扣 1000，无死锁"
+else
+  bad "并发消耗会话退出 $BSTAT"; echo "--- consume ---"; cat "$REL_B"
+fi
+R=$(psql -t -A -c "SELECT s.version||'/'||s.on_hand_qty_milli||'/'||s.hold_qty_milli||'/'||s.ledger_seq||'/'||h180.status||'/'||h180.released_qty_milli||'/'||h182.status||'/'||h182.hold_qty_milli||'/'||h181.status||'/'||h181.released_qty_milli FROM stock s JOIN stock_hold h180 ON h180.id=180 JOIN stock_hold h182 ON h182.id=182 JOIN stock_hold h181 ON h181.id=181 WHERE s.id=63")
+[ "$R" = "1/4000/4000/1/RELEASED/3000/HELD/3000/HELD/1000" ] && ok "并发后 version/on_hand/hold_qty/ledger/待回库/已释放/报损状态/报损量/活鲜状态/活鲜已释放 = $R（同列转换没改库存数量，只被消耗扣了 1000）" || bad "并发后 = $R（期望 1/4000/4000/1/RELEASED/3000/HELD/3000/HELD/1000）"
+rm -f "$REL_A" "$REL_B"
+
+echo "=== 2g. docs/12 权限与审计（小赵评审 B1、I1–I7、S1 + SCRAP_MISREPORT）==="
+seed "INSERT INTO sys_user (id,username,password_hash) VALUES (101,'picker01','x');"
+seed "UPDATE sys_user SET perm_version = 3 WHERE id = 101;"
+seed "INSERT INTO sys_role (id,code,name) VALUES (1,'WH_SUPERVISOR','仓库主管'),(2,'CENTER_OPS','中心运维'),(3,'QC_SUPERVISOR','质检主管');"
+seed "INSERT INTO sys_permission (id,code,name,module) VALUES (1,'device.binding.approve','设备绑定审批','12'),(2,'delivery.pod.correct.approve','POD 更正审批','15'),(3,'outbound.order.cancel_after_pick.approve','拣后取消审批','04'),(4,'outbound.order.cancel_after_pick','拣后取消申请','04');"
+seed "INSERT INTO sys_role_perm (role_id,perm_id) VALUES (1,1),(1,2),(1,3),(1,4),(2,3);"
+seed "INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (2,'W2','x','20:00'),(3,'ABCDEFGH12345678','x','20:00'),(4,'SHPD01','x','20:00');"
+seed "INSERT INTO sys_user_role (user_id,role_id) VALUES (202,1),(202,2),(203,2),(205,3),(206,1),(207,3),(101,1),(208,1),(201,1);"
+seed "INSERT INTO sys_user_warehouse (user_id,warehouse_id) VALUES (202,1),(203,1),(204,1),(205,1),(206,1),(101,1),(201,1);"
+seed "INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id) VALUES (1,'DEV-A','PDA',101,1);"
+seed "INSERT INTO offline_token (id,jti,binding_id,user_id,device_instance_id,warehouse_id,perm_version,issued_at,expires_at) VALUES (1,'J1',1,101,'DEV-A',1,1,'2026-10-15 08:00','2026-10-15 20:00');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (1,'APR-WHSH01-20261015-000111','CANCEL_AFTER_PICK',1,'OUTBOUND','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');"
+seed "INSERT INTO audit_log (id,action,node_id,node_seq,warehouse_id) VALUES (1,'outbound.cancel_after_pick',7,1,1);"
+_AC=$(psql -t -A -c "SELECT count(*) FROM audit_log")
+expect_block "12 审计重复回传同 (node_id,node_seq)" \
+  "INSERT INTO audit_log (id,action,node_id,node_seq) VALUES (2,'x',7,1);" "uq_audit_node_seq"
+_AC2=$(psql -t -A -c "SELECT count(*) FROM audit_log"); [ "$_AC2" = "$_AC" ] && ok "12 审计重复回传同 (node_id,node_seq)：audit_log 行数不变（$_AC）" || bad "12 审计重复回传同 (node_id,node_seq)：audit_log 行数 $_AC -> $_AC2"
+_AH=$(psql -t -A -c "SELECT md5(row_to_json(a)::text) FROM audit_log a WHERE id=1")
+expect_block "12 audit_log 只追加（UPDATE）" \
+  "UPDATE audit_log SET reason='x' WHERE id=1;" "append_only_violation: audit_log"
+_AH2=$(psql -t -A -c "SELECT md5(row_to_json(a)::text) FROM audit_log a WHERE id=1"); [ -n "$_AH" ] && [ "$_AH2" = "$_AH" ] && ok "12 audit_log 只追加（UPDATE）：id=1 行内容不变（md5 $_AH）" || bad "12 audit_log 只追加（UPDATE）：id=1 行内容变了 $_AH -> $_AH2"
+_AC=$(psql -t -A -c "SELECT count(*) FROM audit_log")
+expect_block "12 audit_log 只追加（DELETE）" \
+  "DELETE FROM audit_log WHERE id=1;" "append_only_violation: audit_log"
+_AC2=$(psql -t -A -c "SELECT count(*) FROM audit_log"); [ "$_AC2" = "$_AC" ] && ok "12 audit_log 只追加（DELETE）：audit_log 行数不变（$_AC）" || bad "12 audit_log 只追加（DELETE）：audit_log 行数 $_AC -> $_AC2"
+expect_allow "12 B1 正向：新 (node_id,node_seq) 追加" \
+  "BEGIN; INSERT INTO audit_log (id,action,node_id,node_seq) VALUES (3,'x',7,2); COMMIT;"
+expect_block "12 同一设备实例两条 PENDING/ACTIVE 绑定" \
+  "INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id) VALUES (2,'DEV-A','PDA',102,1);" "uq_udb_active"
+expect_block "12 I3 直接插成 ACTIVE" \
+  "INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id,status,activated_at,approval_id) VALUES (3,'DEV-C','PDA',101,1,'ACTIVE','2026-10-15 08:00',1);" "binding_insert_not_pending"
+expect_block "12 REVOKED 没有吊销时间" \
+  "UPDATE user_device_binding SET status='REVOKED' WHERE id=1;" "ck_udb_status"
+expect_block "12 I3 用不存在的审批激活" \
+  "UPDATE user_device_binding SET status='ACTIVE', approval_id=999, activated_at='2026-10-15 09:00' WHERE id=1;" "binding_approval_invalid"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (7,'APR-WHSH01-20261015-000007','DEVICE_BIND',1,'DEVICE_BINDING','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',202,'2099-01-01');"
+seed "UPDATE approval_request SET status='APPROVED', first_approver_id=101, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=7;"
+expect_block "12 S1 审批人 = 绑定使用人" \
+  "UPDATE user_device_binding SET status='ACTIVE', approval_id=7, activated_at='2026-10-15 09:00' WHERE id=1;" "binding_approval_invalid"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (8,'APR-WHSH01-20261015-000008','DEVICE_BIND',1,'DEVICE_BINDING','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',101,'2099-01-01');"
+seed "UPDATE approval_request SET status='REJECTED', decided_at='2026-10-15 09:00', reject_reason='x' WHERE id=8;"
+expect_block "12 I3 用已驳回的审批激活" \
+  "UPDATE user_device_binding SET status='ACTIVE', approval_id=8, activated_at='2026-10-15 09:00' WHERE id=1;" "binding_approval_invalid"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (9,'APR-WHSH01-20261015-000909','CANCEL_AFTER_PICK',1,'DEVICE_BINDING','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',101,'2099-01-01');"
+seed "UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=9;"
+expect_block "12 I3 用别的类型的审批激活" \
+  "UPDATE user_device_binding SET status='ACTIVE', approval_id=9, activated_at='2026-10-15 09:00' WHERE id=1;" "binding_approval_invalid"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (10,'APR-WHSH01-20261015-000010','DEVICE_BIND',1,'DEVICE_BINDING','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',101,'2099-01-01');"
+seed "UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=10;"
+expect_allow "12 I3 正向：DEVICE_BIND 已通过、审批人≠使用人 → PENDING→ACTIVE" \
+  "BEGIN; UPDATE user_device_binding SET status='ACTIVE', approval_id=10, activated_at='2026-10-15 09:00' WHERE id=1 AND status='PENDING'; COMMIT;"
+expect_block "12 I3 绑定换人" \
+  "UPDATE user_device_binding SET user_id=99 WHERE id=1;" "binding_immutable"
+expect_block "12 I3 ACTIVE 退回 PENDING" \
+  "UPDATE user_device_binding SET status='PENDING', activated_at=NULL WHERE id=1;" "binding_immutable"
+expect_allow "12 I3 正向：吊销" \
+  "BEGIN; UPDATE user_device_binding SET status='REVOKED', revoked_at='2026-10-15 10:00', revoke_reason='LOST' WHERE id=1; COMMIT;"
+expect_block "12 I3 REVOKED 复活" \
+  "UPDATE user_device_binding SET status='ACTIVE', revoked_at=NULL WHERE id=1;" "binding_immutable"
+expect_block "12 绑定不可删除" \
+  "DELETE FROM user_device_binding WHERE id=1;" "append_only_violation: user_device_binding"
+expect_block "12 离线令牌到期早于签发" \
+  "INSERT INTO offline_token (id,jti,binding_id,user_id,device_instance_id,warehouse_id,perm_version,issued_at,expires_at) VALUES (2,'J2',1,101,'DEV-A',1,1,'2026-10-15 08:00','2026-10-15 07:00');" "ck_offline_ttl"
+expect_block "12 I4 离线令牌 30 天" \
+  "INSERT INTO offline_token (id,jti,binding_id,user_id,device_instance_id,warehouse_id,perm_version,issued_at,expires_at) VALUES (3,'J3',1,101,'DEV-A',1,1,'2026-10-15 08:00','2026-11-14 08:00');" "ck_offline_max_ttl"
+expect_allow "12 I4 正向：恰好 12 小时" \
+  "BEGIN; INSERT INTO offline_token (id,jti,binding_id,user_id,device_instance_id,warehouse_id,perm_version,issued_at,expires_at) VALUES (4,'J4',1,101,'DEV-A',1,1,'2026-10-15 08:00','2026-10-15 20:00'); COMMIT;"
+expect_block "12 离线令牌 jti 重复" \
+  "INSERT INTO offline_token (id,jti,binding_id,user_id,device_instance_id,warehouse_id,perm_version,issued_at,expires_at) VALUES (5,'J1',1,101,'DEV-A',1,1,'2026-10-15 08:00','2026-10-15 20:00');" "uq_offline_jti"
+expect_block "12 I4 延长有效期" \
+  "UPDATE offline_token SET expires_at='2026-10-15 19:00' WHERE id=1;" "offline_token_immutable"
+expect_allow "12 I4 正向：吊销" \
+  "BEGIN; UPDATE offline_token SET revoked_at='2026-10-15 10:00' WHERE id=1; COMMIT;"
+expect_block "12 I4 吊销后恢复" \
+  "UPDATE offline_token SET revoked_at=NULL WHERE id=1;" "offline_token_immutable"
+expect_block "12 I2 直接插成 APPROVED" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at,status) VALUES (20,'APR-WHSH01-20261015-000020','POD_CORRECT',1,'POD','20','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01','APPROVED');" "approval_insert_not_pending"
+expect_block "12 同一目标两条待审批" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (21,'APR-WHSH01-20261015-000021','CANCEL_AFTER_PICK',1,'OUTBOUND','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',203,'2099-01-01');" "uq_apr_open"
+expect_block "12 SoD：申请人自己审批" \
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=201, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=1;" "ck_apr_sod"
+expect_block "12 I2 单人审批进 PARTIAL" \
+  "UPDATE approval_request SET status='PARTIAL', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00' WHERE id=1;" "ck_apr_partial"
+expect_block "12 I2 审批人三列不成组" \
+  "UPDATE approval_request SET first_approver_id=202 WHERE id=1;" "ck_apr_pair"
+expect_block "12 I2 REJECTED 没有 decided_at" \
+  "UPDATE approval_request SET status='REJECTED' WHERE id=1;" "ck_apr_decided"
+expect_allow "12 正向：主管审批通过" \
+  "BEGIN; UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=1; COMMIT;"
+expect_block "12 I1/I2 APPROVED 改回 PENDING" \
+  "UPDATE approval_request SET status='PENDING', decided_at=NULL WHERE id=1;" "approval_final"
+expect_block "12 审批不可删除" \
+  "DELETE FROM approval_request WHERE id=1;" "append_only_violation: approval_request"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (4,'APR-WHSH01-20261015-000114','POD_CORRECT',1,'POD','4','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2020-01-01');"
+expect_block "12 I2 过期后审批" \
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=4;" "approval_expired"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (41,'APR-WHSH01-20261015-000041','POD_CORRECT',1,'POD','41','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,(now() AT TIME ZONE 'UTC') - interval '1 minute');"
+expect_block "12 UTC 反向：expires_at = UTC 当前 −1 分钟，已过期不能再批" \
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=41;" "approval_expired"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (42,'APR-WHSH01-20261015-000042','POD_CORRECT',1,'POD','42','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,(now() AT TIME ZONE 'UTC') + interval '2 hours');"
+expect_allow "12 UTC 正向：expires_at = UTC 当前 +2 小时（比本地 UTC+8 早）仍可批" \
+  "BEGIN; UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=42; COMMIT;"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (3,'APR-WHSH01-20261015-000903','UNPLANNED_FAILOVER',1,'WAREHOUSE','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');"
+expect_block "12 I5 第一确认人不持有任何角色" \
+  "UPDATE approval_request SET status='PARTIAL', first_approver_id=204, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00' WHERE id=3;" "approval_role_not_held"
+expect_block "12 I5 第一确认人只有 CENTER_OPS 却写 WH_SUPERVISOR" \
+  "UPDATE approval_request SET status='PARTIAL', first_approver_id=203, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00' WHERE id=3;" "approval_role_not_held"
+expect_allow "12 I5 正向：真主管确认 → PARTIAL" \
+  "BEGIN; UPDATE approval_request SET status='PARTIAL', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00' WHERE id=3; COMMIT;"
+expect_block "12 I2 换第一审批人" \
+  "UPDATE approval_request SET first_approver_id=203 WHERE id=3;" "approval_approver_immutable"
+expect_block "12 I2 PARTIAL 倒退 PENDING" \
+  "UPDATE approval_request SET status='PENDING' WHERE id=3;" "approval_transition_invalid"
+expect_block "12 I5 第二确认人不持有 CENTER_OPS" \
+  "UPDATE approval_request SET second_approver_id=204, second_approver_role='CENTER_OPS', second_approved_at='2026-10-15 09:30' WHERE id=3;" "approval_role_not_held"
+expect_block "12 第二确认人 = 第一确认人" \
+  "UPDATE approval_request SET second_approver_id=202, second_approver_role='CENTER_OPS', second_approved_at='2026-10-15 09:30' WHERE id=3;" "ck_apr_dual"
+expect_block "12 非计划切换只有一人确认就 APPROVED" \
+  "UPDATE approval_request SET status='APPROVED', decided_at='2026-10-15 09:30' WHERE id=3;" "ck_apr_done"
+expect_allow "12 I5 正向：中心运维第二确认 → APPROVED" \
+  "BEGIN; UPDATE approval_request SET status='APPROVED', second_approver_id=203, second_approver_role='CENTER_OPS', second_approved_at='2026-10-15 09:30', decided_at='2026-10-15 09:30' WHERE id=3; COMMIT;"
+expect_block "12 SM 发起人不是本仓仓库主管（只有 CENTER_OPS）" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (23,'APR-WHSH01-20261015-000023','SCRAP_MISREPORT',1,'SCRAP_ORDER','9009','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',203,'2099-01-01');" "approval_role_not_held"
+expect_block "12 SM 发起人是质检主管而非仓库主管" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (24,'APR-WHSH01-20261015-000024','SCRAP_MISREPORT',1,'SCRAP_ORDER','9010','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',205,'2099-01-01');" "approval_role_not_held"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (5,'APR-WHSH01-20261015-000005','SCRAP_MISREPORT',1,'SCRAP_ORDER','9001','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',202,'2099-01-01');"
+expect_block "12 SM 发起人自己审批（202 兼 CENTER_OPS 也不行）" \
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='CENTER_OPS', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=5;" "ck_apr_sod"
+expect_block "12 SM 审批角色写成仓库主管（另一主管 206 不具审批权）" \
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=206, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=5;" "ck_apr_scrap_roles"
+expect_block "12 SM 审批人不持有 QC_SUPERVISOR 却写质检主管" \
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=204, first_approver_role='QC_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=5;" "approval_role_not_held"
+expect_block "12 SM 质检主管不在本仓" \
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=207, first_approver_role='QC_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=5;" "approval_role_not_held"
+expect_allow "12 SM 正向：本仓质检主管审批" \
+  "BEGIN; UPDATE approval_request SET status='APPROVED', first_approver_id=205, first_approver_role='QC_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=5; COMMIT;"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (6,'APR-WHSH01-20261015-000006','SCRAP_MISREPORT',1,'SCRAP_ORDER','9002','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',206,'2099-01-01');"
+expect_allow "12 SM 正向：中心运维审批" \
+  "BEGIN; UPDATE approval_request SET status='APPROVED', first_approver_id=203, first_approver_role='CENTER_OPS', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=6; COMMIT;"
+expect_block "12 审批单号格式：旧格式 SM-2026-001" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (30,'SM-2026-001','CANCEL_AFTER_PICK',1,'OUTBOUND','30','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+expect_block "12 审批单号格式：日期 7 位 APR-WHSH01-2026101-000001" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (31,'APR-WHSH01-2026101-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','31','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+expect_block "12 审批单号格式：序号 5 位 APR-WHSH01-20261015-00001" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (32,'APR-WHSH01-20261015-00001','CANCEL_AFTER_PICK',1,'OUTBOUND','32','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+expect_block "12 审批单号格式：仓库编码为空 APR--20261015-000001" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (33,'APR--20261015-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','33','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+expect_block "12 审批单号格式：日期含字母 APR-WHSH01-2026A015-000001" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (34,'APR-WHSH01-2026A015-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','34','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+expect_block "12 审批单号格式：月份 13 APR-WHSH01-20261315-000001" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (35,'APR-WHSH01-20261315-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','35','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+expect_block "12 审批单号格式：序号含字母 APR-WHSH01-20261015-00000X" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (36,'APR-WHSH01-20261015-00000X','CANCEL_AFTER_PICK',1,'OUTBOUND','36','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+expect_block "12 审批单号格式：前缀小写 apr-WH01-20261015-000001" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (37,'apr-WH01-20261015-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','37','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+expect_block "12 审批单号格式：仓库编码含 - APR-WH-01-20261015-000001" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (38,'APR-WH-01-20261015-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','38','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+expect_allow "12 审批单号格式正向：APR-SHPD01-20261231-999999" \
+  "BEGIN; INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (40,'APR-SHPD01-20261231-999999','POD_CORRECT',4,'POD','40','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01'); COMMIT;"
+expect_block "12 审批类型不在码表" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (22,'APR-WHSH01-20261015-000022','BANANA',1,'X','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_type"
+expect_block "12 perm_version 回退" \
+  "UPDATE sys_user SET perm_version = 1 WHERE id = 101;" "perm_version_rewind"
+expect_allow "12 I7 正向：perm_version 前进" \
+  "BEGIN; UPDATE sys_user SET perm_version = 4 WHERE id = 101; COMMIT;"
+expect_block "12 T1 审批单号：仓库编码小写 APR-sh01-20261015-000001" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (50,'APR-sh01-20261015-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','50','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+expect_block "12 T1 审批单号：仓库编码含下划线 APR-S_01-20261015-000002" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (51,'APR-S_01-20261015-000002','CANCEL_AFTER_PICK',1,'OUTBOUND','51','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+expect_block "12 T1 审批单号：仓库编码含空格 APR-S 01-20261015-000003" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (52,'APR-S 01-20261015-000003','CANCEL_AFTER_PICK',1,'OUTBOUND','52','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+expect_block "12 T1 审批单号：仓库编码长度 1 APR-A-20261015-000004" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (53,'APR-A-20261015-000004','CANCEL_AFTER_PICK',1,'OUTBOUND','53','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+expect_block "12 T1 审批单号：仓库编码长度 17 APR-ABCDEFGHIJKLMNOPQ-20261015-000005" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (54,'APR-ABCDEFGHIJKLMNOPQ-20261015-000005','CANCEL_AFTER_PICK',1,'OUTBOUND','54','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+expect_allow "12 T1 正向：仓库编码长度 2 / 16" \
+  "BEGIN; INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (56,'APR-W2-20261015-000006','POD_CORRECT',2,'POD','56','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01'); INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (57,'APR-ABCDEFGH12345678-20261015-000007','POD_CORRECT',3,'POD','57','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01'); COMMIT;"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (60,'APR-WHSH01-20261015-000060','DEVICE_BIND',1,'DEVICE_BINDING','60','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',101,'2099-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (61,'APR-WHSH01-20261015-000061','POD_CORRECT',1,'POD','61','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (62,'APR-WHSH01-20261015-000062','CANCEL_AFTER_PICK',1,'OUTBOUND','62','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');"
+expect_block "12 T2 DEVICE_BIND：无任何角色的用户（204）批准" \
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=204, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=60;" "approval_perm_not_held"
+expect_block "12 T2 POD_CORRECT：无任何角色的用户（204）批准" \
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=204, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=61;" "approval_perm_not_held"
+expect_block "12 T2 CANCEL_AFTER_PICK：无任何角色的用户（204）批准" \
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=204, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=62;" "approval_perm_not_held"
+expect_block "12 T2 DEVICE_BIND：角色存在但无该权限点（203 CENTER_OPS）" \
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=203, first_approver_role='CENTER_OPS', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=60;" "approval_perm_not_held"
+expect_block "12 T2 DEVICE_BIND：有主管角色但不在本仓（208）" \
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=208, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=60;" "approval_perm_not_held"
+expect_block "12 T2 POD_CORRECT：质检主管无该权限点（205）" \
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=205, first_approver_role='QC_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=61;" "approval_perm_not_held"
+expect_allow "12 T2 正向：本仓主管经 sys_role_perm 持有 device.binding.approve" \
+  "BEGIN; UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=60; COMMIT;"
+expect_allow "12 T2 正向：本仓主管持有 delivery.pod.correct.approve" \
+  "BEGIN; UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=61; COMMIT;"
+expect_allow "12 T2 正向：本仓主管持有 outbound.order.cancel_after_pick.approve" \
+  "BEGIN; UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=62; COMMIT;"
+seed "INSERT INTO sys_role (id,code,name) VALUES (4,'CS','客服');"
+seed "INSERT INTO sys_role_perm (role_id,perm_id) VALUES (4,4);"
+seed "INSERT INTO sys_user_role (user_id,role_id) VALUES (209,4),(210,2);"
+seed "INSERT INTO sys_user_warehouse (user_id,warehouse_id) VALUES (209,1);"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (63,'APR-WHSH01-20261015-000063','CANCEL_AFTER_PICK',1,'OUTBOUND','63','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',209,'2099-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (64,'APR-WHSH01-20261015-000064','CANCEL_AFTER_PICK',1,'OUTBOUND','64','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',202,'2099-01-01');"
+expect_block "12 拣后取消：只有申请权限 cancel_after_pick（客服 209）不能审批" \
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=209, first_approver_role='CS', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=64;" "approval_perm_not_held"
+expect_block "12 拣后取消：申请人 202（持有 .approve）审批自己的单" \
+  "UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=64;" "ck_apr_sod"
+expect_allow "12 拣后取消正向：不在本仓的 CENTER_OPS（210，数据范围 ALL）审批" \
+  "BEGIN; UPDATE approval_request SET status='APPROVED', first_approver_id=210, first_approver_role='CENTER_OPS', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=63; COMMIT;"
+expect_allow "12 拣后取消正向：另一位本仓主管 201 审批 202 的申请" \
+  "BEGIN; UPDATE approval_request SET status='APPROVED', first_approver_id=201, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=64; COMMIT;"
+expect_block "12 单号仓库编码 WH01 ≠ 仓 1 的 WHSH01" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (65,'APR-WH01-20261015-000065','POD_CORRECT',1,'POD','65','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "approval_code_warehouse_mismatch"
+expect_block "12 单号写 W2 但挂在仓 1" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (66,'APR-W2-20261015-000066','POD_CORRECT',1,'POD','66','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "approval_code_warehouse_mismatch"
+expect_block "12 所属仓不存在（warehouse_id=99）" \
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (67,'APR-WHSH01-20261015-000067','POD_CORRECT',99,'POD','67','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "approval_code_warehouse_mismatch"
+expect_allow "12 单号仓库编码正向：APR-WHSH01-… 挂仓 1" \
+  "BEGIN; INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (68,'APR-WHSH01-20261015-000068','POD_CORRECT',1,'POD','68','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01'); COMMIT;"
+OUT=$(psql_capture "SET ROLE wms_app; DELETE FROM approval_request WHERE id=1;")
+case "$OUT" in *"permission denied for table approval_request"*) ok "12 wms_app 不能删审批";; *) bad "12 wms_app 不能删审批 未被拒：$OUT";; esac
+OUT=$(psql_capture "SET ROLE wms_app; UPDATE offline_token SET expires_at='2030-01-01' WHERE id=4;")
+case "$OUT" in *"permission denied for table offline_token"*) ok "12 wms_app 不能改离线令牌有效期";; *) bad "12 wms_app 不能改离线令牌有效期 未被拒：$OUT";; esac
+OUT=$(psql_capture "SET ROLE wms_app; DELETE FROM user_device_binding WHERE id=1;")
+case "$OUT" in *"permission denied for table user_device_binding"*) ok "12 wms_app 不能删设备绑定";; *) bad "12 wms_app 不能删设备绑定 未被拒：$OUT";; esac
+OUT=$(psql_capture "SET ROLE wms_app; UPDATE user_device_binding SET user_id=5 WHERE id=1;")
+case "$OUT" in *"permission denied for table user_device_binding"*) ok "12 I3 wms_app 不能改绑定使用人（列级授权）";; *) bad "12 I3 wms_app 不能改绑定使用人（列级授权） 未被拒：$OUT";; esac
+_AC=$(psql -t -A -c "SELECT count(*) FROM audit_log")
+OUT=$(psql_capture "TRUNCATE audit_log;")
+case "$OUT" in *"append_only_violation"*) ok "12 TRUNCATE audit_log 被语句级触发器拦下";; *) bad "TRUNCATE audit_log 未被拦：$OUT";; esac
+_AC2=$(psql -t -A -c "SELECT count(*) FROM audit_log"); [ "$_AC2" = "$_AC" ] && ok "12 TRUNCATE audit_log：audit_log 行数不变（$_AC）" || bad "12 TRUNCATE audit_log：audit_log 行数 $_AC -> $_AC2"
+# 叠加 #2 的 fk_hold_approval_no 后，PG 会先以外键拒绝 TRUNCATE（报错不再是 append_only_violation）；两种拦法都算通过，再核对行数未变
+CNT_B=$(psql -qtAc "SELECT (SELECT count(*) FROM approval_request)||'/'||(SELECT count(*) FROM user_device_binding);")
+OUT=$(psql_capture "TRUNCATE approval_request, user_device_binding;")
+CNT_A=$(psql -qtAc "SELECT (SELECT count(*) FROM approval_request)||'/'||(SELECT count(*) FROM user_device_binding);")
+case "$OUT" in *"append_only_violation"*|*"cannot truncate a table referenced in a foreign key constraint"*) ok "12 TRUNCATE 审批/绑定被拦";; *) bad "TRUNCATE 审批/绑定未被拦：$OUT";; esac
+[ -n "$CNT_B" ] && [ "$CNT_B" = "$CNT_A" ] && ok "12 TRUNCATE 审批/绑定后行数不变（$CNT_A）" || bad "TRUNCATE 审批/绑定后行数变化：$CNT_B -> $CNT_A"
+# 逐表单独 TRUNCATE：同一事务内先拆掉引用它的外键（只有 stock_hold.fk_hold_approval_no 引用 approval_request；stock_hold 自身也受保护，不能清行，所以 DROP CONSTRAINT），不用 session_replication_role，确保命中目标表自己的 TRUNCATE 触发器；ROLLBACK 还原
+for T in approval_request user_device_binding audit_log; do
+  PRE=""; [ "$T" = approval_request ] && PRE="ALTER TABLE stock_hold DROP CONSTRAINT fk_hold_approval_no;"
+  OUT=$(psql_capture "BEGIN; $PRE TRUNCATE $T; ROLLBACK;")
+  case "$OUT" in *"append_only_violation: $T"*) ok "12 单表 TRUNCATE $T 命中自身触发器（外键已在事务内拆除）";; *) bad "12 单表 TRUNCATE $T 未报 append_only_violation：$OUT";; esac
+done
+FKN=$(psql -qtAc "SELECT count(*) FROM pg_constraint WHERE conname='fk_hold_approval_no';")
+[ "$FKN" = 1 ] && ok "12 单表 TRUNCATE 用例回滚后 fk_hold_approval_no 仍在" || bad "fk_hold_approval_no 回滚后丢失：$FKN"
+
+
+echo "=== 2g2. 新审批类型 + audit node 必填 ==="
+seed "INSERT INTO sys_permission (id,code,name,module) VALUES (11,'offline.paper.approve','纸质补录审批','00'),(12,'pack.box.void.approve','作废箱审批','06'),(13,'process.yield.approve','得率偏离审批','17'),(14,'live.death.approve','活鲜死亡超阈值审批','18'),(15,'process.rework.approve','加工返工审批','17');"
+seed "INSERT INTO sys_role_perm (role_id,perm_id) VALUES (1,11),(1,12),(1,13),(1,14),(1,15);"
+H=$(printf 'a%.0s' $(seq 64))
+i=0
+for T in PAPER_BACKFILL BOX_VOID PROCESS_YIELD_DEVIATION LIVE_DEATH_OVER PROCESS_REWORK; do
+  A=$((81+i)); B=$((86+i))
+  seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES ($A,'APR-WHSH01-20261015-0000$A','$T',1,'$T','$A','{}','$H','r',201,'2099-01-01'),($B,'APR-WHSH01-20261015-0000$B','$T',1,'$T','$B','{}','$H','r',202,'2099-01-01');"
+  APP="UPDATE approval_request SET status='APPROVED', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00'"
+  expect_block "12 $T：无该审批权限点（质检主管 205）" "$APP, first_approver_id=205, first_approver_role='QC_SUPERVISOR' WHERE id=$A;" "approval_perm_not_held"
+  expect_block "12 $T：申请人 202 自批" "$APP, first_approver_id=202, first_approver_role='WH_SUPERVISOR' WHERE id=$B;" "ck_apr_sod"
+  expect_allow "12 $T 正向：本仓主管 202 审批 201 的申请" "$APP, first_approver_id=202, first_approver_role='WH_SUPERVISOR' WHERE id=$A;"
+  i=$((i+1))
+done
+# 12 search_path 固定：8 个函数都带 SET search_path = pg_catalog, public（防同名表劫持）
+R=$(psql -t -A -c "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public' AND p.proname IN ('trg_audit_node_required','trg_audit_append_only','trg_apr_insert','trg_apr_final','trg_udb_guard','trg_no_delete_12','trg_offline_guard','trg_user_perm_ver') AND 'search_path=pg_catalog, public' = ANY(p.proconfig)")
+[ "$R" = "8" ] && ok "12 search_path：8 个触发器函数 proconfig 均为 search_path=pg_catalog, public（$R）" || bad "12 search_path：只有 $R/8 个函数固定了 search_path"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (95,'APR-WHSH01-20261015-000095','PAPER_BACKFILL',1,'PAPER_BACKFILL','95','{}','$H','r',201,'2099-01-01');"
+# 劫持：会话把自建 schema 放在 search_path 最前，建同名的 sys_user_role/sys_role/sys_role_perm/sys_permission/sys_user_warehouse 影子表，给质检主管 205 伪造 offline.paper.approve。函数固定了 search_path，仍查 public 的真表 → 必须照样 approval_perm_not_held
+OUT=$(psql_capture "CREATE SCHEMA hijack12; CREATE TABLE hijack12.sys_user_role (user_id BIGINT, role_id BIGINT); CREATE TABLE hijack12.sys_role (id BIGINT, code VARCHAR(32)); CREATE TABLE hijack12.sys_role_perm (role_id BIGINT, perm_id BIGINT); CREATE TABLE hijack12.sys_permission (id BIGINT, code VARCHAR(64)); CREATE TABLE hijack12.sys_user_warehouse (user_id BIGINT, warehouse_id BIGINT); INSERT INTO hijack12.sys_user_role VALUES (205,3); INSERT INTO hijack12.sys_role VALUES (3,'QC_SUPERVISOR'); INSERT INTO hijack12.sys_role_perm VALUES (3,11); INSERT INTO hijack12.sys_permission VALUES (11,'offline.paper.approve'); INSERT INTO hijack12.sys_user_warehouse VALUES (205,1); SET search_path = hijack12, public; UPDATE approval_request SET status='APPROVED', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00', first_approver_id=205, first_approver_role='QC_SUPERVISOR' WHERE id=95;")
+case "$OUT" in *"approval_perm_not_held"*) ok "12 search_path 劫持：影子权限表在前，质检主管 205 仍被 approval_perm_not_held 拦下";; *) bad "12 search_path 劫持未拦：$OUT";; esac
+R=$(psql -t -A -c "SELECT status||'/'||(SELECT count(*) FROM pg_namespace WHERE nspname='hijack12') FROM approval_request WHERE id=95")
+psql -q -c "DROP SCHEMA IF EXISTS hijack12 CASCADE;" >/dev/null 2>&1
+[ "$R" = "PENDING/0" ] && ok "12 search_path 劫持后审批仍 PENDING，影子 schema 随事务回滚（$R）" || bad "12 search_path 劫持后 状态/影子 schema = $R（期望 PENDING/0）"
+_AC=$(psql -t -A -c "SELECT count(*) FROM audit_log")
+expect_block "12 audit_log 新写入省略 node_id/node_seq → 40001" "INSERT INTO audit_log (id,action,warehouse_id) VALUES (900,'x',1);" "audit_node_required"
+_AC2=$(psql -t -A -c "SELECT count(*) FROM audit_log"); [ "$_AC2" = "$_AC" ] && ok "12 audit_log 新写入省略 node_id/node_seq → 40001：audit_log 行数不变（$_AC）" || bad "12 audit_log 新写入省略 node_id/node_seq → 40001：audit_log 行数 $_AC -> $_AC2"
+_AC=$(psql -t -A -c "SELECT count(*) FROM audit_log")
+expect_block "12 audit_log node_seq=0 → 40001" "INSERT INTO audit_log (id,action,node_id,node_seq,warehouse_id) VALUES (901,'x',7,0,1);" "audit_node_required"
+_AC2=$(psql -t -A -c "SELECT count(*) FROM audit_log"); [ "$_AC2" = "$_AC" ] && ok "12 audit_log node_seq=0 → 40001：audit_log 行数不变（$_AC）" || bad "12 audit_log node_seq=0 → 40001：audit_log 行数 $_AC -> $_AC2"
+expect_allow "12 audit_log node_id/node_seq > 0 正向" "INSERT INTO audit_log (id,action,node_id,node_seq,warehouse_id) VALUES (902,'x',7,902,1);"
+expect_block "12 stock_hold.approval_no 没有对应审批单" "INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no,is_reversal) VALUES (990,41,'RETURN_QC','RETURN_QC','QC',7990,'CVT:990',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH01-20261015-000990',true);" "fk_hold_approval_no"
+expect_allow "12 stock_hold.approval_no 指向已有审批单" "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id,approval_type,approval_no,is_reversal) VALUES (991,41,'RETURN_QC','RETURN_QC','QC',7991,'CVT:991',1000,0,'HELD',0,'SCRAP_MISREPORT','APR-WHSH01-20261015-000123',true); ROLLBACK;"
 
 echo "=== 汇总 ==="
 echo "  通过 $pass 项 / 失败 $fail 项"
