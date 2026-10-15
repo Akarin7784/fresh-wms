@@ -1562,6 +1562,8 @@ expect_block_tx("17 ck_prcv_qty 冲回量为 0", ["INSERT INTO process_reversal 
 _m17_ck("ck_prcv_qty", ["INSERT INTO process_reversal (id,warehouse_id,process_order_id,op_key,reversal_type,issue_id,qty_milli,movement_ref,hold_release_id,reason,operator_id) VALUES (1931,1,1710,'PRCR:1710:00000000-0000-4000-8000-000000001931','ISSUE',1720,0,'PRCR-1710:1:D1:1',1735,'x',9);"])
 expect_block_tx("17 ck_prcv_apr 返工审批单号长度不足", ["INSERT INTO process_reversal (id,warehouse_id,process_order_id,op_key,reversal_type,disposition,approval_no,output_id,qty_milli,movement_ref,reason,operator_id) VALUES (1932,1,1710,'PRCR:1710:00000000-0000-4000-8000-000000001932','OUTPUT','REWORK','APR-X',1750,1,'PRCR-1710:1:D1:1','x',9);"], "ck_prcv_apr")
 _m17_ck("ck_prcv_apr", ["INSERT INTO process_reversal (id,warehouse_id,process_order_id,op_key,reversal_type,disposition,approval_no,output_id,qty_milli,movement_ref,reason,operator_id) VALUES (1932,1,1710,'PRCR:1710:00000000-0000-4000-8000-000000001932','OUTPUT','REWORK','APR-X',1750,1,'PRCR-1710:1:D1:1','x',9);"])
+expect_block_tx("17 ck_prc_int 非整数计划量", ["INSERT INTO process_order (id,warehouse_id,code,work_date,bom_id,process_location_id,planned_input_qty_milli,created_by) VALUES (1904,1,'PRC-CK6','2026-10-15',1701,1790,1.5,8)"], "ck_prc_int")
+_m17_ck("ck_prc_int", ["INSERT INTO process_order (id,warehouse_id,code,work_date,bom_id,process_location_id,planned_input_qty_milli,created_by) VALUES (1904,1,'PRC-CK6','2026-10-15',1701,1790,1.5,8)"])
 print("=== 2h-loss. docs/17 损耗定案主守卫：损耗行条件更新（审批回调 / 12h 过期任务重放）===")
 def _settle(stmts):
     conn.execute("BEGIN IMMEDIATE")
