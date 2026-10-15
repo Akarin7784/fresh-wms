@@ -2659,9 +2659,10 @@ echo "=== 2z. pg_temp 劫持（#2 第九轮）：search_path 必须显式写 pg_
 # 能建同名临时表盖住 public 的真表。所以 'pg_catalog, public' 不够，必须 'pg_catalog, public, pg_temp'（pg_temp 显式且最后）。
 # SQLite 没有对应攻击面：没有 schema 搜索路径，TEMP 表只对本连接可见，触发器体里的表名在建触发器时就绑到 main（不跟会话走），verify_sqlite.py 不加对应用例。
 # 目录断言：public 里所有带 search_path 设置的函数（含退供增量自带的 5 个，米雪儿已按本规则写）都必须正好是 pg_catalog, public, pg_temp。
-# docs/07（本分支）新增 5 个 PL/pgSQL 触发器函数（trg_rt_forward、trg_rtl_forward、trg_rpd_forward、trg_mo_forward、trg_mol_forward）→ 86 → 91。
+# docs/07 新增 5 个 PL/pgSQL 触发器函数（trg_rt_forward、trg_rtl_forward、trg_rpd_forward、trg_mo_forward、trg_mol_forward）→ 86 → 91。
+# 05 增量 +2：trg_wave_parent_cycle / trg_pt_handover_cycle → 91 → 93。
 R=$(psql -t -A -c "SELECT count(*) FILTER (WHERE c <> 'search_path=pg_catalog, public, pg_temp') || '/' || count(*) FROM (SELECT unnest(p.proconfig) c FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace) s WHERE c LIKE 'search_path=%'")
-[ "$R" = "0/91" ] && ok "pg_temp 目录断言：91 个固定 search_path 的函数都显式以 pg_temp 结尾（不合规/总数 = $R）" || bad "pg_temp 目录断言：不合规/总数 = $R（期望 0/91）"
+[ "$R" = "0/93" ] && ok "pg_temp 目录断言：93 个固定 search_path 的函数都显式以 pg_temp 结尾（不合规/总数 = $R）" || bad "pg_temp 目录断言：不合规/总数 = $R（期望 0/93）"
 # 通用断言（不限函数个数）：public 下任何函数只要设了 search_path，pg_temp 必须是最后一项
 R=$(psql -t -A -c "SELECT count(*) FILTER (WHERE c !~ ',\s*pg_temp\s*$') || '/' || count(*) || '#' || COALESCE(string_agg(proname, ',') FILTER (WHERE c !~ ',\s*pg_temp\s*$'), '') FROM (SELECT p.proname, c FROM pg_proc p, unnest(p.proconfig) c WHERE p.pronamespace = 'public'::regnamespace AND c LIKE 'search_path=%') s")
 [ "${R%%/*}" = "0" ] && ok "pg_temp 末位断言：public 下设了 search_path 的函数 pg_temp 都在最后（缺/总 = ${R%%#*}）" || bad "pg_temp 末位断言：缺/总 = ${R%%#*}，函数：${R#*#}"
@@ -2713,7 +2714,7 @@ echo "  → fixed/mut：02[$A0 | $A1] 09[$B0 | $B1] 11[$C0 | $C1] 12[$D0 | $D1]"
 [ "$B0" = "scrap_line_locked" ] && ok "pg_temp 劫持 09 trg_scrl_draft_only：临时表 scrap_order 把已取消单伪造成 DRAFT，函数仍读 public → $B0" || bad "09 pg_temp 劫持：$B0（期望 scrap_line_locked）"
 [ "$C0" = "PT_PASSED" ] && ok "pg_temp 劫持 11 trg_outbox_order_guard：临时表 outbox_event 伪造同 biz_key 更早的 PENDING 行想卡住投递，函数仍读 public，真实事件照常进 SENDING（$C0）" || bad "11 pg_temp 劫持：$C0（期望正常放行 PT_PASSED）"
 [ "$D0" = "approval_code_warehouse_mismatch" ] && ok "pg_temp 劫持 12 trg_apr_insert：临时表 warehouse 把仓 1 编码伪造成 PTFAKE，函数仍读 public → $D0" || bad "12 pg_temp 劫持：$D0（期望 approval_code_warehouse_mismatch）"
-[ "$PC1" = "4/91" ] && ok "变异：四个函数去掉 pg_temp 后目录断言变红（$PC1）" || bad "变异目录断言没变红：$PC1（期望 4/91）"
+[ "$PC1" = "4/93" ] && ok "变异：四个函数去掉 pg_temp 后目录断言变红（$PC1）" || bad "变异目录断言没变红：$PC1（期望 4/93）"
 [ "$A1" != "$A0" ] && ok "变异：trg_mvk_line_kind 去掉 pg_temp 后临时表劫持生效（$A1）" || bad "变异没变红：trg_mvk_line_kind 去掉 pg_temp 后仍是 $A1"
 [ "$B1" != "$B0" ] && ok "变异：trg_scrl_draft_only 去掉 pg_temp 后临时表劫持生效（$B1）" || bad "变异没变红：trg_scrl_draft_only 去掉 pg_temp 后仍是 $B1"
 [ "$C1" != "$C0" ] && ok "变异：trg_outbox_order_guard 去掉 pg_temp 后临时表劫持生效（$C1）" || bad "变异没变红：trg_outbox_order_guard 去掉 pg_temp 后仍是 $C1"
@@ -3643,7 +3644,7 @@ mut05 "ck_wave_status" "wave" "INSERT INTO wave (id,code,warehouse_id,work_date,
 expect_block "05 拒绝：ck_wave_strategy 非法拣货策略" "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,pick_strategy) VALUES (9103,'W-9103',1,'2026-10-15','CHILLED','R1','BOGUS');" "ck_wave_strategy"
 mut05 "ck_wave_strategy" "wave" "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,pick_strategy) VALUES (9103,'W-9103',1,'2026-10-15','CHILLED','R1','BOGUS');"
 expect_block "05 拒绝：ck_wave_parent 自指父波次" "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,parent_wave_id) VALUES (9104,'W-9104',1,'2026-10-15','CHILLED','R1',9104);" "ck_wave_parent"
-mut05 "ck_wave_parent" "wave" "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,parent_wave_id) VALUES (9104,'W-9104',1,'2026-10-15','CHILLED','R1',9104);"
+expect_allow "05 变异：去掉 ck_wave_parent 与环守卫后，自指波次通过（随后回滚）" "BEGIN; ALTER TABLE wave DROP CONSTRAINT ck_wave_parent; DROP TRIGGER trg_wave_parent_cycle ON wave; INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,parent_wave_id) VALUES (9104,'W-9104',1,'2026-10-15','CHILLED','R1',9104); ROLLBACK;"
 expect_block "05 拒绝：ck_wave_count 汇总量为负" "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,order_count) VALUES (9105,'W-9105',1,'2026-10-15','CHILLED','R1',-1);" "ck_wave_count"
 mut05 "ck_wave_count" "wave" "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,order_count) VALUES (9105,'W-9105',1,'2026-10-15','CHILLED','R1',-1);"
 expect_block "05 拒绝：ck_pt_type 非法任务类型" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,task_type) VALUES (9104,'PT-9104',9101,1,'BOGUS');" "ck_pt_type"
@@ -3655,7 +3656,7 @@ mut05 "ck_pt_exec" "pick_task" "INSERT INTO pick_task (id,code,wave_id,warehouse
 expect_block "05 拒绝：ck_pt_count done_count 大于 line_count" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,line_count,done_count) VALUES (9107,'PT-9107',9101,1,1,2);" "ck_pt_count"
 mut05 "ck_pt_count" "pick_task" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,line_count,done_count) VALUES (9107,'PT-9107',9101,1,1,2);"
 expect_block "05 拒绝：ck_pt_handover 交接来源指向自身" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,handover_from_task_id) VALUES (9108,'PT-9108',9101,1,9108);" "ck_pt_handover"
-mut05 "ck_pt_handover" "pick_task" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,handover_from_task_id) VALUES (9108,'PT-9108',9101,1,9108);"
+expect_allow "05 变异：去掉 ck_pt_handover 与环守卫后，自指交接通过（随后回滚）" "BEGIN; ALTER TABLE pick_task DROP CONSTRAINT ck_pt_handover; DROP TRIGGER trg_pt_handover_cycle ON pick_task; INSERT INTO pick_task (id,code,wave_id,warehouse_id,handover_from_task_id) VALUES (9108,'PT-9108',9101,1,9108); ROLLBACK;"
 expect_block "05 拒绝：ck_ptl_status 非法任务行状态" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom,status) VALUES (9102,9101,2,1,1,1,11,1000,'KG','BOGUS');" "ck_ptl_status"
 mut05 "ck_ptl_status" "pick_task_line" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom,status) VALUES (9102,9101,2,1,1,1,11,1000,'KG','BOGUS');"
 expect_block "05 拒绝：ck_ptl_short SHORT 行缺原因码" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom,status) VALUES (9103,9101,3,1,1,1,11,1000,'KG','SHORT');" "ck_ptl_short"
@@ -3827,6 +3828,52 @@ R=$(psql -t -A -c "SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND
 [ "$R" = "1" ] && ok "08 目录：ix_cnt_line_loc 存在且挂在 count_line(location_id)" || bad "08 目录：ix_cnt_line_loc = $R"
 R=$(psql -t -A -c "BEGIN; DROP INDEX ix_cnt_line_loc; SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexname='ix_cnt_line_loc'; ROLLBACK;" | sed -n 's/^\([0-9][0-9]*\)$/\1/p' | tail -1)
 [ "$R" = "0" ] && ok "08 变异：去掉 ix_cnt_line_loc 后目录断言命中 0（随后回滚）" || bad "08 变异：去掉 ix_cnt_line_loc 后 = $R"
+echo "=== 2t2. docs/05 增量：空串设备号 / 父子链·改派链环守卫 / 撤销回退行状态（正向 / 按名拒绝 / 变异）==="
+# 变异 = 同一事务里去掉该守卫再执行原被拒语句，必须变成通过，然后 ROLLBACK（证明拒绝确实来自该守卫）
+mut_trg05() { expect_allow "05 增量变异：去掉触发器 $1 后，原被拒语句通过（随后回滚）" "BEGIN; DROP TRIGGER $1 ON $2; $3 ROLLBACK;"; }
+# ① 空串设备号（镜鉴 r5 重要项①）：ck_pt_device 与 ck_pt_exec 各管一件事，EXECUTING + 空串必须撞 ck_pt_device
+expect_block "05 增量①：ck_pt_device 拒非空的空串设备号" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,device_instance_id) VALUES (9401,'PT-9401',9101,1,'');" "ck_pt_device"
+mut05 "ck_pt_device" "pick_task" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,device_instance_id) VALUES (9401,'PT-9401',9101,1,'');"
+expect_block "05 增量①：EXECUTING + 空串设备也一样撞 ck_pt_device（旧 ck_pt_exec 放行的那条）" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,status,assigned_to,device_instance_id) VALUES (9402,'PT-9402',9101,1,'EXECUTING',41,'');" "ck_pt_device"
+# r6 加固（镜鉴）：'' 之外，全空格与制表符也必须拒（否则 P{设备}.{op_seq} 仍会退化）
+expect_block "05 增量①r6：ck_pt_device 拒全空格设备号" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,device_instance_id) VALUES (9406,'PT-9406',9101,1,'   ');" "ck_pt_device"
+expect_block "05 增量①r6：ck_pt_device 拒制表符/换行组成的设备号" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,device_instance_id) VALUES (9407,'PT-9407',9101,1,E'\t\n');" "ck_pt_device"
+expect_allow "05 增量①r6 正向：设备号两侧带空格的合法值仍可落库" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,device_instance_id) VALUES (9408,'PT-9408',9101,1,' D9408 ');"
+# ② 环守卫（镜鉴 r5 重要项②）：合法链通过，两点成环在 UPDATE / INSERT 两条路径上都被拒
+seed "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status,parent_wave_id) VALUES (9201,'W-9201',1,'2026-10-15','CHILLED','R1','PLANNED',NULL);"
+seed "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status,parent_wave_id) VALUES (9202,'W-9202',1,'2026-10-15','CHILLED','R1','PLANNED',9201);"
+expect_allow "05 增量②正向：合法父子链（9203 → 9202 → 9201）" "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status,parent_wave_id) VALUES (9203,'W-9203',1,'2026-10-15','CHILLED','R1','PLANNED',9202);"
+expect_block "05 增量②：trg_wave_parent_cycle 拒两点成环（UPDATE 闭合 9201 → 9202）" "UPDATE wave SET parent_wave_id=9202 WHERE id=9201;" "wave_parent_cycle"
+mut_trg05 "trg_wave_parent_cycle" "wave" "UPDATE wave SET parent_wave_id=9202 WHERE id=9201;"
+expect_allow "05 增量②：悬空父指针仍可落库（无自引用外键，见 §12 Q14）" "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status,parent_wave_id) VALUES (9206,'W-9206',1,'2026-10-15','CHILLED','R1','PLANNED',9205);"
+expect_block "05 增量②：INSERT 补上第二条边成环也被拒（9205 → 9206 → 9205）" "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status,parent_wave_id) VALUES (9205,'W-9205',1,'2026-10-15','CHILLED','R1','PLANNED',9206);" "wave_parent_cycle"
+# r6 加固（镜鉴）：旧 SQLite 递归只走 64 行，65 节链闭合会漏检——两库对 65 节链都必须报 cycle；
+# 已存在的 >64 节深链（触发器禁用期间造的）两库都必须报 depth，不许静默放行。
+seed "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status,parent_wave_id) SELECT g, 'W-C'||g, 1, '2026-10-15', 'CHILLED', 'R1', 'PLANNED', CASE WHEN g=9601 THEN NULL ELSE g-1 END FROM generate_series(9601,9665) g;"
+expect_block "05 增量②r6：65 节链闭合报 wave_parent_cycle（旧 SQLite 递归上限漏检的那条）" "UPDATE wave SET parent_wave_id=9665 WHERE id=9601;" "wave_parent_cycle"
+expect_block "05 增量②r6：已存在的 66 节深链再闭合报 wave_parent_cycle_depth（两库同口径）" "BEGIN; ALTER TABLE wave DISABLE TRIGGER trg_wave_parent_cycle; INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status,parent_wave_id) SELECT g, 'W-E'||g, 1, '2026-10-15', 'CHILLED', 'R1', 'PLANNED', CASE WHEN g=9701 THEN NULL ELSE g-1 END FROM generate_series(9701,9766) g; ALTER TABLE wave ENABLE TRIGGER trg_wave_parent_cycle; UPDATE wave SET parent_wave_id=9766 WHERE id=9701; ROLLBACK;" "wave_parent_cycle_depth"
+seed "INSERT INTO pick_task (id,code,wave_id,warehouse_id,status,assigned_to,device_instance_id) VALUES (9403,'PT-9403',9201,1,'EXECUTING',41,'D9403');"
+seed "INSERT INTO pick_task (id,code,wave_id,warehouse_id,status,assigned_to,device_instance_id,handover_from_task_id) VALUES (9404,'PT-9404',9201,1,'EXECUTING',42,'D9404',9403);"
+expect_block "05 增量②：trg_pt_handover_cycle 拒改派链成环（9403 → 9404 → 9403）" "UPDATE pick_task SET handover_from_task_id=9404 WHERE id=9403;" "pick_task_handover_cycle"
+mut_trg05 "trg_pt_handover_cycle" "pick_task" "UPDATE pick_task SET handover_from_task_id=9404 WHERE id=9403;"
+R=$(psql -t -A -c "SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND tgname IN ('trg_wave_parent_cycle','trg_pt_handover_cycle')")
+[ "$R" = "2" ] && ok "05 增量②目录：两个环守卫触发器都在（$R）" || bad "05 增量②目录：$R（期望 2）"
+R=$(psql -t -A -c "SELECT count(*) FILTER (WHERE proconfig = ARRAY['search_path=pg_catalog, public, pg_temp']::text[])::text || '/' || count(*)::text FROM pg_proc WHERE pronamespace='public'::regnamespace AND proname IN ('trg_wave_parent_cycle','trg_pt_handover_cycle')")
+[ "$R" = "2/2" ] && ok "05 增量②：两个触发器函数 proconfig 都是 search_path=pg_catalog, public, pg_temp（$R）" || bad "05 增量② search_path 目录：$R（期望 2/2）"
+R=$(psql -q -t -A -c "BEGIN; ALTER FUNCTION public.trg_wave_parent_cycle() RESET search_path; SELECT count(*) FILTER (WHERE proconfig = ARRAY['search_path=pg_catalog, public, pg_temp']::text[])::text || '/' || count(*)::text FROM pg_proc WHERE pronamespace='public'::regnamespace AND proname IN ('trg_wave_parent_cycle','trg_pt_handover_cycle'); ROLLBACK;" | head -1)
+[ "$R" = "1/2" ] && ok "05 增量②变异：RESET 一个函数的 search_path 后目录断言变红（$R）" || bad "05 增量② search_path 变异：$R（期望 1/2）"
+# ③ 撤销回退行状态（镜鉴 r5 重要项③）：§6.5 的撤销必须与数量同一条 UPDATE 回退 status，否则 T-done 仍判拣满
+seed "INSERT INTO pick_task (id,code,wave_id,warehouse_id,status,assigned_to,device_instance_id,line_count,done_count) VALUES (9405,'PT-9405',9201,1,'EXECUTING',41,'D9405',1,1);"
+seed "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,outbound_line_id,planned_qty_milli,confirmed_qty_milli,uom,status) VALUES (9405,9405,1,1,1,1,11,1,1000,1000,'KG','DONE');"
+R=$(psql -t -A -c "WITH u AS (UPDATE pick_task_line SET confirmed_qty_milli=confirmed_qty_milli-300, status=CASE WHEN status='DONE' AND confirmed_qty_milli-300 < planned_qty_milli THEN 'PENDING' ELSE status END WHERE id=9405 AND confirmed_qty_milli>=300 RETURNING status) SELECT count(*)::text || '/' || COALESCE(max(status),'-') FROM u")
+[ "$R" = "1/PENDING" ] && ok "05 增量③：撤销同一条 UPDATE 把 DONE 行回退成 PENDING（$R）" || bad "05 增量③ 撤销回退：$R（期望 1/PENDING）"
+R=$(psql -t -A -c "WITH u AS (UPDATE pick_task SET status='DONE' WHERE id=9405 AND status='EXECUTING' AND NOT EXISTS (SELECT 1 FROM pick_task_line l WHERE l.pick_task_id=9405 AND l.status IN ('PENDING','SKIP','ABNORMAL')) RETURNING 1) SELECT count(*) FROM u")
+[ "$R" = "0" ] && ok "05 增量③：回退后 T-done 守卫命中 0 行（任务不得进 DONE）" || bad "05 增量③ T-done：$R（期望 0）"
+seed "UPDATE pick_task_line SET confirmed_qty_milli=1000, status='DONE' WHERE id=9405;"
+R=$(psql -t -A -c "WITH u AS (UPDATE pick_task_line SET confirmed_qty_milli=confirmed_qty_milli-300 WHERE id=9405 AND confirmed_qty_milli>=300 RETURNING status) SELECT count(*)::text || '/' || COALESCE(max(status),'-') FROM u")
+[ "$R" = "1/DONE" ] && ok "05 增量③变异：只减量不回退状态的旧写法，行仍是 DONE（$R）" || bad "05 增量③变异旧写法：$R（期望 1/DONE）"
+R=$(psql -t -A -c "WITH u AS (UPDATE pick_task SET status='DONE' WHERE id=9405 AND status='EXECUTING' AND NOT EXISTS (SELECT 1 FROM pick_task_line l WHERE l.pick_task_id=9405 AND l.status IN ('PENDING','SKIP','ABNORMAL')) RETURNING 1) SELECT count(*) FROM u")
+[ "$R" = "1" ] && ok "05 增量③变异：不回退状态时同一任务被判 DONE（证明回退是拦它的那条）" || bad "05 增量③变异 T-done：$R（期望 1）"
 echo "=== 汇总 ==="
 echo "  通过 $pass 项 / 失败 $fail 项"
 cleanup

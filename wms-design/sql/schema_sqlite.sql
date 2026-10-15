@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 14 处 DEFAULT now()、74 处 DEFAULT (now() AT TIME ZONE 'UTC') / (date_trunc('second', now() AT TIME ZONE 'UTC')) → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
---   3. 方言专属行：删除 1523 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 925 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 1554 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 986 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -1251,6 +1251,43 @@ CREATE TABLE wave (
 );
 CREATE INDEX ix_wave_wh ON wave(warehouse_id, status, work_date DESC);
 
+-- 环守卫（镜鉴 r5 重要项②）：ck_wave_parent 只防自指，两点成环（A→B、B→A）能落库。
+-- 00 §6.1 明说 ID 不保证跨节点单调、业务逻辑不得依赖 ID 大小，所以不能用 parent_wave_id < id 当拓扑序，只能真沿链上溯。
+-- 用 AFTER 而不是 BEFORE：守卫必须在 REPLACE / UPSERT 插入的新行上也生效（AFTER INSERT 照常触发），
+--   同时不把 wave / pick_task 变成 00 §6.10 的「受锁表」（那会强制补 no-REPLACE 守卫，是另一个增量）。
+-- 事务内可观测的环（含任意长度、INSERT 与 UPDATE 两条路径）必被拦；写偏斜（两个事务各写一半、都看不到对方）由应用层
+--   在同一事务内对父波次行加锁串行化，见 docs/05 §8「环写的并发口径」。
+CREATE TRIGGER trg_wave_parent_cycle AFTER INSERT ON wave WHEN NEW.parent_wave_id IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'wave_parent_cycle') WHERE EXISTS (
+    WITH RECURSIVE anc(id, parent_wave_id, lvl) AS (
+      SELECT w.id, w.parent_wave_id, 1 FROM wave w WHERE w.id = NEW.parent_wave_id
+      UNION ALL
+      SELECT w.id, w.parent_wave_id, a.lvl + 1 FROM wave w JOIN anc a ON w.id = a.parent_wave_id WHERE a.lvl < 65)
+    SELECT 1 FROM anc WHERE id = NEW.id);
+  SELECT RAISE(ABORT, 'wave_parent_cycle_depth') WHERE EXISTS (
+    WITH RECURSIVE anc(id, parent_wave_id, lvl) AS (
+      SELECT w.id, w.parent_wave_id, 1 FROM wave w WHERE w.id = NEW.parent_wave_id
+      UNION ALL
+      SELECT w.id, w.parent_wave_id, a.lvl + 1 FROM wave w JOIN anc a ON w.id = a.parent_wave_id WHERE a.lvl < 65)
+    SELECT 1 FROM anc WHERE lvl > 64);
+END;
+CREATE TRIGGER trg_wave_parent_cycle_u AFTER UPDATE OF parent_wave_id ON wave WHEN NEW.parent_wave_id IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'wave_parent_cycle') WHERE EXISTS (
+    WITH RECURSIVE anc(id, parent_wave_id, lvl) AS (
+      SELECT w.id, w.parent_wave_id, 1 FROM wave w WHERE w.id = NEW.parent_wave_id
+      UNION ALL
+      SELECT w.id, w.parent_wave_id, a.lvl + 1 FROM wave w JOIN anc a ON w.id = a.parent_wave_id WHERE a.lvl < 65)
+    SELECT 1 FROM anc WHERE id = NEW.id);
+  SELECT RAISE(ABORT, 'wave_parent_cycle_depth') WHERE EXISTS (
+    WITH RECURSIVE anc(id, parent_wave_id, lvl) AS (
+      SELECT w.id, w.parent_wave_id, 1 FROM wave w WHERE w.id = NEW.parent_wave_id
+      UNION ALL
+      SELECT w.id, w.parent_wave_id, a.lvl + 1 FROM wave w JOIN anc a ON w.id = a.parent_wave_id WHERE a.lvl < 65)
+    SELECT 1 FROM anc WHERE lvl > 64);
+END;
+
 CREATE TABLE pick_task (
     id                      BIGINT       PRIMARY KEY,
     code                    VARCHAR(64)  NOT NULL,
@@ -1274,6 +1311,10 @@ CREATE TABLE pick_task (
     CONSTRAINT ck_pt_type   CHECK (task_type IN ('PICK','REPLENISH')),
     CONSTRAINT ck_pt_status CHECK (status IN ('PENDING','EXECUTING','DONE','ABNORMAL','CANCELLED','CLOSED')),
     CONSTRAINT ck_pt_exec   CHECK (status <> 'EXECUTING' OR (assigned_to IS NOT NULL AND device_instance_id IS NOT NULL)),
+    -- 空白串不算设备号（镜鉴 r5 重要项① + r6 加固）：'' / '   ' / '\t' 都能绕过 ck_pt_exec，
+    -- 两台没写设备号的 PDA 生成同一个幂等键 P{设备}.{op_seq}（00 §6.5 四元组），把并发上报当成重放。
+    -- 与状态无关，一律拒；PG 用 btrim（默认只去空格，必须显式给 ASCII 空白集），SQLite 用 trim(X,Y)。
+    CONSTRAINT ck_pt_device CHECK (device_instance_id IS NULL OR trim(device_instance_id, ' ' || char(9) || char(10) || char(11) || char(12) || char(13)) <> ''),
     CONSTRAINT ck_pt_count  CHECK (line_count >= 0 AND done_count >= 0 AND done_count <= line_count),
     CONSTRAINT ck_pt_handover CHECK (handover_from_task_id IS NULL OR handover_from_task_id <> id),
     CONSTRAINT fk_pt_wave   FOREIGN KEY (wave_id)  REFERENCES wave(id),
@@ -1283,6 +1324,38 @@ CREATE TABLE pick_task (
 CREATE INDEX ix_pt_claim ON pick_task(wave_id, status, zone_id) WHERE status = 'PENDING';
 CREATE INDEX ix_pt_mine  ON pick_task(assigned_to, status);
 CREATE INDEX ix_pt_handover ON pick_task(handover_from_task_id) WHERE handover_from_task_id IS NOT NULL;
+
+-- 环守卫（镜鉴 r5 重要项②）：改派链同样只防自指，A→B→A 能落库。口径与 trg_wave_parent_cycle 一致（AFTER 触发 + 真沿链上溯 + 应用层加锁）。
+CREATE TRIGGER trg_pt_handover_cycle AFTER INSERT ON pick_task WHEN NEW.handover_from_task_id IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'pick_task_handover_cycle') WHERE EXISTS (
+    WITH RECURSIVE anc(id, handover_from_task_id, lvl) AS (
+      SELECT t.id, t.handover_from_task_id, 1 FROM pick_task t WHERE t.id = NEW.handover_from_task_id
+      UNION ALL
+      SELECT t.id, t.handover_from_task_id, a.lvl + 1 FROM pick_task t JOIN anc a ON t.id = a.handover_from_task_id WHERE a.lvl < 65)
+    SELECT 1 FROM anc WHERE id = NEW.id);
+  SELECT RAISE(ABORT, 'pick_task_handover_cycle_depth') WHERE EXISTS (
+    WITH RECURSIVE anc(id, handover_from_task_id, lvl) AS (
+      SELECT t.id, t.handover_from_task_id, 1 FROM pick_task t WHERE t.id = NEW.handover_from_task_id
+      UNION ALL
+      SELECT t.id, t.handover_from_task_id, a.lvl + 1 FROM pick_task t JOIN anc a ON t.id = a.handover_from_task_id WHERE a.lvl < 65)
+    SELECT 1 FROM anc WHERE lvl > 64);
+END;
+CREATE TRIGGER trg_pt_handover_cycle_u AFTER UPDATE OF handover_from_task_id ON pick_task WHEN NEW.handover_from_task_id IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'pick_task_handover_cycle') WHERE EXISTS (
+    WITH RECURSIVE anc(id, handover_from_task_id, lvl) AS (
+      SELECT t.id, t.handover_from_task_id, 1 FROM pick_task t WHERE t.id = NEW.handover_from_task_id
+      UNION ALL
+      SELECT t.id, t.handover_from_task_id, a.lvl + 1 FROM pick_task t JOIN anc a ON t.id = a.handover_from_task_id WHERE a.lvl < 65)
+    SELECT 1 FROM anc WHERE id = NEW.id);
+  SELECT RAISE(ABORT, 'pick_task_handover_cycle_depth') WHERE EXISTS (
+    WITH RECURSIVE anc(id, handover_from_task_id, lvl) AS (
+      SELECT t.id, t.handover_from_task_id, 1 FROM pick_task t WHERE t.id = NEW.handover_from_task_id
+      UNION ALL
+      SELECT t.id, t.handover_from_task_id, a.lvl + 1 FROM pick_task t JOIN anc a ON t.id = a.handover_from_task_id WHERE a.lvl < 65)
+    SELECT 1 FROM anc WHERE lvl > 64);
+END;
 
 CREATE TABLE pick_task_line (
     id                  BIGINT          PRIMARY KEY,

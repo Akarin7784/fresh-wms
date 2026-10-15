@@ -34,6 +34,58 @@ CREATE TABLE wave (
 );
 CREATE INDEX ix_wave_wh ON wave(warehouse_id, status, work_date DESC);
 
+-- 环守卫（镜鉴 r5 重要项②）：ck_wave_parent 只防自指，两点成环（A→B、B→A）能落库。
+-- 00 §6.1 明说 ID 不保证跨节点单调、业务逻辑不得依赖 ID 大小，所以不能用 parent_wave_id < id 当拓扑序，只能真沿链上溯。
+-- 用 AFTER 而不是 BEFORE：守卫必须在 REPLACE / UPSERT 插入的新行上也生效（AFTER INSERT 照常触发），
+--   同时不把 wave / pick_task 变成 00 §6.10 的「受锁表」（那会强制补 no-REPLACE 守卫，是另一个增量）。
+-- 事务内可观测的环（含任意长度、INSERT 与 UPDATE 两条路径）必被拦；写偏斜（两个事务各写一半、都看不到对方）由应用层
+--   在同一事务内对父波次行加锁串行化，见 docs/05 §8「环写的并发口径」。
+CREATE FUNCTION trg_wave_parent_cycle() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
+DECLARE                                                                                                                       -- @pg-only
+    cur BIGINT := NEW.parent_wave_id;                                                                                         -- @pg-only
+    lvl INT := 0;                                                                                                             -- @pg-only
+BEGIN                                                                                                                         -- @pg-only
+    IF cur IS NULL THEN RETURN NULL; END IF;                                                                                  -- @pg-only
+    WHILE cur IS NOT NULL LOOP                                                                                                -- @pg-only
+        IF cur = NEW.id THEN RAISE EXCEPTION 'wave_parent_cycle' USING ERRCODE = '23514'; END IF;                             -- @pg-only
+        lvl := lvl + 1;                                                                                                       -- @pg-only
+        IF lvl > 64 THEN RAISE EXCEPTION 'wave_parent_cycle_depth' USING ERRCODE = '23514'; END IF;                           -- @pg-only
+        SELECT parent_wave_id INTO cur FROM wave WHERE id = cur;                                                              -- @pg-only
+    END LOOP;                                                                                                                 -- @pg-only
+    RETURN NULL;                                                                                                              -- @pg-only
+END $$;                                                                                                                       -- @pg-only
+CREATE TRIGGER trg_wave_parent_cycle AFTER INSERT OR UPDATE OF parent_wave_id ON wave FOR EACH ROW EXECUTE FUNCTION trg_wave_parent_cycle();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_wave_parent_cycle AFTER INSERT ON wave WHEN NEW.parent_wave_id IS NOT NULL
+-- @sqlite-only BEGIN
+-- @sqlite-only   SELECT RAISE(ABORT, 'wave_parent_cycle') WHERE EXISTS (
+-- @sqlite-only     WITH RECURSIVE anc(id, parent_wave_id, lvl) AS (
+-- @sqlite-only       SELECT w.id, w.parent_wave_id, 1 FROM wave w WHERE w.id = NEW.parent_wave_id
+-- @sqlite-only       UNION ALL
+-- @sqlite-only       SELECT w.id, w.parent_wave_id, a.lvl + 1 FROM wave w JOIN anc a ON w.id = a.parent_wave_id WHERE a.lvl < 65)
+-- @sqlite-only     SELECT 1 FROM anc WHERE id = NEW.id);
+-- @sqlite-only   SELECT RAISE(ABORT, 'wave_parent_cycle_depth') WHERE EXISTS (
+-- @sqlite-only     WITH RECURSIVE anc(id, parent_wave_id, lvl) AS (
+-- @sqlite-only       SELECT w.id, w.parent_wave_id, 1 FROM wave w WHERE w.id = NEW.parent_wave_id
+-- @sqlite-only       UNION ALL
+-- @sqlite-only       SELECT w.id, w.parent_wave_id, a.lvl + 1 FROM wave w JOIN anc a ON w.id = a.parent_wave_id WHERE a.lvl < 65)
+-- @sqlite-only     SELECT 1 FROM anc WHERE lvl > 64);
+-- @sqlite-only END;
+-- @sqlite-only CREATE TRIGGER trg_wave_parent_cycle_u AFTER UPDATE OF parent_wave_id ON wave WHEN NEW.parent_wave_id IS NOT NULL
+-- @sqlite-only BEGIN
+-- @sqlite-only   SELECT RAISE(ABORT, 'wave_parent_cycle') WHERE EXISTS (
+-- @sqlite-only     WITH RECURSIVE anc(id, parent_wave_id, lvl) AS (
+-- @sqlite-only       SELECT w.id, w.parent_wave_id, 1 FROM wave w WHERE w.id = NEW.parent_wave_id
+-- @sqlite-only       UNION ALL
+-- @sqlite-only       SELECT w.id, w.parent_wave_id, a.lvl + 1 FROM wave w JOIN anc a ON w.id = a.parent_wave_id WHERE a.lvl < 65)
+-- @sqlite-only     SELECT 1 FROM anc WHERE id = NEW.id);
+-- @sqlite-only   SELECT RAISE(ABORT, 'wave_parent_cycle_depth') WHERE EXISTS (
+-- @sqlite-only     WITH RECURSIVE anc(id, parent_wave_id, lvl) AS (
+-- @sqlite-only       SELECT w.id, w.parent_wave_id, 1 FROM wave w WHERE w.id = NEW.parent_wave_id
+-- @sqlite-only       UNION ALL
+-- @sqlite-only       SELECT w.id, w.parent_wave_id, a.lvl + 1 FROM wave w JOIN anc a ON w.id = a.parent_wave_id WHERE a.lvl < 65)
+-- @sqlite-only     SELECT 1 FROM anc WHERE lvl > 64);
+-- @sqlite-only END;
+
 CREATE TABLE pick_task (
     id                      BIGINT       PRIMARY KEY,
     code                    VARCHAR(64)  NOT NULL,
@@ -57,6 +109,11 @@ CREATE TABLE pick_task (
     CONSTRAINT ck_pt_type   CHECK (task_type IN ('PICK','REPLENISH')),
     CONSTRAINT ck_pt_status CHECK (status IN ('PENDING','EXECUTING','DONE','ABNORMAL','CANCELLED','CLOSED')),
     CONSTRAINT ck_pt_exec   CHECK (status <> 'EXECUTING' OR (assigned_to IS NOT NULL AND device_instance_id IS NOT NULL)),
+    -- 空白串不算设备号（镜鉴 r5 重要项① + r6 加固）：'' / '   ' / '\t' 都能绕过 ck_pt_exec，
+    -- 两台没写设备号的 PDA 生成同一个幂等键 P{设备}.{op_seq}（00 §6.5 四元组），把并发上报当成重放。
+    -- 与状态无关，一律拒；PG 用 btrim（默认只去空格，必须显式给 ASCII 空白集），SQLite 用 trim(X,Y)。
+    CONSTRAINT ck_pt_device CHECK (device_instance_id IS NULL OR btrim(device_instance_id, E' \t\r\n\v\f') <> ''),  -- @pg-only
+-- @sqlite-only     CONSTRAINT ck_pt_device CHECK (device_instance_id IS NULL OR trim(device_instance_id, ' ' || char(9) || char(10) || char(11) || char(12) || char(13)) <> ''),
     CONSTRAINT ck_pt_count  CHECK (line_count >= 0 AND done_count >= 0 AND done_count <= line_count),
     CONSTRAINT ck_pt_handover CHECK (handover_from_task_id IS NULL OR handover_from_task_id <> id),
     CONSTRAINT fk_pt_wave   FOREIGN KEY (wave_id)  REFERENCES wave(id),
@@ -66,6 +123,53 @@ CREATE TABLE pick_task (
 CREATE INDEX ix_pt_claim ON pick_task(wave_id, status, zone_id) WHERE status = 'PENDING';
 CREATE INDEX ix_pt_mine  ON pick_task(assigned_to, status);
 CREATE INDEX ix_pt_handover ON pick_task(handover_from_task_id) WHERE handover_from_task_id IS NOT NULL;
+
+-- 环守卫（镜鉴 r5 重要项②）：改派链同样只防自指，A→B→A 能落库。口径与 trg_wave_parent_cycle 一致（AFTER 触发 + 真沿链上溯 + 应用层加锁）。
+CREATE FUNCTION trg_pt_handover_cycle() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
+DECLARE                                                                                                                      -- @pg-only
+    cur BIGINT := NEW.handover_from_task_id;                                                                                 -- @pg-only
+    lvl INT := 0;                                                                                                            -- @pg-only
+BEGIN                                                                                                                        -- @pg-only
+    IF cur IS NULL THEN RETURN NULL; END IF;                                                                                 -- @pg-only
+    WHILE cur IS NOT NULL LOOP                                                                                               -- @pg-only
+        IF cur = NEW.id THEN RAISE EXCEPTION 'pick_task_handover_cycle' USING ERRCODE = '23514'; END IF;                     -- @pg-only
+        lvl := lvl + 1;                                                                                                      -- @pg-only
+        IF lvl > 64 THEN RAISE EXCEPTION 'pick_task_handover_cycle_depth' USING ERRCODE = '23514'; END IF;                   -- @pg-only
+        SELECT handover_from_task_id INTO cur FROM pick_task WHERE id = cur;                                                 -- @pg-only
+    END LOOP;                                                                                                                -- @pg-only
+    RETURN NULL;                                                                                                             -- @pg-only
+END $$;                                                                                                                      -- @pg-only
+CREATE TRIGGER trg_pt_handover_cycle AFTER INSERT OR UPDATE OF handover_from_task_id ON pick_task FOR EACH ROW EXECUTE FUNCTION trg_pt_handover_cycle();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_pt_handover_cycle AFTER INSERT ON pick_task WHEN NEW.handover_from_task_id IS NOT NULL
+-- @sqlite-only BEGIN
+-- @sqlite-only   SELECT RAISE(ABORT, 'pick_task_handover_cycle') WHERE EXISTS (
+-- @sqlite-only     WITH RECURSIVE anc(id, handover_from_task_id, lvl) AS (
+-- @sqlite-only       SELECT t.id, t.handover_from_task_id, 1 FROM pick_task t WHERE t.id = NEW.handover_from_task_id
+-- @sqlite-only       UNION ALL
+-- @sqlite-only       SELECT t.id, t.handover_from_task_id, a.lvl + 1 FROM pick_task t JOIN anc a ON t.id = a.handover_from_task_id WHERE a.lvl < 65)
+-- @sqlite-only     SELECT 1 FROM anc WHERE id = NEW.id);
+-- @sqlite-only   SELECT RAISE(ABORT, 'pick_task_handover_cycle_depth') WHERE EXISTS (
+-- @sqlite-only     WITH RECURSIVE anc(id, handover_from_task_id, lvl) AS (
+-- @sqlite-only       SELECT t.id, t.handover_from_task_id, 1 FROM pick_task t WHERE t.id = NEW.handover_from_task_id
+-- @sqlite-only       UNION ALL
+-- @sqlite-only       SELECT t.id, t.handover_from_task_id, a.lvl + 1 FROM pick_task t JOIN anc a ON t.id = a.handover_from_task_id WHERE a.lvl < 65)
+-- @sqlite-only     SELECT 1 FROM anc WHERE lvl > 64);
+-- @sqlite-only END;
+-- @sqlite-only CREATE TRIGGER trg_pt_handover_cycle_u AFTER UPDATE OF handover_from_task_id ON pick_task WHEN NEW.handover_from_task_id IS NOT NULL
+-- @sqlite-only BEGIN
+-- @sqlite-only   SELECT RAISE(ABORT, 'pick_task_handover_cycle') WHERE EXISTS (
+-- @sqlite-only     WITH RECURSIVE anc(id, handover_from_task_id, lvl) AS (
+-- @sqlite-only       SELECT t.id, t.handover_from_task_id, 1 FROM pick_task t WHERE t.id = NEW.handover_from_task_id
+-- @sqlite-only       UNION ALL
+-- @sqlite-only       SELECT t.id, t.handover_from_task_id, a.lvl + 1 FROM pick_task t JOIN anc a ON t.id = a.handover_from_task_id WHERE a.lvl < 65)
+-- @sqlite-only     SELECT 1 FROM anc WHERE id = NEW.id);
+-- @sqlite-only   SELECT RAISE(ABORT, 'pick_task_handover_cycle_depth') WHERE EXISTS (
+-- @sqlite-only     WITH RECURSIVE anc(id, handover_from_task_id, lvl) AS (
+-- @sqlite-only       SELECT t.id, t.handover_from_task_id, 1 FROM pick_task t WHERE t.id = NEW.handover_from_task_id
+-- @sqlite-only       UNION ALL
+-- @sqlite-only       SELECT t.id, t.handover_from_task_id, a.lvl + 1 FROM pick_task t JOIN anc a ON t.id = a.handover_from_task_id WHERE a.lvl < 65)
+-- @sqlite-only     SELECT 1 FROM anc WHERE lvl > 64);
+-- @sqlite-only END;
 
 CREATE TABLE pick_task_line (
     id                  BIGINT          PRIMARY KEY,

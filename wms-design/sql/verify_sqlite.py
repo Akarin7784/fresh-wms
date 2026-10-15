@@ -4015,6 +4015,20 @@ def _m05_fk(name, stmts):
         expect_allow_tx(f"05 变异：去掉 {name} 后，原被拒语句通过（随后回滚）", stmts)
     finally:
         _fk_off_allowed = False; conn.execute("PRAGMA foreign_keys = ON")
+def _m05_ck_trg(desc, drops, stmts):
+    """变异：自指用例现在有两道防线（CHECK + 环守卫触发器），要同时去掉才谈得上"去掉守卫后通过"；随后回滚恢复。"""
+    conn.execute("SAVEPOINT m05cktrg"); conn.execute("PRAGMA ignore_check_constraints = ON")
+    for d in drops:
+        conn.execute(d)
+    try:
+        for st in stmts:
+            conn.execute(st)
+        ok(f"{desc} → 通过（随后回滚）")
+    except sqlite3.Error as e:
+        bad(f"{desc} → 被误拦：{e}")
+    finally:
+        conn.execute("PRAGMA ignore_check_constraints = OFF")
+        conn.execute("ROLLBACK TO m05cktrg"); conn.execute("RELEASE m05cktrg")
 conn.execute("INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status) VALUES (9101,'W-9101',1,'2026-10-15','CHILLED','R1','PLANNED')")
 expect_allow_tx("05 正向：波次 + 任务 + 任务行（12 个 CHECK / 8 个外键全满足）", ["INSERT INTO pick_task (id,code,wave_id,warehouse_id,task_type,zone_id,status,assigned_to,device_instance_id,line_count,done_count) VALUES (9101,'PT-9101',9101,1,'PICK',1,'EXECUTING',41,'D9101',1,0)", "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,outbound_line_id,planned_qty_milli,confirmed_qty_milli,uom,status) VALUES (9101,9101,1,1,1,1,11,1,1000,1000,'KG','DONE')"])
 expect_block_tx("05 拒绝：ck_wave_status 非法状态值", ["INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status) VALUES (9102,'W-9102',1,'2026-10-15','CHILLED','R1','BOGUS')"], "ck_wave_status")
@@ -4022,7 +4036,7 @@ _m05_ck("ck_wave_status", ["INSERT INTO wave (id,code,warehouse_id,work_date,tem
 expect_block_tx("05 拒绝：ck_wave_strategy 非法拣货策略", ["INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,pick_strategy) VALUES (9103,'W-9103',1,'2026-10-15','CHILLED','R1','BOGUS')"], "ck_wave_strategy")
 _m05_ck("ck_wave_strategy", ["INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,pick_strategy) VALUES (9103,'W-9103',1,'2026-10-15','CHILLED','R1','BOGUS')"])
 expect_block_tx("05 拒绝：ck_wave_parent 自指父波次", ["INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,parent_wave_id) VALUES (9104,'W-9104',1,'2026-10-15','CHILLED','R1',9104)"], "ck_wave_parent")
-_m05_ck("ck_wave_parent", ["INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,parent_wave_id) VALUES (9104,'W-9104',1,'2026-10-15','CHILLED','R1',9104)"])
+_m05_ck_trg("05 变异：去掉 ck_wave_parent 与环守卫后，自指波次通过（随后回滚）", ["DROP TRIGGER trg_wave_parent_cycle", "DROP TRIGGER trg_wave_parent_cycle_u"], ["INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,parent_wave_id) VALUES (9104,'W-9104',1,'2026-10-15','CHILLED','R1',9104)"])
 expect_block_tx("05 拒绝：ck_wave_count 汇总量为负", ["INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,order_count) VALUES (9105,'W-9105',1,'2026-10-15','CHILLED','R1',-1)"], "ck_wave_count")
 _m05_ck("ck_wave_count", ["INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,order_count) VALUES (9105,'W-9105',1,'2026-10-15','CHILLED','R1',-1)"])
 expect_block_tx("05 拒绝：ck_pt_type 非法任务类型", ["INSERT INTO pick_task (id,code,wave_id,warehouse_id,task_type) VALUES (9104,'PT-9104',9101,1,'BOGUS')"], "ck_pt_type")
@@ -4034,7 +4048,7 @@ _m05_ck("ck_pt_exec", ["INSERT INTO pick_task (id,code,wave_id,warehouse_id,stat
 expect_block_tx("05 拒绝：ck_pt_count done_count 大于 line_count", ["INSERT INTO pick_task (id,code,wave_id,warehouse_id,line_count,done_count) VALUES (9107,'PT-9107',9101,1,1,2)"], "ck_pt_count")
 _m05_ck("ck_pt_count", ["INSERT INTO pick_task (id,code,wave_id,warehouse_id,line_count,done_count) VALUES (9107,'PT-9107',9101,1,1,2)"])
 expect_block_tx("05 拒绝：ck_pt_handover 交接来源指向自身", ["INSERT INTO pick_task (id,code,wave_id,warehouse_id,handover_from_task_id) VALUES (9108,'PT-9108',9101,1,9108)"], "ck_pt_handover")
-_m05_ck("ck_pt_handover", ["INSERT INTO pick_task (id,code,wave_id,warehouse_id,handover_from_task_id) VALUES (9108,'PT-9108',9101,1,9108)"])
+_m05_ck_trg("05 变异：去掉 ck_pt_handover 与环守卫后，自指交接通过（随后回滚）", ["DROP TRIGGER trg_pt_handover_cycle", "DROP TRIGGER trg_pt_handover_cycle_u"], ["INSERT INTO pick_task (id,code,wave_id,warehouse_id,handover_from_task_id) VALUES (9108,'PT-9108',9101,1,9108)"])
 expect_block_tx("05 拒绝：ck_ptl_status 非法任务行状态", ["INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom,status) VALUES (9102,9101,2,1,1,1,11,1000,'KG','BOGUS')"], "ck_ptl_status")
 _m05_ck("ck_ptl_status", ["INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom,status) VALUES (9102,9101,2,1,1,1,11,1000,'KG','BOGUS')"])
 expect_block_tx("05 拒绝：ck_ptl_short SHORT 行缺原因码", ["INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom,status) VALUES (9103,9101,3,1,1,1,11,1000,'KG','SHORT')"], "ck_ptl_short")
@@ -4232,6 +4246,85 @@ for _ixname, _ixtbl, _ixdesc in (("ix_cnt_wh", "count_order", "count_order(wareh
     _ixm = one("SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?", _ixname)[0]
     conn.execute("ROLLBACK TO ix08"); conn.execute("RELEASE ix08")
     (ok if _ixm == 0 else bad)(f"08 变异：去掉 {_ixname} 后目录断言命中 0（随后回滚）")
+print("=== 2t2. docs/05 增量：空串设备号 / 父子链·改派链环守卫 / 撤销回退行状态（正向 / 按名拒绝 / 变异）===")
+# 环守卫变异：SQLite DDL 可回滚 → 在保存点里 DROP TRIGGER，原被拒语句必须通过，再回滚恢复。
+def _m05_trg(desc, drops, stmt):
+    conn.execute("SAVEPOINT m05trg")
+    for d in drops:
+        conn.execute(d)
+    try:
+        conn.execute(stmt)
+        ok(f"{desc} → 通过（随后回滚）")
+    except sqlite3.Error as e:
+        bad(f"{desc} → 被误拦：{e}")
+    finally:
+        conn.execute("ROLLBACK TO m05trg"); conn.execute("RELEASE m05trg")
+# 深链（>64 节）没法在守卫开着时建出来 → 在保存点里去掉 4 个触发器造链、用 sqlite_master 里的原文装回去，再闭合必须报 depth。
+def _m05_deep(desc, inserts, close_sql, want):
+    names = ("trg_wave_parent_cycle", "trg_wave_parent_cycle_u", "trg_pt_handover_cycle", "trg_pt_handover_cycle_u")
+    saved = [one("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", n)[0] for n in names]
+    conn.execute("SAVEPOINT m05deep")
+    try:
+        for n in names:
+            conn.execute(f"DROP TRIGGER {n}")
+        for st in inserts:
+            conn.execute(st)
+        for s in saved:
+            conn.execute(s)
+        try:
+            conn.execute(close_sql)
+            bad(f"{desc} → 未拦截（SQLite 侧有洞）")
+        except sqlite3.IntegrityError as e:
+            msg = str(e)
+            if msg == want or msg.endswith(": " + want):
+                ok(f"{desc} → 已拦截（{msg}）")
+            else:
+                bad(f"{desc} → 被拦了但守卫不对：期望 {want!r}，实际 {msg!r}")
+    finally:
+        conn.execute("ROLLBACK TO m05deep"); conn.execute("RELEASE m05deep")
+# ① 空串设备号：ck_pt_device 与 ck_pt_exec 各管一件事，EXECUTING + 空串也必须撞 ck_pt_device
+expect_block_tx("05 增量①：ck_pt_device 拒非空的空串设备号", ["INSERT INTO pick_task (id,code,wave_id,warehouse_id,device_instance_id) VALUES (9401,'PT-9401',9101,1,'')"], "ck_pt_device")
+_m05_ck("ck_pt_device", ["INSERT INTO pick_task (id,code,wave_id,warehouse_id,device_instance_id) VALUES (9401,'PT-9401',9101,1,'')"])
+expect_block_tx("05 增量①：EXECUTING + 空串设备也一样撞 ck_pt_device（旧 ck_pt_exec 放行的那条）", ["INSERT INTO pick_task (id,code,wave_id,warehouse_id,status,assigned_to,device_instance_id) VALUES (9402,'PT-9402',9101,1,'EXECUTING',41,'')"], "ck_pt_device")
+# r6 加固（镜鉴）：'' 之外，全空格与制表符也必须拒（否则 P{设备}.{op_seq} 仍会退化）
+expect_block_tx("05 增量①r6：ck_pt_device 拒全空格设备号", ["INSERT INTO pick_task (id,code,wave_id,warehouse_id,device_instance_id) VALUES (9406,'PT-9406',9101,1,'   ')"], "ck_pt_device")
+expect_block_tx("05 增量①r6：ck_pt_device 拒制表符/换行组成的设备号", ["INSERT INTO pick_task (id,code,wave_id,warehouse_id,device_instance_id) VALUES (9407,'PT-9407',9101,1,char(9)||char(10))"], "ck_pt_device")
+expect_allow_tx("05 增量①r6 正向：设备号两侧带空格的合法值仍可落库", ["INSERT INTO pick_task (id,code,wave_id,warehouse_id,device_instance_id) VALUES (9408,'PT-9408',9101,1,' D9408 ')"])
+# ② 环守卫：合法链通过，两点成环在 UPDATE / INSERT 两条路径上都被拒
+conn.execute("INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status,parent_wave_id) VALUES (9201,'W-9201',1,'2026-10-15','CHILLED','R1','PLANNED',NULL)")
+conn.execute("INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status,parent_wave_id) VALUES (9202,'W-9202',1,'2026-10-15','CHILLED','R1','PLANNED',9201)")
+expect_allow_tx("05 增量②正向：合法父子链（9203 → 9202 → 9201）", ["INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status,parent_wave_id) VALUES (9203,'W-9203',1,'2026-10-15','CHILLED','R1','PLANNED',9202)"])
+expect_block_tx("05 增量②：环守卫拒两点成环（UPDATE 闭合 9201 → 9202）", ["UPDATE wave SET parent_wave_id=9202 WHERE id=9201"], "wave_parent_cycle")
+_m05_trg("05 增量②变异：去掉两个环守卫触发器后，成环 UPDATE 通过", ["DROP TRIGGER trg_wave_parent_cycle", "DROP TRIGGER trg_wave_parent_cycle_u"], "UPDATE wave SET parent_wave_id=9202 WHERE id=9201")
+expect_allow_tx("05 增量②：悬空父指针仍可落库（无自引用外键，见 §12 Q14）", ["INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status,parent_wave_id) VALUES (9206,'W-9206',1,'2026-10-15','CHILLED','R1','PLANNED',9205)"])
+expect_block_tx("05 增量②：INSERT 补上第二条边成环也被拒（9205 → 9206 → 9205）", ["INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status,parent_wave_id) VALUES (9205,'W-9205',1,'2026-10-15','CHILLED','R1','PLANNED',9206)"], "wave_parent_cycle")
+# r6 加固（镜鉴）：旧 SQLite 递归只走 64 行，65 节链闭合会漏检——现在必须报 cycle；>64 节深链必须报 depth（与 PG 同口径）
+for _g in range(9601, 9666):
+    conn.execute("INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status,parent_wave_id) VALUES (?,?,1,'2026-10-15','CHILLED','R1','PLANNED',?)", (_g, f"W-C{_g}", None if _g == 9601 else _g - 1))
+expect_block_tx("05 增量②r6：65 节链闭合报 wave_parent_cycle（旧递归上限漏检的那条）", ["UPDATE wave SET parent_wave_id=9665 WHERE id=9601"], "wave_parent_cycle")
+_m05_deep("05 增量②r6：已存在的 66 节深链再闭合报 wave_parent_cycle_depth（两库同口径）",
+          [f"INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status,parent_wave_id) VALUES ({_g},'W-E{_g}',1,'2026-10-15','CHILLED','R1','PLANNED',{'NULL' if _g == 9701 else _g - 1})" for _g in range(9701, 9767)],
+          "UPDATE wave SET parent_wave_id=9766 WHERE id=9701", "wave_parent_cycle_depth")
+conn.execute("INSERT INTO pick_task (id,code,wave_id,warehouse_id,status,assigned_to,device_instance_id) VALUES (9403,'PT-9403',9201,1,'EXECUTING',41,'D9403')")
+conn.execute("INSERT INTO pick_task (id,code,wave_id,warehouse_id,status,assigned_to,device_instance_id,handover_from_task_id) VALUES (9404,'PT-9404',9201,1,'EXECUTING',42,'D9404',9403)")
+expect_block_tx("05 增量②：环守卫拒改派链成环（9403 → 9404 → 9403）", ["UPDATE pick_task SET handover_from_task_id=9404 WHERE id=9403"], "pick_task_handover_cycle")
+_m05_trg("05 增量②变异：去掉两个改派链守卫触发器后，成环 UPDATE 通过", ["DROP TRIGGER trg_pt_handover_cycle", "DROP TRIGGER trg_pt_handover_cycle_u"], "UPDATE pick_task SET handover_from_task_id=9404 WHERE id=9403")
+_cyc = one("SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN ('trg_wave_parent_cycle','trg_wave_parent_cycle_u','trg_pt_handover_cycle','trg_pt_handover_cycle_u')")[0]
+(ok if _cyc == 4 else bad)(f"05 增量②目录：4 个环守卫触发器都在 sqlite_master（实际 {_cyc}）")
+# ③ 撤销回退行状态：§6.5 的撤销必须与数量同一条 UPDATE 回退 status，否则 T-done 仍判拣满
+conn.execute("INSERT INTO pick_task (id,code,wave_id,warehouse_id,status,assigned_to,device_instance_id,line_count,done_count) VALUES (9405,'PT-9405',9201,1,'EXECUTING',41,'D9405',1,1)")
+conn.execute("INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,outbound_line_id,planned_qty_milli,confirmed_qty_milli,uom,status) VALUES (9405,9405,1,1,1,1,11,1,1000,1000,'KG','DONE')")
+_u5n = conn.execute("UPDATE pick_task_line SET confirmed_qty_milli=confirmed_qty_milli-300, status=CASE WHEN status='DONE' AND confirmed_qty_milli-300 < planned_qty_milli THEN 'PENDING' ELSE status END WHERE id=9405 AND confirmed_qty_milli>=300").rowcount
+_u5s = one("SELECT status FROM pick_task_line WHERE id=9405")[0]
+(ok if (_u5n, _u5s) == (1, 'PENDING') else bad)(f"05 增量③：撤销同一条 UPDATE 把 DONE 行回退成 PENDING（{_u5n}/{_u5s}）")
+_t5d = conn.execute("UPDATE pick_task SET status='DONE' WHERE id=9405 AND status='EXECUTING' AND NOT EXISTS (SELECT 1 FROM pick_task_line l WHERE l.pick_task_id=9405 AND l.status IN ('PENDING','SKIP','ABNORMAL'))").rowcount
+(ok if _t5d == 0 else bad)(f"05 增量③：回退后 T-done 守卫命中 0 行（任务不得进 DONE），实际 {_t5d}")
+conn.execute("UPDATE pick_task_line SET confirmed_qty_milli=1000, status='DONE' WHERE id=9405")
+_v5n = conn.execute("UPDATE pick_task_line SET confirmed_qty_milli=confirmed_qty_milli-300 WHERE id=9405 AND confirmed_qty_milli>=300").rowcount
+_v5s = one("SELECT status FROM pick_task_line WHERE id=9405")[0]
+(ok if (_v5n, _v5s) == (1, 'DONE') else bad)(f"05 增量③变异：只减量不回退状态的旧写法，行仍是 DONE（{_v5n}/{_v5s}）")
+_t5m = conn.execute("UPDATE pick_task SET status='DONE' WHERE id=9405 AND status='EXECUTING' AND NOT EXISTS (SELECT 1 FROM pick_task_line l WHERE l.pick_task_id=9405 AND l.status IN ('PENDING','SKIP','ABNORMAL'))").rowcount
+(ok if _t5m == 1 else bad)(f"05 增量③变异：不回退状态时同一任务被判 DONE（证明回退是拦它的那条），实际 {_t5m}")
 print("=== 汇总 ===")
 print(f"  通过 {passed} 项 / 失败 {failed} 项")
 conn.close()
