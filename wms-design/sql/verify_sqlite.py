@@ -584,8 +584,19 @@ conn.execute("ROLLBACK")
 ok("S6 I3e 反向：绕过释放记录直接 UPDATE 释放 → 对账查出 hold 55") if r == [55] else bad(f"I3e 未查出：{r}")
 # 十六轮：SQLite 应用只能插入 PENDING（trg_outbox_insert_pending）。SENT 种子走单独的种子路径：临时 DROP 触发器，写完原样重建
 _OB_TRG = one("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_outbox_insert_pending'")[0]
-def outbox_seed_begin(): conn.execute("DROP TRIGGER trg_outbox_insert_pending"); conn.commit()
-def outbox_seed_end(): conn.execute(_OB_TRG); conn.commit()
+# 第 11 篇时间加固：*_now 触发器只收 now±300s。下面这些历史时间种子临时 DROP、写完按原文重建（同 outbox 种子路径）
+_T11 = ('trg_idem_created_now', 'trg_idem_expires_past', 'trg_idem_expires_ttl', 'trg_upl_received_now', 'trg_paper_submitted_now', 'trg_paper_approved_now')
+_T11_SQL = {}
+def t11_seed_begin():
+    for n in _T11:
+        _T11_SQL[n] = conn.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (n,)).fetchone()[0]
+        conn.execute(f"DROP TRIGGER {n}")
+    conn.commit()
+def t11_seed_end():
+    for n in _T11: conn.execute(_T11_SQL[n])
+    conn.commit()
+def outbox_seed_begin(): conn.execute("DROP TRIGGER trg_outbox_insert_pending"); t11_seed_begin()
+def outbox_seed_end(): conn.execute(_OB_TRG); t11_seed_end()
 outbox_seed_begin()
 expect_allow_tx('Q2 准备：去重记录（未过期/已过期）+ outbox（PENDING / 8 天前 SENT / 刚 SENT）', ["INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,expires_at) VALUES ('live','h','{}',200,datetime('now','+1 day')),('dead','h','{}',200,datetime('now','-1 hour'))", "INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at,ack_kind) VALUES (8801,'t','k','{}','PENDING',NULL,NULL),(8802,'t','k','{}','SENT',datetime('now','-8 days'),'2XX'),(8803,'t','k','{}','SENT',datetime('now'),'2XX')"])
 expect_block_tx('Q2 删未过期去重记录', ["DELETE FROM idempotency_record WHERE idem_key = 'live'"], 'purge_not_allowed: idempotency_record')
@@ -638,7 +649,9 @@ expect_block_tx('S1 outbox next_retry_at 25:00:00', ["UPDATE outbox_event SET ne
 allow_rb('S1 正向：标准 UTC 文本 datetime(\'now\', \'+1 day\')', ["INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,expires_at) VALUES ('s1ok','h','{}',200,datetime('now','+1 day'))"])
 import os, time
 cnt = {}
+t11_seed_begin()
 conn.execute("INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,expires_at) VALUES ('tz_live12h','h','{}',200,datetime('now','+12 hours')),('tz_dead','h','{}',200,datetime('now','-1 hour'))")
+t11_seed_end()
 old_tz = os.environ.get('TZ')
 for tz in ('Etc/GMT-8', 'Etc/GMT+10'):   # POSIX 记号相反：Etc/GMT-8 = UTC+8，Etc/GMT+10 = UTC-10
     os.environ['TZ'] = tz; time.tzset()
@@ -1532,13 +1545,14 @@ ok("18 依赖的 uq_exc_ldth_key：UNIQUE (source_key) WHERE source_type = 'LIVE
 
 print("=== 2i. docs/11 集成：outbox 节点序号、入站报文 ===")
 expect_allow('11 outbox 事件（node 3, seq 1）', "INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (100,'wms.shipment.completed','SHP1','{}',1,3,1)")
-expect_block('11 同节点 seq 重复（回传顺序被破坏）', "INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (101,'wms.shipment.completed','SHP2','{}',1,3,1)", 'outbox_event.node_id, outbox_event.seq')
+expect_block('11 同节点 seq 重复（回传顺序被破坏）', "INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (101,'wms.shipment.completed','SHP2','{}',1,3,1)", 'outbox_duplicate')   # X2：no-REPLACE 守卫覆盖该唯一键，先于 UNIQUE 报错
 expect_allow('11 不同节点同 seq 合法', "INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (102,'wms.shipment.completed','SHP3','{}',1,4,1)")
 expect_block('11 outbox 非法状态', "UPDATE outbox_event SET status='LOST' WHERE id=100", 'ck_outbox_status')
 expect_allow('11 入站报文落库', "INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha) VALUES (100,'ERP','SALES_ORDER','SO-1','{}','h1')")
-expect_block('11 同源同单号重复落库', "INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha) VALUES (101,'ERP','SALES_ORDER','SO-1','{}','h2')", 'inbound_message.source, inbound_message.biz_type, inbound_message.external_no')
+expect_block('11 同源同单号重复落库', "INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha) VALUES (101,'ERP','SALES_ORDER','SO-1','{}','h2')", 'inbound_message_duplicate')   # trg_in_msg_no_replace 覆盖 uq_in_msg，先于 UNIQUE 报错
 expect_block('11 入站报文非法状态', "UPDATE inbound_message SET status='OK' WHERE id=100", 'ck_in_msg_status')
 
+t11_seed_begin()
 expect_allow("11 推送日志：同单号重推各记一行（只追加，不唯一；保留 90 天）", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,warehouse_id,payload_sha,payload,received_at,result_status,retain_until) VALUES (1,'ERP','SALES_ORDER','SO-1',1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2027-01-13 01:00:00'),(2,'ERP','SALES_ORDER','SO-1',1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:05:00','DUPLICATE','2027-01-13 01:05:00')")
 expect_block("11 推送日志结果取值", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (3,'ERP','SALES_ORDER','SO-3','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','OK','2027-01-13 01:00:00')", 'ck_upl_result')
 expect_block("11 I1 保留期等于接收时间", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (4,'ERP','SALES_ORDER','SO-4','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2026-10-15 01:00:00')", 'ck_upl_retain')
@@ -1555,8 +1569,9 @@ expect_allow("11 写一条已过保留期的旧日志（归档用例）", "INSER
 expect_block_tx("11 B1 SQLite 删已过期行也拦（边缘无角色，清理走维护脚本）", ["DELETE FROM upstream_push_log WHERE id=20"], 'append_only_violation: upstream_push_log')
 expect_block("11 I1 SQLite 保留期写成不可解析的字符串", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (12,'ERP','SALES_ORDER','SO-12','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','never')", 'ck_upl_retain')
 expect_block("11 I1 SQLite 接收时间写成不可解析的字符串", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (13,'ERP','SALES_ORDER','SO-13','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','garbage','ACCEPTED','2027-01-13 01:00:00')", 'ck_upl_retain')
-expect_allow("11 I1 SQLite ISO T 写法 90 天同样放行", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (14,'ERP','SALES_ORDER','SO-14','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15T01:00:00','ACCEPTED','2027-01-13T01:00:00')")
+expect_block("11 I1 SQLite ISO T 写法不是标准整秒格式（00 §6.8，时间加固起拒）", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (14,'ERP','SALES_ORDER','SO-14','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15T01:00:00','ACCEPTED','2027-01-13T01:00:00')", 'ck_upl_retain')
 expect_block("11 I1 SQLite ISO T 写法 89 天", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (15,'ERP','SALES_ORDER','SO-15','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15T01:00:00','ACCEPTED','2027-01-12T01:00:00')", 'ck_upl_retain')
+t11_seed_end()
 r = one("SELECT count(*) FROM upstream_push_log WHERE id IN (1,2,8,20)")
 ok(f"11 B1 绕过尝试后日志仍在（{r[0]} 行）") if r[0] == 4 else bad(f"11 日志被动过：{r}")
 print("=== 2i2. docs/11 小吴 C1 死信阻塞同 biz_key / C2 409 判定 / C3 形态 A relay 补 seq ===")
@@ -1565,7 +1580,7 @@ expect_allow_tx('C1 第 1 个事件投递成功（SENDING→SENT 2XX）', ["UPDA
 expect_allow_tx('C1 第 2 个事件进死信（SENDING→FAILED→DEAD）', ["UPDATE outbox_event SET status='SENDING' WHERE id=9102", "UPDATE outbox_event SET status='FAILED' WHERE id=9102", "UPDATE outbox_event SET status='DEAD' WHERE id=9102"])
 expect_block_tx('C1 第 3 个事件在前序 DEAD 时不能投递（验收用例）', ["UPDATE outbox_event SET status='SENDING' WHERE id=9103"], 'outbox_bizkey_blocked')
 outbox_seed_begin()  # DEAD 种子走种子路径（应用只能插入 PENDING）
-expect_block_tx('C1 同一 biz_key 第二条 DEAD', ["INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq,status) VALUES (9104,'wms.outbound.changed','OBT-C1','{}',1,0,0,'DEAD')"], 'outbox_event.biz_key')
+expect_block_tx('C1 同一 biz_key 第二条 DEAD', ["INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq,status) VALUES (9104,'wms.outbound.changed','OBT-C1','{}',1,0,0,'DEAD')"], 'outbox_duplicate')   # X2：no-REPLACE 守卫覆盖该唯一键，先于 UNIQUE 报错
 outbox_seed_end()
 expect_block_tx('C1 跳过不带审计（无人、无时间、无原因）', ["UPDATE outbox_event SET status='SKIPPED' WHERE id=9102"], 'ck_outbox_skip')
 expect_block_tx('C1 跳过原因过短', ["UPDATE outbox_event SET status='SKIPPED', skipped_by=7, skipped_at='2026-10-15 03:00:00', skip_reason='x' WHERE id=9102"], 'ck_outbox_skip')
@@ -1596,6 +1611,7 @@ r = one("SELECT count(*) FROM numbering_segment WHERE biz_prefix LIKE 'OUTBOX%'"
 ok("C3 形态 A 不再写 numbering_segment(OUTBOX:node)") if r == 0 else bad(f"numbering_segment 出现 OUTBOX 行：{r}")
 
 print("=== 2i3. 第 11 篇 Q1：离线纸质单补录 offline_paper_record（PAPER_BACKFILL）===")
+t11_seed_begin()
 expect_allow_tx("Q1 正向：提交 PENDING（恢复联网后 14h，窗口内）", ["INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (11,1,'PDA-07','PICK_CONFIRM','PK-L1','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 10:00:00','PENDING',NULL,'PAPER_BACKFILL')"])
 expect_allow_tx("Q1 正向：主管（≠ 申请人）审批通过", ["UPDATE offline_paper_record SET status='APPROVED', approver_id=8, approved_at='2026-10-15 11:00:00' WHERE id=11"])
 expect_allow_tx("Q1 正向：过期补录落 EXPIRED 并挂异常单", ["INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (12,1,'PDA-07','PICK_CONFIRM','PK-L2','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 21:00:00','EXPIRED',5001,'PAPER_BACKFILL')"])
@@ -1605,9 +1621,239 @@ expect_block_tx("Q1 反向：过期后仍以 PENDING 提交", ["INSERT INTO offl
 expect_block_tx("Q1 反向：过期但不挂异常单", ["INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (16,1,'PDA-07','PICK_CONFIRM','PK-L6','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 21:00:00','EXPIRED',NULL,'PAPER_BACKFILL')"], "ck_paper_expired")
 expect_block_tx("Q1 反向：审批类型不是 PAPER_BACKFILL", ["INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (17,1,'PDA-07','PICK_CONFIRM','PK-L7','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 10:00:00','PENDING',NULL,'SCRAP_MISREPORT')"], "ck_paper_type")
 expect_block_tx("Q1 反向：APPROVED 不带审批人", ["INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (18,1,'PDA-07','PICK_CONFIRM','PK-L8','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 10:00:00','PENDING',NULL,'PAPER_BACKFILL')", "UPDATE offline_paper_record SET status='APPROVED' WHERE id=18"], "ck_paper_approve")
-expect_block_tx("Q1 反向：同仓同 biz_key 重复补录", ["INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (19,1,'PDA-07','PICK_CONFIRM','PK-L1','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 10:00:00','PENDING',NULL,'PAPER_BACKFILL')"], "offline_paper_record.warehouse_id, offline_paper_record.biz_key")
+expect_block_tx("Q1 反向：同仓同 biz_key 重复补录", ["INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (19,1,'PDA-07','PICK_CONFIRM','PK-L1','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 10:00:00','PENDING',NULL,'PAPER_BACKFILL')"], "paper_duplicate")   # 00 §6.10 第 6 条：no-REPLACE 触发器报自己的错误名
+t11_seed_end()
 r = one("SELECT group_concat(id || ':' || status) FROM (SELECT id, status FROM offline_paper_record ORDER BY id)")[0]
 ok("Q1 反向用例全部回滚，只剩 11:APPROVED、12:EXPIRED") if r == "11:APPROVED,12:EXPIRED" else bad(f"Q1 残留：{r}")
+print("=== 2i4. 第 11 篇时间加固（小玛丽 time-scan 11-1…11-6；00 §6.8）===")
+_UPL = "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES ({id},'ERP','SALES_ORDER','SO-T{id}','" + "c" * 64 + "','{{}}',{rv},'ACCEPTED',{rt})"
+_PAP = "INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES ({id},1,'PDA-07','PICK_CONFIRM','PK-T{id}',{oc},11,'{{}}',7,{of},{rc},{dl},{sb},'PENDING',NULL,'PAPER_BACKFILL')"
+def t11_mut(desc, trg, stmts, check):
+    """变异：去掉 trg 后同一攻击必须成功（证明对应拒绝用例会变红），结束后整体回滚"""
+    conn.execute("SAVEPOINT m11")
+    try:
+        conn.execute(f"DROP TRIGGER {trg}")
+        for x in stmts: conn.execute(x)
+        r = conn.execute(check).fetchone()[0]
+        ok(f"{desc} → 变异后攻击成功（{r}），拒绝用例会变红") if r else bad(f"{desc} → 变异后仍拦/未生效")
+    except sqlite3.Error as e:
+        bad(f"{desc} → 变异后仍被拦：{e}")
+    finally:
+        conn.execute("ROLLBACK TO m11"); conn.execute("RELEASE m11")
+_old = "'2000-01-01 00:00:00'"
+_a = _UPL.format(id=40, rv=_old, rt="'2000-04-01 00:00:00'")
+expect_block_tx("11-1 推送日志倒填 received_at=2000-01-01", [_a], "upl_received_not_now")
+expect_block_tx("11-1 推送日志 received_at 晚 301 秒", [_UPL.format(id=41, rv="datetime('now','+301 seconds')", rt="datetime('now','+91 days')")], "upl_received_not_now")
+expect_block_tx("11-1 推送日志 received_at 带 -09:00 偏移（非标准）", [_UPL.format(id=42, rv="datetime('now') || '-09:00'", rt="datetime('now','+91 days')")], "ck_upl_retain")
+expect_allow_tx("11-1 正向：received_at = now、retain +90 天", [_UPL.format(id=43, rv="datetime('now')", rt="datetime('now','+90 days')")])
+t11_mut("11-1 变异 DROP trg_upl_received_now", "trg_upl_received_now", [_a], "SELECT count(*) FROM upstream_push_log WHERE id=40")
+expect_block_tx("§6.10 推送日志 INSERT OR REPLACE 改写已有行（id=43）", [_UPL.replace("INSERT INTO", "INSERT OR REPLACE INTO").format(id=43, rv="datetime('now')", rt="datetime('now','+120 days')")], "append_only_violation: upstream_push_log")
+t11_mut("§6.10 变异 DROP trg_upl_no_replace", "trg_upl_no_replace", [_UPL.replace("INSERT INTO", "INSERT OR REPLACE INTO").format(id=43, rv="datetime('now')", rt="datetime('now','+120 days')")], "SELECT count(*) FROM upstream_push_log WHERE id=43 AND CAST(strftime('%s', retain_until) AS INTEGER) - CAST(strftime('%s', received_at) AS INTEGER) > 100 * 86400")
+_p = "INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,expires_at) VALUES ('t11past','h','{}',200,datetime('now','-1 hour'))"
+expect_block_tx("11-2 idem expires_at 已过期（-1h）", [_p], "idem_expires_in_past")
+expect_block_tx("11-2 idem created_at 倒填 2000 年", ["INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,created_at,expires_at) VALUES ('t11c','h','{}',200,'2000-01-01 00:00:00',datetime('now','+1 day'))"], "idem_created_not_now")
+expect_block_tx("11-2 idem expires_at ≠ created_at + ttl（写成 +2099）", ["INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,expires_at) VALUES ('t11t','h','{}',200,'2099-01-01 00:00:00')"], "idem_expires_not_ttl")
+expect_allow_tx("11-2 正向：ttl_seconds=600、expires_at = now+600s", ["INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,ttl_seconds,expires_at) VALUES ('t11ok','h','{}',200,600,datetime('now','+600 seconds'))"])
+expect_block_tx("11-2 正向记录不可立即清理（purge 守卫）", ["DELETE FROM idempotency_record WHERE idem_key='t11ok'"], "purge_not_allowed: idempotency_record")
+expect_block_tx("11-2 ttl_seconds 超过 90 天", ["INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,ttl_seconds,expires_at) VALUES ('t11big','h','{}',200,7776001,datetime('now','+7776001 seconds'))"], "ck_idem_ttl")
+t11_mut("11-2 变异 DROP trg_idem_expires_past", "trg_idem_expires_past", [_p], "SELECT count(*) FROM idempotency_record WHERE idem_key='t11past'")
+_six = _PAP.format(id=40, oc="'2020-10-14 10:00:00'", of="'2020-10-14 08:00:00'", rc="'2020-10-14 20:00:00'", dl="'2020-10-15 20:00:00'", sb="'2020-10-14 20:00:00'")
+expect_block_tx("11-5 6 年前补录写 submitted_at=reconnected_at 以 PENDING 提交", [_six], "paper_submitted_not_now")
+t11_mut("11-5 变异 DROP trg_paper_submitted_now", "trg_paper_submitted_now", [_six], "SELECT count(*) FROM offline_paper_record WHERE id=40 AND status='PENDING'")
+expect_block_tx("11-3 reconnected_at 不可解析（原 NULL 放行，截止可填 2099）", [_PAP.format(id=41, oc="datetime('now','-3 hours')", of="datetime('now','-4 hours')", rc="'garbage'", dl="'2099-01-01 00:00:00'", sb="datetime('now')")], "ck_paper_deadline")
+expect_block_tx("11-4 submitted_at 带 -09:00 偏移（文本比较曾判未过期）", [_PAP.format(id=42, oc="datetime('now','-30 hours')", of="datetime('now','-31 hours')", rc="datetime('now','-30 hours')", dl="datetime('now','-6 hours')", sb="strftime('%Y-%m-%d %H:%M:%S','now','-9 hours') || '-09:00'")], "ck_paper_ts")
+expect_block_tx("11-4 截止写成 T 格式（文本比较可提前 11 小时）", [_PAP.format(id=43, oc="datetime('now','-3 hours')", of="datetime('now','-4 hours')", rc="datetime('now','-2 hours')", dl="strftime('%Y-%m-%dT%H:%M:%S','now','+22 hours')", sb="datetime('now')")], "ck_paper_ts")
+expect_allow_tx("11-5 正向：恢复联网 2 小时前，submitted_at = now", [_PAP.format(id=44, oc="datetime('now','-3 hours')", of="datetime('now','-4 hours')", rc="datetime('now','-2 hours')", dl="datetime('now','+22 hours')", sb="datetime('now')")])
+expect_block_tx("11-5 审批 approved_at 倒填 2000 年", ["UPDATE offline_paper_record SET status='APPROVED', approver_id=8, approved_at='2000-01-01 00:00:00' WHERE id=44"], "paper_approved_not_now")
+t11_mut("11-5 变异 DROP trg_paper_approved_now", "trg_paper_approved_now", ["UPDATE offline_paper_record SET status='APPROVED', approver_id=8, approved_at='2000-01-01 00:00:00' WHERE id=44"], "SELECT count(*) FROM offline_paper_record WHERE id=44 AND approved_at='2000-01-01 00:00:00'")
+expect_allow_tx("11-5 正向：审批 approved_at = now", ["UPDATE offline_paper_record SET status='APPROVED', approver_id=8, approved_at=datetime('now') WHERE id=44"])
+expect_block_tx("§6.10 纸质单 REPLACE 撞 (warehouse_id, biz_key) 换新 id（→ 40910 OFFLINE_PAPER）", [_PAP.replace("INSERT INTO", "REPLACE INTO").format(id=45, oc="datetime('now','-3 hours')", of="datetime('now','-4 hours')", rc="datetime('now','-2 hours')", dl="datetime('now','+22 hours')", sb="datetime('now')").replace("'PK-T45'", "'PK-T44'")], "paper_duplicate")
+t11_mut("§6.10 变异 DROP trg_paper_no_replace", "trg_paper_no_replace", [_PAP.replace("INSERT INTO", "REPLACE INTO").format(id=45, oc="datetime('now','-3 hours')", of="datetime('now','-4 hours')", rc="datetime('now','-2 hours')", dl="datetime('now','+22 hours')", sb="datetime('now')").replace("'PK-T45'", "'PK-T44'")], "SELECT count(*) FROM offline_paper_record WHERE id=45 AND NOT EXISTS (SELECT 1 FROM offline_paper_record WHERE id=44)")
+# ── 00 §6.10 / 小玛丽 pr2-r11 X2：第 11 篇 no-REPLACE 逐唯一键行为测试（每个 PK / UNIQUE / 部分唯一索引各打一次冲突 REPLACE）
+print("=== 2i5. 第 11 篇 no-REPLACE 逐唯一键覆盖（X2）===")
+_OB = "INSERT INTO outbox_event (id,topic,biz_key,payload,status,node_id,seq) VALUES ({id},'t','{bk}','{{}}','{st}',77,{seq})"
+_REPCASES = [
+  # (表, 唯一键, guard, 错误名, 种子语句, 冲突 REPLACE, 原行存活检查, 去掉该键子句后的 WHEN)
+  ("outbox_event", "PK(id)", "trg_outbox_no_replace", "outbox_duplicate",
+   [_OB.format(id=779100, bk="X2-A", st="PENDING", seq=99900)],
+   _OB.replace("INSERT INTO", "REPLACE INTO").format(id=779100, bk="X2-B", st="PENDING", seq=99901),
+   "SELECT count(*) FROM outbox_event WHERE id=779100 AND biz_key='X2-A'",
+   "EXISTS (SELECT 1 FROM outbox_event o WHERE (NEW.seq > 0 AND o.seq > 0 AND o.node_id = NEW.node_id AND o.seq = NEW.seq) OR (NEW.status = 'DEAD' AND o.status = 'DEAD' AND o.biz_key = NEW.biz_key))"),
+  ("outbox_event", "uq_outbox_seq(node_id,seq) WHERE seq>0", "trg_outbox_no_replace", "outbox_duplicate",
+   [_OB.format(id=779100, bk="X2-A", st="PENDING", seq=99900)],
+   _OB.replace("INSERT INTO", "REPLACE INTO").format(id=779101, bk="X2-B", st="PENDING", seq=99900),
+   "SELECT count(*) FROM outbox_event WHERE id=779100",
+   "EXISTS (SELECT 1 FROM outbox_event o WHERE o.id = NEW.id OR (NEW.status = 'DEAD' AND o.status = 'DEAD' AND o.biz_key = NEW.biz_key))"),
+  ("outbox_event", "uq_outbox_dead_bizkey(biz_key) WHERE status='DEAD'", "trg_outbox_no_replace", "outbox_duplicate",
+   ["DROP TRIGGER trg_outbox_insert_pending", _OB.format(id=779100, bk="X2-D", st="DEAD", seq=99900)],
+   _OB.replace("INSERT INTO", "REPLACE INTO").format(id=779102, bk="X2-D", st="DEAD", seq=99902),
+   "SELECT count(*) FROM outbox_event WHERE id=779100",
+   "EXISTS (SELECT 1 FROM outbox_event o WHERE o.id = NEW.id OR (NEW.seq > 0 AND o.seq > 0 AND o.node_id = NEW.node_id AND o.seq = NEW.seq))"),
+  ("idempotency_record", "PK(idem_key)", "trg_idem_no_replace", "idem_duplicate",
+   ["INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,expires_at) VALUES ('x2k','h1','{}',200,datetime('now','+1 day'))"],
+   "REPLACE INTO idempotency_record (idem_key,req_hash,response,status_code,expires_at) VALUES ('x2k','h2','{}',200,datetime('now','+1 day'))",
+   "SELECT count(*) FROM idempotency_record WHERE idem_key='x2k' AND req_hash='h1'", "0"),
+  ("upstream_push_log", "PK(id)", "trg_upl_no_replace", "append_only_violation: upstream_push_log",
+   [_UPL.format(id=150, rv="datetime('now')", rt="datetime('now','+90 days')")],
+   _UPL.replace("INSERT INTO", "REPLACE INTO").format(id=150, rv="datetime('now')", rt="datetime('now','+120 days')"),
+   "SELECT count(*) FROM upstream_push_log WHERE id=150 AND retain_until = datetime(received_at,'+90 days')", "0"),
+  ("offline_paper_record", "PK(id)", "trg_paper_no_replace", "paper_duplicate",
+   [_PAP.format(id=150, oc="datetime('now','-3 hours')", of="datetime('now','-4 hours')", rc="datetime('now','-2 hours')", dl="datetime('now','+22 hours')", sb="datetime('now')")],
+   _PAP.replace("INSERT INTO", "REPLACE INTO").format(id=150, oc="datetime('now','-3 hours')", of="datetime('now','-4 hours')", rc="datetime('now','-2 hours')", dl="datetime('now','+22 hours')", sb="datetime('now')").replace("'PK-T150'", "'PK-T151'"),
+   "SELECT count(*) FROM offline_paper_record WHERE id=150 AND biz_key='PK-T150'",
+   "EXISTS (SELECT 1 FROM offline_paper_record o WHERE o.warehouse_id = NEW.warehouse_id AND o.biz_key = NEW.biz_key)"),
+  ("offline_paper_record", "uq_paper_bizkey(warehouse_id,biz_key)", "trg_paper_no_replace", "paper_duplicate",
+   [_PAP.format(id=150, oc="datetime('now','-3 hours')", of="datetime('now','-4 hours')", rc="datetime('now','-2 hours')", dl="datetime('now','+22 hours')", sb="datetime('now')")],
+   _PAP.replace("INSERT INTO", "REPLACE INTO").format(id=152, oc="datetime('now','-3 hours')", of="datetime('now','-4 hours')", rc="datetime('now','-2 hours')", dl="datetime('now','+22 hours')", sb="datetime('now')").replace("'PK-T152'", "'PK-T150'"),
+   "SELECT count(*) FROM offline_paper_record WHERE id=150",
+   "EXISTS (SELECT 1 FROM offline_paper_record o WHERE o.id = NEW.id)"),
+  ("numbering_segment", "PK(biz_prefix,date_key)", "trg_numbering_no_replace", "numbering_regress",
+   ["INSERT INTO numbering_segment (biz_prefix,date_key,next_value,step) VALUES ('X2N','20261015',5000,100)"],
+   "REPLACE INTO numbering_segment (biz_prefix,date_key,next_value,step) VALUES ('X2N','20261015',1,100)",
+   "SELECT count(*) FROM numbering_segment WHERE biz_prefix='X2N' AND next_value=5000", "0"),
+  ("inbound_message", "PK(id)", "trg_in_msg_no_replace", "inbound_message_duplicate",
+   ["INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha,received_at) VALUES (779601,'ERP','SALES_ORDER','SO-X2A','{}','h',datetime('now'))"],
+   "REPLACE INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha,received_at) VALUES (779601,'ERP','SALES_ORDER','SO-X2B','{}','h',datetime('now'))",
+   "SELECT count(*) FROM inbound_message WHERE id=779601 AND external_no='SO-X2A'",
+   "EXISTS (SELECT 1 FROM inbound_message m WHERE m.source = NEW.source AND m.biz_type = NEW.biz_type AND m.external_no = NEW.external_no)"),
+  ("inbound_message", "uq_in_msg(source,biz_type,external_no)", "trg_in_msg_no_replace", "inbound_message_duplicate",
+   ["INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha,received_at) VALUES (779601,'ERP','SALES_ORDER','SO-X2A','{}','h',datetime('now'))"],
+   "REPLACE INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha,received_at) VALUES (779602,'ERP','SALES_ORDER','SO-X2A','{}','h2',datetime('now'))",
+   "SELECT count(*) FROM inbound_message WHERE id=779601",
+   "EXISTS (SELECT 1 FROM inbound_message m WHERE m.id = NEW.id)"),
+]
+def _guard_body(trg):
+    sql = conn.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (trg,)).fetchone()[0]
+    import re as _re
+    return " " + sql[_re.search(r"\sBEGIN\s", sql, _re.I).start():].lstrip()
+_seen_keys = {}
+for tb, key, trg, err, seed, attack, alive, mut_when in _REPCASES:
+    _seen_keys.setdefault(tb, set()).add(key)
+    conn.execute("SAVEPOINT x2")
+    try:
+        for x in seed: conn.execute(x)
+        try:
+            conn.execute(attack); bad(f"X2 {tb} {key} 冲突 REPLACE 未拦截")
+        except sqlite3.IntegrityError as e:
+            m = str(e)
+            (ok if (m == err or m.endswith(": " + err)) else bad)(f"X2 {tb} {key} 冲突 REPLACE → {m}")
+        ok(f"X2 {tb} {key} 原行仍在") if conn.execute(alive).fetchone()[0] == 1 else bad(f"X2 {tb} {key} 原行被删")
+        fk = conn.execute("PRAGMA foreign_key_check").fetchall()
+        ok(f"X2 {tb} {key} foreign_key_check 干净") if not fk else bad(f"X2 {tb} {key} foreign_key_check：{fk[:3]}")
+    finally:
+        conn.execute("ROLLBACK TO x2"); conn.execute("RELEASE x2")
+    # 变异：去掉该键子句（单键表即 WHEN 恒假），同一 REPLACE 必须删掉原行 → 红
+    conn.execute("SAVEPOINT x2m")
+    try:
+        for x in seed: conn.execute(x)
+        body = _guard_body(trg)
+        conn.execute(f"DROP TRIGGER {trg}")
+        conn.execute(f"CREATE TRIGGER {trg} BEFORE INSERT ON {tb} WHEN {mut_when}{body}")
+        try:
+            conn.execute(attack)
+            r = conn.execute(alive).fetchone()[0]
+            ok(f"X2 变异 {trg} 去掉 {key} 子句 → 原行被删，测试会变红") if r == 0 else bad(f"X2 变异 {key} 后原行仍在")
+        except sqlite3.Error as e:
+            bad(f"X2 变异 {trg} 去掉 {key} 子句后仍被拦：{e}")
+    finally:
+        conn.execute("ROLLBACK TO x2m"); conn.execute("RELEASE x2m")
+# 2z3b 实打需要一条满足 uq_outbox_dead_bizkey 谓词（status='DEAD'）的样本行：按合法迁移 PENDING → SENDING → FAILED → DEAD 留一条，提交保留
+expect_allow_tx("X2 种子：留一条 DEAD 事件供 2z3b 实打 uq_outbox_dead_bizkey", [
+    "INSERT INTO outbox_event (id,topic,biz_key,payload,status,node_id,seq) VALUES (779200,'t','X2-DEAD-SEED','{}','PENDING',78,0)",
+    "UPDATE outbox_event SET status='SENDING' WHERE id=779200",
+    "UPDATE outbox_event SET status='FAILED', last_error='seed' WHERE id=779200",
+    "UPDATE outbox_event SET status='DEAD' WHERE id=779200"])
+# 完整性：每张表的唯一索引数 = 已覆盖用例数（新增唯一键而不补用例 → 红）
+for tb, keys in _seen_keys.items():
+    n = sum(1 for r in conn.execute(f"PRAGMA index_list({tb})") if r[2] == 1)
+    ok(f"X2 {tb} 唯一索引 {n} 个全部有 REPLACE 用例") if n == len(keys) else bad(f"X2 {tb} 唯一索引 {n} 个，用例 {len(keys)} 个")
+# 小玛丽 blocker：号段只许前进 / 入站判重键不可改（SQLite 侧，与 PG NS1/IM1 同口径）
+expect_allow_tx("NS1 准备：建号段 T11N/20261015 next_value=1000", ["INSERT INTO numbering_segment (biz_prefix,date_key,next_value,step) VALUES ('T11N','20261015',1000,100)"])
+expect_allow_tx("NS1 正向：取号原语 next_value = next_value + step", ["UPDATE numbering_segment SET next_value = next_value + step WHERE biz_prefix='T11N' AND date_key='20261015'"])
+r = one("SELECT next_value FROM numbering_segment WHERE biz_prefix='T11N'")[0]
+ok("NS1 取号后 next_value=1100") if r == 1100 else bad(f"NS1 取号结果：{r}")
+expect_block_tx("NS1 把 next_value 调回 500（号段回退）", ["UPDATE numbering_segment SET next_value = 500 WHERE biz_prefix='T11N'"], "numbering_regress")
+expect_block_tx("NS1 step 改负再取号", ["UPDATE numbering_segment SET step = -100, next_value = next_value - 100 WHERE biz_prefix='T11N'"], "numbering_regress")
+expect_block_tx("NS1 改键列 date_key", ["UPDATE numbering_segment SET date_key='20261016' WHERE biz_prefix='T11N'"], "numbering_key_immutable")
+expect_block_tx("NS1 改键列 biz_prefix", ["UPDATE numbering_segment SET biz_prefix='T11X' WHERE biz_prefix='T11N'"], "numbering_key_immutable")
+expect_block_tx("NS1 DELETE 号段（删了重插 = 回退）", ["DELETE FROM numbering_segment WHERE biz_prefix='T11N'"], "numbering_regress")
+expect_block_tx("NS1 REPLACE 号段回到 1", ["REPLACE INTO numbering_segment (biz_prefix,date_key,next_value,step) VALUES ('T11N','20261015',1,100)"], "numbering_regress")
+r = one("SELECT next_value FROM numbering_segment WHERE biz_prefix='T11N' AND date_key='20261015'")[0]
+ok("NS1 拒绝用例后号段仍为 1100") if r == 1100 else bad(f"NS1 号段被改：{r}")
+t11_mut("NS1 变异 DROP trg_numbering_regress", "trg_numbering_regress", ["UPDATE numbering_segment SET next_value = 500 WHERE biz_prefix='T11N'"], "SELECT count(*) FROM numbering_segment WHERE biz_prefix='T11N' AND next_value=500")
+t11_mut("NS1 变异 DROP trg_numbering_key_immutable", "trg_numbering_key_immutable", ["UPDATE numbering_segment SET date_key='20261016' WHERE biz_prefix='T11N'"], "SELECT count(*) FROM numbering_segment WHERE biz_prefix='T11N' AND date_key='20261016'")
+t11_mut("NS1 变异 DROP trg_numbering_no_delete", "trg_numbering_no_delete", ["DELETE FROM numbering_segment WHERE biz_prefix='T11N'", "INSERT INTO numbering_segment (biz_prefix,date_key,next_value) VALUES ('T11N','20261015',1)"], "SELECT count(*) FROM numbering_segment WHERE biz_prefix='T11N' AND next_value=1")
+expect_allow_tx("IM1 准备：入站报文 ERP/SALES_ORDER/SO-I1", ["INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha,received_at) VALUES (9601,'ERP','SALES_ORDER','SO-I1','{}','h',datetime('now'))"])
+expect_allow_tx("IM1 正向：处理状态可推进", ["UPDATE inbound_message SET status='DONE', processed_at=datetime('now'), biz_ref='OBT-1' WHERE id=9601"])
+expect_block_tx("IM1 改 external_no", ["UPDATE inbound_message SET external_no='SO-I1-x' WHERE id=9601"], "inbound_message_key_immutable")
+expect_block_tx("IM1 改 source", ["UPDATE inbound_message SET source='WMS' WHERE id=9601"], "inbound_message_key_immutable")
+expect_block_tx("IM1 改 biz_type", ["UPDATE inbound_message SET biz_type='PURCHASE' WHERE id=9601"], "inbound_message_key_immutable")
+expect_block_tx("IM1 改 id", ["UPDATE inbound_message SET id=9602 WHERE id=9601"], "inbound_message_key_immutable")
+expect_block_tx("IM1 同号重推再插（→ 40910 INBOUND_MESSAGE）", ["INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha,received_at) VALUES (9603,'ERP','SALES_ORDER','SO-I1','{}','h',datetime('now'))"], "inbound_message_duplicate")
+t11_mut("IM1 变异 DROP trg_in_msg_key_immutable", "trg_in_msg_key_immutable", ["UPDATE inbound_message SET external_no='SO-I1-x' WHERE id=9601"], "SELECT count(*) FROM inbound_message WHERE external_no='SO-I1-x'")
+_mv = "UPDATE offline_paper_record SET reconnected_at=datetime(reconnected_at,'+1 day'), backfill_deadline_at=datetime(backfill_deadline_at,'+1 day') WHERE id=44"
+expect_block_tx("11-5 事后改 reconnected_at（挪截止）", [_mv], "paper_time_immutable")
+expect_block_tx("11-5 事后改 approved_at", ["UPDATE offline_paper_record SET approved_at=datetime('now','+1 minute') WHERE id=44"], "paper_time_immutable")
+t11_mut("11-5 变异 DROP trg_paper_time_immutable", "trg_paper_time_immutable", ["UPDATE offline_paper_record SET approved_at=datetime('now','+1 minute') WHERE id=44"], "SELECT count(*) FROM offline_paper_record WHERE id=44 AND approved_at = datetime('now','+1 minute')")
+# T2（Doro 裁定）：occurred_at / received_at 只收 now±300s 标准整秒；设备原始时间留在 client_occurred_at（只验格式，无容差，不参与清理/比较）
+_au = "INSERT INTO audit_log (id,action,node_id,node_seq,warehouse_id,occurred_at,client_occurred_at) VALUES ({i},'t11.t2',7,{i},1,{oc},'2000-01-01 00:00:00')"
+_im = "INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha,received_at,client_occurred_at) VALUES ({i},'ERP','SALES_ORDER','SO-T{i}','{{}}','h',{oc},'2000-01-01 00:00:00')"
+expect_block_tx("T2 审计 occurred_at 倒填 2000 年", [_au.format(i=9503, oc="'2000-01-01 00:00:00'")], "audit_occurred_not_now")
+expect_block_tx("T2 审计 occurred_at 写 T 格式", [_au.format(i=9503, oc="strftime('%Y-%m-%dT%H:%M:%S','now')")], "audit_occurred_not_now")
+expect_block_tx("T2 入站报文 received_at 倒填 2000 年", [_im.format(i=9503, oc="'2000-01-01 00:00:00'")], "inbound_received_not_now")
+t11_mut("T2 变异 DROP trg_audit_occurred_now", "trg_audit_occurred_now", [_au.format(i=9504, oc="'2000-01-01 00:00:00'")], "SELECT count(*) FROM audit_log WHERE id=9504 AND occurred_at='2000-01-01 00:00:00'")
+t11_mut("T2 变异 DROP trg_in_msg_received_now", "trg_in_msg_received_now", [_im.format(i=9504, oc="'2000-01-01 00:00:00'")], "SELECT count(*) FROM inbound_message WHERE id=9504 AND received_at='2000-01-01 00:00:00'")
+expect_allow_tx("T2 正向：库时间 + 设备原始时间 2000 年（无容差）", [_au.format(i=9505, oc="datetime('now')"), _im.format(i=9505, oc="datetime('now')")])
+r = (one("SELECT client_occurred_at FROM audit_log WHERE id=9505")[0], one("SELECT client_occurred_at FROM inbound_message WHERE id=9505")[0])
+ok(f"T2 client_occurred_at 原样保留 {r}") if r == ('2000-01-01 00:00:00',) * 2 else bad(f"T2 client_occurred_at：{r}")
+expect_block_tx("T2 client_occurred_at 非标准（带 Z）", ["INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha,client_occurred_at) VALUES (9506,'ERP','SALES_ORDER','SO-T9506','{}','h','2026-10-15 01:00:00Z')"], "ck_in_msg_cts")
+expect_block_tx("T2 client_occurred_at 非标准（审计，小数秒）", ["INSERT INTO audit_log (id,action,node_id,node_seq,warehouse_id,client_occurred_at) VALUES (9506,'t11.t2',7,9506,1,'2026-10-15 01:00:00.5')"], "ck_audit_cts")
+_T2Q = "SELECT count(*) FROM sqlite_master WHERE sql LIKE '%client_occurred_at%' AND NOT (type='table' AND name IN ('audit_log','inbound_message'))"
+r = one(_T2Q)[0]
+ok("T2 client_occurred_at 不进任何触发器（含清理守卫）、索引、视图") if r == 0 else bad(f"T2 client_occurred_at 被引用 {r} 处")
+conn.execute("SAVEPOINT t2m"); conn.execute("CREATE TRIGGER t11_bad_purge BEFORE DELETE ON audit_log WHEN OLD.client_occurred_at < datetime('now') BEGIN SELECT 1; END")
+r = one(_T2Q)[0]; conn.execute("ROLLBACK TO t2m"); conn.execute("RELEASE t2m")
+ok("T2 变异：加一个按 client_occurred_at 判断的清理触发器，目录断言变红") if r == 1 else bad(f"T2 目录变异未变红：{r}")
+# 11-3/11-4 强化变异：用旧 ck_paper_deadline/window/expired 重建一张同构表，攻击能过（红）；同样的行在新表被拒（绿）
+_ddl = one("SELECT sql FROM sqlite_master WHERE type='table' AND name='offline_paper_record'")[0]
+import re as _re
+_old = _ddl.replace("CREATE TABLE offline_paper_record", "CREATE TABLE t11_paper_old", 1)
+_old = _re.sub(r"CONSTRAINT ck_paper_ts CHECK \(.*?\),\n", "", _old, count=1, flags=_re.S)
+def _swap(src, name, old_expr):
+    i = src.index(f"CONSTRAINT {name} "); j = src.index("\n", i)
+    return src[:i] + f"CONSTRAINT {name} CHECK ({old_expr})," + src[j:]
+_old = _swap(_old, "ck_paper_deadline", "backfill_deadline_at = datetime(reconnected_at, '+24 hours')")
+_old = _swap(_old, "ck_paper_window", "reconnected_at > offline_since AND occurred_at >= offline_since AND occurred_at <= reconnected_at AND submitted_at >= reconnected_at")
+_old = _swap(_old, "ck_paper_expired", "(status = 'EXPIRED' AND submitted_at > backfill_deadline_at AND exception_case_id IS NOT NULL) OR (status <> 'EXPIRED' AND submitted_at <= backfill_deadline_at AND exception_case_id IS NULL)")
+_n = lambda m: one(f"SELECT datetime('now','{m}')")[0]
+_d0 = one("SELECT date('now')")[0]
+_atk = {
+  "11-3 reconnected_at='…Z!' 不可解析，截止填 2099": f"{_n('-3 hours')}|{_n('-4 hours')}|{_n('-2 hours')}Z!|2099-01-01 00:00:00|{_n('+0 seconds')}",
+  "11-4 submitted_at 带 -09:00（实际晚截止 9h）仍 PENDING": f"{_d0} 01:00:00|{_d0} 00:00:00|{_d0} 03:00:00|" + one("SELECT datetime(date('now'),'+1 day','+3 hours')")[0] + "|" + one("SELECT strftime('%Y-%m-%d %H:%M:%S', date('now'), '+1 day', '+2 hours', '+59 minutes', '+59 seconds')")[0] + "-09:00",
+}
+_ins = "INSERT INTO {t} (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (?,1,'PDA-07','PICK_CONFIRM',?,?,11,'{{}}',7,?,?,?,?,'PENDING',NULL,'PAPER_BACKFILL')"
+conn.execute("SAVEPOINT p11old")
+try:
+    conn.execute(_old)
+    for k, (desc, vals) in enumerate(_atk.items()):
+        oc, of, rc, dl, sb = vals.split("|")
+        args = (60 + k, f"PK-OLD{k}", oc, of, rc, dl, sb)
+        try:
+            conn.execute(_ins.format(t="t11_paper_old"), args)
+            ok(f"{desc}：旧表达式重建的表放行（红，原洞可复现）")
+        except sqlite3.Error as e:
+            bad(f"{desc}：旧表达式也拦了，变异没复现原洞：{e}")
+        try:
+            conn.execute("SAVEPOINT p11new"); conn.execute(_ins.format(t="offline_paper_record"), args)
+            bad(f"{desc}：新约束未拦")
+        except sqlite3.IntegrityError as e:
+            ok(f"{desc}：新约束拦下（绿，{e}）")
+        finally:
+            conn.execute("ROLLBACK TO p11new"); conn.execute("RELEASE p11new")
+finally:
+    conn.execute("ROLLBACK TO p11old"); conn.execute("RELEASE p11old")
+r = one("SELECT group_concat(id) FROM offline_paper_record WHERE id >= 40")[0]
+ok("11 时间加固反向用例全部回滚（纸质单只剩 44）") if r == "44" else bad(f"11 时间加固残留：{r}")
 print("=== 3. §4.4 FEFO 候选池排序（视图 + 排序键）===")
 rows = conn.execute(
     """
@@ -2368,9 +2614,9 @@ def key_cover(keys, guards):
     return {c: any(d <= set(c) for d in direct) for _, c, _ in keys if None not in c}
 # 表级豁免：整张表还没有 no-REPLACE 触发器。只能缩小；修好一张删一行（已有触发器还在名单 = 红）
 REPLACE_ALLOW = {
-    "inbound_order": "03", "supplier_return": "10", "upstream_push_log": "11", "process_bom": "17", "process_bom_line": "17",
+    "inbound_order": "03", "supplier_return": "10", "process_bom": "17", "process_bom_line": "17",
 }
-REPLACE_BASELINE = frozenset({"lot", "stock_ledger_line", "inbound_order", "supplier_return", "upstream_push_log", "process_bom", "process_bom_line"})
+REPLACE_BASELINE = frozenset({"lot", "stock_ledger_line", "inbound_order", "supplier_return", "process_bom", "process_bom_line"})   # 第 11 篇时间增量补了 trg_upl_no_replace，按"只能缩小"从基线和名单同时删掉 upstream_push_log
 # 第十二轮扩面：没有锁定字段的表也要逐唯一键拦 REPLACE。下面两张名单都冻结基线、只能缩小；表已全部覆盖还在名单 = 红
 # REPLACE_OK：REPLACE 可以接受（主数据整行改写 ≈ UPDATE，无去重/序号语义；被引用的行由外键兜底，REPLACE 删父行会报 FOREIGN KEY）
 REPLACE_OK = {
@@ -2381,14 +2627,12 @@ REPLACE_OK_BASELINE = frozenset({"sku_unit"})   # 第十三轮冻结（r12 的 w
 REPLACE_TODO = {t: o for o, ts in {
     "03 小肥鱼": ("inbound_line",), "04": ("outbound_order", "outbound_line"), "05 小肥鱼": ("wave", "pick_task", "pick_task_line"),
     "06 小肥鱼": ("pack_box", "pack_box_line", "shipment", "shipment_order"), "08": ("count_order", "count_line", "adjust_order", "adjust_line"),
-    "10 米雪儿": ("exception_code",), "11 米雪儿（offline_paper_record 在 11 时间 diff 里加守卫；numbering_segment 是取号计数器、inbound_message 是去重表，应加守卫）": ("offline_paper_record", "inbound_message", "numbering_segment"),
+    "10 米雪儿": ("exception_code",),
     "12 爱弥斯": ("sys_role", "sys_permission", "sys_user_role", "sys_role_perm", "sys_user_warehouse", "api_credential"),
 }.items() for t in ts}
 REPLACE_TODO_BASELINE = frozenset(REPLACE_TODO)
 # 键级豁免（第十二轮）：表已有守卫，但这几个唯一键还没拦。按条文属主，只能缩小；键已被覆盖还在名单 = 红；基线外 = 红
 REPLACE_KEY_ALLOW = {
-    ("outbox_event", ("biz_key",)): "11 米雪儿（uq_outbox_dead_bizkey，部分索引）",
-    ("outbox_event", ("node_id", "seq")): "11 米雪儿（uq_outbox_seq；小玛丽 r11 实打可删未投递事件）",
     ("exception_case", ("code",)): "10 米雪儿",
     ("process_order", ("approval_no",)): "17 米雪儿（uq_prc_apr）",
     ("scrap_line", ("scrap_id", "line_no")): "09 米雪儿",
@@ -2449,7 +2693,11 @@ _scan_mut("假守卫：只写 NEW.id IS NULL（引用了列但不比较）", _dd
 _scan_mut("WHEN 少一个键：trg_res_no_replace 只查 id，不查 op_key", _ddl_nr + "\nCREATE TRIGGER trg_res_no_replace BEFORE INSERT ON stock_reservation WHEN EXISTS (SELECT 1 FROM stock_reservation r WHERE r.id = NEW.id) BEGIN SELECT RAISE(ABORT, 'reservation_duplicate'); END;", REPLACE_ALLOW, "stock_reservation(op_key)")
 _scan_mut("去掉 trg_mvk_no_replace_idem（X1 回退）", sqlite_ddl + "\nDROP TRIGGER trg_mvk_no_replace_idem;", REPLACE_ALLOW, "stock_movement_key(idempotency_key)")
 _scan_mut("去掉 trg_mvk_no_replace_seq（X1 回退）", sqlite_ddl + "\nDROP TRIGGER trg_mvk_no_replace_seq;", REPLACE_ALLOW, "stock_movement_key(stock_id,stock_seq)")
-_scan_mut("键级豁免去掉 outbox_event(node_id,seq)", sqlite_ddl, REPLACE_ALLOW, "outbox_event(node_id,seq)", {k: v for k, v in REPLACE_KEY_ALLOW.items() if k != ("outbox_event", ("node_id", "seq"))})
+_ddl_ob = sqlite_ddl + "\nDROP TRIGGER trg_outbox_no_replace;\nCREATE TRIGGER trg_outbox_no_replace BEFORE INSERT ON outbox_event WHEN EXISTS (SELECT 1 FROM outbox_event o WHERE o.id = NEW.id) BEGIN SELECT RAISE(ABORT, 'outbox_duplicate'); END;"
+_scan_mut("第 11 篇 trg_outbox_no_replace 退回只查 id（小玛丽 r11 X2）", _ddl_ob, REPLACE_ALLOW, "outbox_event(node_id,seq)")
+_scan_mut("第 11 篇已覆盖的 outbox_event(node_id,seq) 塞回键级豁免", sqlite_ddl, REPLACE_ALLOW, "键级豁免", {**REPLACE_KEY_ALLOW, ("outbox_event", ("node_id", "seq")): "x"})
+_scan_mut("第 11 篇去掉 trg_numbering_no_replace（受锁表）", sqlite_ddl + "\nDROP TRIGGER trg_numbering_no_replace;", REPLACE_ALLOW, "numbering_segment: 有 BEFORE")
+_scan_mut("第 11 篇去掉 trg_in_msg_no_replace（受锁表）", sqlite_ddl + "\nDROP TRIGGER trg_in_msg_no_replace;", REPLACE_ALLOW, "inbound_message: 有 BEFORE")
 _scan_mut("键级豁免加入已覆盖的 stock_movement_key(idempotency_key)", sqlite_ddl, REPLACE_ALLOW, "键级豁免过期", {**REPLACE_KEY_ALLOW, ("stock_movement_key", ("idempotency_key",)): "x"})
 _scan_mut("键级豁免加入基线外的键", sqlite_ddl + "\nDROP TRIGGER trg_hold_no_replace_ret;", REPLACE_ALLOW, "键级豁免含冻结基线外", {**REPLACE_KEY_ALLOW, ("stock_hold", ("source_id",)): "x"})
 _scan_mut("表达式唯一索引", sqlite_ddl + "\nCREATE UNIQUE INDEX zz_res_expr ON stock_reservation(lower(op_key));", REPLACE_ALLOW, "stock_reservation(zz_res_expr): 表达式唯一索引")
@@ -2470,6 +2718,30 @@ for _ty, (_miss, _extra) in _base_check(sqlite_ddl).items():
     if _extra: print(f"  · 01/02 {_ty} 基线外新增（请补进基线）：{_extra}")
 _m = _base_check(sqlite_ddl + "\nDROP TRIGGER trg_mvk_no_replace_seq;\nDROP INDEX uq_mvk_stock_seq;")
 ok(f"变异：去掉 trg_mvk_no_replace_seq + uq_mvk_stock_seq → 基线变红（{_m['trigger'][0]} / {_m['index'][0]}）") if _m["trigger"][0] and _m["index"][0] else bad("变异：去掉触发器 / 索引后基线仍绿")
+print("=== 2z4-11 第 11 篇触发器 / 索引名冻结基线（同 #2 第十三轮机制；少一个 = 红）===")
+T11 = ('outbox_event', 'idempotency_record', 'upstream_push_log', 'offline_paper_record', 'inbound_message', 'numbering_segment', 'audit_log')   # audit_log 属第 11 篇（爱弥斯确认），12b 挂在它上面的触发器 / 索引一并冻结
+SQ_BASE_11 = {"trigger": frozenset(['trg_audit_no_delete', 'trg_audit_no_replace', 'trg_audit_no_update', 'trg_audit_node_required', 'trg_audit_occurred_now', 'trg_idem_created_now', 'trg_idem_expires_past', 'trg_idem_expires_ttl', 'trg_idem_expiry_fwd', 'trg_idem_no_replace', 'trg_idem_purge_guard', 'trg_in_msg_key_immutable', 'trg_in_msg_no_replace', 'trg_in_msg_received_now', 'trg_numbering_key_immutable', 'trg_numbering_no_delete', 'trg_numbering_no_replace', 'trg_numbering_regress', 'trg_outbox_bizkey_blocked', 'trg_outbox_expiry_fwd', 'trg_outbox_illegal_transition', 'trg_outbox_insert_pending', 'trg_outbox_no_replace', 'trg_outbox_purge_guard', 'trg_outbox_sent_now', 'trg_outbox_seq_immutable', 'trg_paper_approved_now', 'trg_paper_no_replace', 'trg_paper_submitted_now', 'trg_paper_time_immutable', 'trg_upl_no_delete', 'trg_upl_no_replace', 'trg_upl_no_update', 'trg_upl_received_now']),
+              "index": frozenset(['ix_audit_actor', 'ix_audit_target', 'ix_audit_wh', 'ix_idem_exp', 'ix_in_msg_retry', 'ix_outbox_bizkey', 'ix_outbox_noseq', 'ix_outbox_pending', 'ix_paper_pending', 'ix_upl_src', 'ix_upl_time', 'sqlite_autoindex_audit_log_1', 'sqlite_autoindex_idempotency_record_1', 'sqlite_autoindex_inbound_message_1', 'sqlite_autoindex_inbound_message_2', 'sqlite_autoindex_numbering_segment_1', 'sqlite_autoindex_offline_paper_record_1', 'sqlite_autoindex_offline_paper_record_2', 'sqlite_autoindex_outbox_event_1', 'sqlite_autoindex_upstream_push_log_1', 'uq_audit_node_seq', 'uq_outbox_dead_bizkey', 'uq_outbox_seq'])}
+def _names_11(ddl):
+    mc = sqlite3.connect(":memory:"); mc.executescript(ddl)
+    out = {ty: {n for (n,) in mc.execute(f"SELECT name FROM sqlite_master WHERE type = ? AND tbl_name IN ({','.join('?' * len(T11))})", (ty,) + T11)} for ty in ("trigger", "index")}
+    mc.close(); return out
+def _base_check_11(ddl):
+    now = _names_11(ddl)
+    return {ty: (sorted(SQ_BASE_11[ty] - now[ty]), sorted(now[ty] - SQ_BASE_11[ty])) for ty in now}
+for _ty, (_miss, _extra) in _base_check_11(sqlite_ddl).items():
+    ok(f"11 {_ty} 名单与冻结基线一致（{len(SQ_BASE_11[_ty])} 个）") if not _miss else bad(f"11 {_ty} 少了：{_miss}")
+    if _extra: print(f"  · 11 {_ty} 基线外新增（请补进基线）：{_extra}")
+_m = _base_check_11(sqlite_ddl + "\nDROP TRIGGER trg_numbering_no_replace;\nDROP INDEX uq_outbox_seq;")
+ok(f"变异：去掉 trg_numbering_no_replace + uq_outbox_seq → 11 基线变红（{_m['trigger'][0]} / {_m['index'][0]}）") if _m["trigger"][0] and _m["index"][0] else bad("变异：11 去掉触发器 / 索引后基线仍绿")
+# 第 13 轮配套：11 表声明外键（audit_log.warehouse_id、offline_paper_record.warehouse_id）种子无孤儿
+_fk11 = [r for t_ in ("audit_log", "offline_paper_record") for r in conn.execute(f"PRAGMA foreign_key_check({t_})")]
+ok("11 外键：audit_log / offline_paper_record foreign_key_check 干净") if not _fk11 else bad(f"11 外键孤儿：{_fk11[:5]}")
+expect_block_tx("11 外键：audit_log.warehouse_id 指向不存在的仓", ["INSERT INTO audit_log (id,action,node_id,node_seq,warehouse_id,occurred_at) VALUES (779701,'t11.fk',7,779701,999999,datetime('now'))"], "FOREIGN KEY constraint failed")
+# Doro 裁定：audit_log.actor_id → sys_user(id) 在 SQLite 写进 11 的 CREATE TABLE（PG 由 12_auth ALTER，爱弥斯）
+_fka = [(r[2], r[3], r[4]) for r in conn.execute("PRAGMA foreign_key_list(audit_log)")]
+ok("11 外键：audit_log.actor_id → sys_user(id) 已声明") if ("sys_user", "actor_id", "id") in _fka else bad(f"11 外键缺 audit_log.actor_id → sys_user：{_fka}")
+expect_block_tx("11 外键：audit_log.actor_id 指向不存在的用户", ["INSERT INTO audit_log (id,actor_id,action,node_id,node_seq,warehouse_id,occurred_at) VALUES (779703,999999,'t11.fk',7,779703,1,datetime('now'))"], "FOREIGN KEY constraint failed")
 
 print("=== 2z2 预占 / 流水 防 REPLACE ===")
 _RES = "INTO stock_reservation (id,stock_id,stage,source_type,source_id,source_line_id,op_key,reserve_qty_milli,status) VALUES ({i},11,'RESERVE','OUTBOUND_LINE',1,{i},'{k}',1000,'RESERVED')"

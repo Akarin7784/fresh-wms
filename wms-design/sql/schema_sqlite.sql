@@ -1,8 +1,8 @@
 -- 本文件由 sql/verify_sqlite.py 从 sql/schema/*.sql 按加载顺序机械生成，请勿手改。
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
---   2. 47 处 DEFAULT now()、22 处 DEFAULT (now() AT TIME ZONE 'UTC') / (date_trunc('second', now() AT TIME ZONE 'UTC')) → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
---   3. 方言专属行：删除 901 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 612 行 @sqlite-only（等价触发器）
+--   2. 44 处 DEFAULT now()、25 处 DEFAULT (now() AT TIME ZONE 'UTC') / (date_trunc('second', now() AT TIME ZONE 'UTC')) → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
+--   3. 方言专属行：删除 974 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 661 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -1551,7 +1551,7 @@ CREATE TABLE upstream_push_log (
     warehouse_id    BIGINT       NOT NULL DEFAULT 0,
     payload_sha     VARCHAR(64)  NOT NULL,   -- 规范化报文 SHA-256（= 业务侧 source_hash）
     payload         TEXT         NOT NULL,   -- 原文（脱敏后）
-    received_at     TIMESTAMP    NOT NULL,   -- 中心接收时间（UTC）
+    received_at     TIMESTAMP    NOT NULL,   -- 中心接收时间（UTC 整秒）。时间加固：PG 非属主插入由 trg_upl_server_time 强制为服务端时间；SQLite 只收 now±300s
     result_status   VARCHAR(16)  NOT NULL,   -- ACCEPTED/DUPLICATE/CONFLICT/REJECTED/FAILED
     result_code     VARCHAR(8)   NOT NULL DEFAULT '0',
     wms_doc_no      VARCHAR(64),
@@ -1560,7 +1560,7 @@ CREATE TABLE upstream_push_log (
     CONSTRAINT ck_upl_result CHECK (result_status IN ('ACCEPTED','DUPLICATE','CONFLICT','REJECTED','FAILED')),
     -- 小赵 I1 / 项目经理决定：保留期下限 90 天库层落地。PG 用 interval；SQLite 时间列是 TEXT，用 julianday 做等价比较
     -- （同时接受 'YYYY-MM-DD HH:MM:SS' 与 ISO 'T' 写法），并要求两列都能被解析，防止乱写的字符串让比较结果为 NULL 而放行
-    CONSTRAINT ck_upl_retain CHECK (julianday(received_at) IS NOT NULL AND julianday(retain_until) IS NOT NULL AND julianday(retain_until) - julianday(received_at) >= 90),
+    CONSTRAINT ck_upl_retain CHECK ((typeof(received_at) = 'text' AND length(received_at) = 19 AND received_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(received_at) IS received_at AND substr(received_at, 12, 2) <= '23') AND (typeof(retain_until) = 'text' AND length(retain_until) = 19 AND retain_until GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(retain_until) IS retain_until AND substr(retain_until, 12, 2) <= '23') AND CAST(strftime('%s', retain_until) AS INTEGER) - CAST(strftime('%s', received_at) AS INTEGER) >= 7776000),   -- 时间加固：只收标准整秒格式，按整数秒比较
     -- D6 口径：规范化报文 SHA-256，64 位小写十六进制（与 ck_obo_hash 同写法，两库通用）
     CONSTRAINT ck_upl_sha CHECK (length(payload_sha) = 64 AND lower(payload_sha) = payload_sha AND replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(payload_sha,'0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9',''),'a',''),'b',''),'c',''),'d',''),'e',''),'f','') = '')
 );
@@ -1572,7 +1572,7 @@ CREATE INDEX ix_upl_src  ON upstream_push_log(source_system, source_order_no, re
 -- 一行 = 一张纸质单。补录产生的库存事件走 02 post_event，biz_key 与在线事件同一规则，由 uq_mvk_biz_line 去重；本表另按 (warehouse_id, biz_key) 防同单重复补录。
 CREATE TABLE offline_paper_record (
     id                   BIGINT       PRIMARY KEY,
-    warehouse_id         BIGINT       NOT NULL,
+    warehouse_id         BIGINT       NOT NULL REFERENCES warehouse(id),
     device_id            VARCHAR(64)  NOT NULL,                 -- 离线的终端
     action_type          VARCHAR(24)  NOT NULL,                 -- 拣货确认 / 收货登记 / 签收
     biz_key              VARCHAR(128) NOT NULL,                 -- 与在线事件同一 biz_key 规则
@@ -1595,12 +1595,11 @@ CREATE TABLE offline_paper_record (
     CONSTRAINT ck_paper_type     CHECK (approval_type = 'PAPER_BACKFILL'),
     CONSTRAINT ck_paper_action   CHECK (action_type IN ('PICK_CONFIRM','RECEIVE_REGISTER','POD_SIGN')),
     CONSTRAINT ck_paper_status   CHECK (status IN ('PENDING','APPROVED','REJECTED','EXPIRED')),
-    CONSTRAINT ck_paper_deadline CHECK (backfill_deadline_at = datetime(reconnected_at, '+24 hours')),
-    CONSTRAINT ck_paper_window   CHECK (reconnected_at > offline_since AND occurred_at >= offline_since
-                                        AND occurred_at <= reconnected_at AND submitted_at >= reconnected_at),
+    CONSTRAINT ck_paper_deadline CHECK (COALESCE(CAST(strftime('%s', backfill_deadline_at) AS INTEGER) = CAST(strftime('%s', reconnected_at) AS INTEGER) + 86400, 0)),   -- 时间加固：整数秒；解析不了 → 0（不放行）
+    CONSTRAINT ck_paper_ts CHECK ((typeof(occurred_at) = 'text' AND length(occurred_at) = 19 AND occurred_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(occurred_at) IS occurred_at AND substr(occurred_at, 12, 2) <= '23') AND (typeof(offline_since) = 'text' AND length(offline_since) = 19 AND offline_since GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(offline_since) IS offline_since AND substr(offline_since, 12, 2) <= '23') AND (typeof(reconnected_at) = 'text' AND length(reconnected_at) = 19 AND reconnected_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(reconnected_at) IS reconnected_at AND substr(reconnected_at, 12, 2) <= '23') AND (typeof(backfill_deadline_at) = 'text' AND length(backfill_deadline_at) = 19 AND backfill_deadline_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(backfill_deadline_at) IS backfill_deadline_at AND substr(backfill_deadline_at, 12, 2) <= '23') AND (typeof(submitted_at) = 'text' AND length(submitted_at) = 19 AND submitted_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(submitted_at) IS submitted_at AND substr(submitted_at, 12, 2) <= '23') AND (typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(created_at) IS created_at AND substr(created_at, 12, 2) <= '23') AND (approved_at IS NULL OR (typeof(approved_at) = 'text' AND length(approved_at) = 19 AND approved_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(approved_at) IS approved_at AND substr(approved_at, 12, 2) <= '23'))),
     -- 过期：提交晚于 backfill_deadline_at 只能落 EXPIRED，且必须挂异常单；未过期不能是 EXPIRED
-    CONSTRAINT ck_paper_expired  CHECK ((status = 'EXPIRED' AND submitted_at > backfill_deadline_at AND exception_case_id IS NOT NULL)
-                                        OR (status <> 'EXPIRED' AND submitted_at <= backfill_deadline_at AND exception_case_id IS NULL)),
+    CONSTRAINT ck_paper_window   CHECK (COALESCE(CAST(strftime('%s', reconnected_at) AS INTEGER) > CAST(strftime('%s', offline_since) AS INTEGER) AND CAST(strftime('%s', occurred_at) AS INTEGER) >= CAST(strftime('%s', offline_since) AS INTEGER) AND CAST(strftime('%s', occurred_at) AS INTEGER) <= CAST(strftime('%s', reconnected_at) AS INTEGER) AND CAST(strftime('%s', submitted_at) AS INTEGER) >= CAST(strftime('%s', reconnected_at) AS INTEGER), 0)),   -- 时间加固：整数秒，不按文本
+    CONSTRAINT ck_paper_expired  CHECK (COALESCE((status = 'EXPIRED' AND CAST(strftime('%s', submitted_at) AS INTEGER) > CAST(strftime('%s', backfill_deadline_at) AS INTEGER) AND exception_case_id IS NOT NULL) OR (status <> 'EXPIRED' AND CAST(strftime('%s', submitted_at) AS INTEGER) <= CAST(strftime('%s', backfill_deadline_at) AS INTEGER) AND exception_case_id IS NULL), 0)),
     CONSTRAINT ck_paper_sod      CHECK (approver_id IS NULL OR approver_id <> applicant_id),   -- 申请人不能自批
     CONSTRAINT ck_paper_approve  CHECK ((status IN ('APPROVED','REJECTED') AND approver_id IS NOT NULL AND approved_at IS NOT NULL)
                                         OR (status IN ('PENDING','EXPIRED') AND approver_id IS NULL AND approved_at IS NULL))
@@ -1618,8 +1617,10 @@ CREATE TABLE idempotency_record (
     req_hash     VARCHAR(64)  NOT NULL,
     response     TEXT         NOT NULL,
     status_code  INT          NOT NULL,
+    ttl_seconds  INTEGER      NOT NULL DEFAULT 86400,   -- 时间加固：去重 TTL（秒）。PG 非属主插入 expires_at = 服务端 created_at + ttl_seconds（trg_idem_server_time）
     created_at   TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- 一律存 UTC（P1）
-    expires_at   TIMESTAMP    NOT NULL                -- UTC；写入后只许往后改（trg_idem_expiry_fwd，P2）
+    expires_at   TIMESTAMP    NOT NULL,               -- UTC；写入后只许往后改（trg_idem_expiry_fwd，P2）
+    CONSTRAINT ck_idem_ttl CHECK (ttl_seconds BETWEEN 1 AND 7776000)   -- 1 秒 ~ 90 天
     -- 小赵 S1：SQLite 不约束时间类型，'garbage'、T 格式、整数都能写进去，按文本比较永远清不掉；限定为 'YYYY-MM-DD HH:MM:SS' 且是真实日期时间
     , CONSTRAINT ck_idem_ts CHECK ((typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) IS NOT NULL AND time(created_at) IS NOT NULL AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8) AND substr(created_at, 12, 2) <= '23') AND (typeof(expires_at) = 'text' AND length(expires_at) = 19 AND expires_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(expires_at) IS NOT NULL AND time(expires_at) IS NOT NULL AND date(expires_at) = substr(expires_at, 1, 10) AND time(expires_at) = substr(expires_at, 12, 8) AND substr(expires_at, 12, 2) <= '23'))
 );
@@ -1636,11 +1637,13 @@ CREATE TABLE inbound_message (
     retry_count     SMALLINT     NOT NULL DEFAULT 0,
     next_retry_at   TIMESTAMP,
     error           VARCHAR(512),
-    received_at     TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    received_at     TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- 时间加固（00 §6.8）：中心接收时间，UTC 整秒，由库写（trg_11_recv_server_time；SQLite trg_in_msg_received_now）
+    client_occurred_at TIMESTAMP,                -- T2（Doro 裁定）：上游/设备给的原始时间（UTC），只供展示、排障；不参与任何 CHECK、清理、比较
     processed_at    TIMESTAMP,
     biz_ref         VARCHAR(64),                 -- 第 11 篇：处理成功后生成的 WMS 单号
     CONSTRAINT uq_in_msg UNIQUE (source, biz_type, external_no),
     CONSTRAINT ck_in_msg_status CHECK (status IN ('RECEIVED','PROCESSING','DONE','FAILED','DEAD','REJECTED'))
+    , CONSTRAINT ck_in_msg_cts CHECK (client_occurred_at IS NULL OR (typeof(client_occurred_at) = 'text' AND length(client_occurred_at) = 19 AND client_occurred_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(client_occurred_at) IS client_occurred_at AND substr(client_occurred_at, 12, 2) <= '23'))   -- 只验格式，不设容差
 );
 CREATE INDEX ix_in_msg_retry ON inbound_message(status, next_retry_at);
 
@@ -1722,12 +1725,14 @@ BEGIN SELECT RAISE(ABORT, 'sent_at_not_now'); END;
 -- SQLite REPLACE 冲突删旧行不触发 DELETE 触发器 → BEFORE INSERT 主键已存在就中止（应用把 idem_duplicate 当作"键已存在"处理，与 PG 23505 同分支）
 CREATE TRIGGER trg_idem_no_replace BEFORE INSERT ON idempotency_record WHEN EXISTS (SELECT 1 FROM idempotency_record r WHERE r.idem_key = NEW.idem_key)
 BEGIN SELECT RAISE(ABORT, 'idem_duplicate'); END;
-CREATE TRIGGER trg_outbox_no_replace BEFORE INSERT ON outbox_event WHEN EXISTS (SELECT 1 FROM outbox_event o WHERE o.id = NEW.id)
+-- 00 §6.10 / 小玛丽 pr2-r11 X2：WHEN 覆盖本表全部唯一键，部分索引带同一谓词（不加 IS NULL 之类逃逸）：
+--   PK(id)；uq_outbox_seq(node_id, seq) WHERE seq > 0；uq_outbox_dead_bizkey(biz_key) WHERE status = 'DEAD'
+CREATE TRIGGER trg_outbox_no_replace BEFORE INSERT ON outbox_event WHEN EXISTS (SELECT 1 FROM outbox_event o WHERE o.id = NEW.id OR (NEW.seq > 0 AND o.seq > 0 AND o.node_id = NEW.node_id AND o.seq = NEW.seq) OR (NEW.status = 'DEAD' AND o.status = 'DEAD' AND o.biz_key = NEW.biz_key))
 BEGIN SELECT RAISE(ABORT, 'outbox_duplicate'); END;
 
 CREATE TABLE audit_log (
     id              BIGINT       PRIMARY KEY,
-    actor_id        BIGINT,
+    actor_id        BIGINT       REFERENCES sys_user(id),   -- Doro 裁定：SQLite 建表不检查父表是否已存在，可前向引用 12_auth 的 sys_user
     actor_name      VARCHAR(64),
     client_type     VARCHAR(16),
     action          VARCHAR(64)  NOT NULL,   -- outbound.cancel_after_pick / lot.expiry_override ...
@@ -1736,10 +1741,12 @@ CREATE TABLE audit_log (
     before_json     TEXT,
     after_json      TEXT,
     reason          VARCHAR(256),
-    warehouse_id    BIGINT,
+    warehouse_id    BIGINT       REFERENCES warehouse(id),   -- 第 13 轮配套：声明外键（NULL = 非仓级操作）
     trace_id        VARCHAR(32),
     ip              VARCHAR(45),
-    occurred_at     TIMESTAMP    NOT NULL DEFAULT (datetime('now'))
+    occurred_at     TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- 时间加固（00 §6.8）：UTC 整秒，由库写（trg_11_recv_server_time；SQLite trg_audit_occurred_now）
+    client_occurred_at TIMESTAMP   -- T2：设备原始时间（UTC），只供展示、排障；不参与任何 CHECK、清理、比较
+    , CONSTRAINT ck_audit_cts CHECK (client_occurred_at IS NULL OR (typeof(client_occurred_at) = 'text' AND length(client_occurred_at) = 19 AND client_occurred_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(client_occurred_at) IS client_occurred_at AND substr(client_occurred_at, 12, 2) <= '23'))
 );
 CREATE INDEX ix_audit_target ON audit_log(target_type, target_id, occurred_at DESC);
 CREATE INDEX ix_audit_actor  ON audit_log(actor_id, occurred_at DESC);
@@ -1749,12 +1756,72 @@ CREATE TABLE numbering_segment (
     date_key     VARCHAR(8)   NOT NULL,
     next_value   BIGINT       NOT NULL,
     step         INT          NOT NULL DEFAULT 100,
-    updated_at   TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    updated_at   TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- 时间加固（00 §6.8）
     PRIMARY KEY (biz_prefix, date_key)
 );
 -- 取号（号段预取，两库语义一致）：
 --   UPDATE numbering_segment SET next_value = next_value + step WHERE biz_prefix=? AND date_key=?
 --   然后 SELECT next_value - step 作为本段起点。多实例安全，不依赖 Redis 持久化。
+-- 小玛丽 blocker（号段回退）：numbering_segment 只许前进。next_value 只增不减、键列 (biz_prefix, date_key) 不可改、
+-- 不许 DELETE / TRUNCATE（删了重插 = 回退，任何角色都拦，含属主；旧日号段留着，每天每前缀一行，体量可忽略），SQLite 不许 REPLACE。
+-- 取号原语 UPDATE … SET next_value = next_value + step 不受影响（step 必须 > 0，否则 next_value 变小同样被拦）。
+CREATE TRIGGER trg_numbering_regress BEFORE UPDATE ON numbering_segment WHEN NEW.next_value < OLD.next_value
+BEGIN SELECT RAISE(ABORT, 'numbering_regress'); END;
+CREATE TRIGGER trg_numbering_key_immutable BEFORE UPDATE OF biz_prefix, date_key ON numbering_segment WHEN NEW.biz_prefix IS NOT OLD.biz_prefix OR NEW.date_key IS NOT OLD.date_key
+BEGIN SELECT RAISE(ABORT, 'numbering_key_immutable'); END;
+CREATE TRIGGER trg_numbering_no_delete BEFORE DELETE ON numbering_segment
+BEGIN SELECT RAISE(ABORT, 'numbering_regress'); END;
+CREATE TRIGGER trg_numbering_no_replace BEFORE INSERT ON numbering_segment WHEN EXISTS (SELECT 1 FROM numbering_segment n WHERE n.biz_prefix = NEW.biz_prefix AND n.date_key = NEW.date_key)
+BEGIN SELECT RAISE(ABORT, 'numbering_regress'); END;
+-- inbound_message 判重键不可改：id、(source, biz_type, external_no)；SQLite no-REPLACE 覆盖 PK 与 uq_in_msg（00 §6.10）
+CREATE TRIGGER trg_in_msg_key_immutable BEFORE UPDATE OF id, source, biz_type, external_no ON inbound_message WHEN NEW.id IS NOT OLD.id OR NEW.source IS NOT OLD.source OR NEW.biz_type IS NOT OLD.biz_type OR NEW.external_no IS NOT OLD.external_no
+BEGIN SELECT RAISE(ABORT, 'inbound_message_key_immutable'); END;
+CREATE TRIGGER trg_in_msg_no_replace BEFORE INSERT ON inbound_message WHEN EXISTS (SELECT 1 FROM inbound_message m WHERE m.id = NEW.id OR (m.source = NEW.source AND m.biz_type = NEW.biz_type AND m.external_no = NEW.external_no))
+BEGIN SELECT RAISE(ABORT, 'inbound_message_duplicate'); END;
+-- =============================================================================
+-- 第 11 篇 时间加固（小玛丽时间专项 11-1…11-6；00 §6.8 时间约定、§6.9 search_path）
+-- 服务端时间：PG 用 BEFORE 触发器强制 date_trunc('second', now() AT TIME ZONE 'UTC')，表属主（迁移/种子）豁免（同 trg_outbox_insert_pending 先例）；
+-- SQLite 无角色：由服务端写的时间只收标准整秒且与 now 相差 ≤ 300s，格式错的交给各表 CHECK（ck_upl_retain / ck_idem_ts / ck_paper_ts）报。
+-- =============================================================================
+-- 11-1 阻断：upstream_push_log.received_at 由库写；retain_until 至少 received_at + 90 天（调用方可以往后延，不能往前）
+-- 11-2：idempotency_record.created_at 由库写，expires_at = created_at + ttl_seconds；显式给过去的 expires_at 直接拒（idem_expires_in_past）
+-- 11-5：纸质单补录。INSERT：submitted_at、created_at 由库写（审批态插入时 approved_at 也由库写）；
+-- UPDATE：进入 APPROVED/REJECTED 时 approved_at 由库写；时间列写入后对任何角色都不可改（paper_time_immutable）
+-- SQLite 等价：插入时服务端时间 ±300s；纸质单时间列不可改（verify_sqlite 的种子路径临时 DROP 这些 *_now 触发器写历史数据，写完重建）
+CREATE TRIGGER trg_upl_received_now BEFORE INSERT ON upstream_push_log
+WHEN (typeof(NEW.received_at) = 'text' AND length(NEW.received_at) = 19 AND NEW.received_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.received_at) IS NEW.received_at AND substr(NEW.received_at, 12, 2) <= '23') AND abs(CAST(strftime('%s', NEW.received_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300
+BEGIN SELECT RAISE(ABORT, 'upl_received_not_now'); END;
+CREATE TRIGGER trg_idem_created_now BEFORE INSERT ON idempotency_record
+WHEN (typeof(NEW.created_at) = 'text' AND length(NEW.created_at) = 19 AND NEW.created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.created_at) IS NEW.created_at AND substr(NEW.created_at, 12, 2) <= '23') AND (typeof(NEW.expires_at) = 'text' AND length(NEW.expires_at) = 19 AND NEW.expires_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.expires_at) IS NEW.expires_at AND substr(NEW.expires_at, 12, 2) <= '23') AND NOT EXISTS (SELECT 1 FROM idempotency_record r WHERE r.idem_key = NEW.idem_key) AND abs(CAST(strftime('%s', NEW.created_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300
+BEGIN SELECT RAISE(ABORT, 'idem_created_not_now'); END;
+CREATE TRIGGER trg_idem_expires_past BEFORE INSERT ON idempotency_record
+WHEN (typeof(NEW.created_at) = 'text' AND length(NEW.created_at) = 19 AND NEW.created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.created_at) IS NEW.created_at AND substr(NEW.created_at, 12, 2) <= '23') AND (typeof(NEW.expires_at) = 'text' AND length(NEW.expires_at) = 19 AND NEW.expires_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.expires_at) IS NEW.expires_at AND substr(NEW.expires_at, 12, 2) <= '23') AND NOT EXISTS (SELECT 1 FROM idempotency_record r WHERE r.idem_key = NEW.idem_key) AND abs(CAST(strftime('%s', NEW.created_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) <= 300 AND CAST(strftime('%s', NEW.expires_at) AS INTEGER) <= CAST(strftime('%s', 'now') AS INTEGER)
+BEGIN SELECT RAISE(ABORT, 'idem_expires_in_past'); END;
+CREATE TRIGGER trg_idem_expires_ttl BEFORE INSERT ON idempotency_record
+WHEN (typeof(NEW.created_at) = 'text' AND length(NEW.created_at) = 19 AND NEW.created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.created_at) IS NEW.created_at AND substr(NEW.created_at, 12, 2) <= '23') AND (typeof(NEW.expires_at) = 'text' AND length(NEW.expires_at) = 19 AND NEW.expires_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.expires_at) IS NEW.expires_at AND substr(NEW.expires_at, 12, 2) <= '23') AND NOT EXISTS (SELECT 1 FROM idempotency_record r WHERE r.idem_key = NEW.idem_key) AND abs(CAST(strftime('%s', NEW.created_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) <= 300 AND CAST(strftime('%s', NEW.expires_at) AS INTEGER) > CAST(strftime('%s', 'now') AS INTEGER) AND CAST(strftime('%s', NEW.expires_at) AS INTEGER) <> CAST(strftime('%s', NEW.created_at) AS INTEGER) + NEW.ttl_seconds
+BEGIN SELECT RAISE(ABORT, 'idem_expires_not_ttl'); END;
+CREATE TRIGGER trg_paper_submitted_now BEFORE INSERT ON offline_paper_record
+WHEN (typeof(NEW.submitted_at) = 'text' AND length(NEW.submitted_at) = 19 AND NEW.submitted_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.submitted_at) IS NEW.submitted_at AND substr(NEW.submitted_at, 12, 2) <= '23') AND (typeof(NEW.created_at) = 'text' AND length(NEW.created_at) = 19 AND NEW.created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.created_at) IS NEW.created_at AND substr(NEW.created_at, 12, 2) <= '23') AND (abs(CAST(strftime('%s', NEW.submitted_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300 OR abs(CAST(strftime('%s', NEW.created_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300 OR (NEW.approved_at IS NOT NULL AND (typeof(NEW.approved_at) = 'text' AND length(NEW.approved_at) = 19 AND NEW.approved_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.approved_at) IS NEW.approved_at AND substr(NEW.approved_at, 12, 2) <= '23') AND abs(CAST(strftime('%s', NEW.approved_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300))
+BEGIN SELECT RAISE(ABORT, 'paper_submitted_not_now'); END;
+CREATE TRIGGER trg_paper_approved_now BEFORE UPDATE ON offline_paper_record
+WHEN NEW.status IN ('APPROVED','REJECTED') AND OLD.status NOT IN ('APPROVED','REJECTED') AND (typeof(NEW.approved_at) = 'text' AND length(NEW.approved_at) = 19 AND NEW.approved_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.approved_at) IS NEW.approved_at AND substr(NEW.approved_at, 12, 2) <= '23') AND abs(CAST(strftime('%s', NEW.approved_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300
+BEGIN SELECT RAISE(ABORT, 'paper_approved_not_now'); END;
+CREATE TRIGGER trg_paper_time_immutable BEFORE UPDATE ON offline_paper_record
+WHEN NEW.occurred_at IS NOT OLD.occurred_at OR NEW.offline_since IS NOT OLD.offline_since OR NEW.reconnected_at IS NOT OLD.reconnected_at OR NEW.backfill_deadline_at IS NOT OLD.backfill_deadline_at OR NEW.submitted_at IS NOT OLD.submitted_at OR NEW.created_at IS NOT OLD.created_at OR (OLD.approved_at IS NOT NULL AND NEW.approved_at IS NOT OLD.approved_at)
+BEGIN SELECT RAISE(ABORT, 'paper_time_immutable'); END;
+-- T2（Doro 裁定，待 00 §6.8）：audit_log.occurred_at、inbound_message.received_at 由库写；设备原始时间放 client_occurred_at
+CREATE TRIGGER trg_audit_occurred_now BEFORE INSERT ON audit_log
+WHEN NOT (typeof(NEW.occurred_at) = 'text' AND length(NEW.occurred_at) = 19 AND NEW.occurred_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.occurred_at) IS NEW.occurred_at AND substr(NEW.occurred_at, 12, 2) <= '23') OR abs(CAST(strftime('%s', NEW.occurred_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300
+BEGIN SELECT RAISE(ABORT, 'audit_occurred_not_now'); END;
+CREATE TRIGGER trg_in_msg_received_now BEFORE INSERT ON inbound_message
+WHEN NOT (typeof(NEW.received_at) = 'text' AND length(NEW.received_at) = 19 AND NEW.received_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.received_at) IS NEW.received_at AND substr(NEW.received_at, 12, 2) <= '23') OR abs(CAST(strftime('%s', NEW.received_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300
+BEGIN SELECT RAISE(ABORT, 'inbound_received_not_now'); END;
+-- 00 §6.10 防 REPLACE（SQLite）：upstream_push_log 只追加，REPLACE 撞主键会删旧行且不触发 DELETE 触发器 → 插入前主键已存在即拒，错误名沿用 append_only_violation（同 12 audit_log）
+CREATE TRIGGER trg_upl_no_replace BEFORE INSERT ON upstream_push_log WHEN EXISTS (SELECT 1 FROM upstream_push_log u WHERE u.id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'append_only_violation: upstream_push_log'); END;
+-- offline_paper_record 有 trg_paper_time_immutable（BEFORE UPDATE RAISE），按 §6.10 第 2 条同时查主键和 uq_paper_bizkey；paper_duplicate → 40910 key_type=OFFLINE_PAPER（PG 撞 uq_paper_bizkey 同口径）
+CREATE TRIGGER trg_paper_no_replace BEFORE INSERT ON offline_paper_record WHEN EXISTS (SELECT 1 FROM offline_paper_record o WHERE o.id = NEW.id OR (o.warehouse_id = NEW.warehouse_id AND o.biz_key = NEW.biz_key))
+BEGIN SELECT RAISE(ABORT, 'paper_duplicate'); END;
 -- -----------------------------------------------------------------------------
 -- 权限（RBAC + 数据权限）
 -- -----------------------------------------------------------------------------
