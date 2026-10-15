@@ -191,6 +191,8 @@ CREATE TABLE customer (
     created_at          TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
     updated_at          TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
     CONSTRAINT uq_customer_code UNIQUE (code),
+    -- 门店编码与供应商编码同口径：A-Z0-9、2–32 位（镜鉴 I1：原先 customer.code 一条格式 CHECK 都没有）
+    CONSTRAINT ck_customer_code CHECK (length(code) BETWEEN 2 AND 32 AND replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(code,'A',''),'B',''),'C',''),'D',''),'E',''),'F',''),'G',''),'H',''),'I',''),'J',''),'K',''),'L',''),'M',''),'N',''),'O',''),'P',''),'Q',''),'R',''),'S',''),'T',''),'U',''),'V',''),'W',''),'X',''),'Y',''),'Z',''),'0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9','') = ''),
     CONSTRAINT ck_customer_type CHECK (store_type IN ('STORE','MALL','OTHER')),
     CONSTRAINT ck_customer_status CHECK (status IN ('ACTIVE','DISABLED'))
 );
@@ -237,7 +239,7 @@ CREATE TABLE device (
     id                  BIGINT       PRIMARY KEY,
     device_instance_id  VARCHAR(64)  NOT NULL,
     device_type         VARCHAR(16)  NOT NULL DEFAULT 'PDA',
-    warehouse_id        BIGINT       NOT NULL REFERENCES warehouse(id),
+    warehouse_id        BIGINT       NOT NULL CONSTRAINT fk_device_warehouse REFERENCES warehouse(id),
     status              VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
     last_seen_at        TIMESTAMP,
     created_at          TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
@@ -278,6 +280,7 @@ CREATE TABLE lot (
 );
 CREATE INDEX ix_lot_expiry ON lot(sku_id, expiry_date) WHERE quality_status = 'QUALIFIED';
 CREATE INDEX ix_lot_aging  ON lot(remaining_life_days, sku_id);
+CREATE INDEX ix_lot_supplier ON lot(supplier_id);   -- 外键列索引（01 增量：供应商反查批次；Chief 2026-10-16 定，与其他 FK 一致）
 -- [SQLite] 两个部分索引均支持；ix_lot_aging 支撑效期预警列表
 -- sell_deadline 建档固定、不回溯：其余列仍可更新，只有这一列（含 NULL）写入后不可改
 -- search_path 固定为 pg_catalog, public。IS DISTINCT FROM 用的 =(date,date) 来自 pg_catalog，调用方 schema 里的同名运算符不生效。

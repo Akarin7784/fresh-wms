@@ -48,7 +48,7 @@ SCHEMA_PARTS=(
 #    move_order PK/uq_mo_code/ix_mo_wh、move_order_line PK/uq_mol/ix_mol_order/ix_mol_stock）
 #   +1 视图（v_location_sku_candidate）→ 84 表 / 276 索引 / 3 视图（PG16 实测）
 EXPECT_TABLES=98
-EXPECT_INDEXES=322
+EXPECT_INDEXES=323
 # 第 12 篇：+device_reconnect（PK、uq_drc_id_binding、ix_drc_binding、ix_drc_jti）+ audit_log.uq_audit_rbac_once → 79 表 / 248 索引（PG16 实测）
 # docs/05（长流）：+ix_pt_handover（pick_task 交接任务来源的部分索引）→ 249 索引
 # docs/08（长流）：+ix_cnt_wh、ix_adj_wh、ix_adj_src、uq_adjl、ix_cnt_line_count、ix_cnt_line_loc → 255 索引（249 + 6）
@@ -3666,6 +3666,28 @@ expect_block "01 拒绝：ck_device_instance 全空白实例号" "INSERT INTO de
 mut01 "ck_device_instance" "device" "INSERT INTO device (id,device_instance_id,warehouse_id) VALUES (8816,'   ',1);"
 expect_block "01 拒绝：fk_lot_supplier 批次挂不存在的供应商" "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date,supplier_id) VALUES (8817,1,'LOT-SUP-8817','2026-12-02','2026-10-15',999999);" "fk_lot_supplier"
 mut01 "fk_lot_supplier" "lot" "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date,supplier_id) VALUES (8817,1,'LOT-SUP-8817','2026-12-02','2026-10-15',999999);"
+# 镜鉴 I2（覆盖补齐）：把台账 19 个新约束的三件套补全——新增 CHECK / 5 个唯一键 / device.warehouse_id 外键
+expect_block "01 拒绝：ck_customer_code 小写门店编码" "INSERT INTO customer (id,code,name) VALUES (8821,'store-x','x');" "ck_customer_code"
+mut01 "ck_customer_code" "customer" "INSERT INTO customer (id,code,name) VALUES (8821,'store-x','x');"
+expect_block "01 拒绝：ck_customer_status 未知状态" "INSERT INTO customer (id,code,name,status) VALUES (8822,'STORE003','x','PENDING');" "ck_customer_status"
+expect_block "01 拒绝：ck_vehicle_type 未知车型" "INSERT INTO vehicle (id,plate_no,vehicle_type) VALUES (8823,'沪A88888','SHIP');" "ck_vehicle_type"
+expect_block "01 拒绝：ck_vehicle_status 未知状态" "INSERT INTO vehicle (id,plate_no,vehicle_type,status) VALUES (8824,'沪A88889','VAN','PENDING');" "ck_vehicle_status"
+expect_block "01 拒绝：ck_vehicle_cap 载重为 0" "INSERT INTO vehicle (id,plate_no,vehicle_type,capacity_kg) VALUES (8825,'沪A88890','VAN',0);" "ck_vehicle_cap"
+mut01 "ck_vehicle_cap" "vehicle" "INSERT INTO vehicle (id,plate_no,vehicle_type,capacity_kg) VALUES (8825,'沪A88890','VAN',0);"
+expect_block "01 拒绝：ck_driver_status 未知状态" "INSERT INTO driver (id,name,phone,status) VALUES (8826,'王师傅','13900139000','PENDING');" "ck_driver_status"
+expect_block "01 拒绝：ck_device_type 未知设备类型" "INSERT INTO device (id,device_instance_id,device_type,warehouse_id) VALUES (8827,'D-PDA-8827','ROBOT',1);" "ck_device_type"
+mut01 "ck_device_type" "device" "INSERT INTO device (id,device_instance_id,device_type,warehouse_id) VALUES (8827,'D-PDA-8827','ROBOT',1);"
+expect_block "01 拒绝：ck_device_status 未知状态" "INSERT INTO device (id,device_instance_id,device_type,status,warehouse_id) VALUES (8828,'D-PDA-8828','PDA','PENDING',1);" "ck_device_status"
+expect_block "01 拒绝：ck_device_seen 心跳早于建档" "INSERT INTO device (id,device_instance_id,device_type,warehouse_id,created_at,last_seen_at) VALUES (8829,'D-PDA-8829','PDA',1,'2026-10-15 10:00:00','2026-10-15 09:00:00');" "ck_device_seen"
+mut01 "ck_device_seen" "device" "INSERT INTO device (id,device_instance_id,device_type,warehouse_id,created_at,last_seen_at) VALUES (8829,'D-PDA-8829','PDA',1,'2026-10-15 10:00:00','2026-10-15 09:00:00');"
+expect_block "01 拒绝：fk_device_warehouse 设备挂不存在的仓" "INSERT INTO device (id,device_instance_id,device_type,warehouse_id) VALUES (8830,'D-PDA-8830','PDA',999999);" "fk_device_warehouse"
+expect_block "01 拒绝：uq_supplier_code 编码重复" "INSERT INTO supplier (id,code,name) VALUES (8831,'SUP001','重复编码');" "uq_supplier_code"
+expect_block "01 拒绝：uq_customer_code 门店编码重复" "INSERT INTO customer (id,code,name) VALUES (8832,'STORE001','重复门店');" "uq_customer_code"
+expect_block "01 拒绝：uq_vehicle_plate 车牌重复" "INSERT INTO vehicle (id,plate_no,vehicle_type) VALUES (8833,'沪A12345','VAN');" "uq_vehicle_plate"
+expect_block "01 拒绝：uq_driver_phone 手机号重复" "INSERT INTO driver (id,name,phone) VALUES (8834,'赵师傅','13800138000');" "uq_driver_phone"
+expect_block "01 拒绝：uq_device_instance 实例号重复" "INSERT INTO device (id,device_instance_id,device_type,warehouse_id) VALUES (8835,'D-PDA-8805','PDA',1);" "uq_device_instance"
+R=$(psql -t -A -c "SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexname='ix_lot_supplier'")
+[ "$R" = "1" ] && ok "01 目录断言：ix_lot_supplier（lot.supplier_id 外键列索引）存在（$R）" || bad "01 ix_lot_supplier 缺：$R（期望 1）"
 echo "=== 2t. docs/05 波次与拣货：本轮新增 12 个 CHECK / 8 个外键 / ix_pt_handover 的三件套（正向 / 按名拒绝 / 变异）==="
 # 变异 = 同一事务里去掉该约束再执行原被拒语句，必须变成通过，然后 ROLLBACK（证明拒绝确实来自该约束）
 mut05() { expect_allow "05 变异：去掉 $1 后，原被拒语句通过（随后回滚）" "BEGIN; ALTER TABLE $2 DROP CONSTRAINT $1; $3 ROLLBACK;"; }
