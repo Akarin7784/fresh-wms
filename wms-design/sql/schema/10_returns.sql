@@ -106,7 +106,7 @@ CREATE UNIQUE INDEX uq_exc_ldth_key ON exception_case(source_key) WHERE source_t
 --    进入 RESOLVED 后声称、实点、差异、处置结论、处置单号、责任方、关闭人不可改，closed_at 只能从 NULL 写一次；CLOSED / CANCELLED 整行只读（含 version）。
 -- L3 不许 DELETE / TRUNCATE；SQLite 另拦 REPLACE（id 或 (source_type, source_key) 已存在即拒），去重键永不释放。
 -- 建议 2：SQLite 外键依赖 PRAGMA foreign_keys=ON，边缘连接漏开也要拦：exception_code 存在性用触发器再校验一次。
-CREATE FUNCTION trg_exc_forward() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_exc_forward() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN   -- @pg-only
     IF NEW.status <> OLD.status AND NEW.status IN ('OPEN','PROCESSING','RESOLVED','CLOSED','CANCELLED') AND NOT (   -- @pg-only
           (OLD.status = 'OPEN' AND NEW.status IN ('PROCESSING','RESOLVED','CANCELLED'))   -- @pg-only
@@ -132,7 +132,7 @@ BEGIN   -- @pg-only
     RETURN NEW;   -- @pg-only
 END $$;   -- @pg-only
 CREATE TRIGGER trg_exc_forward BEFORE UPDATE ON exception_case FOR EACH ROW EXECUTE FUNCTION trg_exc_forward();   -- @pg-only
-CREATE FUNCTION trg_exc_no_delete() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_exc_no_delete() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN   -- @pg-only
     RAISE EXCEPTION 'exc_no_delete' USING ERRCODE = '23514';   -- @pg-only
 END $$;   -- @pg-only
@@ -170,7 +170,7 @@ CREATE TRIGGER trg_exc_no_trunc  BEFORE TRUNCATE ON exception_case FOR EACH STAT
 -- @sqlite-only WHEN NOT EXISTS (SELECT 1 FROM exception_code c WHERE c.code = NEW.exception_code)
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'exc_code_unknown'); END;
 -- 盲收异常单：link_deadline_at 建单时必须 = created_at + 48h（截止只能往后改，见 trg_exc_forward / trg_exc_deadline）
-CREATE FUNCTION trg_exc_blind_ins() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_exc_blind_ins() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN   -- @pg-only
     IF NEW.source_type = 'BLIND_RETURN' AND NEW.link_deadline_at IS NOT NULL AND NEW.link_deadline_at IS DISTINCT FROM NEW.created_at + INTERVAL '48 hours' THEN   -- @pg-only
         RAISE EXCEPTION 'exc_blind_deadline' USING ERRCODE = '23514';   -- @pg-only
@@ -249,7 +249,7 @@ CREATE TABLE return_blind_receipt (
     CONSTRAINT ck_rbr_ctn     CHECK (length(container_code) > 0 AND (store_code IS NULL OR length(store_code) > 0)),
     CONSTRAINT ck_rbr_reason  CHECK (reason_code IN ('QUALITY','DAMAGED','EXPIRED','NEAR_EXPIRY','WRONG_ITEM','OVERSTOCK','TEMP_ABNORMAL','PACKAGING','OTHER'))
 );
-CREATE FUNCTION trg_rrsv_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_rrsv_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN   -- @pg-only
     IF NEW.status <> OLD.status AND NOT (OLD.status = 'CREATED' AND NEW.status IN ('RECEIVED','CANCELLED')) THEN   -- @pg-only
         RAISE EXCEPTION 'rrsv_state_forward_only' USING ERRCODE = '23514';   -- @pg-only
@@ -263,7 +263,7 @@ BEGIN   -- @pg-only
     RETURN NEW;   -- @pg-only
 END $$;   -- @pg-only
 CREATE TRIGGER trg_rrsv_guard BEFORE UPDATE ON return_reservation FOR EACH ROW EXECUTE FUNCTION trg_rrsv_guard();   -- @pg-only
-CREATE FUNCTION trg_rrsl_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_rrsl_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN   -- @pg-only
     IF TG_OP = 'INSERT' THEN   -- @pg-only
         IF NOT EXISTS (SELECT 1 FROM return_reservation r WHERE r.id = NEW.reservation_id AND r.status = 'CREATED') THEN   -- @pg-only
@@ -281,11 +281,11 @@ BEGIN   -- @pg-only
     RETURN NEW;   -- @pg-only
 END $$;   -- @pg-only
 CREATE TRIGGER trg_rrsl_guard BEFORE INSERT OR UPDATE ON return_reservation_line FOR EACH ROW EXECUTE FUNCTION trg_rrsl_guard();   -- @pg-only
-CREATE FUNCTION trg_rtn10_no_delete() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_rtn10_no_delete() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN   -- @pg-only
     RAISE EXCEPTION 'return_no_delete' USING ERRCODE = '23514';   -- @pg-only
 END $$;   -- @pg-only
-CREATE FUNCTION trg_rbr_immutable() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_rbr_immutable() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN   -- @pg-only
     RAISE EXCEPTION 'rbr_immutable' USING ERRCODE = '23514';   -- @pg-only
 END $$;   -- @pg-only

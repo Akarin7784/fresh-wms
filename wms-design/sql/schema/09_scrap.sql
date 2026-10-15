@@ -81,7 +81,7 @@ CREATE INDEX ix_scrl_stock ON scrap_line(stock_id);
 --     release_scrap_hold(REVOKED) 也拒绝（02 f802a41）；质检或交接判错只走 SCRAP_MISREPORT 审批 → VOIDED（与 convert_hold SCRAP_PENDING→RETURN_QC 同事务）。
 -- K3：code / warehouse_id / source_* / applicant_id 建单后不可改；approver_id / approved_at / posted_at 只能从 NULL 写一次；终态整行只读。
 -- S1：INSERT 只能是 DRAFT。K2：不许 DELETE / TRUNCATE（PG 兜超级用户和迁移脚本），SQLite 另拦 REPLACE。
-CREATE FUNCTION trg_scr_forward() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_scr_forward() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN   -- @pg-only
     IF NEW.status <> OLD.status AND OLD.source_type IN ('RETURN_HANDOVER','RETURN_QC')   -- @pg-only
        AND NEW.status IN ('DRAFT','CANCELLED','REJECTED') THEN   -- @pg-only
@@ -114,7 +114,7 @@ BEGIN   -- @pg-only
     RETURN NEW;   -- @pg-only
 END $$;   -- @pg-only
 CREATE TRIGGER trg_scr_forward BEFORE UPDATE ON scrap_order FOR EACH ROW EXECUTE FUNCTION trg_scr_forward();   -- @pg-only
-CREATE FUNCTION trg_scr_ins_draft() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_scr_ins_draft() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN   -- @pg-only
     IF NEW.status <> 'DRAFT' AND NEW.status IN ('PENDING_APPROVAL','APPROVED','POSTED','REJECTED','CANCELLED','VOIDED') THEN   -- @pg-only
         RAISE EXCEPTION 'scrap_insert_draft_only' USING ERRCODE = '23514';   -- @pg-only
@@ -124,7 +124,7 @@ END $$;   -- @pg-only
 CREATE TRIGGER trg_scr_ins_draft BEFORE INSERT ON scrap_order FOR EACH ROW EXECUTE FUNCTION trg_scr_ins_draft();   -- @pg-only
 -- 报损行（K3/K4）：只能在 DRAFT 单下新增或修改；单据离开 DRAFT 后整行只读；
 -- 带冻结的行（hold_id≠0）数量必须等于冻结余量、库存一致；锁定来源（交接 / 质检）的行冻结写定后数量、库存、hold_id 都不能改
-CREATE FUNCTION trg_scrl_draft_only() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_scrl_draft_only() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN   -- @pg-only
     IF TG_OP = 'INSERT' THEN   -- @pg-only
         IF NOT EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = NEW.scrap_id AND o.status = 'DRAFT') THEN   -- @pg-only
@@ -153,7 +153,7 @@ BEGIN   -- @pg-only
     RETURN NEW;   -- @pg-only
 END $$;   -- @pg-only
 CREATE TRIGGER trg_scrl_draft_only BEFORE INSERT OR UPDATE ON scrap_line FOR EACH ROW EXECUTE FUNCTION trg_scrl_draft_only();   -- @pg-only
-CREATE FUNCTION trg_scr_no_delete() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_scr_no_delete() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN   -- @pg-only
     RAISE EXCEPTION 'scrap_no_delete' USING ERRCODE = '23514';   -- @pg-only
 END $$;   -- @pg-only

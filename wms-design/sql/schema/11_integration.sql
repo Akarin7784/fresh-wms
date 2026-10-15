@@ -31,7 +31,7 @@ CREATE INDEX ix_upl_time ON upstream_push_log(warehouse_id, received_at);
 CREATE INDEX ix_upl_src  ON upstream_push_log(source_system, source_order_no, received_at);
 -- 小赵 B1：只追加在库层落地（写法同 stock_movement）。wms_app 只有 SELECT/INSERT；
 -- 唯一能删的是清理函数 purge_push_log()（属主 wms_purge_owner，与 02 purge_expired 同一套），且只能删 retain_until 已过（按 UTC）的行；UPDATE、TRUNCATE 对任何角色都拦。
-CREATE FUNCTION trg_upl_append_only() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_upl_append_only() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF TG_OP = 'DELETE' AND current_user = 'wms_purge_owner' AND OLD.retain_until < (now() AT TIME ZONE 'UTC') THEN  -- @pg-only
         RETURN OLD;                                                                                           -- @pg-only
@@ -91,7 +91,7 @@ REVOKE UPDATE, DELETE, TRUNCATE ON upstream_push_log FROM wms_app;              
 -- 属主 wms_purge_owner、wms_cleaner 的 EXECUTE、wms_purge_owner 对 upstream_push_log 的 SELECT/DELETE 都由 #2 99_grants.sql 按目录检查授予
 -- （GRANT 自 4e3a7efb；ALTER FUNCTION … OWNER 自 #2 round 7）。SECURITY DEFINER + search_path = pg_catalog, public（本库对象都在 public）。
 CREATE FUNCTION public.purge_push_log(OUT push_log_deleted BIGINT)                     -- @pg-only
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$          -- @pg-only
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$          -- @pg-only
 BEGIN                                                                                  -- @pg-only
     DELETE FROM public.upstream_push_log WHERE retain_until < (now() AT TIME ZONE 'UTC');  -- @pg-only
     GET DIAGNOSTICS push_log_deleted = ROW_COUNT;                                      -- @pg-only
@@ -172,7 +172,7 @@ CREATE INDEX ix_outbox_noseq ON outbox_event(node_id, id) WHERE seq = 0;
 --   ① 进 SENDING 时，同 biz_key 更早（id 更小）的事件必须都已 SENT 或 SKIPPED，否则 outbox_bizkey_blocked
 --   ② SKIPPED 只能从 DEAD 来，且 SKIPPED / SENT 是终态
 --   ③ seq 只能从 0 补成正数一次，之后不可改（relay 补号、边缘事务内取号都满足）
-CREATE FUNCTION trg_outbox_order_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_outbox_order_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF NEW.status = 'SENDING' AND OLD.status <> 'SENDING' AND EXISTS (SELECT 1 FROM outbox_event e WHERE e.biz_key = NEW.biz_key AND e.id < NEW.id AND e.status NOT IN ('SENT','SKIPPED')) THEN  -- @pg-only
         RAISE EXCEPTION 'outbox_bizkey_blocked' USING ERRCODE = '23514';                                      -- @pg-only
@@ -198,7 +198,7 @@ CREATE TRIGGER trg_outbox_order_guard BEFORE UPDATE ON outbox_event FOR EACH ROW
 
 -- 小赵 Q2：去重记录与 outbox 只能清理"已过期 / 已投递且过保留期"的行（两库触发器，条件与 purge_expired() 一致）
 -- search_path 固定为 pg_catalog, public。now()、interval、AT TIME ZONE 走 pg_catalog。
-CREATE FUNCTION trg_purge_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_purge_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF TG_OP = 'TRUNCATE' THEN RAISE EXCEPTION 'purge_not_allowed: %', TG_TABLE_NAME USING ERRCODE = '42501'; END IF;  -- @pg-only
     IF TG_TABLE_NAME = 'idempotency_record' THEN                                                              -- @pg-only
@@ -220,7 +220,7 @@ CREATE TRIGGER trg_outbox_no_truncate  BEFORE TRUNCATE ON outbox_event       FOR
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'purge_not_allowed: outbox_event'); END;
 -- 九轮 P2：过期/投递时间写入后只许往后改，不许改早；created_at 不可改；SENT 是终态；sent_at 首次写入不得早于 created_at
 -- search_path 固定为 pg_catalog, public。now()、extract、interval、AT TIME ZONE 走 pg_catalog，调用方 schema 里的 now() 不生效。
-CREATE FUNCTION trg_expiry_forward() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_expiry_forward() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF NEW.created_at IS DISTINCT FROM OLD.created_at THEN                                                    -- @pg-only
         RAISE EXCEPTION 'expiry_backdate: created_at' USING ERRCODE = '42501'; END IF;                        -- @pg-only
@@ -248,7 +248,7 @@ CREATE TRIGGER trg_outbox_expiry_fwd BEFORE UPDATE ON outbox_event       FOR EAC
 -- 非属主插入非 PENDING、或带上 sent_at：直接拒绝（outbox_insert_not_pending），不把 status 改写成 PENDING。
 -- 表属主（建表的迁移角色）可以插入其他状态，种子和迁移走这条。
 -- search_path 固定为 pg_catalog, public。属主查询全部写在 pg_catalog。
-CREATE FUNCTION trg_outbox_insert_pending() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_outbox_insert_pending() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 DECLARE                                                                                                       -- @pg-only
     owner_name name;                                                                                          -- @pg-only
 BEGIN                                                                                                         -- @pg-only

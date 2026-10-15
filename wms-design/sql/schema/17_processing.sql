@@ -35,7 +35,7 @@ CREATE TABLE process_bom (
 -- 同仓同编码只能有一个 ACTIVE 版本
 CREATE UNIQUE INDEX uq_pbom_active ON process_bom(warehouse_id, code) WHERE status = 'ACTIVE';
 -- 状态只前进 DRAFT→ACTIVE→RETIRED（不允许 ACTIVE→DRAFT 再改行绕过 trg_pboml_frozen）；非 DRAFT 时配置列只读
-CREATE FUNCTION trg_pbom_forward() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_pbom_forward() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF NOT ((OLD.status = NEW.status) OR (OLD.status = 'DRAFT' AND NEW.status = 'ACTIVE')                     -- @pg-only
             OR (OLD.status = 'ACTIVE' AND NEW.status = 'RETIRED'))                                            -- @pg-only
@@ -70,7 +70,7 @@ CREATE TABLE process_bom_line (
     CONSTRAINT ck_pboml_qty  CHECK (std_qty_milli > 0 AND std_qty_milli = CAST(std_qty_milli AS BIGINT) AND line_no >= 1)
 );
 -- BOM 生效后只读：改配方 = 新版本（加工单下达时另有快照，双保险）
-CREATE FUNCTION trg_pboml_frozen() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_pboml_frozen() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF EXISTS (SELECT 1 FROM process_bom b WHERE b.id = COALESCE(NEW.bom_id, OLD.bom_id) AND b.status <> 'DRAFT')   -- @pg-only
        OR (TG_OP = 'UPDATE' AND EXISTS (SELECT 1 FROM process_bom b WHERE b.id = OLD.bom_id AND b.status <> 'DRAFT')) THEN  -- @pg-only
@@ -206,7 +206,7 @@ CREATE TABLE process_order (
 CREATE INDEX ix_prc_status ON process_order(warehouse_id, status, work_date, bom_code);
 CREATE UNIQUE INDEX uq_prc_apr ON process_order(approval_no) WHERE approval_no IS NOT NULL;
 -- 快照只读、终态只读、累计列只增（领用/冲回/消耗/报废/返工）
-CREATE FUNCTION trg_prc_snapshot() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_prc_snapshot() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF (OLD.status <> 'CREATED' AND (NEW.bom_id IS DISTINCT FROM OLD.bom_id OR NEW.bom_code IS DISTINCT FROM OLD.bom_code  -- @pg-only
          OR NEW.bom_version IS DISTINCT FROM OLD.bom_version OR NEW.bom_snapshot IS DISTINCT FROM OLD.bom_snapshot      -- @pg-only
@@ -231,7 +231,7 @@ BEGIN                                                                           
     RETURN NEW;                                                                                               -- @pg-only
 END $$;                                                                                                       -- @pg-only
 CREATE TRIGGER trg_prc_snapshot BEFORE UPDATE ON process_order FOR EACH ROW EXECUTE FUNCTION trg_prc_snapshot();  -- @pg-only
-CREATE FUNCTION trg_prc_insert() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_prc_insert() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF NEW.status <> 'CREATED' THEN RAISE EXCEPTION 'process_order_bad_transition' USING ERRCODE = '23514'; END IF;  -- @pg-only
     RETURN NEW;                                                                                               -- @pg-only
@@ -317,7 +317,7 @@ CREATE TABLE process_issue (
 );
 CREATE INDEX ix_prci_lot ON process_issue(lot_id);
 -- 领用行关键列只读、累计列只增、不可删（S1-2）
-CREATE FUNCTION trg_prci_immutable() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_prci_immutable() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF TG_OP = 'DELETE' OR NEW.issue_qty_milli IS DISTINCT FROM OLD.issue_qty_milli OR NEW.hold_id IS DISTINCT FROM OLD.hold_id  -- @pg-only
        OR NEW.lot_id IS DISTINCT FROM OLD.lot_id OR NEW.src_stock_id IS DISTINCT FROM OLD.src_stock_id        -- @pg-only
@@ -515,7 +515,7 @@ CREATE TRIGGER trg_prcv_append_only BEFORE UPDATE OR DELETE ON process_reversal 
 -- @sqlite-only WHEN EXISTS (SELECT 1 FROM process_reversal v WHERE v.id = NEW.id OR v.op_key = NEW.op_key)
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'process_reversal_duplicate'); END;
 -- 产出行：关键列只读，reversed_qty_milli 只增
-CREATE FUNCTION trg_prco_immutable() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_prco_immutable() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF TG_OP = 'DELETE' OR NEW.qty_milli IS DISTINCT FROM OLD.qty_milli OR NEW.gross_qty_milli IS DISTINCT FROM OLD.gross_qty_milli  -- @pg-only
        OR NEW.tare_qty_milli IS DISTINCT FROM OLD.tare_qty_milli OR NEW.lot_id IS DISTINCT FROM OLD.lot_id     -- @pg-only

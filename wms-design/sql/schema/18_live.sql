@@ -18,7 +18,7 @@ CREATE TABLE sku_live_param (
     CONSTRAINT ck_slp_bp CHECK (weigh_tolerance_bp BETWEEN 0 AND 10000 AND death_rate_threshold_bp BETWEEN 0 AND 10000 AND shrink_tolerance_bp BETWEEN 0 AND 10000)
 -- @sqlite-only     , CONSTRAINT ck_slp_ts CHECK ((typeof(updated_at) = 'text' AND length(updated_at) = 19 AND updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(updated_at) = substr(updated_at, 1, 10) AND time(updated_at) = substr(updated_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
 );
-CREATE FUNCTION trg_slp_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_slp_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN                                                                                     -- @pg-only
     IF TG_OP = 'DELETE' OR (NEW.sku_id <> OLD.sku_id) THEN RAISE EXCEPTION 'slp_immutable'; END IF;  -- @pg-only
     RETURN NEW;                                                                           -- @pg-only
@@ -61,7 +61,7 @@ CREATE TABLE live_tank (
     CONSTRAINT fk_lt_sku FOREIGN KEY (sku_id) REFERENCES sku(id)
 -- @sqlite-only     , CONSTRAINT ck_lt_ts CHECK ((typeof(updated_at) = 'text' AND length(updated_at) = 19 AND updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(updated_at) = substr(updated_at, 1, 10) AND time(updated_at) = substr(updated_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
 );
-CREATE FUNCTION trg_lt_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_lt_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN                                                                                     -- @pg-only
     IF TG_OP = 'DELETE' OR (NEW.location_id <> OLD.location_id OR NEW.warehouse_id <> OLD.warehouse_id OR NEW.sku_id <> OLD.sku_id) THEN RAISE EXCEPTION 'lt_immutable'; END IF;  -- @pg-only
     RETURN NEW;                                                                           -- @pg-only
@@ -70,7 +70,7 @@ CREATE TRIGGER trg_lt_guard BEFORE UPDATE OR DELETE ON live_tank FOR EACH ROW EX
 CREATE TRIGGER trg_lt_no_truncate BEFORE TRUNCATE ON live_tank FOR EACH STATEMENT EXECUTE FUNCTION trg_append_only();  -- @pg-only
 -- @sqlite-only CREATE TRIGGER trg_lt_upd BEFORE UPDATE ON live_tank WHEN NEW.location_id <> OLD.location_id OR NEW.warehouse_id <> OLD.warehouse_id OR NEW.sku_id <> OLD.sku_id BEGIN SELECT RAISE(ABORT, 'lt_immutable'); END;
 -- @sqlite-only CREATE TRIGGER trg_lt_del BEFORE DELETE ON live_tank BEGIN SELECT RAISE(ABORT, 'lt_immutable'); END;
-CREATE FUNCTION trg_lt_type() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$                       -- @pg-only
+CREATE FUNCTION trg_lt_type() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$                       -- @pg-only
 BEGIN                                                                                       -- @pg-only
     IF NOT EXISTS (SELECT 1 FROM location l WHERE l.id = NEW.location_id AND l.location_type = 'LIVE_TANK' AND l.warehouse_id = NEW.warehouse_id)  -- @pg-only
     THEN RAISE EXCEPTION 'lt_not_live_tank'; END IF;                                        -- @pg-only
@@ -97,7 +97,7 @@ CREATE TABLE live_stock_count (
     CONSTRAINT fk_lsc_lot FOREIGN KEY (lot_id) REFERENCES lot(id)
 -- @sqlite-only     , CONSTRAINT ck_lsc_ts CHECK ((typeof(updated_at) = 'text' AND length(updated_at) = 19 AND updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(updated_at) = substr(updated_at, 1, 10) AND time(updated_at) = substr(updated_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
 );
-CREATE FUNCTION trg_lsc_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$                     -- @pg-only
+CREATE FUNCTION trg_lsc_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$                     -- @pg-only
 BEGIN                                                                                       -- @pg-only
     IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'lsc_immutable'; END IF;                       -- @pg-only
     IF TG_OP = 'UPDATE' AND (NEW.stock_id <> OLD.stock_id OR NEW.location_id <> OLD.location_id OR NEW.lot_id <> OLD.lot_id)  -- @pg-only
@@ -197,7 +197,7 @@ CREATE TABLE live_tank_hold (
 -- @sqlite-only     , CONSTRAINT ck_lth_ts CHECK ((released_at IS NULL OR (typeof(released_at) = 'text' AND length(released_at) = 19 AND released_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(released_at) = substr(released_at, 1, 10) AND time(released_at) = substr(released_at, 12, 8))) AND (typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
 );
 CREATE UNIQUE INDEX uq_lth_active ON live_tank_hold(location_id) WHERE status = 'ACTIVE';
-CREATE FUNCTION trg_lth_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$                     -- @pg-only
+CREATE FUNCTION trg_lth_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$                     -- @pg-only
 BEGIN                                                                                       -- @pg-only
     IF TG_OP = 'INSERT' THEN                                                                -- @pg-only
         IF NEW.status <> 'ACTIVE' THEN RAISE EXCEPTION 'lth_state'; END IF; RETURN NEW;    -- @pg-only
@@ -316,7 +316,7 @@ CREATE TABLE live_death (
 CREATE INDEX ix_ld_tank_day ON live_death(location_id, work_date);   -- 日死亡率
 CREATE INDEX ix_ld_pending ON live_death(deduct_status) WHERE deduct_status <> 'DEDUCTED';   -- 补扣作业 / 在途对账
 -- 只追加，唯一例外：写节点恢复后补扣，PENDING → DEDUCTED / EXCEPTION，只改 deduct_status、movement_id、deducted_qty_milli、exception_key
-CREATE FUNCTION trg_ld_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$                                     -- @pg-only
+CREATE FUNCTION trg_ld_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$                                     -- @pg-only
 BEGIN                                                                                                       -- @pg-only
     IF TG_OP = 'UPDATE' AND OLD.deduct_status = 'PENDING' AND NEW.deduct_status IN ('DEDUCTED', 'EXCEPTION')   -- @pg-only
        AND (to_jsonb(NEW) - 'deduct_status' - 'movement_id' - 'exception_key' - 'deducted_qty_milli')                  -- @pg-only
@@ -397,7 +397,7 @@ GRANT SELECT ON v_live_death_in_transit TO wms_app;  -- @pg-only
 -- 02 五轮口径：同一 idempotency_key（LD-{id}:1:D1:1）已有流水就直接返回 EXISTING_MOVEMENT:{状态}，不再进库存。
 -- 返回 WON:{已扣}:{差额}:{sku_id}；差额 > 0 时调用方在同事务按 10 篇开异常单（source_type=LIVE_DEATH，键 LDTH:{id}，sku_id = 返回的 sku）。
 -- 最后的条件 UPDATE 是第二道保险：0 行即 RAISE，整笔回滚。SQLite 单写者，应用层同序执行，不建本函数。
-CREATE FUNCTION live_death_makeup(p_ld BIGINT, p_mid BIGINT) RETURNS TEXT LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION live_death_makeup(p_ld BIGINT, p_mid BIGINT) RETURNS TEXT LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 DECLARE st TEXT; v_sid BIGINT; v_lot BIGINT; v_loc BIGINT; v_wh BIGINT; v_day DATE; v_death BIGINT; v_sku BIGINT;  -- @pg-only
         v_hid BIGINT; v_avail BIGINT; v_q BIGINT; v_after BIGINT; v_seq BIGINT; v_biz TEXT; v_opk TEXT; n INT;  -- @pg-only
 BEGIN  -- @pg-only
@@ -429,7 +429,7 @@ BEGIN  -- @pg-only
             RETURNING on_hand_qty_milli, ledger_seq INTO v_after, v_seq;  -- @pg-only
         END IF;  -- @pg-only
         IF v_seq IS NULL THEN RAISE EXCEPTION 'makeup_stock_rowcount_0: %', p_ld; END IF;  -- @pg-only
-        INSERT INTO stock_ledger_line (biz_no, line_no, src_kind, owner_device_instance_id) VALUES (v_biz, 1, 'DOC', NULL) ON CONFLICT DO NOTHING;  -- @pg-only
+        INSERT INTO stock_ledger_line (biz_no, line_no, src_kind, owner_device_instance_id) SELECT v_biz,1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = v_biz AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING;  -- @pg-only
         INSERT INTO stock_movement (id, biz_no, line_no, op_no, leg, src_kind, biz_type, direction, stock_id, stock_seq, warehouse_id, location_id, sku_id, lot_id,  -- @pg-only
                                     move_qty_milli, on_hand_before_qty_milli, on_hand_after_qty_milli, occurred_at, idempotency_key, hold_id)  -- @pg-only
              VALUES (p_mid, v_biz, 1, 1, 1, 'DOC', 'SCRAP', -1, v_sid, v_seq, v_wh, v_loc, v_sku, v_lot, v_q, v_after + v_q, v_after, v_day, v_opk, v_hid);  -- @pg-only
