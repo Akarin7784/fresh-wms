@@ -119,9 +119,11 @@ CREATE TABLE approval_request (
 -- @sqlite-only         AND substr(code, -16) GLOB '-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]'
 -- @sqlite-only         AND (substr(code, -11, 2) GLOB '0[1-9]' OR substr(code, -11, 2) GLOB '1[0-2]')
 -- @sqlite-only         AND (substr(code, -9, 2) GLOB '0[1-9]' OR substr(code, -9, 2) GLOB '[12][0-9]' OR substr(code, -9, 2) GLOB '3[01]')),
-    -- SCRAP_MISREPORT 审批人：质检主管或中心运维（是否真持有由 trg_apr_final / trg_apr_role 查 sys_user_role）
+    -- SCRAP_MISREPORT 审批人不再限角色：改由权限点 scrap.misreport.approve 判定（trg_apr_final 的权限点分支）。
+    -- 依 Chief 裁决：00 §6.6 是三层校验（权限点 + 数据权限 + 强制边界），13 篇前端也按权限点渲染按钮，
+    -- 只走角色会让「前端渲染 vs 后端拒绝」永远对不上。本 CHECK 退化为格式兜底（角色非空由 ck_apr_pair 管）。
     CONSTRAINT ck_apr_scrap_roles CHECK (approval_type <> 'SCRAP_MISREPORT'
-        OR first_approver_id IS NULL OR first_approver_role IN ('QC_SUPERVISOR','CENTER_OPS'))
+        OR first_approver_id IS NULL OR first_approver_role IS NOT NULL)
 );
 ALTER TABLE audit_log ADD CONSTRAINT fk_audit_approval FOREIGN KEY (approval_id) REFERENCES approval_request (id);  -- @pg-only
 
@@ -201,9 +203,10 @@ BEGIN                                                                           
     END IF;                                                                                                   -- @pg-only
     IF NEW.approval_type = 'SCRAP_MISREPORT' AND NOT EXISTS (                                                 -- @pg-only
          SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id                                  -- @pg-only
+          JOIN sys_role_perm rp ON rp.role_id = r.id JOIN sys_permission p ON p.id = rp.perm_id                -- @pg-only
           JOIN sys_user_warehouse uw ON uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id         -- @pg-only
-          WHERE ur.user_id = NEW.requested_by AND r.code = 'WH_SUPERVISOR') THEN                              -- @pg-only
-        RAISE EXCEPTION 'approval_role_not_held' USING ERRCODE = '23514';                                    -- @pg-only
+          WHERE ur.user_id = NEW.requested_by AND p.code = 'scrap.misreport.request') THEN                    -- @pg-only
+        RAISE EXCEPTION 'approval_perm_not_held' USING ERRCODE = '23514';                                     -- @pg-only
     END IF;                                                                                                   -- @pg-only
     RETURN NEW;                                                                                               -- @pg-only
 END $$;                                                                                                       -- @pg-only
@@ -263,10 +266,12 @@ BEGIN                                                                           
     END IF;                                                                                                   -- @pg-only
     IF NEW.approval_type = 'SCRAP_MISREPORT' AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL  -- @pg-only
        AND NOT EXISTS (SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id                    -- @pg-only
+             JOIN sys_role_perm rp ON rp.role_id = r.id JOIN sys_permission p ON p.id = rp.perm_id            -- @pg-only
              WHERE ur.user_id = NEW.first_approver_id AND r.code = NEW.first_approver_role                    -- @pg-only
                AND (r.code = 'CENTER_OPS' OR EXISTS (SELECT 1 FROM sys_user_warehouse uw                      -- @pg-only
-                    WHERE uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id))) THEN              -- @pg-only
-        RAISE EXCEPTION 'approval_role_not_held' USING ERRCODE = '23514';                                    -- @pg-only
+                    WHERE uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id))                    -- @pg-only
+               AND p.code = 'scrap.misreport.approve') THEN                                                   -- @pg-only
+        RAISE EXCEPTION 'approval_perm_not_held' USING ERRCODE = '23514';                                    -- @pg-only
     END IF;                                                                                                   -- @pg-only
     RETURN NEW;                                                                                               -- @pg-only
 END $$;                                                                                                       -- @pg-only
@@ -288,9 +293,10 @@ CREATE TRIGGER trg_apr_final BEFORE UPDATE ON approval_request FOR EACH ROW EXEC
 -- @sqlite-only CREATE TRIGGER trg_apr_insert_role BEFORE INSERT ON approval_request
 -- @sqlite-only WHEN NEW.approval_type = 'SCRAP_MISREPORT' AND NOT EXISTS (
 -- @sqlite-only     SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
+-- @sqlite-only      JOIN sys_role_perm rp ON rp.role_id = r.id JOIN sys_permission p ON p.id = rp.perm_id
 -- @sqlite-only      JOIN sys_user_warehouse uw ON uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id
--- @sqlite-only      WHERE ur.user_id = NEW.requested_by AND r.code = 'WH_SUPERVISOR')
--- @sqlite-only BEGIN SELECT RAISE(ABORT, 'approval_role_not_held'); END;
+-- @sqlite-only      WHERE ur.user_id = NEW.requested_by AND p.code = 'scrap.misreport.request')
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'approval_perm_not_held'); END;
 -- @sqlite-only CREATE TRIGGER trg_apr_final BEFORE UPDATE ON approval_request
 -- @sqlite-only WHEN OLD.status IN ('APPROVED','REJECTED','EXPIRED','WITHDRAWN')
 -- @sqlite-only   OR NEW.payload_hash IS NOT OLD.payload_hash OR NEW.payload_json IS NOT OLD.payload_json
@@ -345,10 +351,12 @@ CREATE TRIGGER trg_apr_final BEFORE UPDATE ON approval_request FOR EACH ROW EXEC
 -- @sqlite-only CREATE TRIGGER trg_apr_scrap_role BEFORE UPDATE ON approval_request
 -- @sqlite-only WHEN NEW.approval_type = 'SCRAP_MISREPORT' AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL
 -- @sqlite-only   AND NOT EXISTS (SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
+-- @sqlite-only         JOIN sys_role_perm rp ON rp.role_id = r.id JOIN sys_permission p ON p.id = rp.perm_id
 -- @sqlite-only         WHERE ur.user_id = NEW.first_approver_id AND r.code = NEW.first_approver_role
 -- @sqlite-only           AND (r.code = 'CENTER_OPS' OR EXISTS (SELECT 1 FROM sys_user_warehouse uw
--- @sqlite-only                WHERE uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id)))
--- @sqlite-only BEGIN SELECT RAISE(ABORT, 'approval_role_not_held'); END;
+-- @sqlite-only                WHERE uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id))
+-- @sqlite-only           AND p.code = 'scrap.misreport.approve')
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'approval_perm_not_held'); END;
 
 -- ===== 小赵 I3 + S1：设备绑定 INSERT 只能 PENDING；REVOKED 终态；身份列不可改；激活必须有本绑定的已通过 DEVICE_BIND 审批，审批人 ≠ 使用人 =====
 CREATE FUNCTION trg_udb_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$                                      -- @pg-only
