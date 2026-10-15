@@ -1,8 +1,8 @@
 -- 本文件由 sql/verify_sqlite.py 从 sql/schema/*.sql 按加载顺序机械生成，请勿手改。
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
---   2. 33 处 DEFAULT now()、42 处 DEFAULT (now() AT TIME ZONE 'UTC') / (date_trunc('second', now() AT TIME ZONE 'UTC')) → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
---   3. 方言专属行：删除 1187 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 765 行 @sqlite-only（等价触发器）
+--   2. 32 处 DEFAULT now()、44 处 DEFAULT (now() AT TIME ZONE 'UTC') / (date_trunc('second', now() AT TIME ZONE 'UTC')) → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
+--   3. 方言专属行：删除 1405 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 857 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -2197,7 +2197,7 @@ CREATE TABLE sys_user (
     mp_openid       VARCHAR(64),
     status          VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
     last_login_at   TIMESTAMP,
-    created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- 00 §6.8：UTC 整秒
     deleted_at      TIMESTAMP,
     CONSTRAINT uq_user_name UNIQUE (username)
 );
@@ -2222,9 +2222,12 @@ CREATE TABLE sys_permission (
     CONSTRAINT uq_perm_code UNIQUE (code)
 );
 
-CREATE TABLE sys_user_role     (user_id BIGINT NOT NULL, role_id BIGINT NOT NULL, PRIMARY KEY(user_id, role_id));
-CREATE TABLE sys_role_perm     (role_id BIGINT NOT NULL, perm_id BIGINT NOT NULL, PRIMARY KEY(role_id, perm_id));
-CREATE TABLE sys_user_warehouse(user_id BIGINT NOT NULL, warehouse_id BIGINT NOT NULL, PRIMARY KEY(user_id, warehouse_id));
+CREATE TABLE sys_user_role     (user_id BIGINT NOT NULL, role_id BIGINT NOT NULL, PRIMARY KEY(user_id, role_id),
+    CONSTRAINT fk_ur_user FOREIGN KEY (user_id) REFERENCES sys_user (id), CONSTRAINT fk_ur_role FOREIGN KEY (role_id) REFERENCES sys_role (id));
+CREATE TABLE sys_role_perm     (role_id BIGINT NOT NULL, perm_id BIGINT NOT NULL, PRIMARY KEY(role_id, perm_id),
+    CONSTRAINT fk_rp_role FOREIGN KEY (role_id) REFERENCES sys_role (id), CONSTRAINT fk_rp_perm FOREIGN KEY (perm_id) REFERENCES sys_permission (id));
+CREATE TABLE sys_user_warehouse(user_id BIGINT NOT NULL, warehouse_id BIGINT NOT NULL, PRIMARY KEY(user_id, warehouse_id),
+    CONSTRAINT fk_uw_user FOREIGN KEY (user_id) REFERENCES sys_user (id), CONSTRAINT fk_uw_wh FOREIGN KEY (warehouse_id) REFERENCES warehouse (id));
 
 CREATE TABLE api_credential (
     id               BIGINT       PRIMARY KEY,
@@ -2236,6 +2239,7 @@ CREATE TABLE api_credential (
     last_used_at     TIMESTAMP,
     CONSTRAINT uq_api_key UNIQUE (api_key)
 );
+-- Doro 裁定：audit_log.actor_id → sys_user(id)。SQLite 由 11 写进 CREATE TABLE；PG 在 sys_user 建好后由此处补（不搬文件、不改加载顺序）
 -- =============================================================================
 -- 12b_auth_audit.sql —— 第 12 篇（权限与审计，PR #9）自有 DDL
 -- 加载顺序：紧跟 12_auth.sql 之后、90_available_view.sql 之前。
@@ -2246,7 +2250,7 @@ CREATE TABLE api_credential (
 ALTER TABLE audit_log ADD COLUMN node_id INT NOT NULL DEFAULT 0;            -- 0 = 未登记节点，应用层必填真实 node_id
 ALTER TABLE audit_log ADD COLUMN node_seq BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE audit_log ADD COLUMN device_instance_id VARCHAR(64);
-ALTER TABLE audit_log ADD COLUMN approval_id BIGINT;
+ALTER TABLE audit_log ADD COLUMN approval_id BIGINT REFERENCES approval_request(id);   -- 可空、默认 NULL；SQLite 允许前向引用
 CREATE UNIQUE INDEX uq_audit_node_seq ON audit_log(node_id, node_seq);
 CREATE INDEX ix_audit_wh ON audit_log(warehouse_id, occurred_at DESC);
 -- Doro 定：DEFAULT 0 只为兼容存量行；新写入 node_id/node_seq 必须 > 0（应用层映射 40001 PARAM_INVALID）
@@ -2269,49 +2273,7 @@ ALTER TABLE sys_user ADD COLUMN perm_version BIGINT NOT NULL DEFAULT 1 CONSTRAIN
 -- -----------------------------------------------------------------------------
 
 -- 设备实例绑定：device_instance_id（App 安装实例）↔ 账号 + 仓。一个实例同时最多一条 PENDING/ACTIVE 绑定
-CREATE TABLE user_device_binding (
-    id                  BIGINT       PRIMARY KEY,
-    device_instance_id  VARCHAR(64)  NOT NULL,
-    device_id           BIGINT,                      -- 第 1 篇 device 台账；司机自有手机可为空
-    client_type         VARCHAR(16)  NOT NULL,       -- PDA / DRIVER_APP
-    user_id             BIGINT       NOT NULL,
-    warehouse_id        BIGINT       NOT NULL,
-    status              VARCHAR(16)  NOT NULL DEFAULT 'PENDING',   -- PENDING（待主管确认）/ ACTIVE / REVOKED（终态）
-    approval_id         BIGINT,                      -- DEVICE_BIND 审批单
-    bound_at            TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- UTC
-    activated_at        TIMESTAMP,
-    revoked_at          TIMESTAMP,
-    revoked_by          BIGINT,
-    revoke_reason       VARCHAR(64),
-    CONSTRAINT ck_udb_client CHECK (client_type IN ('PDA','DRIVER_APP')),
-    CONSTRAINT ck_udb_status CHECK ((status = 'PENDING' AND revoked_at IS NULL AND activated_at IS NULL)
-        OR (status = 'ACTIVE' AND revoked_at IS NULL AND activated_at IS NOT NULL AND approval_id IS NOT NULL)
-        OR (status = 'REVOKED' AND revoked_at IS NOT NULL))
-);
--- 同一设备实例同时最多一条未吊销绑定（PENDING 或 ACTIVE）
-CREATE UNIQUE INDEX uq_udb_active ON user_device_binding(device_instance_id) WHERE status IN ('PENDING','ACTIVE');
-CREATE INDEX ix_udb_user ON user_device_binding(user_id, status);
-
--- 离线令牌：断网时边缘节点/终端本地校验用。签名在应用层，库里只存 jti 与吊销状态
-CREATE TABLE offline_token (
-    id                  BIGINT       PRIMARY KEY,
-    jti                 VARCHAR(64)  NOT NULL,
-    binding_id          BIGINT       NOT NULL,       -- user_device_binding.id
-    user_id             BIGINT       NOT NULL,
-    device_instance_id  VARCHAR(64)  NOT NULL,
-    warehouse_id        BIGINT       NOT NULL,
-    perm_version        BIGINT       NOT NULL,       -- 签发时的权限版本，权限变更后旧令牌联网即失效
-    issued_at           TIMESTAMP    NOT NULL,
-    expires_at          TIMESTAMP    NOT NULL,
-    revoked_at          TIMESTAMP,
-    CONSTRAINT uq_offline_jti UNIQUE (jti),
-    CONSTRAINT ck_offline_ttl CHECK (expires_at > issued_at),
-    -- 有效期上限 12 小时（docs/12 §3.3，小赵 I4）
-    CONSTRAINT ck_offline_max_ttl CHECK (datetime(expires_at) <= datetime(issued_at, '+12 hours'))
-);
-CREATE INDEX ix_offline_binding ON offline_token(binding_id) WHERE revoked_at IS NULL;
-
--- 主管审批（docs/12 §5）
+-- approval_request 建表提前到绑定表之前：fk_udb_approval 直接写在 CREATE TABLE 里（不再 ALTER）
 CREATE TABLE approval_request (
     id                  BIGINT       PRIMARY KEY,
     code                VARCHAR(64)  NOT NULL,       -- 审批单号 APR-{warehouse_code}-{yyyyMMdd}-{6 位序号}（ck_apr_code）；02 stock_hold.approval_no 存本列
@@ -2333,12 +2295,20 @@ CREATE TABLE approval_request (
     result_ref          VARCHAR(64),                 -- 执行结果引用：如 POD 更正的新 pod_id + correct_seq（服务端执行时分配）
     decided_at          TIMESTAMP,
     reject_reason       VARCHAR(256),
-    expires_at          TIMESTAMP    NOT NULL,
+    expires_at          TIMESTAMP,                   -- 不传由库算 created_at + 按类型上限（ck_apr_ttl）；只许缩短；不许 NULL（PG NOT NULL，SQLite trg_apr_expires_null）
     version             INT          NOT NULL DEFAULT 0,
-    created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- UTC；expires_at 等时间列一律存 UTC（对齐 02 ad8ec1b P1）
+    created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- UTC 整秒；非属主写入由库覆盖（trg_apr_zclock）
     CONSTRAINT uq_apr_code UNIQUE (code),
+    CONSTRAINT fk_apr_wh FOREIGN KEY (warehouse_id) REFERENCES warehouse (id),
+    CONSTRAINT fk_apr_requester FOREIGN KEY (requested_by) REFERENCES sys_user (id),
+    CONSTRAINT fk_apr_first FOREIGN KEY (first_approver_id) REFERENCES sys_user (id),
+    CONSTRAINT fk_apr_second FOREIGN KEY (second_approver_id) REFERENCES sys_user (id),
+    -- 有效期上限按类型（docs/12 §5 默认有效期：FAILOVER 1h、拣后取消 2h、得率偏离 12h，其余 24h）；00 §6.8 第 6 条：允许缩短，不许超上限
+    CONSTRAINT ck_apr_ttl CHECK (expires_at IS NULL OR COALESCE(CAST(strftime('%s', expires_at) AS INTEGER) - CAST(strftime('%s', created_at) AS INTEGER) BETWEEN 1 AND CASE approval_type WHEN 'UNPLANNED_FAILOVER' THEN 3600 WHEN 'CANCEL_AFTER_PICK' THEN 7200 WHEN 'PROCESS_YIELD_DEVIATION' THEN 43200 ELSE 86400 END, 0)),
+    CONSTRAINT ck_apr_ts CHECK ((created_at IS NULL OR (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(created_at) IS created_at AND substr(created_at, 12, 2) <= '23')) AND (expires_at IS NULL OR (expires_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(expires_at) IS expires_at AND substr(expires_at, 12, 2) <= '23')) AND (first_approved_at IS NULL OR (first_approved_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(first_approved_at) IS first_approved_at AND substr(first_approved_at, 12, 2) <= '23')) AND (second_approved_at IS NULL OR (second_approved_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(second_approved_at) IS second_approved_at AND substr(second_approved_at, 12, 2) <= '23')) AND (decided_at IS NULL OR (decided_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(decided_at) IS decided_at AND substr(decided_at, 12, 2) <= '23'))),
     CONSTRAINT ck_apr_type CHECK (approval_type IN ('POD_CORRECT','CANCEL_AFTER_PICK','UNPLANNED_FAILOVER','DEVICE_BIND','SCRAP_MISREPORT',
-        'PAPER_BACKFILL','BOX_VOID','PROCESS_YIELD_DEVIATION','LIVE_DEATH_OVER','PROCESS_REWORK')),   -- 【ck_apr_type 变更】00 已登记的 4 类 + PROCESS_REWORK（Doro 06:16）
+        'PAPER_BACKFILL','BOX_VOID','PROCESS_YIELD_DEVIATION','LIVE_DEATH_OVER','PROCESS_REWORK',
+        'INBOUND_CORRECTION','INBOUND_SOD_WAIVER')),   -- 【ck_apr_type 变更】00 已登记的 4 类 + PROCESS_REWORK（Doro 06:16）+ 第 3 篇两类（00 §6.6.1）
     -- 非计划切换 = 发起人 + 仓库主管 + 中心运维三人（00 §9.1），角色字符串固定；是否真持有该角色由 trg_apr_transition 查 sys_user_role
     CONSTRAINT ck_apr_failover_roles CHECK (approval_type <> 'UNPLANNED_FAILOVER'
         OR ((first_approver_id IS NULL OR first_approver_role = 'WH_SUPERVISOR')
@@ -2373,6 +2343,59 @@ CREATE TABLE approval_request (
     CONSTRAINT ck_apr_scrap_roles CHECK (approval_type <> 'SCRAP_MISREPORT'
         OR first_approver_id IS NULL OR first_approver_role IN ('QC_SUPERVISOR','CENTER_OPS'))
 );
+CREATE TABLE user_device_binding (
+    id                  BIGINT       PRIMARY KEY,
+    device_instance_id  VARCHAR(64)  NOT NULL,
+    device_id           BIGINT,                      -- 第 1 篇 device 台账；司机自有手机可为空
+    client_type         VARCHAR(16)  NOT NULL,       -- PDA / DRIVER_APP
+    user_id             BIGINT       NOT NULL,
+    warehouse_id        BIGINT       NOT NULL,
+    status              VARCHAR(16)  NOT NULL DEFAULT 'PENDING',   -- PENDING（待主管确认）/ ACTIVE / REVOKED（终态）
+    approval_id         BIGINT,                      -- DEVICE_BIND 审批单；fk_udb_approval → approval_request(id)（两库都写在建表语句里）
+    bound_at            TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- UTC 整秒；非属主写入由库覆盖（trg_udb_zclock）
+    activated_at        TIMESTAMP,
+    revoked_at          TIMESTAMP,
+    revoked_by          BIGINT,
+    revoke_reason       VARCHAR(64),
+    CONSTRAINT fk_udb_approval FOREIGN KEY (approval_id) REFERENCES approval_request (id),
+    CONSTRAINT fk_udb_user FOREIGN KEY (user_id) REFERENCES sys_user (id),
+    CONSTRAINT fk_udb_wh FOREIGN KEY (warehouse_id) REFERENCES warehouse (id),
+    CONSTRAINT fk_udb_revoker FOREIGN KEY (revoked_by) REFERENCES sys_user (id),
+    CONSTRAINT ck_udb_ts CHECK ((bound_at IS NULL OR (bound_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(bound_at) IS bound_at AND substr(bound_at, 12, 2) <= '23')) AND (activated_at IS NULL OR (activated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(activated_at) IS activated_at AND substr(activated_at, 12, 2) <= '23')) AND (revoked_at IS NULL OR (revoked_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(revoked_at) IS revoked_at AND substr(revoked_at, 12, 2) <= '23'))),
+    CONSTRAINT ck_udb_client CHECK (client_type IN ('PDA','DRIVER_APP')),
+    CONSTRAINT ck_udb_status CHECK ((status = 'PENDING' AND revoked_at IS NULL AND activated_at IS NULL)
+        OR (status = 'ACTIVE' AND revoked_at IS NULL AND activated_at IS NOT NULL AND approval_id IS NOT NULL)
+        OR (status = 'REVOKED' AND revoked_at IS NOT NULL))
+);
+-- 同一设备实例同时最多一条未吊销绑定（PENDING 或 ACTIVE）
+CREATE UNIQUE INDEX uq_udb_active ON user_device_binding(device_instance_id) WHERE status IN ('PENDING','ACTIVE');
+CREATE INDEX ix_udb_user ON user_device_binding(user_id, status);
+
+-- 离线令牌：断网时边缘节点/终端本地校验用。签名在应用层，库里只存 jti 与吊销状态
+CREATE TABLE offline_token (
+    id                  BIGINT       PRIMARY KEY,
+    jti                 VARCHAR(64)  NOT NULL,
+    binding_id          BIGINT       NOT NULL,       -- user_device_binding.id
+    user_id             BIGINT       NOT NULL,
+    device_instance_id  VARCHAR(64)  NOT NULL,
+    warehouse_id        BIGINT       NOT NULL,
+    perm_version        BIGINT       NOT NULL,       -- 签发时的权限版本，权限变更后旧令牌联网即失效
+    issued_at           TIMESTAMP    NOT NULL,
+    expires_at          TIMESTAMP    NOT NULL,
+    revoked_at          TIMESTAMP,
+    CONSTRAINT uq_offline_jti UNIQUE (jti),
+    CONSTRAINT fk_offline_binding FOREIGN KEY (binding_id) REFERENCES user_device_binding (id),
+    CONSTRAINT fk_offline_user FOREIGN KEY (user_id) REFERENCES sys_user (id),
+    CONSTRAINT fk_offline_wh FOREIGN KEY (warehouse_id) REFERENCES warehouse (id),
+    CONSTRAINT ck_offline_ts CHECK ((issued_at IS NULL OR (issued_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(issued_at) IS issued_at AND substr(issued_at, 12, 2) <= '23')) AND (expires_at IS NULL OR (expires_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(expires_at) IS expires_at AND substr(expires_at, 12, 2) <= '23')) AND (revoked_at IS NULL OR (revoked_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(revoked_at) IS revoked_at AND substr(revoked_at, 12, 2) <= '23'))),
+    -- SQLite 一律按整数秒比较（00 §6.8 第 5 条）；解析不了 → COALESCE 成 0 → 拒（自查 B2-2 NULL 放行、B2-3 文本序误判）
+    CONSTRAINT ck_offline_ttl CHECK (COALESCE(CAST(strftime('%s', expires_at) AS INTEGER) > CAST(strftime('%s', issued_at) AS INTEGER), 0)),
+    -- 有效期上限 12 小时（docs/12 §3.3，小赵 I4）
+    CONSTRAINT ck_offline_max_ttl CHECK (COALESCE(CAST(strftime('%s', expires_at) AS INTEGER) - CAST(strftime('%s', issued_at) AS INTEGER) <= 43200, 0))
+);
+CREATE INDEX ix_offline_binding ON offline_token(binding_id) WHERE revoked_at IS NULL;
+
+-- 主管审批（docs/12 §5）
 CREATE UNIQUE INDEX uq_apr_open ON approval_request(approval_type, target_type, target_id) WHERE status IN ('PENDING','PARTIAL');
 CREATE INDEX ix_apr_wh ON approval_request(warehouse_id, status, created_at);
 CREATE INDEX ix_apr_requester ON approval_request(requested_by, status, created_at);   -- GET /approvals?mine=true
@@ -2380,8 +2403,8 @@ CREATE INDEX ix_apr_requester ON approval_request(requested_by, status, created_
 -- ===== 小赵 I1/I2/I5：审批只能 INSERT 成 PENDING；迁移单向；审批人写入后不可改；过期不能再审；FAILOVER 确认人必须真持有角色 =====
 CREATE TRIGGER trg_apr_no_replace BEFORE INSERT ON approval_request
 WHEN EXISTS (SELECT 1 FROM approval_request a WHERE a.id = NEW.id OR a.code = NEW.code
-  OR (a.status IN ('PENDING','PARTIAL') AND a.approval_type = NEW.approval_type AND a.target_type = NEW.target_type AND a.target_id = NEW.target_id))
-BEGIN SELECT RAISE(ABORT, 'approval_duplicate'); END;
+  OR (NEW.status IN ('PENDING','PARTIAL') AND a.status IN ('PENDING','PARTIAL') AND a.approval_type = NEW.approval_type AND a.target_type = NEW.target_type AND a.target_id = NEW.target_id))
+BEGIN SELECT RAISE(ABORT, 'approval_request_duplicate'); END;
 CREATE TRIGGER trg_apr_insert BEFORE INSERT ON approval_request
 WHEN NEW.status <> 'PENDING' OR NEW.first_approver_id IS NOT NULL OR NEW.second_approver_id IS NOT NULL
   OR NEW.decided_at IS NOT NULL OR NEW.result_ref IS NOT NULL
@@ -2404,7 +2427,7 @@ WHEN OLD.status IN ('APPROVED','REJECTED','EXPIRED','WITHDRAWN')
   OR NEW.requested_by IS NOT OLD.requested_by OR NEW.approval_type IS NOT OLD.approval_type
   OR NEW.code IS NOT OLD.code OR NEW.warehouse_id IS NOT OLD.warehouse_id
   OR NEW.target_type IS NOT OLD.target_type OR NEW.target_id IS NOT OLD.target_id
-  OR NEW.expires_at IS NOT OLD.expires_at OR NEW.created_at IS NOT OLD.created_at
+  OR (NEW.expires_at IS NOT OLD.expires_at AND OLD.expires_at IS NOT NULL) OR NEW.created_at IS NOT OLD.created_at   -- OLD NULL 只在 trg_apr_ttl_fill 同语句补算时出现
 BEGIN SELECT RAISE(ABORT, 'approval_final'); END;
 CREATE TRIGGER trg_apr_transition BEFORE UPDATE ON approval_request
 WHEN OLD.status IN ('PENDING','PARTIAL') AND NOT ((OLD.status = NEW.status AND NEW.status IN ('PENDING','PARTIAL'))
@@ -2417,7 +2440,8 @@ WHEN (OLD.first_approver_id IS NOT NULL AND (NEW.first_approver_id IS NOT OLD.fi
   OR (OLD.second_approver_id IS NOT NULL AND NEW.second_approver_id IS NOT OLD.second_approver_id)
 BEGIN SELECT RAISE(ABORT, 'approval_approver_immutable'); END;
 CREATE TRIGGER trg_apr_expired BEFORE UPDATE ON approval_request
-WHEN NEW.status IN ('PARTIAL','APPROVED') AND NEW.status <> OLD.status AND COALESCE(datetime(OLD.expires_at) <= datetime('now'), 0)
+WHEN NEW.status IN ('PARTIAL','APPROVED') AND NEW.status <> OLD.status
+  AND NOT COALESCE(CAST(strftime('%s', OLD.expires_at) AS INTEGER) > CAST(strftime('%s', 'now') AS INTEGER), 0)   -- 自查 B2-1：解析不了 / NULL 一律视为已过期
 BEGIN SELECT RAISE(ABORT, 'approval_expired'); END;
 CREATE TRIGGER trg_apr_role BEFORE UPDATE ON approval_request
 WHEN NEW.approval_type = 'UNPLANNED_FAILOVER' AND (
@@ -2430,7 +2454,7 @@ WHEN NEW.approval_type = 'UNPLANNED_FAILOVER' AND (
         WHERE ur.user_id = NEW.second_approver_id AND r.code = 'CENTER_OPS')))
 BEGIN SELECT RAISE(ABORT, 'approval_role_not_held'); END;
 CREATE TRIGGER trg_apr_perm BEFORE UPDATE ON approval_request
-WHEN NEW.approval_type IN ('DEVICE_BIND','POD_CORRECT','CANCEL_AFTER_PICK','PAPER_BACKFILL','BOX_VOID','PROCESS_YIELD_DEVIATION','LIVE_DEATH_OVER','PROCESS_REWORK')
+WHEN NEW.approval_type IN ('DEVICE_BIND','POD_CORRECT','CANCEL_AFTER_PICK','PAPER_BACKFILL','BOX_VOID','PROCESS_YIELD_DEVIATION','LIVE_DEATH_OVER','PROCESS_REWORK','INBOUND_CORRECTION','INBOUND_SOD_WAIVER')
   AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL AND NEW.first_approver_role IS NOT NULL AND NOT EXISTS (
     SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
       JOIN sys_role_perm rp ON rp.role_id = r.id JOIN sys_permission p ON p.id = rp.perm_id
@@ -2444,6 +2468,8 @@ WHEN NEW.approval_type IN ('DEVICE_BIND','POD_CORRECT','CANCEL_AFTER_PICK','PAPE
                                            WHEN 'PROCESS_YIELD_DEVIATION' THEN 'process.yield.approve'
                                            WHEN 'LIVE_DEATH_OVER' THEN 'live.death.approve'
                                            WHEN 'PROCESS_REWORK' THEN 'process.rework.approve'
+                                           WHEN 'INBOUND_CORRECTION' THEN 'inbound.receipt.adjust.approve'
+                                           WHEN 'INBOUND_SOD_WAIVER' THEN 'inbound.sod.waive'
                                            ELSE 'outbound.order.cancel_after_pick.approve' END)
 BEGIN SELECT RAISE(ABORT, 'approval_perm_not_held'); END;
 CREATE TRIGGER trg_apr_scrap_role BEFORE UPDATE ON approval_request
@@ -2457,8 +2483,8 @@ BEGIN SELECT RAISE(ABORT, 'approval_role_not_held'); END;
 -- ===== 小赵 I3 + S1：设备绑定 INSERT 只能 PENDING；REVOKED 终态；身份列不可改；激活必须有本绑定的已通过 DEVICE_BIND 审批，审批人 ≠ 使用人 =====
 CREATE TRIGGER trg_udb_no_replace BEFORE INSERT ON user_device_binding
 WHEN EXISTS (SELECT 1 FROM user_device_binding b WHERE b.id = NEW.id
-  OR (b.device_instance_id = NEW.device_instance_id AND b.status IN ('PENDING','ACTIVE')))
-BEGIN SELECT RAISE(ABORT, 'binding_duplicate'); END;
+  OR (NEW.status IN ('PENDING','ACTIVE') AND b.status IN ('PENDING','ACTIVE') AND b.device_instance_id = NEW.device_instance_id))
+BEGIN SELECT RAISE(ABORT, 'user_device_binding_duplicate'); END;
 CREATE TRIGGER trg_udb_insert BEFORE INSERT ON user_device_binding WHEN NEW.status <> 'PENDING' OR NEW.approval_id IS NOT NULL
 BEGIN SELECT RAISE(ABORT, 'binding_insert_not_pending'); END;
 CREATE TRIGGER trg_udb_immutable BEFORE UPDATE ON user_device_binding
@@ -2505,6 +2531,137 @@ BEGIN SELECT RAISE(ABORT, 'fk_hold_approval_no'); END;
 CREATE TRIGGER trg_hold_approval_fk_upd AFTER UPDATE OF approval_no ON stock_hold
 WHEN NEW.approval_no IS NOT NULL AND NOT EXISTS (SELECT 1 FROM approval_request a WHERE a.code = NEW.approval_no)
 BEGIN SELECT RAISE(ABORT, 'fk_hold_approval_no'); END;
+
+-- ===== 第 12 篇时间加固（自查 B2/B3，00 §6.8）=====
+-- PG：服务端时间由 BEFORE 触发器对非表属主写入强制覆盖为 date_trunc('second', now() AT TIME ZONE 'UTC')；表属主（迁移/种子角色）豁免，
+--     同第 11 篇 outbox / 退供 trg_srtn_zclock 口径。函数名带 z，同表 BEFORE 触发器按名字排在业务守卫之后。
+--     只写一次的时间列对任何角色都不可改（*_time_immutable → 40004）。
+-- SQLite（不能改 NEW）：时间列只收整秒 'YYYY-MM-DD HH:MM:SS'（ck_*_ts），服务端时间只收与 now 相差 ≤ 300 s（*_clock_skew → 40003），一律按 strftime('%s') 整数秒比较。
+CREATE TRIGGER trg_apr_clock_ins BEFORE INSERT ON approval_request
+WHEN NOT COALESCE(NEW.created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.created_at) IS NEW.created_at AND substr(NEW.created_at, 12, 2) <= '23' AND abs(CAST(strftime('%s', NEW.created_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) <= 300, 0)
+BEGIN SELECT RAISE(ABORT, 'approval_request_clock_skew'); END;
+CREATE TRIGGER trg_apr_ttl_fill AFTER INSERT ON approval_request WHEN NEW.expires_at IS NULL
+BEGIN UPDATE approval_request SET expires_at = datetime(NEW.created_at, '+' || CASE NEW.approval_type WHEN 'UNPLANNED_FAILOVER' THEN 3600 WHEN 'CANCEL_AFTER_PICK' THEN 7200
+  WHEN 'PROCESS_YIELD_DEVIATION' THEN 43200 ELSE 86400 END || ' seconds') WHERE id = NEW.id; END;
+CREATE TRIGGER trg_apr_expires_null BEFORE UPDATE OF expires_at ON approval_request WHEN NEW.expires_at IS NULL
+BEGIN SELECT RAISE(ABORT, 'approval_request_expires_null'); END;
+CREATE TRIGGER trg_apr_clock_upd BEFORE UPDATE ON approval_request
+WHEN (NEW.first_approved_at IS NOT OLD.first_approved_at AND NEW.first_approved_at IS NOT NULL AND NOT COALESCE(NEW.first_approved_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.first_approved_at) IS NEW.first_approved_at AND substr(NEW.first_approved_at, 12, 2) <= '23' AND abs(CAST(strftime('%s', NEW.first_approved_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) <= 300, 0))
+  OR (NEW.second_approved_at IS NOT OLD.second_approved_at AND NEW.second_approved_at IS NOT NULL AND NOT COALESCE(NEW.second_approved_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.second_approved_at) IS NEW.second_approved_at AND substr(NEW.second_approved_at, 12, 2) <= '23' AND abs(CAST(strftime('%s', NEW.second_approved_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) <= 300, 0))
+  OR (NEW.decided_at IS NOT OLD.decided_at AND NEW.decided_at IS NOT NULL AND NOT COALESCE(NEW.decided_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.decided_at) IS NEW.decided_at AND substr(NEW.decided_at, 12, 2) <= '23' AND abs(CAST(strftime('%s', NEW.decided_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) <= 300, 0))
+BEGIN SELECT RAISE(ABORT, 'approval_request_clock_skew'); END;
+
+CREATE TRIGGER trg_udb_clock_ins BEFORE INSERT ON user_device_binding
+WHEN NOT COALESCE(NEW.bound_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.bound_at) IS NEW.bound_at AND substr(NEW.bound_at, 12, 2) <= '23' AND abs(CAST(strftime('%s', NEW.bound_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) <= 300, 0)
+BEGIN SELECT RAISE(ABORT, 'user_device_binding_clock_skew'); END;
+CREATE TRIGGER trg_udb_clock_upd BEFORE UPDATE ON user_device_binding
+WHEN (NEW.activated_at IS NOT OLD.activated_at AND NEW.activated_at IS NOT NULL AND NOT COALESCE(NEW.activated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.activated_at) IS NEW.activated_at AND substr(NEW.activated_at, 12, 2) <= '23' AND abs(CAST(strftime('%s', NEW.activated_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) <= 300, 0))
+  OR (NEW.revoked_at IS NOT OLD.revoked_at AND NEW.revoked_at IS NOT NULL AND NOT COALESCE(NEW.revoked_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.revoked_at) IS NEW.revoked_at AND substr(NEW.revoked_at, 12, 2) <= '23' AND abs(CAST(strftime('%s', NEW.revoked_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) <= 300, 0))
+BEGIN SELECT RAISE(ABORT, 'user_device_binding_clock_skew'); END;
+CREATE TRIGGER trg_udb_time_lock BEFORE UPDATE ON user_device_binding
+WHEN OLD.activated_at IS NOT NULL AND NEW.activated_at IS NOT OLD.activated_at AND OLD.status <> 'REVOKED' AND NEW.status <> 'PENDING'
+BEGIN SELECT RAISE(ABORT, 'user_device_binding_time_immutable'); END;
+
+CREATE TRIGGER trg_offline_clock_ins BEFORE INSERT ON offline_token
+WHEN NOT COALESCE(NEW.issued_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.issued_at) IS NEW.issued_at AND substr(NEW.issued_at, 12, 2) <= '23' AND abs(CAST(strftime('%s', NEW.issued_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) <= 300, 0)
+BEGIN SELECT RAISE(ABORT, 'offline_token_clock_skew'); END;
+CREATE TRIGGER trg_offline_clock_upd BEFORE UPDATE OF revoked_at ON offline_token
+WHEN OLD.revoked_at IS NULL AND NEW.revoked_at IS NOT NULL AND NOT COALESCE(NEW.revoked_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.revoked_at) IS NEW.revoked_at AND substr(NEW.revoked_at, 12, 2) <= '23' AND abs(CAST(strftime('%s', NEW.revoked_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) <= 300, 0)
+BEGIN SELECT RAISE(ABORT, 'offline_token_clock_skew'); END;
+
+-- ===== 设备恢复联网记录（第 11 篇纸单补录 T1 的服务端证据：offline_paper_record 引用 device_reconnect.id）=====
+-- 只追加：wms_app 只有 SELECT / INSERT；UPDATE / DELETE / TRUNCATE 触发器全拦（含属主）。occurred_at 由库写，整行写入后不可改。
+-- offline_jti：本次离线期间用的离线令牌，可空（离线前可能没签过令牌）；非空时必须属于同一绑定，绑定必须属于同一仓（device_reconnect_binding_mismatch）。
+CREATE TABLE device_reconnect (
+    id                  BIGINT       PRIMARY KEY,
+    warehouse_id        BIGINT       NOT NULL,
+    binding_id          BIGINT       NOT NULL,
+    offline_jti         VARCHAR(64),
+    occurred_at         TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- UTC 整秒，库写
+    CONSTRAINT fk_drc_binding FOREIGN KEY (binding_id) REFERENCES user_device_binding (id),
+    CONSTRAINT fk_drc_wh FOREIGN KEY (warehouse_id) REFERENCES warehouse (id),
+    CONSTRAINT fk_drc_jti FOREIGN KEY (offline_jti) REFERENCES offline_token (jti),
+    CONSTRAINT uq_drc_id_binding UNIQUE (id, binding_id),   -- 第 22 个唯一键：11 纸质补录用复合外键 (reconnect_id, binding_id) 引用，保证补录挂的绑定就是这次重连的绑定
+    CONSTRAINT ck_drc_ts CHECK (occurred_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(occurred_at) IS occurred_at AND substr(occurred_at, 12, 2) <= '23')
+);
+CREATE INDEX ix_drc_binding ON device_reconnect(binding_id, occurred_at);
+CREATE INDEX ix_drc_jti ON device_reconnect(offline_jti) WHERE offline_jti IS NOT NULL;
+CREATE TRIGGER trg_drc_no_replace BEFORE INSERT ON device_reconnect
+WHEN EXISTS (SELECT 1 FROM device_reconnect d WHERE d.id = NEW.id OR (d.id = NEW.id AND d.binding_id = NEW.binding_id))   -- 后一项 = uq_drc_id_binding（PK 的超集；§6.10 每个唯一键每列都要出现）
+BEGIN SELECT RAISE(ABORT, 'device_reconnect_duplicate'); END;
+CREATE TRIGGER trg_drc_guard BEFORE INSERT ON device_reconnect
+WHEN NOT EXISTS (SELECT 1 FROM user_device_binding b WHERE b.id = NEW.binding_id AND b.warehouse_id = NEW.warehouse_id)
+  OR (NEW.offline_jti IS NOT NULL AND NOT EXISTS (SELECT 1 FROM offline_token o WHERE o.jti = NEW.offline_jti AND o.binding_id = NEW.binding_id))
+BEGIN SELECT RAISE(ABORT, 'device_reconnect_binding_mismatch'); END;
+CREATE TRIGGER trg_drc_clock BEFORE INSERT ON device_reconnect
+WHEN NOT COALESCE(NEW.occurred_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND datetime(NEW.occurred_at) IS NEW.occurred_at AND substr(NEW.occurred_at, 12, 2) <= '23' AND abs(CAST(strftime('%s', NEW.occurred_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) <= 300, 0)
+BEGIN SELECT RAISE(ABORT, 'device_reconnect_clock_skew'); END;
+CREATE TRIGGER trg_drc_no_update BEFORE UPDATE ON device_reconnect BEGIN SELECT RAISE(ABORT, 'append_only_violation: device_reconnect'); END;
+CREATE TRIGGER trg_drc_no_delete BEFORE DELETE ON device_reconnect BEGIN SELECT RAISE(ABORT, 'append_only_violation: device_reconnect'); END;
+
+
+-- ===== 12 篇 no-REPLACE 扩到全部去重 / 序号类唯一键（00 §6.10）+ 键列不可改 + 计数器只增 =====
+-- 权限映射 / 码表 / 凭证的唯一键都在做去重：SQLite REPLACE 会先删旧行（DELETE 触发器不触发），所以每个唯一键都要在 WHEN 里。
+CREATE TRIGGER trg_sys_role_no_replace BEFORE INSERT ON sys_role
+WHEN EXISTS (SELECT 1 FROM sys_role r WHERE (r.id = NEW.id) OR (r.code = NEW.code))
+BEGIN SELECT RAISE(ABORT, 'sys_role_duplicate'); END;
+CREATE TRIGGER trg_sys_permission_no_replace BEFORE INSERT ON sys_permission
+WHEN EXISTS (SELECT 1 FROM sys_permission p WHERE (p.id = NEW.id) OR (p.code = NEW.code))
+BEGIN SELECT RAISE(ABORT, 'sys_permission_duplicate'); END;
+CREATE TRIGGER trg_sys_user_role_no_replace BEFORE INSERT ON sys_user_role
+WHEN EXISTS (SELECT 1 FROM sys_user_role m WHERE (m.user_id = NEW.user_id AND m.role_id = NEW.role_id))
+BEGIN SELECT RAISE(ABORT, 'sys_user_role_duplicate'); END;
+CREATE TRIGGER trg_sys_role_perm_no_replace BEFORE INSERT ON sys_role_perm
+WHEN EXISTS (SELECT 1 FROM sys_role_perm m WHERE (m.role_id = NEW.role_id AND m.perm_id = NEW.perm_id))
+BEGIN SELECT RAISE(ABORT, 'sys_role_perm_duplicate'); END;
+CREATE TRIGGER trg_sys_user_warehouse_no_replace BEFORE INSERT ON sys_user_warehouse
+WHEN EXISTS (SELECT 1 FROM sys_user_warehouse m WHERE (m.user_id = NEW.user_id AND m.warehouse_id = NEW.warehouse_id))
+BEGIN SELECT RAISE(ABORT, 'sys_user_warehouse_duplicate'); END;
+CREATE TRIGGER trg_api_credential_no_replace BEFORE INSERT ON api_credential
+WHEN EXISTS (SELECT 1 FROM api_credential c WHERE (c.id = NEW.id) OR (c.api_key = NEW.api_key))
+BEGIN SELECT RAISE(ABORT, 'api_credential_duplicate'); END;
+-- 键列不可改（改键 = 绕过去重/改写映射；要换键只能新插一行）。PG 用一个通用函数，列名走触发器参数；PG 触发器统一命名 trg_0_key_lock（按名排序最先触发，报错稳定为 key_immutable）。
+CREATE TRIGGER trg_sys_user_key_lock BEFORE UPDATE ON sys_user WHEN NEW.id IS NOT OLD.id OR NEW.username IS NOT OLD.username BEGIN SELECT RAISE(ABORT, 'sys_user_key_immutable'); END;
+CREATE TRIGGER trg_approval_request_key_lock BEFORE UPDATE ON approval_request WHEN NEW.id IS NOT OLD.id OR NEW.code IS NOT OLD.code OR NEW.approval_type IS NOT OLD.approval_type OR NEW.target_type IS NOT OLD.target_type OR NEW.target_id IS NOT OLD.target_id BEGIN SELECT RAISE(ABORT, 'approval_request_key_immutable'); END;
+CREATE TRIGGER trg_user_device_binding_key_lock BEFORE UPDATE ON user_device_binding WHEN NEW.id IS NOT OLD.id OR NEW.device_instance_id IS NOT OLD.device_instance_id BEGIN SELECT RAISE(ABORT, 'user_device_binding_key_immutable'); END;
+CREATE TRIGGER trg_offline_token_key_lock BEFORE UPDATE ON offline_token WHEN NEW.id IS NOT OLD.id OR NEW.jti IS NOT OLD.jti BEGIN SELECT RAISE(ABORT, 'offline_token_key_immutable'); END;
+CREATE TRIGGER trg_sys_role_key_lock BEFORE UPDATE ON sys_role WHEN NEW.id IS NOT OLD.id OR NEW.code IS NOT OLD.code BEGIN SELECT RAISE(ABORT, 'sys_role_key_immutable'); END;
+CREATE TRIGGER trg_sys_permission_key_lock BEFORE UPDATE ON sys_permission WHEN NEW.id IS NOT OLD.id OR NEW.code IS NOT OLD.code BEGIN SELECT RAISE(ABORT, 'sys_permission_key_immutable'); END;
+CREATE TRIGGER trg_sys_user_role_key_lock BEFORE UPDATE ON sys_user_role WHEN NEW.user_id IS NOT OLD.user_id OR NEW.role_id IS NOT OLD.role_id BEGIN SELECT RAISE(ABORT, 'sys_user_role_key_immutable'); END;
+CREATE TRIGGER trg_sys_role_perm_key_lock BEFORE UPDATE ON sys_role_perm WHEN NEW.role_id IS NOT OLD.role_id OR NEW.perm_id IS NOT OLD.perm_id BEGIN SELECT RAISE(ABORT, 'sys_role_perm_key_immutable'); END;
+CREATE TRIGGER trg_sys_user_warehouse_key_lock BEFORE UPDATE ON sys_user_warehouse WHEN NEW.user_id IS NOT OLD.user_id OR NEW.warehouse_id IS NOT OLD.warehouse_id BEGIN SELECT RAISE(ABORT, 'sys_user_warehouse_key_immutable'); END;
+CREATE TRIGGER trg_api_credential_key_lock BEFORE UPDATE ON api_credential WHEN NEW.id IS NOT OLD.id OR NEW.api_key IS NOT OLD.api_key BEGIN SELECT RAISE(ABORT, 'api_credential_key_immutable'); END;
+-- sys_user 行承载 perm_version 计数器：删行 / 清空会让同 id 重建后版本回到 1（旧离线令牌复活），所有角色（含属主）都拒；停用走 status。
+CREATE TRIGGER trg_user_no_delete BEFORE DELETE ON sys_user BEGIN SELECT RAISE(ABORT, 'append_only_violation: sys_user'); END;
+-- 计数器只增：approval_request.version（乐观锁）；sys_user.perm_version 已由 trg_user_perm_ver 管；audit_log.node_seq 只追加。
+CREATE TRIGGER trg_apr_version BEFORE UPDATE ON approval_request WHEN NEW.version < OLD.version BEGIN SELECT RAISE(ABORT, 'approval_request_version_regress'); END;
+
+-- ===== 用户停用 + 权限映射只经函数变更（第 12 篇 §权限变更；00 §6.6.4）=====
+-- 用户只停用不物删（trg_user_no_delete）；status / deleted_at 一变，perm_version 由库 +1，已签发的令牌联网即失效。
+-- 登录名 username 唯一（uq_user_name）、不可改（trg_0_key_lock）、行不可删 → 永不释放、不可复用。
+CREATE TRIGGER trg_user_status_bump AFTER UPDATE OF status, deleted_at ON sys_user
+WHEN (NEW.status IS NOT OLD.status OR NEW.deleted_at IS NOT OLD.deleted_at) AND NEW.perm_version <= OLD.perm_version
+BEGIN UPDATE sys_user SET perm_version = OLD.perm_version + 1 WHERE id = NEW.id; END;
+
+-- PG（中心）：wms_app 对 sys_user_role / sys_role_perm / sys_user_warehouse 只留 SELECT；增删只经下面 6 个 SECURITY DEFINER 函数
+-- （属主 wms_rbac_owner：NOLOGIN、非超级用户，只有必要的权限）。同一事务里：
+--   调用人取自会话变量 wms.actor_id（未设 → rbac_actor_unset），且会话里的 wms.actor_perm_version 必须等于库里当前值（令牌签发后权限变过 → rbac_actor_stale）；
+--   调用人持有对应权限点且 ACTIVE；不能改自己（含给自己所在角色加减权限）；改映射；受影响用户 perm_version +1；
+--   写 audit_log：id、node_seq 由库分配（应用不能传），node_id 取会话变量 wms.node_id（未设即拒）；
+--   审计单次消费：同一 (权限点, 目标, 请求号 p_request_id → trace_id) 只能成功一次，重放 → audit_log_rbac_replay（uq_audit_rbac_once 兜底）。
+-- SQLite（边缘库）：三张映射表只读。权限变更只在中心 PG 做，经同步下发。应用连接上任何直接 INSERT / UPDATE / DELETE 都拒（<表>_edge_read_only → 40312）。
+-- 同步落库只经同步进程自己的连接：它在连接上注册 edge_sync_active() = 1（应用连接 connect_main() 注册为 0）。
+-- 这个开关只存在于连接里，库里没有任何表 / 列 / 标志可以被 SQL 改写，应用连接用 SQL 打不开；没注册该函数的连接写映射时报 no such function，同样失败（失败即关）。
+-- 同步过程不在边缘本地递增 perm_version、不写审计：sys_user.perm_version 与 audit_log 都以中心为准随同步下发。
+CREATE TRIGGER trg_sys_user_role_edge_ro_ins BEFORE INSERT ON sys_user_role WHEN NOT edge_sync_active() BEGIN SELECT RAISE(ABORT, 'sys_user_role_edge_read_only'); END;
+CREATE TRIGGER trg_sys_user_role_edge_ro_upd BEFORE UPDATE ON sys_user_role WHEN NOT edge_sync_active() BEGIN SELECT RAISE(ABORT, 'sys_user_role_edge_read_only'); END;
+CREATE TRIGGER trg_sys_user_role_edge_ro_del BEFORE DELETE ON sys_user_role WHEN NOT edge_sync_active() BEGIN SELECT RAISE(ABORT, 'sys_user_role_edge_read_only'); END;
+CREATE TRIGGER trg_sys_role_perm_edge_ro_ins BEFORE INSERT ON sys_role_perm WHEN NOT edge_sync_active() BEGIN SELECT RAISE(ABORT, 'sys_role_perm_edge_read_only'); END;
+CREATE TRIGGER trg_sys_role_perm_edge_ro_upd BEFORE UPDATE ON sys_role_perm WHEN NOT edge_sync_active() BEGIN SELECT RAISE(ABORT, 'sys_role_perm_edge_read_only'); END;
+CREATE TRIGGER trg_sys_role_perm_edge_ro_del BEFORE DELETE ON sys_role_perm WHEN NOT edge_sync_active() BEGIN SELECT RAISE(ABORT, 'sys_role_perm_edge_read_only'); END;
+CREATE TRIGGER trg_sys_user_warehouse_edge_ro_ins BEFORE INSERT ON sys_user_warehouse WHEN NOT edge_sync_active() BEGIN SELECT RAISE(ABORT, 'sys_user_warehouse_edge_read_only'); END;
+CREATE TRIGGER trg_sys_user_warehouse_edge_ro_upd BEFORE UPDATE ON sys_user_warehouse WHEN NOT edge_sync_active() BEGIN SELECT RAISE(ABORT, 'sys_user_warehouse_edge_read_only'); END;
+CREATE TRIGGER trg_sys_user_warehouse_edge_ro_del BEFORE DELETE ON sys_user_warehouse WHEN NOT edge_sync_active() BEGIN SELECT RAISE(ABORT, 'sys_user_warehouse_edge_read_only'); END;
 
 -- 授权（PG）
 -- docs/12 新表 wms_app 最小授权：不给 DELETE/TRUNCATE；离线令牌只能写吊销时间；审批只能改决策相关列

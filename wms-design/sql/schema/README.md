@@ -20,7 +20,7 @@
 | `09_scrap.sql` | 报损单、报损行（含 SELL_EXPIRED / LIVE_* / PROCESS_LOSS / SUPPLIER_RETURN 来源）；对 10 supplier_return 的 ALTER（见跨篇加列） |
 | `11_integration.sql` | 幂等、入站消息、outbox、审计、取号 |
 | `12_auth.sql` | 用户、角色、权限、API 凭证 |
-| `12b_auth_audit.sql` | 设备绑定、离线令牌、审批单；audit_log 节点列与只追加；sys_user.perm_version |
+| `12b_auth_audit.sql` | 设备绑定、离线令牌、审批单、设备恢复联网记录 `device_reconnect`（只追加，第 11 篇纸单补录引用）；audit_log 节点列与只追加；sys_user.perm_version；第 12 篇时间加固（服务端时间由库写：PG `trg_apr_zclock` / `trg_udb_zclock` / `trg_offline_zclock` / `trg_drc_guard` 对非表属主覆盖，表属主豁免；SQLite ±300 s 时钟窗口 + 整秒格式 CHECK；审批 `expires_at` 由库按类型补上限、只许缩短）；用户停用自动递增 perm_version；权限映射只经 6 个 SECURITY DEFINER 函数（属主 wms_rbac_owner，SQLite 为先审计后删的库强制契约）；12 张表的 FK 全部写在建表语句里（approval_request 提前到绑定表之前） |
 | `17_processing.sql` | 加工 BOM、加工单、领料、产出、冲回、批次追溯 |
 | `18_live.sql` | 第 18 篇活鲜暂存：池扩展、只数账、巡检、锁池单、出池称重、死亡、日失重（只建本篇表，不改 02 约束；跨篇外键待补见 docs/18 §4.11） |
 | `90_available_view.sql` | `v_stock_available`，然后 `COMMIT` |

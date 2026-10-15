@@ -11,7 +11,7 @@ CREATE TABLE sys_user (
     mp_openid       VARCHAR(64),
     status          VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
     last_login_at   TIMESTAMP,
-    created_at      TIMESTAMP    NOT NULL DEFAULT now(),
+    created_at      TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),   -- 00 §6.8：UTC 整秒
     deleted_at      TIMESTAMP,
     CONSTRAINT uq_user_name UNIQUE (username)
 );
@@ -36,9 +36,12 @@ CREATE TABLE sys_permission (
     CONSTRAINT uq_perm_code UNIQUE (code)
 );
 
-CREATE TABLE sys_user_role     (user_id BIGINT NOT NULL, role_id BIGINT NOT NULL, PRIMARY KEY(user_id, role_id));
-CREATE TABLE sys_role_perm     (role_id BIGINT NOT NULL, perm_id BIGINT NOT NULL, PRIMARY KEY(role_id, perm_id));
-CREATE TABLE sys_user_warehouse(user_id BIGINT NOT NULL, warehouse_id BIGINT NOT NULL, PRIMARY KEY(user_id, warehouse_id));
+CREATE TABLE sys_user_role     (user_id BIGINT NOT NULL, role_id BIGINT NOT NULL, PRIMARY KEY(user_id, role_id),
+    CONSTRAINT fk_ur_user FOREIGN KEY (user_id) REFERENCES sys_user (id), CONSTRAINT fk_ur_role FOREIGN KEY (role_id) REFERENCES sys_role (id));
+CREATE TABLE sys_role_perm     (role_id BIGINT NOT NULL, perm_id BIGINT NOT NULL, PRIMARY KEY(role_id, perm_id),
+    CONSTRAINT fk_rp_role FOREIGN KEY (role_id) REFERENCES sys_role (id), CONSTRAINT fk_rp_perm FOREIGN KEY (perm_id) REFERENCES sys_permission (id));
+CREATE TABLE sys_user_warehouse(user_id BIGINT NOT NULL, warehouse_id BIGINT NOT NULL, PRIMARY KEY(user_id, warehouse_id),
+    CONSTRAINT fk_uw_user FOREIGN KEY (user_id) REFERENCES sys_user (id), CONSTRAINT fk_uw_wh FOREIGN KEY (warehouse_id) REFERENCES warehouse (id));
 
 CREATE TABLE api_credential (
     id               BIGINT       PRIMARY KEY,
@@ -51,3 +54,5 @@ CREATE TABLE api_credential (
     CONSTRAINT uq_api_key UNIQUE (api_key)
 );
 GRANT SELECT, INSERT, UPDATE ON sys_user, sys_role, sys_permission, sys_role_perm, sys_user_role, sys_user_warehouse, api_credential TO wms_app;  -- @pg-only
+-- Doro 裁定：audit_log.actor_id → sys_user(id)。SQLite 由 11 写进 CREATE TABLE；PG 在 sys_user 建好后由此处补（不搬文件、不改加载顺序）
+ALTER TABLE audit_log ADD CONSTRAINT fk_audit_actor FOREIGN KEY (actor_id) REFERENCES sys_user (id);  -- @pg-only

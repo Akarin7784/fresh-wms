@@ -40,8 +40,9 @@ SCHEMA_PARTS=(
 # docs/12 的 DDL 在 12b_auth_audit.sql：在 43 表 / 119 索引上增加 user_device_binding、offline_token、approval_request（3 主键 + uq_offline_jti + uq_apr_code + uq_audit_node_seq + 7 个显式索引）→ 46 表 / 132 索引；合入 1d907031（#2 第四轮 ix_mv_hold，43/120）后 → 46 表 / 133 索引（PG16.15 实测）。以 PG 实测为准。
 # 退供（pr-supplier-return，基于 30041054）：+supplier_return（PK、uq_srtn_code、ix_srtn_due）+ uq_srtn_scrap、uq_scr_srtn → 73 表 / 218 索引。
 # docs/03：+5 表（测温/收货/更正单/上架/质量反馈），索引 +25
-EXPECT_TABLES=78
-EXPECT_INDEXES=243
+EXPECT_TABLES=79
+EXPECT_INDEXES=248
+# 第 12 篇：+device_reconnect（PK、uq_drc_id_binding、ix_drc_binding、ix_drc_jti）+ audit_log.uq_audit_rbac_once → 79 表 / 248 索引（PG16 实测）
 EXPECT_VIEWS=2
 
 CTR=wms-pg-verify
@@ -142,7 +143,7 @@ echo "  → 表 $T 张 / 索引 $I 个 / 视图 $V 个"
 [ "$V" = "$EXPECT_VIEWS" ]   && ok "视图数 = $V" || bad "视图数 = $V，期望 $EXPECT_VIEWS"
 
 # 小赵 S4：按期望权限矩阵逐表核对 wms_app（表、分区父表、视图、物化视图；序列查 USAGE），多给、少给、漏表都失败
-EXPECT_PRIVS="adjust_line:SELECT,INSERT,UPDATE adjust_order:SELECT,INSERT,UPDATE api_credential:SELECT,INSERT,UPDATE approval_request:SELECT,INSERT audit_log:SELECT,INSERT count_line:SELECT,INSERT,UPDATE count_order:SELECT,INSERT,UPDATE exception_case:SELECT,INSERT,UPDATE exception_code:SELECT,INSERT,UPDATE idempotency_record:SELECT,INSERT,UPDATE inbound_correction:SELECT,INSERT inbound_line:SELECT,INSERT inbound_message:SELECT,INSERT,UPDATE inbound_order:SELECT,INSERT,UPDATE inbound_putaway:SELECT,INSERT inbound_quality_feedback:SELECT,INSERT,UPDATE inbound_receipt:SELECT,INSERT inbound_temp_check:SELECT,INSERT live_count_ledger:SELECT,INSERT live_death:SELECT,INSERT live_inspection:SELECT,INSERT live_shrink_settlement:SELECT,INSERT live_stock_count:SELECT,INSERT,UPDATE live_tank:SELECT,INSERT,UPDATE live_tank_hold:SELECT,INSERT live_weigh:SELECT,INSERT location:SELECT,INSERT,UPDATE lot:SELECT,INSERT,UPDATE numbering_segment:SELECT,INSERT,UPDATE offline_paper_record:SELECT,INSERT,UPDATE offline_token:SELECT,INSERT outbound_line:SELECT,INSERT,UPDATE outbound_order:SELECT,INSERT,UPDATE outbox_event:SELECT,INSERT,UPDATE pack_box:SELECT,INSERT,UPDATE pack_box_line:SELECT,INSERT,UPDATE pick_task:SELECT,INSERT,UPDATE pick_task_line:SELECT,INSERT,UPDATE process_bom:SELECT,INSERT,UPDATE process_bom_line:SELECT,INSERT,UPDATE process_issue:SELECT,INSERT,UPDATE process_lot_trace:SELECT,INSERT process_order:SELECT,INSERT,UPDATE process_output:SELECT,INSERT,UPDATE process_report:SELECT,INSERT process_reversal:SELECT,INSERT return_blind_receipt:SELECT,INSERT return_reservation:SELECT,INSERT,UPDATE return_reservation_line:SELECT,INSERT,UPDATE scrap_line:SELECT,INSERT,UPDATE scrap_order:SELECT,INSERT,UPDATE shipment:SELECT,INSERT,UPDATE shipment_order:SELECT,INSERT,UPDATE sku:SELECT,INSERT,UPDATE sku_barcode:SELECT,INSERT,UPDATE sku_live_param:SELECT,INSERT,UPDATE sku_unit:SELECT,INSERT,UPDATE stock:SELECT,INSERT,UPDATE stock_hold:SELECT,INSERT stock_hold_release:SELECT,INSERT stock_ledger_line:SELECT,INSERT stock_movement:SELECT,INSERT stock_movement_key:SELECT,INSERT stock_recon_alert:SELECT,INSERT,UPDATE stock_reservation:SELECT,INSERT,UPDATE stock_snapshot_daily:SELECT,INSERT supplier_return:SELECT,INSERT sys_permission:SELECT,INSERT,UPDATE sys_role:SELECT,INSERT,UPDATE sys_role_perm:SELECT,INSERT,UPDATE sys_user:SELECT,INSERT,UPDATE sys_user_role:SELECT,INSERT,UPDATE sys_user_warehouse:SELECT,INSERT,UPDATE upstream_push_log:SELECT,INSERT user_device_binding:SELECT,INSERT v_live_death_in_transit:SELECT v_stock_available:SELECT warehouse:SELECT,INSERT,UPDATE wave:SELECT,INSERT,UPDATE zone:SELECT,INSERT,UPDATE"
+EXPECT_PRIVS="adjust_line:SELECT,INSERT,UPDATE adjust_order:SELECT,INSERT,UPDATE api_credential:SELECT,INSERT,UPDATE approval_request:SELECT,INSERT audit_log:SELECT,INSERT count_line:SELECT,INSERT,UPDATE count_order:SELECT,INSERT,UPDATE device_reconnect:SELECT,INSERT exception_case:SELECT,INSERT,UPDATE exception_code:SELECT,INSERT,UPDATE idempotency_record:SELECT,INSERT,UPDATE inbound_correction:SELECT,INSERT inbound_line:SELECT,INSERT inbound_message:SELECT,INSERT,UPDATE inbound_order:SELECT,INSERT,UPDATE inbound_putaway:SELECT,INSERT inbound_quality_feedback:SELECT,INSERT,UPDATE inbound_receipt:SELECT,INSERT inbound_temp_check:SELECT,INSERT live_count_ledger:SELECT,INSERT live_death:SELECT,INSERT live_inspection:SELECT,INSERT live_shrink_settlement:SELECT,INSERT live_stock_count:SELECT,INSERT,UPDATE live_tank:SELECT,INSERT,UPDATE live_tank_hold:SELECT,INSERT live_weigh:SELECT,INSERT location:SELECT,INSERT,UPDATE lot:SELECT,INSERT,UPDATE numbering_segment:SELECT,INSERT,UPDATE offline_paper_record:SELECT,INSERT,UPDATE offline_token:SELECT,INSERT outbound_line:SELECT,INSERT,UPDATE outbound_order:SELECT,INSERT,UPDATE outbox_event:SELECT,INSERT,UPDATE pack_box:SELECT,INSERT,UPDATE pack_box_line:SELECT,INSERT,UPDATE pick_task:SELECT,INSERT,UPDATE pick_task_line:SELECT,INSERT,UPDATE process_bom:SELECT,INSERT,UPDATE process_bom_line:SELECT,INSERT,UPDATE process_issue:SELECT,INSERT,UPDATE process_lot_trace:SELECT,INSERT process_order:SELECT,INSERT,UPDATE process_output:SELECT,INSERT,UPDATE process_report:SELECT,INSERT process_reversal:SELECT,INSERT return_blind_receipt:SELECT,INSERT return_reservation:SELECT,INSERT,UPDATE return_reservation_line:SELECT,INSERT,UPDATE scrap_line:SELECT,INSERT,UPDATE scrap_order:SELECT,INSERT,UPDATE shipment:SELECT,INSERT,UPDATE shipment_order:SELECT,INSERT,UPDATE sku:SELECT,INSERT,UPDATE sku_barcode:SELECT,INSERT,UPDATE sku_live_param:SELECT,INSERT,UPDATE sku_unit:SELECT,INSERT,UPDATE stock:SELECT,INSERT,UPDATE stock_hold:SELECT,INSERT stock_hold_release:SELECT,INSERT stock_ledger_line:SELECT,INSERT stock_movement:SELECT,INSERT stock_movement_key:SELECT,INSERT stock_recon_alert:SELECT,INSERT,UPDATE stock_reservation:SELECT,INSERT,UPDATE stock_snapshot_daily:SELECT,INSERT supplier_return:SELECT,INSERT sys_permission:SELECT,INSERT,UPDATE sys_role:SELECT,INSERT,UPDATE sys_role_perm:SELECT sys_user:SELECT,INSERT,UPDATE sys_user_role:SELECT sys_user_warehouse:SELECT upstream_push_log:SELECT,INSERT user_device_binding:SELECT,INSERT v_live_death_in_transit:SELECT v_stock_available:SELECT warehouse:SELECT,INSERT,UPDATE wave:SELECT,INSERT,UPDATE zone:SELECT,INSERT,UPDATE"
 ACT=$(psql -t -A -c "SELECT string_agg(x, ' ' ORDER BY x) FROM (SELECT c.relname || ':' || COALESCE(NULLIF(concat_ws(',', CASE WHEN c.relkind='S' THEN (CASE WHEN has_sequence_privilege('wms_app', c.oid, 'USAGE') THEN 'USAGE' END) ELSE (CASE WHEN has_table_privilege('wms_app', c.oid, 'SELECT') THEN 'SELECT' END) END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'INSERT') THEN 'INSERT' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'UPDATE') THEN 'UPDATE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'DELETE') THEN 'DELETE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'TRUNCATE') THEN 'TRUNCATE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'REFERENCES') THEN 'REFERENCES' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'TRIGGER') THEN 'TRIGGER' END), ''), 'NONE') AS x FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','S') AND NOT c.relispartition) t")
 if [ "$ACT" = "$EXPECT_PRIVS" ]; then ok "S4 wms_app 权限矩阵与期望逐表一致（$(echo "$ACT" | wc -w) 个对象，含 TRIGGER/REFERENCES；列级 UPDATE 另测）"
 else bad "S4 wms_app 权限矩阵不符：$(diff <(echo "$EXPECT_PRIVS" | tr ' ' '\n') <(echo "$ACT" | tr ' ' '\n') | grep '^[<>]' | tr '\n' ' ')"; fi
@@ -155,6 +156,8 @@ assert_n() {  # $1 描述  $2 SQL  $3 期望行数。计数语句本身失败也
   [ "$n" = "$3" ] && ok "$1 = $n" || bad "$1 = $n，期望 $3"
 }
 seed "INSERT INTO warehouse (id,code,name,cutoff_time,work_date_offset) VALUES (1,'WHSH01','上海青浦仓','20:00',-1);"
+# 第 12 篇 FK 底数：102–199、201–299 号测试用户（审批人 / 申请人 / 映射引用）
+seed "INSERT INTO sys_user (id,username,password_hash) SELECT i, 'seed' || i, 'x' FROM generate_series(102,299) i WHERE i <> 200;"
 seed "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (1,1,'Z-C1','冷藏拣货区','CHILLED','PICK'),(2,1,'Z-C2','冷藏存储区','CHILLED','STORAGE');"
 seed "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (1,1,1,'A01-02-03','BIN',2,'A010'),(2,1,1,'A01-03-01','BIN',2,'A020'),(3,1,2,'B02-01-05','PALLET',8,'B010');"
 seed "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life) VALUES (1,'SKU-APPLE','山东红富士 80#','KG','CHILLED',30,10);"
@@ -568,7 +571,7 @@ R2=$(psql -t -A -c "SELECT string_agg(idem_key, ',' ORDER BY idem_key) FROM idem
 [ "$R/$R2" = "n=1/tz_live12h" ] && ok "P1 +14 时区实删后 tz_live12h 仍在（$R/$R2）" || bad "P1 +14 实删：$R/$R2"
 
 echo "=== 2f3. 误报回转 SCRAP_PENDING → RETURN_QC（SCRAP_MISREPORT 审批）==="
-seed "CREATE TABLE IF NOT EXISTS approval_request (     id BIGINT PRIMARY KEY,     code VARCHAR(64) NOT NULL,     CONSTRAINT uq_apr_code UNIQUE (code) ); INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (90,'W1','x','20:00'),(91,'Z9Z9Z9Z9Z9Z9Z9Z9','x','20:00') ON CONFLICT (id) DO NOTHING; INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (5001,'APR-WHSH01-20261015-000001','CANCEL_AFTER_PICK',1,'HOLD','5001','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01'), (5002,'APR-WHSH01-20261015-000002','CANCEL_AFTER_PICK',1,'HOLD','5002','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01'), (5003,'APR-WHSH01-20261015-000003','CANCEL_AFTER_PICK',1,'HOLD','5003','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01'), (5004,'APR-WHSH01-20261015-000004','CANCEL_AFTER_PICK',1,'HOLD','5004','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01'), (5009,'APR-WHSH01-20261015-000009','CANCEL_AFTER_PICK',1,'HOLD','5009','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01'), (5099,'APR-WHSH01-20261015-000099','CANCEL_AFTER_PICK',1,'HOLD','5099','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01'), (5123,'APR-WHSH01-20261015-000123','CANCEL_AFTER_PICK',1,'HOLD','5123','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01'), (5999,'APR-WHSH01-20261231-999999','CANCEL_AFTER_PICK',1,'HOLD','5999','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01'), (5160,'APR-Z9Z9Z9Z9Z9Z9Z9Z9-20260101-000000','CANCEL_AFTER_PICK',91,'HOLD','5160','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01'), (5011,'APR-W1-20261015-000001','CANCEL_AFTER_PICK',90,'HOLD','5011','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01'), (5000,'APR-WHSH01-20260101-000000','CANCEL_AFTER_PICK',1,'HOLD','5000','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01'), (5029,'APR-WHSH01-20280229-000001','CANCEL_AFTER_PICK',1,'HOLD','5029','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,'2099-01-01') ON CONFLICT (code) DO NOTHING;"
+seed "CREATE TABLE IF NOT EXISTS approval_request (     id BIGINT PRIMARY KEY,     code VARCHAR(64) NOT NULL,     CONSTRAINT uq_apr_code UNIQUE (code) ); INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (90,'W1','x','20:00'),(91,'Z9Z9Z9Z9Z9Z9Z9Z9','x','20:00') ON CONFLICT (id) DO NOTHING; INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (5001,'APR-WHSH01-20261015-000001','CANCEL_AFTER_PICK',1,'HOLD','5001','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,NULL), (5002,'APR-WHSH01-20261015-000002','CANCEL_AFTER_PICK',1,'HOLD','5002','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,NULL), (5003,'APR-WHSH01-20261015-000003','CANCEL_AFTER_PICK',1,'HOLD','5003','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,NULL), (5004,'APR-WHSH01-20261015-000004','CANCEL_AFTER_PICK',1,'HOLD','5004','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,NULL), (5009,'APR-WHSH01-20261015-000009','CANCEL_AFTER_PICK',1,'HOLD','5009','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,NULL), (5099,'APR-WHSH01-20261015-000099','CANCEL_AFTER_PICK',1,'HOLD','5099','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,NULL), (5123,'APR-WHSH01-20261015-000123','CANCEL_AFTER_PICK',1,'HOLD','5123','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,NULL), (5999,'APR-WHSH01-20261231-999999','CANCEL_AFTER_PICK',1,'HOLD','5999','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,NULL), (5160,'APR-Z9Z9Z9Z9Z9Z9Z9Z9-20260101-000000','CANCEL_AFTER_PICK',91,'HOLD','5160','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,NULL), (5011,'APR-W1-20261015-000001','CANCEL_AFTER_PICK',90,'HOLD','5011','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,NULL), (5000,'APR-WHSH01-20260101-000000','CANCEL_AFTER_PICK',1,'HOLD','5000','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,NULL), (5029,'APR-WHSH01-20280229-000001','CANCEL_AFTER_PICK',1,'HOLD','5029','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2f3 底数',201,NULL) ON CONFLICT (code) DO NOTHING;"
 assert_n "审批号底数：合法 APR 写入 approval_request" "SELECT count(*) FROM approval_request" 12
 R=$(psql -t -A -c "SELECT quality_hold_qty_milli||'/'||hold_qty_milli||'/'||(on_hand_qty_milli-allocated_qty_milli-reserved_qty_milli-quality_hold_qty_milli-hold_qty_milli) FROM stock WHERE id=41")
 [ "$R" = "0/8000/1000" ] && ok "误报回转前 quality/hold/available = $R" || bad "误报回转前 = $R（期望 0/8000/1000）"
@@ -1956,7 +1959,7 @@ seed "INSERT INTO sys_user_role (user_id,role_id) VALUES (202,1),(202,2),(203,2)
 seed "INSERT INTO sys_user_warehouse (user_id,warehouse_id) VALUES (202,1),(203,1),(204,1),(205,1),(206,1),(101,1),(201,1);"
 seed "INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id) VALUES (1,'DEV-A','PDA',101,1);"
 seed "INSERT INTO offline_token (id,jti,binding_id,user_id,device_instance_id,warehouse_id,perm_version,issued_at,expires_at) VALUES (1,'J1',1,101,'DEV-A',1,1,'2026-10-15 08:00','2026-10-15 20:00');"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (1,'APR-WHSH01-20261015-000111','CANCEL_AFTER_PICK',1,'OUTBOUND','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (1,'APR-WHSH01-20261015-000111','CANCEL_AFTER_PICK',1,'OUTBOUND','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL);"
 seed "INSERT INTO audit_log (id,action,node_id,node_seq,warehouse_id) VALUES (1,'outbound.cancel_after_pick',7,1,1);"
 _AC=$(psql -t -A -c "SELECT count(*) FROM audit_log")
 expect_block "12 审计重复回传同 (node_id,node_seq)" \
@@ -1980,19 +1983,19 @@ expect_block "12 REVOKED 没有吊销时间" \
   "UPDATE user_device_binding SET status='REVOKED' WHERE id=1;" "ck_udb_status"
 expect_block "12 I3 用不存在的审批激活" \
   "UPDATE user_device_binding SET status='ACTIVE', approval_id=999, activated_at='2026-10-15 09:00' WHERE id=1;" "binding_approval_invalid"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (7,'APR-WHSH01-20261015-000007','DEVICE_BIND',1,'DEVICE_BINDING','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',202,'2099-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (7,'APR-WHSH01-20261015-000007','DEVICE_BIND',1,'DEVICE_BINDING','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',202,NULL);"
 seed "UPDATE approval_request SET status='APPROVED', first_approver_id=101, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=7;"
 expect_block "12 S1 审批人 = 绑定使用人" \
   "UPDATE user_device_binding SET status='ACTIVE', approval_id=7, activated_at='2026-10-15 09:00' WHERE id=1;" "binding_approval_invalid"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (8,'APR-WHSH01-20261015-000008','DEVICE_BIND',1,'DEVICE_BINDING','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',101,'2099-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (8,'APR-WHSH01-20261015-000008','DEVICE_BIND',1,'DEVICE_BINDING','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',101,NULL);"
 seed "UPDATE approval_request SET status='REJECTED', decided_at='2026-10-15 09:00', reject_reason='x' WHERE id=8;"
 expect_block "12 I3 用已驳回的审批激活" \
   "UPDATE user_device_binding SET status='ACTIVE', approval_id=8, activated_at='2026-10-15 09:00' WHERE id=1;" "binding_approval_invalid"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (9,'APR-WHSH01-20261015-000909','CANCEL_AFTER_PICK',1,'DEVICE_BINDING','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',101,'2099-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (9,'APR-WHSH01-20261015-000909','CANCEL_AFTER_PICK',1,'DEVICE_BINDING','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',101,NULL);"
 seed "UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=9;"
 expect_block "12 I3 用别的类型的审批激活" \
   "UPDATE user_device_binding SET status='ACTIVE', approval_id=9, activated_at='2026-10-15 09:00' WHERE id=1;" "binding_approval_invalid"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (10,'APR-WHSH01-20261015-000010','DEVICE_BIND',1,'DEVICE_BINDING','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',101,'2099-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (10,'APR-WHSH01-20261015-000010','DEVICE_BIND',1,'DEVICE_BINDING','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',101,NULL);"
 seed "UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=10;"
 expect_allow "12 I3 正向：DEVICE_BIND 已通过、审批人≠使用人 → PENDING→ACTIVE" \
   "BEGIN; UPDATE user_device_binding SET status='ACTIVE', approval_id=10, activated_at='2026-10-15 09:00' WHERE id=1 AND status='PENDING'; COMMIT;"
@@ -2023,7 +2026,7 @@ expect_block "12 I4 吊销后恢复" \
 expect_block "12 I2 直接插成 APPROVED" \
   "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at,status) VALUES (20,'APR-WHSH01-20261015-000020','POD_CORRECT',1,'POD','20','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01','APPROVED');" "approval_insert_not_pending"
 expect_block "12 同一目标两条待审批" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (21,'APR-WHSH01-20261015-000021','CANCEL_AFTER_PICK',1,'OUTBOUND','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',203,'2099-01-01');" "uq_apr_open"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (21,'APR-WHSH01-20261015-000021','CANCEL_AFTER_PICK',1,'OUTBOUND','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',203,NULL);" "uq_apr_open"
 expect_block "12 SoD：申请人自己审批" \
   "UPDATE approval_request SET status='APPROVED', first_approver_id=201, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=1;" "ck_apr_sod"
 expect_block "12 I2 单人审批进 PARTIAL" \
@@ -2038,16 +2041,16 @@ expect_block "12 I1/I2 APPROVED 改回 PENDING" \
   "UPDATE approval_request SET status='PENDING', decided_at=NULL WHERE id=1;" "approval_final"
 expect_block "12 审批不可删除" \
   "DELETE FROM approval_request WHERE id=1;" "append_only_violation: approval_request"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (4,'APR-WHSH01-20261015-000114','POD_CORRECT',1,'POD','4','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2020-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,created_at,expires_at) VALUES (4,'APR-WHSH01-20261015-000114','POD_CORRECT',1,'POD','4','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2019-12-31 23:00:00','2020-01-01 00:00:00');"
 expect_block "12 I2 过期后审批" \
   "UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=4;" "approval_expired"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (41,'APR-WHSH01-20261015-000041','POD_CORRECT',1,'POD','41','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,(now() AT TIME ZONE 'UTC') - interval '1 minute');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,created_at,expires_at) VALUES (41,'APR-WHSH01-20261015-000041','POD_CORRECT',1,'POD','41','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,date_trunc('second', now() AT TIME ZONE 'UTC') - interval '2 minutes',date_trunc('second', now() AT TIME ZONE 'UTC') - interval '1 minute');"
 expect_block "12 UTC 反向：expires_at = UTC 当前 −1 分钟，已过期不能再批" \
   "UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=41;" "approval_expired"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (42,'APR-WHSH01-20261015-000042','POD_CORRECT',1,'POD','42','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,(now() AT TIME ZONE 'UTC') + interval '2 hours');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (42,'APR-WHSH01-20261015-000042','POD_CORRECT',1,'POD','42','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,date_trunc('second', now() AT TIME ZONE 'UTC') + interval '2 hours');"
 expect_allow "12 UTC 正向：expires_at = UTC 当前 +2 小时（比本地 UTC+8 早）仍可批" \
   "BEGIN; UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=42; COMMIT;"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (3,'APR-WHSH01-20261015-000903','UNPLANNED_FAILOVER',1,'WAREHOUSE','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (3,'APR-WHSH01-20261015-000903','UNPLANNED_FAILOVER',1,'WAREHOUSE','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL);"
 expect_block "12 I5 第一确认人不持有任何角色" \
   "UPDATE approval_request SET status='PARTIAL', first_approver_id=204, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00' WHERE id=3;" "approval_role_not_held"
 expect_block "12 I5 第一确认人只有 CENTER_OPS 却写 WH_SUPERVISOR" \
@@ -2067,10 +2070,10 @@ expect_block "12 非计划切换只有一人确认就 APPROVED" \
 expect_allow "12 I5 正向：中心运维第二确认 → APPROVED" \
   "BEGIN; UPDATE approval_request SET status='APPROVED', second_approver_id=203, second_approver_role='CENTER_OPS', second_approved_at='2026-10-15 09:30', decided_at='2026-10-15 09:30' WHERE id=3; COMMIT;"
 expect_block "12 SM 发起人不是本仓仓库主管（只有 CENTER_OPS）" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (23,'APR-WHSH01-20261015-000023','SCRAP_MISREPORT',1,'SCRAP_ORDER','9009','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',203,'2099-01-01');" "approval_role_not_held"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (23,'APR-WHSH01-20261015-000023','SCRAP_MISREPORT',1,'SCRAP_ORDER','9009','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',203,NULL);" "approval_role_not_held"
 expect_block "12 SM 发起人是质检主管而非仓库主管" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (24,'APR-WHSH01-20261015-000024','SCRAP_MISREPORT',1,'SCRAP_ORDER','9010','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',205,'2099-01-01');" "approval_role_not_held"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (5,'APR-WHSH01-20261015-000005','SCRAP_MISREPORT',1,'SCRAP_ORDER','9001','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',202,'2099-01-01');"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (24,'APR-WHSH01-20261015-000024','SCRAP_MISREPORT',1,'SCRAP_ORDER','9010','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',205,NULL);" "approval_role_not_held"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (5,'APR-WHSH01-20261015-000005','SCRAP_MISREPORT',1,'SCRAP_ORDER','9001','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',202,NULL);"
 expect_block "12 SM 发起人自己审批（202 兼 CENTER_OPS 也不行）" \
   "UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='CENTER_OPS', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=5;" "ck_apr_sod"
 expect_block "12 SM 审批角色写成仓库主管（另一主管 206 不具审批权）" \
@@ -2081,50 +2084,50 @@ expect_block "12 SM 质检主管不在本仓" \
   "UPDATE approval_request SET status='APPROVED', first_approver_id=207, first_approver_role='QC_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=5;" "approval_role_not_held"
 expect_allow "12 SM 正向：本仓质检主管审批" \
   "BEGIN; UPDATE approval_request SET status='APPROVED', first_approver_id=205, first_approver_role='QC_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=5; COMMIT;"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (6,'APR-WHSH01-20261015-000006','SCRAP_MISREPORT',1,'SCRAP_ORDER','9002','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',206,'2099-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (6,'APR-WHSH01-20261015-000006','SCRAP_MISREPORT',1,'SCRAP_ORDER','9002','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',206,NULL);"
 expect_allow "12 SM 正向：中心运维审批" \
   "BEGIN; UPDATE approval_request SET status='APPROVED', first_approver_id=203, first_approver_role='CENTER_OPS', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=6; COMMIT;"
 expect_block "12 审批单号格式：旧格式 SM-2026-001" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (30,'SM-2026-001','CANCEL_AFTER_PICK',1,'OUTBOUND','30','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (30,'SM-2026-001','CANCEL_AFTER_PICK',1,'OUTBOUND','30','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL);" "ck_apr_code"
 expect_block "12 审批单号格式：日期 7 位 APR-WHSH01-2026101-000001" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (31,'APR-WHSH01-2026101-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','31','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (31,'APR-WHSH01-2026101-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','31','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL);" "ck_apr_code"
 expect_block "12 审批单号格式：序号 5 位 APR-WHSH01-20261015-00001" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (32,'APR-WHSH01-20261015-00001','CANCEL_AFTER_PICK',1,'OUTBOUND','32','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (32,'APR-WHSH01-20261015-00001','CANCEL_AFTER_PICK',1,'OUTBOUND','32','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL);" "ck_apr_code"
 expect_block "12 审批单号格式：仓库编码为空 APR--20261015-000001" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (33,'APR--20261015-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','33','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (33,'APR--20261015-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','33','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL);" "ck_apr_code"
 expect_block "12 审批单号格式：日期含字母 APR-WHSH01-2026A015-000001" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (34,'APR-WHSH01-2026A015-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','34','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (34,'APR-WHSH01-2026A015-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','34','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL);" "ck_apr_code"
 expect_block "12 审批单号格式：月份 13 APR-WHSH01-20261315-000001" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (35,'APR-WHSH01-20261315-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','35','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (35,'APR-WHSH01-20261315-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','35','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL);" "ck_apr_code"
 expect_block "12 审批单号格式：序号含字母 APR-WHSH01-20261015-00000X" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (36,'APR-WHSH01-20261015-00000X','CANCEL_AFTER_PICK',1,'OUTBOUND','36','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (36,'APR-WHSH01-20261015-00000X','CANCEL_AFTER_PICK',1,'OUTBOUND','36','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL);" "ck_apr_code"
 expect_block "12 审批单号格式：前缀小写 apr-WH01-20261015-000001" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (37,'apr-WH01-20261015-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','37','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (37,'apr-WH01-20261015-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','37','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL);" "ck_apr_code"
 expect_block "12 审批单号格式：仓库编码含 - APR-WH-01-20261015-000001" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (38,'APR-WH-01-20261015-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','38','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (38,'APR-WH-01-20261015-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','38','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL);" "ck_apr_code"
 expect_allow "12 审批单号格式正向：APR-SHPD01-20261231-999999" \
-  "BEGIN; INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (40,'APR-SHPD01-20261231-999999','POD_CORRECT',4,'POD','40','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01'); COMMIT;"
+  "BEGIN; INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (40,'APR-SHPD01-20261231-999999','POD_CORRECT',4,'POD','40','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL); COMMIT;"
 expect_block "12 审批类型不在码表" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (22,'APR-WHSH01-20261015-000022','BANANA',1,'X','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_type"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (22,'APR-WHSH01-20261015-000022','BANANA',1,'X','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL);" "ck_apr_type"
 expect_block "12 perm_version 回退" \
   "UPDATE sys_user SET perm_version = 1 WHERE id = 101;" "perm_version_rewind"
 expect_allow "12 I7 正向：perm_version 前进" \
   "BEGIN; UPDATE sys_user SET perm_version = 4 WHERE id = 101; COMMIT;"
 expect_block "12 T1 审批单号：仓库编码小写 APR-sh01-20261015-000001" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (50,'APR-sh01-20261015-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','50','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (50,'APR-sh01-20261015-000001','CANCEL_AFTER_PICK',1,'OUTBOUND','50','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL);" "ck_apr_code"
 expect_block "12 T1 审批单号：仓库编码含下划线 APR-S_01-20261015-000002" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (51,'APR-S_01-20261015-000002','CANCEL_AFTER_PICK',1,'OUTBOUND','51','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (51,'APR-S_01-20261015-000002','CANCEL_AFTER_PICK',1,'OUTBOUND','51','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL);" "ck_apr_code"
 expect_block "12 T1 审批单号：仓库编码含空格 APR-S 01-20261015-000003" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (52,'APR-S 01-20261015-000003','CANCEL_AFTER_PICK',1,'OUTBOUND','52','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (52,'APR-S 01-20261015-000003','CANCEL_AFTER_PICK',1,'OUTBOUND','52','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL);" "ck_apr_code"
 expect_block "12 T1 审批单号：仓库编码长度 1 APR-A-20261015-000004" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (53,'APR-A-20261015-000004','CANCEL_AFTER_PICK',1,'OUTBOUND','53','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (53,'APR-A-20261015-000004','CANCEL_AFTER_PICK',1,'OUTBOUND','53','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL);" "ck_apr_code"
 expect_block "12 T1 审批单号：仓库编码长度 17 APR-ABCDEFGHIJKLMNOPQ-20261015-000005" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (54,'APR-ABCDEFGHIJKLMNOPQ-20261015-000005','CANCEL_AFTER_PICK',1,'OUTBOUND','54','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "ck_apr_code"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (54,'APR-ABCDEFGHIJKLMNOPQ-20261015-000005','CANCEL_AFTER_PICK',1,'OUTBOUND','54','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL);" "ck_apr_code"
 expect_allow "12 T1 正向：仓库编码长度 2 / 16" \
-  "BEGIN; INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (56,'APR-W2-20261015-000006','POD_CORRECT',2,'POD','56','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01'); INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (57,'APR-ABCDEFGH12345678-20261015-000007','POD_CORRECT',3,'POD','57','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01'); COMMIT;"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (60,'APR-WHSH01-20261015-000060','DEVICE_BIND',1,'DEVICE_BINDING','60','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',101,'2099-01-01');"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (61,'APR-WHSH01-20261015-000061','POD_CORRECT',1,'POD','61','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (62,'APR-WHSH01-20261015-000062','CANCEL_AFTER_PICK',1,'OUTBOUND','62','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');"
+  "BEGIN; INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (56,'APR-W2-20261015-000006','POD_CORRECT',2,'POD','56','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL); INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (57,'APR-ABCDEFGH12345678-20261015-000007','POD_CORRECT',3,'POD','57','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL); COMMIT;"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (60,'APR-WHSH01-20261015-000060','DEVICE_BIND',1,'DEVICE_BINDING','60','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',101,NULL);"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (61,'APR-WHSH01-20261015-000061','POD_CORRECT',1,'POD','61','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL);"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (62,'APR-WHSH01-20261015-000062','CANCEL_AFTER_PICK',1,'OUTBOUND','62','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL);"
 expect_block "12 T2 DEVICE_BIND：无任何角色的用户（204）批准" \
   "UPDATE approval_request SET status='APPROVED', first_approver_id=204, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=60;" "approval_perm_not_held"
 expect_block "12 T2 POD_CORRECT：无任何角色的用户（204）批准" \
@@ -2147,8 +2150,8 @@ seed "INSERT INTO sys_role (id,code,name) VALUES (4,'CS','客服');"
 seed "INSERT INTO sys_role_perm (role_id,perm_id) VALUES (4,4);"
 seed "INSERT INTO sys_user_role (user_id,role_id) VALUES (209,4),(210,2);"
 seed "INSERT INTO sys_user_warehouse (user_id,warehouse_id) VALUES (209,1);"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (63,'APR-WHSH01-20261015-000063','CANCEL_AFTER_PICK',1,'OUTBOUND','63','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',209,'2099-01-01');"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (64,'APR-WHSH01-20261015-000064','CANCEL_AFTER_PICK',1,'OUTBOUND','64','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',202,'2099-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (63,'APR-WHSH01-20261015-000063','CANCEL_AFTER_PICK',1,'OUTBOUND','63','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',209,NULL);"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (64,'APR-WHSH01-20261015-000064','CANCEL_AFTER_PICK',1,'OUTBOUND','64','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',202,NULL);"
 expect_block "12 拣后取消：只有申请权限 cancel_after_pick（客服 209）不能审批" \
   "UPDATE approval_request SET status='APPROVED', first_approver_id=209, first_approver_role='CS', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=64;" "approval_perm_not_held"
 expect_block "12 拣后取消：申请人 202（持有 .approve）审批自己的单" \
@@ -2158,13 +2161,13 @@ expect_allow "12 拣后取消正向：不在本仓的 CENTER_OPS（210，数据�
 expect_allow "12 拣后取消正向：另一位本仓主管 201 审批 202 的申请" \
   "BEGIN; UPDATE approval_request SET status='APPROVED', first_approver_id=201, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=64; COMMIT;"
 expect_block "12 单号仓库编码 WH01 ≠ 仓 1 的 WHSH01" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (65,'APR-WH01-20261015-000065','POD_CORRECT',1,'POD','65','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "approval_code_warehouse_mismatch"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (65,'APR-WH01-20261015-000065','POD_CORRECT',1,'POD','65','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL);" "approval_code_warehouse_mismatch"
 expect_block "12 单号写 W2 但挂在仓 1" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (66,'APR-W2-20261015-000066','POD_CORRECT',1,'POD','66','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "approval_code_warehouse_mismatch"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (66,'APR-W2-20261015-000066','POD_CORRECT',1,'POD','66','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL);" "approval_code_warehouse_mismatch"
 expect_block "12 所属仓不存在（warehouse_id=99）" \
-  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (67,'APR-WHSH01-20261015-000067','POD_CORRECT',99,'POD','67','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01');" "approval_code_warehouse_mismatch"
+  "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (67,'APR-WHSH01-20261015-000067','POD_CORRECT',99,'POD','67','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL);" "approval_code_warehouse_mismatch"
 expect_allow "12 单号仓库编码正向：APR-WHSH01-… 挂仓 1" \
-  "BEGIN; INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (68,'APR-WHSH01-20261015-000068','POD_CORRECT',1,'POD','68','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,'2099-01-01'); COMMIT;"
+  "BEGIN; INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (68,'APR-WHSH01-20261015-000068','POD_CORRECT',1,'POD','68','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',201,NULL); COMMIT;"
 OUT=$(psql_capture "SET ROLE wms_app; DELETE FROM approval_request WHERE id=1;")
 case "$OUT" in *"permission denied for table approval_request"*) ok "12 wms_app 不能删审批";; *) bad "12 wms_app 不能删审批 未被拒：$OUT";; esac
 OUT=$(psql_capture "SET ROLE wms_app; UPDATE offline_token SET expires_at='2030-01-01' WHERE id=4;")
@@ -2185,7 +2188,7 @@ case "$OUT" in *"append_only_violation"*|*"cannot truncate a table referenced in
 [ -n "$CNT_B" ] && [ "$CNT_B" = "$CNT_A" ] && ok "12 TRUNCATE 审批/绑定后行数不变（$CNT_A）" || bad "TRUNCATE 审批/绑定后行数变化：$CNT_B -> $CNT_A"
 # 逐表单独 TRUNCATE：同一事务内先拆掉引用它的外键（只有 stock_hold.fk_hold_approval_no 引用 approval_request；stock_hold 自身也受保护，不能清行，所以 DROP CONSTRAINT），不用 session_replication_role，确保命中目标表自己的 TRUNCATE 触发器；ROLLBACK 还原
 for T in approval_request user_device_binding audit_log; do
-  PRE=""; [ "$T" = approval_request ] && PRE="ALTER TABLE stock_hold DROP CONSTRAINT fk_hold_approval_no;"
+  PRE=""; [ "$T" = approval_request ] && PRE="ALTER TABLE stock_hold DROP CONSTRAINT fk_hold_approval_no; ALTER TABLE user_device_binding DROP CONSTRAINT fk_udb_approval; ALTER TABLE audit_log DROP CONSTRAINT fk_audit_approval;"; [ "$T" = user_device_binding ] && PRE="ALTER TABLE device_reconnect DROP CONSTRAINT fk_drc_binding; ALTER TABLE offline_token DROP CONSTRAINT fk_offline_binding;"
   OUT=$(psql_capture "BEGIN; $PRE TRUNCATE $T; ROLLBACK;")
   case "$OUT" in *"append_only_violation: $T"*) ok "12 单表 TRUNCATE $T 命中自身触发器（外键已在事务内拆除）";; *) bad "12 单表 TRUNCATE $T 未报 append_only_violation：$OUT";; esac
 done
@@ -2200,7 +2203,7 @@ H=$(printf 'a%.0s' $(seq 64))
 i=0
 for T in PAPER_BACKFILL BOX_VOID PROCESS_YIELD_DEVIATION LIVE_DEATH_OVER PROCESS_REWORK; do
   A=$((81+i)); B=$((86+i))
-  seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES ($A,'APR-WHSH01-20261015-0000$A','$T',1,'$T','$A','{}','$H','r',201,'2099-01-01'),($B,'APR-WHSH01-20261015-0000$B','$T',1,'$T','$B','{}','$H','r',202,'2099-01-01');"
+  seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES ($A,'APR-WHSH01-20261015-0000$A','$T',1,'$T','$A','{}','$H','r',201,NULL),($B,'APR-WHSH01-20261015-0000$B','$T',1,'$T','$B','{}','$H','r',202,NULL);"
   APP="UPDATE approval_request SET status='APPROVED', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00'"
   expect_block "12 $T：无该审批权限点（质检主管 205）" "$APP, first_approver_id=205, first_approver_role='QC_SUPERVISOR' WHERE id=$A;" "approval_perm_not_held"
   expect_block "12 $T：申请人 202 自批" "$APP, first_approver_id=202, first_approver_role='WH_SUPERVISOR' WHERE id=$B;" "ck_apr_sod"
@@ -2210,7 +2213,7 @@ done
 # 12 search_path 固定：8 个函数都带 SET search_path = pg_catalog, public（防同名表劫持）
 R=$(psql -t -A -c "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public' AND p.proname IN ('trg_audit_node_required','trg_audit_append_only','trg_apr_insert','trg_apr_final','trg_udb_guard','trg_no_delete_12','trg_offline_guard','trg_user_perm_ver') AND 'search_path=pg_catalog, public, pg_temp' = ANY(p.proconfig)")
 [ "$R" = "8" ] && ok "12 search_path：8 个触发器函数 proconfig 均为 search_path=pg_catalog, public, pg_temp（$R）" || bad "12 search_path：只有 $R/8 个函数固定了 search_path"
-seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (95,'APR-WHSH01-20261015-000095','PAPER_BACKFILL',1,'PAPER_BACKFILL','95','{}','$H','r',201,'2099-01-01');"
+seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (95,'APR-WHSH01-20261015-000095','PAPER_BACKFILL',1,'PAPER_BACKFILL','95','{}','$H','r',201,NULL);"
 # 劫持：会话把自建 schema 放在 search_path 最前，建同名的 sys_user_role/sys_role/sys_role_perm/sys_permission/sys_user_warehouse 影子表，给质检主管 205 伪造 offline.paper.approve。函数固定了 search_path，仍查 public 的真表 → 必须照样 approval_perm_not_held
 OUT=$(psql_capture "CREATE SCHEMA hijack12; CREATE TABLE hijack12.sys_user_role (user_id BIGINT, role_id BIGINT); CREATE TABLE hijack12.sys_role (id BIGINT, code VARCHAR(32)); CREATE TABLE hijack12.sys_role_perm (role_id BIGINT, perm_id BIGINT); CREATE TABLE hijack12.sys_permission (id BIGINT, code VARCHAR(64)); CREATE TABLE hijack12.sys_user_warehouse (user_id BIGINT, warehouse_id BIGINT); INSERT INTO hijack12.sys_user_role VALUES (205,3); INSERT INTO hijack12.sys_role VALUES (3,'QC_SUPERVISOR'); INSERT INTO hijack12.sys_role_perm VALUES (3,11); INSERT INTO hijack12.sys_permission VALUES (11,'offline.paper.approve'); INSERT INTO hijack12.sys_user_warehouse VALUES (205,1); SET search_path = hijack12, public; UPDATE approval_request SET status='APPROVED', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00', first_approver_id=205, first_approver_role='QC_SUPERVISOR' WHERE id=95;")
 case "$OUT" in *"approval_perm_not_held"*) ok "12 search_path 劫持：影子权限表在前，质检主管 205 仍被 approval_perm_not_held 拦下";; *) bad "12 search_path 劫持未拦：$OUT";; esac
@@ -2238,11 +2241,11 @@ elif [ "$_N9" != "2" ]; then
   bad "17×12 前置：#9 权限点种子不全（$_N9/2）"
 else
 ok "17×12 前置：#9 种子已有 process.yield.approve / process.rework.approve（本段不自建）"
-expect_allow "17×12 审批种子：申请人 1731（也持 PROC_LEAD）、无权审批人 1732（WH_SUPERVISOR 无 process.yield.approve）、加工主管 1733（PROC_LEAD 持有）" "INSERT INTO sys_user (id,username,password_hash) VALUES (1731,'u1731','x'),(1732,'u1732','x'),(1733,'u1733','x'); INSERT INTO sys_role (id,code,name) VALUES (1731,'WH_SUPERVISOR_17','仓库主管'),(1732,'PROC_LEAD','加工主管'); INSERT INTO sys_role_perm (role_id,perm_id) SELECT 1732, id FROM sys_permission WHERE code = 'process.yield.approve'; INSERT INTO sys_user_role (user_id,role_id) VALUES (1732,1731),(1733,1732),(1731,1732); INSERT INTO sys_user_warehouse (user_id,warehouse_id) VALUES (1731,1),(1732,1),(1733,1); INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (1732,'APR-WHSH01-20261015-000032','PROCESS_YIELD_DEVIATION',1,'PROCESS_ORDER','1711','{}','cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc','出成率 43.8% 越界',1731,'2099-01-01 00:00:00');"
+expect_allow "17×12 审批种子：申请人 1731（也持 PROC_LEAD）、无权审批人 1732（WH_SUPERVISOR 无 process.yield.approve）、加工主管 1733（PROC_LEAD 持有）" "INSERT INTO sys_user (id,username,password_hash) VALUES (1731,'u1731','x'),(1732,'u1732','x'),(1733,'u1733','x'); INSERT INTO sys_role (id,code,name) VALUES (1731,'WH_SUPERVISOR_17','仓库主管'),(1732,'PROC_LEAD','加工主管'); INSERT INTO sys_role_perm (role_id,perm_id) SELECT 1732, id FROM sys_permission WHERE code = 'process.yield.approve'; INSERT INTO sys_user_role (user_id,role_id) VALUES (1732,1731),(1733,1732),(1731,1732); INSERT INTO sys_user_warehouse (user_id,warehouse_id) VALUES (1731,1),(1732,1),(1733,1); INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (1732,'APR-WHSH01-20261015-000032','PROCESS_YIELD_DEVIATION',1,'PROCESS_ORDER','1711','{}','cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc','出成率 43.8% 越界',1731,NULL);"
 expect_block "17×12 无 process.yield.approve 的人批 PROCESS_YIELD_DEVIATION" "UPDATE approval_request SET status='APPROVED', first_approver_id=1732, first_approver_role='WH_SUPERVISOR_17', first_approved_at='2026-10-15 05:30:00', decided_at='2026-10-15 05:30:00' WHERE id=1732;" "approval_perm_not_held"
 expect_block "17×12 报工人自己批（SoD）" "UPDATE approval_request SET status='APPROVED', first_approver_id=1731, first_approver_role='PROC_LEAD', first_approved_at='2026-10-15 05:30:00', decided_at='2026-10-15 05:30:00' WHERE id=1732;" "ck_apr_sod"
 expect_allow "17×12 加工主管批 PROCESS_YIELD_DEVIATION" "UPDATE approval_request SET status='APPROVED', first_approver_id=1733, first_approver_role='PROC_LEAD', first_approved_at='2026-10-15 05:30:00', decided_at='2026-10-15 05:30:00' WHERE id=1732;"
-expect_allow "17×12 返工审批种子：发起人 1734（权限点 process.yield.approve / process.rework.approve 复用 #9 种子，不自建；PROC_REWORKER，持 process.order.reverse 且也持 process.rework.approve，专测 SoD）；1733 PROC_LEAD 加持 process.rework.approve" "INSERT INTO sys_user (id,username,password_hash) VALUES (1734,'u1734','x'); INSERT INTO sys_role (id,code,name) VALUES (1734,'PROC_REWORKER','加工返工发起'); INSERT INTO sys_permission (id,code,name,module) VALUES (1734,'process.order.reverse','加工冲回/返工发起','process'); INSERT INTO sys_role_perm (role_id,perm_id) SELECT r.rid, p.id FROM (SELECT 1734 AS rid, 'process.order.reverse' AS pc UNION ALL SELECT 1734, 'process.rework.approve' UNION ALL SELECT 1732, 'process.rework.approve') r JOIN sys_permission p ON p.code = r.pc; INSERT INTO sys_user_role (user_id,role_id) VALUES (1734,1734); INSERT INTO sys_user_warehouse (user_id,warehouse_id) VALUES (1734,1); INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (1735,'APR-WHSH01-20261015-000035','PROCESS_REWORK',1,'PROCESS_ORDER','1711','{}','dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd','产出 1759 返工',1734,'2099-01-01 00:00:00');"
+expect_allow "17×12 返工审批种子：发起人 1734（权限点 process.yield.approve / process.rework.approve 复用 #9 种子，不自建；PROC_REWORKER，持 process.order.reverse 且也持 process.rework.approve，专测 SoD）；1733 PROC_LEAD 加持 process.rework.approve" "INSERT INTO sys_user (id,username,password_hash) VALUES (1734,'u1734','x'); INSERT INTO sys_role (id,code,name) VALUES (1734,'PROC_REWORKER','加工返工发起'); INSERT INTO sys_permission (id,code,name,module) VALUES (1734,'process.order.reverse','加工冲回/返工发起','process'); INSERT INTO sys_role_perm (role_id,perm_id) SELECT r.rid, p.id FROM (SELECT 1734 AS rid, 'process.order.reverse' AS pc UNION ALL SELECT 1734, 'process.rework.approve' UNION ALL SELECT 1732, 'process.rework.approve') r JOIN sys_permission p ON p.code = r.pc; INSERT INTO sys_user_role (user_id,role_id) VALUES (1734,1734); INSERT INTO sys_user_warehouse (user_id,warehouse_id) VALUES (1734,1); INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (1735,'APR-WHSH01-20261015-000035','PROCESS_REWORK',1,'PROCESS_ORDER','1711','{}','dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd','产出 1759 返工',1734,NULL);"
 expect_block "17×12 返工：无 process.rework.approve 的人（1732 仓库主管）批 PROCESS_REWORK" "UPDATE approval_request SET status='APPROVED', first_approver_id=1732, first_approver_role='WH_SUPERVISOR_17', first_approved_at='2026-10-15 05:40:00', decided_at='2026-10-15 05:40:00' WHERE id=1735;" "approval_perm_not_held"
 expect_block "17×12 返工 SoD：发起人 1734 自己批（即使持 process.rework.approve）" "UPDATE approval_request SET status='APPROVED', first_approver_id=1734, first_approver_role='PROC_REWORKER', first_approved_at='2026-10-15 05:40:00', decided_at='2026-10-15 05:40:00' WHERE id=1735;" "ck_apr_sod"
 expect_allow "17×12 返工：加工主管 1733 批 PROCESS_REWORK" "UPDATE approval_request SET status='APPROVED', first_approver_id=1733, first_approver_role='PROC_LEAD', first_approved_at='2026-10-15 05:40:00', decided_at='2026-10-15 05:40:00' WHERE id=1735;"
@@ -2585,7 +2588,7 @@ echo "=== 2z. pg_temp 劫持（#2 第九轮）：search_path 必须显式写 pg_
 # SQLite 没有对应攻击面：没有 schema 搜索路径，TEMP 表只对本连接可见，触发器体里的表名在建触发器时就绑到 main（不跟会话走），verify_sqlite.py 不加对应用例。
 # 目录断言：public 里所有带 search_path 设置的函数（含退供增量自带的 5 个，米雪儿已按本规则写）都必须正好是 pg_catalog, public, pg_temp。
 R=$(psql -t -A -c "SELECT count(*) FILTER (WHERE c <> 'search_path=pg_catalog, public, pg_temp') || '/' || count(*) FROM (SELECT unnest(p.proconfig) c FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace) s WHERE c LIKE 'search_path=%'")
-[ "$R" = "0/70" ] && ok "pg_temp 目录断言：70 个固定 search_path 的函数都显式以 pg_temp 结尾（不合规/总数 = $R）" || bad "pg_temp 目录断言：不合规/总数 = $R（期望 0/70）"
+[ "$R" = "0/84" ] && ok "pg_temp 目录断言：84 个固定 search_path 的函数都显式以 pg_temp 结尾（不合规/总数 = $R）" || bad "pg_temp 目录断言：不合规/总数 = $R（期望 0/84）"
 # 通用断言（不限函数个数）：public 下任何函数只要设了 search_path，pg_temp 必须是最后一项
 R=$(psql -t -A -c "SELECT count(*) FILTER (WHERE c !~ ',\s*pg_temp\s*$') || '/' || count(*) || '#' || COALESCE(string_agg(proname, ',') FILTER (WHERE c !~ ',\s*pg_temp\s*$'), '') FROM (SELECT p.proname, c FROM pg_proc p, unnest(p.proconfig) c WHERE p.pronamespace = 'public'::regnamespace AND c LIKE 'search_path=%') s")
 [ "${R%%/*}" = "0" ] && ok "pg_temp 末位断言：public 下设了 search_path 的函数 pg_temp 都在最后（缺/总 = ${R%%#*}）" || bad "pg_temp 末位断言：缺/总 = ${R%%#*}，函数：${R#*#}"
@@ -2613,7 +2616,7 @@ CREATE FUNCTION pg_temp.pt_try(q text, k text) RETURNS void LANGUAGE plpgsql AS 
 SELECT pg_temp.pt_try($q$INSERT INTO public.stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,stock_id,stock_seq,direction,occurred_at) VALUES (99061,'PT:1:D1:1','PT-HIJACK',1,1,1,'DOC',11,99061,0,'2026-10-15 00:00:00')$q$, 'pt.a0');
 SELECT pg_temp.pt_try($q$INSERT INTO public.scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (19961,19960,1,14,1,1,5000,0,'POST_OUT')$q$, 'pt.b0');
 SELECT pg_temp.pt_try($q$UPDATE public.outbox_event SET status='SENDING' WHERE id=19960$q$, 'pt.c0');
-SELECT pg_temp.pt_try($q$INSERT INTO public.approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (19960,'APR-PTFAKE-20261015-019960','PAPER_BACKFILL',1,'PAPER_BACKFILL','19960','{}','0000000000000000000000000000000000000000000000000000000000000000','r',201,'2099-01-01')$q$, 'pt.d0');
+SELECT pg_temp.pt_try($q$INSERT INTO public.approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (19960,'APR-PTFAKE-20261015-019960','PAPER_BACKFILL',1,'PAPER_BACKFILL','19960','{}','0000000000000000000000000000000000000000000000000000000000000000','r',201,NULL)$q$, 'pt.d0');
 RESET ROLE;
 ALTER FUNCTION public.trg_mvk_line_kind() SET search_path = pg_catalog, public;
 ALTER FUNCTION public.trg_scrl_draft_only() SET search_path = pg_catalog, public;
@@ -2625,7 +2628,7 @@ SET LOCAL search_path = public;
 SELECT pg_temp.pt_try($q$INSERT INTO public.stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,stock_id,stock_seq,direction,occurred_at) VALUES (99061,'PT:1:D1:1','PT-HIJACK',1,1,1,'DOC',11,99061,0,'2026-10-15 00:00:00')$q$, 'pt.a1');
 SELECT pg_temp.pt_try($q$INSERT INTO public.scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (19961,19960,1,14,1,1,5000,0,'POST_OUT')$q$, 'pt.b1');
 SELECT pg_temp.pt_try($q$UPDATE public.outbox_event SET status='SENDING' WHERE id=19960$q$, 'pt.c1');
-SELECT pg_temp.pt_try($q$INSERT INTO public.approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (19960,'APR-PTFAKE-20261015-019960','PAPER_BACKFILL',1,'PAPER_BACKFILL','19960','{}','0000000000000000000000000000000000000000000000000000000000000000','r',201,'2099-01-01')$q$, 'pt.d1');
+SELECT pg_temp.pt_try($q$INSERT INTO public.approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (19960,'APR-PTFAKE-20261015-019960','PAPER_BACKFILL',1,'PAPER_BACKFILL','19960','{}','0000000000000000000000000000000000000000000000000000000000000000','r',201,NULL)$q$, 'pt.d1');
 RESET ROLE;
 SELECT 'PT#' || current_setting('pt.a0') || '#' || current_setting('pt.a1') || '#' || current_setting('pt.b0') || '#' || current_setting('pt.b1') || '#' || current_setting('pt.c0') || '#' || current_setting('pt.c1') || '#' || current_setting('pt.d0') || '#' || current_setting('pt.d1') || '#' || current_setting('pt.cat1');
 ROLLBACK;
@@ -2637,7 +2640,7 @@ echo "  → fixed/mut：02[$A0 | $A1] 09[$B0 | $B1] 11[$C0 | $C1] 12[$D0 | $D1]"
 [ "$B0" = "scrap_line_locked" ] && ok "pg_temp 劫持 09 trg_scrl_draft_only：临时表 scrap_order 把已取消单伪造成 DRAFT，函数仍读 public → $B0" || bad "09 pg_temp 劫持：$B0（期望 scrap_line_locked）"
 [ "$C0" = "PT_PASSED" ] && ok "pg_temp 劫持 11 trg_outbox_order_guard：临时表 outbox_event 伪造同 biz_key 更早的 PENDING 行想卡住投递，函数仍读 public，真实事件照常进 SENDING（$C0）" || bad "11 pg_temp 劫持：$C0（期望正常放行 PT_PASSED）"
 [ "$D0" = "approval_code_warehouse_mismatch" ] && ok "pg_temp 劫持 12 trg_apr_insert：临时表 warehouse 把仓 1 编码伪造成 PTFAKE，函数仍读 public → $D0" || bad "12 pg_temp 劫持：$D0（期望 approval_code_warehouse_mismatch）"
-[ "$PC1" = "4/70" ] && ok "变异：四个函数去掉 pg_temp 后目录断言变红（$PC1）" || bad "变异目录断言没变红：$PC1（期望 4/70）"
+[ "$PC1" = "4/84" ] && ok "变异：四个函数去掉 pg_temp 后目录断言变红（$PC1）" || bad "变异目录断言没变红：$PC1（期望 4/84）"
 [ "$A1" != "$A0" ] && ok "变异：trg_mvk_line_kind 去掉 pg_temp 后临时表劫持生效（$A1）" || bad "变异没变红：trg_mvk_line_kind 去掉 pg_temp 后仍是 $A1"
 [ "$B1" != "$B0" ] && ok "变异：trg_scrl_draft_only 去掉 pg_temp 后临时表劫持生效（$B1）" || bad "变异没变红：trg_scrl_draft_only 去掉 pg_temp 后仍是 $B1"
 [ "$C1" != "$C0" ] && ok "变异：trg_outbox_order_guard 去掉 pg_temp 后临时表劫持生效（$C1）" || bad "变异没变红：trg_outbox_order_guard 去掉 pg_temp 后仍是 $C1"
@@ -3067,6 +3070,407 @@ R=$(psql -q -t -A -c "SELECT COALESCE(string_agg(n, ' ' ORDER BY n), '') FROM ((
 [ -z "$R" ] && ok "18 冻结基线：PG 触发器 28 + 索引 5 全在" || bad "18 冻结基线缺：$R"
 R=$(psql -q -t -A -c "BEGIN; DROP INDEX ix_ld_pending; SELECT COALESCE(string_agg(n, ' ' ORDER BY n), '') FROM ((SELECT unnest(ARRAY['trg_0keylock_live_death','trg_0keylock_live_stock_count','trg_0keylock_live_tank','trg_0keylock_live_tank_hold','trg_0keylock_sku_live_param','trg_lcl_append_only','trg_lcl_no_truncate','trg_ld_append_only','trg_ld_no_truncate','trg_ld_zclock','trg_li_append_only','trg_li_no_truncate','trg_li_zclock','trg_lsc_guard','trg_lsc_no_truncate','trg_lss_append_only','trg_lss_no_truncate','trg_lt_guard','trg_lt_no_truncate','trg_lt_type','trg_lth_guard','trg_lth_no_truncate','trg_lth_zclock','trg_lw_append_only','trg_lw_no_truncate','trg_lw_zclock','trg_slp_guard','trg_slp_no_truncate']) n EXCEPT SELECT tgname::text FROM pg_trigger WHERE NOT tgisinternal) UNION ALL (SELECT unnest(ARRAY['ix_ld_pending','ix_ld_tank_day','ix_li_tank','uq_lth_active','uq_lw_key']) EXCEPT SELECT indexname::text FROM pg_indexes WHERE schemaname='public')) x; ROLLBACK;" 2>&1 | tr -d '\n')
 case "$R" in *"ix_ld_pending"*) ok "18 变异（PG）：DROP INDEX ix_ld_pending → 冻结基线断言变红";; *) bad "18 PG 冻结基线变异未变红：$R";; esac
+echo "=== 2g-t. 第 12 篇时间加固（自查 B2/B3）+ fk_udb_approval + device_reconnect + 第 3 篇审批类型（PG；非属主写入由库覆盖、属主豁免）==="
+H12=$(printf 'a%.0s' $(seq 64))
+APR12="INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at"
+q1() { psql -t -A -q -c "$1"; }
+# 时区用例：会话 Asia/Shanghai + wms_app，调用方填 created_at=2000、不传 expires_at → 库写 UTC 整秒，补 created_at + 2h
+R=$(psql -t -A <<TZSQL | grep '^TZ#'
+SET TIME ZONE 'Asia/Shanghai';
+SET ROLE wms_app;
+$APR12,created_at) VALUES (1201,'APR-WHSH01-20261015-001201','CANCEL_AFTER_PICK',1,'OUTBOUND','1201','{}','$H12','r',201,NULL,'2000-01-01 00:00:00');
+RESET ROLE;
+SELECT 'TZ#' || (abs(extract(epoch FROM created_at - (now() AT TIME ZONE 'UTC'))) <= 5 AND created_at = date_trunc('second', created_at))::text || '#' || extract(epoch FROM expires_at - created_at)::bigint FROM approval_request WHERE id=1201;
+TZSQL
+)
+IFS='#' read -r _ T1 T2 <<< "$R"
+[ "$T1" = "true" ] && ok "12 B3-1 会话 Asia/Shanghai + wms_app 填 created_at=2000：库改写成 UTC 整秒的当前时间（不是 +8h）" || bad "12 B3-1 created_at 不是库时钟 UTC 整秒：$R"
+[ "$T2" = "7200" ] && ok "12 B3-1 拣后取消不传 expires_at：库补 created_at + 2h（$T2 s）" || bad "12 B3-1 expires_at 补算 = $T2（期望 7200）"
+R=$(psql -t -A <<'MUTSQL' | grep '^MUT#'
+BEGIN;
+DROP TRIGGER trg_apr_zclock ON approval_request;
+SET LOCAL ROLE wms_app;
+DO $m$ BEGIN INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at,created_at) VALUES (1299,'APR-WHSH01-20261015-001299','POD_CORRECT',1,'POD','1299','{}',repeat('a',64),'r',201,'2000-01-01 12:00:00','2000-01-01 00:00:00'); PERFORM set_config('m.r','PASSED',true); EXCEPTION WHEN OTHERS THEN PERFORM set_config('m.r',SQLERRM,true); END $m$;
+SELECT 'MUT#' || current_setting('m.r');
+ROLLBACK;
+MUTSQL
+)
+[ "$R" = "MUT#PASSED" ] && ok "变异：去掉 trg_apr_zclock 后 wms_app 写入 created_at=2000 的审批成功（B3-1 断言能抓到）" || bad "变异没变红：去掉 trg_apr_zclock 后仍是 $R"
+expect_block "12 B3-1 wms_app 审批 expires_at=2999（永不过期）" "SET ROLE wms_app; $APR12) VALUES (1202,'APR-WHSH01-20261015-001202','POD_CORRECT',1,'POD','1202','{}','$H12','r',201,'2999-01-01 00:00:00');" "ck_apr_ttl"
+expect_block "12 B3-1 属主审批 expires_at = created_at + 24h + 1s" "$APR12,created_at) VALUES (1202,'APR-WHSH01-20261015-001202','POD_CORRECT',1,'POD','1202','{}','$H12','r',201,'2026-10-16 00:00:01','2026-10-15 00:00:00');" "ck_apr_ttl"
+expect_block "12 B3-1 拣后取消 expires_at 超 2h 上限" "SET ROLE wms_app; $APR12) VALUES (1202,'APR-WHSH01-20261015-001202','CANCEL_AFTER_PICK',1,'OUTBOUND','1202','{}','$H12','r',201,date_trunc('second', now() AT TIME ZONE 'UTC') + interval '2 hours 1 second');" "ck_apr_ttl"
+expect_block "12 审批 expires_at 小数秒" "$APR12) VALUES (1202,'APR-WHSH01-20261015-001202','POD_CORRECT',1,'POD','1202','{}','$H12','r',201,date_trunc('second', now() AT TIME ZONE 'UTC') + interval '1 hour 0.5 second');" "ck_apr_ts"
+R=$(psql -t -A <<'MUTSQL' | grep '^MUT#'
+BEGIN;
+ALTER TABLE approval_request DROP CONSTRAINT ck_apr_ttl;
+SET LOCAL ROLE wms_app;
+DO $m$ BEGIN INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (1299,'APR-WHSH01-20261015-001299','POD_CORRECT',1,'POD','1299','{}',repeat('a',64),'r',201,'2999-01-01 00:00:00'); PERFORM set_config('m.r','PASSED',true); EXCEPTION WHEN OTHERS THEN PERFORM set_config('m.r',SQLERRM,true); END $m$;
+SELECT 'MUT#' || current_setting('m.r');
+ROLLBACK;
+MUTSQL
+)
+[ "$R" = "MUT#PASSED" ] && ok "变异：去掉 ck_apr_ttl 后 expires_at=2999 的审批写入成功" || bad "变异没变红：去掉 ck_apr_ttl 后仍是 $R"
+expect_allow "12 §6.8-6 正向：wms_app 缩短有效期（+60 s）" "SET ROLE wms_app; $APR12) VALUES (1202,'APR-WHSH01-20261015-001202','POD_CORRECT',1,'POD','1202','{}','$H12','r',201,date_trunc('second', now() AT TIME ZONE 'UTC') + interval '60 seconds');"
+expect_block "12 属主把审批 expires_at 改成 NULL" "UPDATE approval_request SET expires_at=NULL WHERE id=1202;" "approval_final"
+R=$(q1 "SELECT attnotnull FROM pg_attribute WHERE attrelid='approval_request'::regclass AND attname='expires_at'")
+[ "$R" = "t" ] && ok "12 approval_request.expires_at NOT NULL（库补算在 BEFORE 触发器里）" || bad "12 expires_at NOT NULL = $R"
+# B3-2：wms_app 审批时填 1999，落库是库时钟
+psql -q -c "SET ROLE wms_app; UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='1999-01-01 00:00:00', decided_at='1999-01-01 00:00:00' WHERE id=1202;" >/dev/null 2>&1
+R=$(q1 "SELECT status || '#' || (abs(extract(epoch FROM first_approved_at - (now() AT TIME ZONE 'UTC'))) <= 5)::text || '#' || (abs(extract(epoch FROM decided_at - (now() AT TIME ZONE 'UTC'))) <= 5)::text FROM approval_request WHERE id=1202")
+[ "$R" = "APPROVED#true#true" ] && ok "12 B3-2 wms_app 填 first_approved_at/decided_at=1999：落库为库时钟（$R）" || bad "12 B3-2 审批时间没被库覆盖：$R"
+psql -q -c "$APR12) VALUES (1203,'APR-WHSH01-20261015-001203','POD_CORRECT',1,'POD','1203','{}','$H12','r',201,NULL);" >/dev/null
+R=$(psql -t -A <<'MUTSQL' | grep '^MUT#'
+BEGIN;
+DROP TRIGGER trg_apr_zclock ON approval_request;
+SET LOCAL ROLE wms_app;
+UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='1999-01-01 00:00:00', decided_at='1999-01-01 00:00:00' WHERE id=1203;
+SELECT 'MUT#' || first_approved_at::text FROM approval_request WHERE id=1203;
+ROLLBACK;
+MUTSQL
+)
+[ "$R" = "MUT#1999-01-01 00:00:00" ] && ok "变异：去掉 trg_apr_zclock 后 wms_app 审批时间 1999 原样落库" || bad "变异没变红：$R"
+# 第 3 篇审批类型
+seed "INSERT INTO sys_permission (id,code,name,module) VALUES (1231,'inbound.receipt.adjust.approve','收货更正审批','03'),(1232,'inbound.sod.waive','收货上架职责分离放宽','03');"
+seed "INSERT INTO sys_role_perm (role_id,perm_id) VALUES (1,1231),(1,1232);"
+seed "$APR12) VALUES (1211,'APR-WHSH01-20261015-001211','INBOUND_CORRECTION',1,'INBOUND_RECEIPT','1211','{}','$H12','r',201,NULL),(1212,'APR-WHSH01-20261015-001212','INBOUND_SOD_WAIVER',1,'INBOUND_ORDER','1212','{}','$H12','r',201,NULL);"
+for P in 1211:INBOUND_CORRECTION 1212:INBOUND_SOD_WAIVER; do
+  I=${P%%:*}; T=${P#*:}
+  APP="UPDATE approval_request SET status='APPROVED', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00'"
+  expect_block "12 $T：质检主管 205 无审批权限点" "$APP, first_approver_id=205, first_approver_role='QC_SUPERVISOR' WHERE id=$I;" "approval_perm_not_held"
+  expect_block "12 $T：申请人 201 自批" "$APP, first_approver_id=201, first_approver_role='WH_SUPERVISOR' WHERE id=$I;" "ck_apr_sod"
+  expect_allow "12 $T 正向：本仓主管 202 审批" "$APP, first_approver_id=202, first_approver_role='WH_SUPERVISOR' WHERE id=$I;"
+done
+# B3-4 绑定 + fk_udb_approval + user_device_binding_time_immutable
+psql -q -c "SET ROLE wms_app; INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id,bound_at) VALUES (1201,'DEV-T1','PDA',101,1,'2000-01-01 00:00:00');" >/dev/null 2>&1
+R=$(q1 "SELECT (abs(extract(epoch FROM bound_at - (now() AT TIME ZONE 'UTC'))) <= 5)::text FROM user_device_binding WHERE id=1201")
+[ "$R" = "true" ] && ok "12 B3-4 wms_app 填 bound_at=2000：落库为库时钟" || bad "12 B3-4 bound_at 没被覆盖：$R"
+R=$(psql -t -A <<'MUTSQL' | grep '^MUT#'
+BEGIN;
+DROP TRIGGER trg_udb_zclock ON user_device_binding;
+SET LOCAL ROLE wms_app;
+INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id,bound_at) VALUES (1299,'DEV-T9','PDA',101,1,'2000-01-01 00:00:00');
+SELECT 'MUT#' || bound_at::text FROM user_device_binding WHERE id=1299;
+ROLLBACK;
+MUTSQL
+)
+[ "$R" = "MUT#2000-01-01 00:00:00" ] && ok "变异：去掉 trg_udb_zclock 后 bound_at=2000 原样落库" || bad "变异没变红：$R"
+expect_block "12 FK：吊销时挂不存在的审批 999999（触发器都放行，只有 fk_udb_approval 能拦）" "UPDATE user_device_binding SET status='REVOKED', revoked_at='2026-10-15 10:00:00', revoke_reason='LOST', approval_id=999999 WHERE id=1201;" "fk_udb_approval"
+R=$(psql -t -A <<'MUTSQL' | grep '^MUT#'
+BEGIN;
+ALTER TABLE user_device_binding DROP CONSTRAINT fk_udb_approval;
+DO $m$ BEGIN UPDATE user_device_binding SET status='REVOKED', revoked_at='2026-10-15 10:00:00', revoke_reason='LOST', approval_id=999999 WHERE id=1201; PERFORM set_config('m.r','PASSED',true); EXCEPTION WHEN OTHERS THEN PERFORM set_config('m.r',SQLERRM,true); END $m$;
+SELECT 'MUT#' || current_setting('m.r');
+ROLLBACK;
+MUTSQL
+)
+[ "$R" = "MUT#PASSED" ] && ok "变异：去掉 fk_udb_approval 后挂不存在的审批成功" || bad "变异没变红：$R"
+psql -q -c "SET ROLE wms_app; UPDATE user_device_binding SET status='REVOKED', revoked_at='2000-01-01 00:00:00', revoke_reason='LOST' WHERE id=1201;" >/dev/null 2>&1
+R=$(q1 "SELECT status || '#' || (abs(extract(epoch FROM revoked_at - (now() AT TIME ZONE 'UTC'))) <= 5)::text FROM user_device_binding WHERE id=1201")
+[ "$R" = "REVOKED#true" ] && ok "12 B3-4 wms_app 吊销填 revoked_at=2000：落库为库时钟（$R）" || bad "12 B3-4 revoked_at：$R"
+seed "INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id) VALUES (1202,'DEV-T2','PDA',101,1);"
+seed "$APR12) VALUES (1221,'APR-WHSH01-20261015-001221','DEVICE_BIND',1,'DEVICE_BINDING','1202','{}','$H12','r',201,NULL);"
+seed "UPDATE approval_request SET status='APPROVED', first_approver_id=202, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=1221;"
+psql -q -c "SET ROLE wms_app; UPDATE user_device_binding SET status='ACTIVE', approval_id=1221, activated_at='2000-01-01 00:00:00' WHERE id=1202;" >/dev/null 2>&1
+R=$(q1 "SELECT status || '#' || (abs(extract(epoch FROM activated_at - (now() AT TIME ZONE 'UTC'))) <= 5)::text FROM user_device_binding WHERE id=1202")
+[ "$R" = "ACTIVE#true" ] && ok "12 B3-4 wms_app 激活填 activated_at=2000：落库为库时钟（$R）" || bad "12 B3-4 activated_at：$R"
+expect_block "12 激活后改 activated_at（属主也不行）" "UPDATE user_device_binding SET activated_at='2026-01-01 00:00:00' WHERE id=1202;" "user_device_binding_time_immutable"
+R=$(psql -t -A <<'MUTSQL' | grep '^MUT#'
+BEGIN;
+DROP TRIGGER trg_udb_zclock ON user_device_binding;
+DO $m$ BEGIN UPDATE user_device_binding SET activated_at='2026-01-01 00:00:00' WHERE id=1202; PERFORM set_config('m.r','PASSED',true); EXCEPTION WHEN OTHERS THEN PERFORM set_config('m.r',SQLERRM,true); END $m$;
+SELECT 'MUT#' || current_setting('m.r');
+ROLLBACK;
+MUTSQL
+)
+[ "$R" = "MUT#PASSED" ] && ok "变异：去掉 trg_udb_zclock 后激活时间可改" || bad "变异没变红：$R"
+# B3-3 离线令牌
+OT12="INSERT INTO offline_token (id,jti,binding_id,user_id,device_instance_id,warehouse_id,perm_version,issued_at,expires_at) VALUES"
+expect_block "12 B3-3 wms_app 签发 issued_at=2030、expires=2030+12h（库把 issued_at 改成 now，超 12h 上限）" "SET ROLE wms_app; $OT12 (1201,'J1201',1202,101,'DEV-T2',1,1,'2030-01-01 00:00:00','2030-01-01 12:00:00');" "ck_offline_max_ttl"
+psql -q -c "SET ROLE wms_app; $OT12 (1201,'J1201',1202,101,'DEV-T2',1,1,'2030-01-01 00:00:00',date_trunc('second', now() AT TIME ZONE 'UTC') + interval '1 hour');" >/dev/null 2>&1
+R=$(q1 "SELECT (abs(extract(epoch FROM issued_at - (now() AT TIME ZONE 'UTC'))) <= 5)::text FROM offline_token WHERE id=1201")
+[ "$R" = "true" ] && ok "12 B3-3 wms_app 填 issued_at=2030：落库为库时钟" || bad "12 B3-3 issued_at：$R"
+R=$(psql -t -A <<'MUTSQL' | grep '^MUT#'
+BEGIN;
+DROP TRIGGER trg_offline_zclock ON offline_token;
+SET LOCAL ROLE wms_app;
+INSERT INTO offline_token (id,jti,binding_id,user_id,device_instance_id,warehouse_id,perm_version,issued_at,expires_at) VALUES (1299,'J1299',1202,101,'DEV-T2',1,1,'2030-01-01 00:00:00','2030-01-01 12:00:00');
+SELECT 'MUT#' || issued_at::text FROM offline_token WHERE id=1299;
+ROLLBACK;
+MUTSQL
+)
+[ "$R" = "MUT#2030-01-01 00:00:00" ] && ok "变异：去掉 trg_offline_zclock 后 issued_at=2030 原样落库" || bad "变异没变红：$R"
+# device_reconnect
+DR12="INSERT INTO device_reconnect (id,warehouse_id,binding_id,offline_jti,occurred_at) VALUES"
+psql -q -c "SET ROLE wms_app; $DR12 (1201,1,1202,'J1201','2000-01-01 00:00:00');" >/dev/null 2>&1
+R=$(q1 "SELECT (abs(extract(epoch FROM occurred_at - (now() AT TIME ZONE 'UTC'))) <= 5 AND occurred_at = date_trunc('second', occurred_at))::text FROM device_reconnect WHERE id=1201")
+[ "$R" = "true" ] && ok "12 device_reconnect wms_app 填 occurred_at=2000：落库为库时钟 UTC 整秒" || bad "12 device_reconnect occurred_at：$R"
+expect_allow "12 device_reconnect 正向：没有离线令牌" "SET ROLE wms_app; $DR12 (1202,1,1202,NULL,DEFAULT);"
+expect_block "12 device_reconnect 用别的绑定的离线令牌 J1" "SET ROLE wms_app; $DR12 (1203,1,1202,'J1',DEFAULT);" "device_reconnect_binding_mismatch"
+expect_block "12 device_reconnect 仓不一致" "SET ROLE wms_app; $DR12 (1203,2,1202,NULL,DEFAULT);" "device_reconnect_binding_mismatch"
+expect_block "12 device_reconnect 绑定不存在" "SET ROLE wms_app; $DR12 (1203,1,999999,NULL,DEFAULT);" "device_reconnect_binding_mismatch"
+expect_block "12 device_reconnect 只追加（属主 UPDATE）" "UPDATE device_reconnect SET occurred_at='2000-01-01 00:00:00' WHERE id=1201;" "append_only_violation: device_reconnect"
+expect_block "12 device_reconnect 只追加（属主 DELETE）" "DELETE FROM device_reconnect WHERE id=1201;" "append_only_violation: device_reconnect"
+expect_block "12 device_reconnect 只追加（TRUNCATE）" "TRUNCATE device_reconnect;" "append_only_violation: device_reconnect"
+expect_block "12 device_reconnect wms_app 不能 UPDATE（无授权）" "SET ROLE wms_app; UPDATE device_reconnect SET offline_jti=NULL WHERE id=1201;" "permission denied for table device_reconnect"
+expect_block "12 device_reconnect 同 id 重复" "SET ROLE wms_app; $DR12 (1201,1,1202,NULL,DEFAULT);" "device_reconnect_pkey"
+R=$(psql -t -A <<'MUTSQL' | grep '^MUT#'
+BEGIN;
+DROP TRIGGER trg_drc_append_only ON device_reconnect;
+DO $m$ BEGIN UPDATE device_reconnect SET occurred_at='2000-01-01 00:00:00' WHERE id=1201; PERFORM set_config('m.r','PASSED',true); EXCEPTION WHEN OTHERS THEN PERFORM set_config('m.r',SQLERRM,true); END $m$;
+SELECT 'MUT#' || current_setting('m.r');
+ROLLBACK;
+MUTSQL
+)
+[ "$R" = "MUT#PASSED" ] && ok "变异：去掉 trg_drc_append_only 后属主可改 occurred_at" || bad "变异没变红：$R"
+# pg_temp 劫持（00 §6.9）：wms_app 建同名临时表 user_device_binding，把绑定 1202 伪造成仓 2；fixed 必须仍按 public 真表拒，去掉 pg_temp 的变异必须放行
+R=$(psql -q -t -A <<'PTSQL' | grep '^PT#'
+BEGIN;
+SET LOCAL ROLE wms_app;
+CREATE TEMP TABLE user_device_binding (id BIGINT, warehouse_id BIGINT) ON COMMIT DROP;
+INSERT INTO pg_temp.user_device_binding VALUES (1202, 2);
+SET LOCAL search_path = public;
+CREATE FUNCTION pg_temp.pt_try(q text, k text) RETURNS void LANGUAGE plpgsql AS $f$ BEGIN BEGIN EXECUTE q; RAISE EXCEPTION 'PT_PASSED'; EXCEPTION WHEN OTHERS THEN PERFORM set_config(k, SQLERRM, true); END; END $f$;
+SELECT pg_temp.pt_try($q$INSERT INTO public.device_reconnect (id,warehouse_id,binding_id) VALUES (1290,2,1202)$q$, 'pt.a0');
+RESET ROLE;
+ALTER FUNCTION public.trg_drc_guard() SET search_path = pg_catalog, public;
+SET LOCAL ROLE wms_app;
+SET LOCAL search_path = public;
+SELECT pg_temp.pt_try($q$INSERT INTO public.device_reconnect (id,warehouse_id,binding_id) VALUES (1290,2,1202)$q$, 'pt.a1');
+RESET ROLE;
+SELECT 'PT#' || current_setting('pt.a0') || '#' || current_setting('pt.a1');
+ROLLBACK;
+PTSQL
+)
+IFS='#' read -r _ A0 A1 <<< "$R"
+[ "$A0" = "device_reconnect_binding_mismatch" ] && ok "pg_temp 劫持 12 trg_drc_guard：wms_app 临时表 user_device_binding 把绑定伪造成仓 2，函数仍读 public → $A0" || bad "12 trg_drc_guard pg_temp 劫持：$A0"
+[ "$A1" != "$A0" ] && ok "变异：trg_drc_guard 去掉 pg_temp 后临时表劫持生效（$A1）" || bad "变异没变红：trg_drc_guard 去掉 pg_temp 后仍是 $A1"
+R=$(q1 "SELECT count(*) FROM pg_proc p WHERE p.pronamespace='public'::regnamespace AND p.proname IN ('trg_apr_zclock','trg_udb_zclock','trg_offline_zclock','trg_drc_guard') AND 'search_path=pg_catalog, public, pg_temp' = ANY(p.proconfig)")
+[ "$R" = "4" ] && ok "12 新增 4 个函数 search_path = pg_catalog, public, pg_temp（$R/4）" || bad "12 新函数 search_path 合规 $R/4"
+echo "=== 2g-k. 第 12 篇键列不可改 + 计数器只增（PG；no-REPLACE 是 SQLite 专属，PG 用 ON CONFLICT 不删行）==="
+seed "INSERT INTO sys_user (id,username,password_hash) VALUES (1301,'u1301','x'),(1305,'u1305','x'); INSERT INTO sys_role (id,code,name) VALUES (1301,'R1301','r'); INSERT INTO sys_permission (id,code,name,module) VALUES (1301,'p.1301','p','12'); INSERT INTO sys_user_role VALUES (1301,1301); INSERT INTO sys_role_perm VALUES (1301,1301); INSERT INTO sys_user_warehouse VALUES (1301,1); INSERT INTO api_credential (id,api_key,secret_encrypted,source_system) VALUES (1301,'K1301','s','ERP');"
+seed "$APR12) VALUES (1301,'APR-WHSH01-20261015-001301','POD_CORRECT',1,'POD','1301','{}','$H12','r',201,NULL); INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id) VALUES (1301,'DEV-R1','PDA',101,1); INSERT INTO offline_token (id,jti,binding_id,user_id,device_instance_id,warehouse_id,perm_version,issued_at,expires_at) VALUES (1301,'J1301',1202,101,'DEV-T2',1,1,date_trunc('second', now() AT TIME ZONE 'UTC'),date_trunc('second', now() AT TIME ZONE 'UTC') + interval '1 hour');"
+for SPEC in "sys_user|id=1301|id=1399|username='u1399'" "approval_request|id=1301|id=1399|code='APR-X'|approval_type='DEVICE_BIND'|target_type='X'|target_id='9'" "user_device_binding|id=1301|id=1399|device_instance_id='DEV-R8'" "offline_token|id=1301|id=1399|jti='J1399'" "sys_role|id=1301|id=1399|code='R1399'" "sys_permission|id=1301|id=1399|code='p.1399'" "sys_user_role|user_id=1301|user_id=102|role_id=1" "sys_role_perm|role_id=1301|role_id=1|perm_id=1231" "sys_user_warehouse|user_id=1301|user_id=102|warehouse_id=2" "api_credential|id=1301|id=1399|api_key='K1399'"; do
+  IFS='|' read -r TB W REST <<< "$SPEC"; IFS='|' read -r -a SETS <<< "$REST"
+  for S in "${SETS[@]}"; do case $TB in approval_request|user_device_binding|offline_token|sys_user_role|sys_role_perm|sys_user_warehouse) AS="";; *) AS="SET ROLE wms_app; ";; esac; expect_block "12 键列不可改（${AS:+wms_app}${AS:-属主；wms_app 列级无 UPDATE 授权}）：$TB.$S" "${AS}UPDATE $TB SET $S WHERE $W;" "${TB}_key_immutable"; done
+  LAST=${SETS[-1]}
+  R=$(psql -t -A <<MUTSQL | grep '^MUT#'
+BEGIN;
+DROP TRIGGER trg_0_key_lock ON $TB;
+DROP TRIGGER IF EXISTS trg_apr_final ON approval_request; DROP TRIGGER IF EXISTS trg_udb_guard ON user_device_binding; DROP TRIGGER IF EXISTS trg_offline_guard ON offline_token;
+DO \$m\$ BEGIN UPDATE $TB SET $LAST WHERE $W; PERFORM set_config('m.r','PASSED',true); EXCEPTION WHEN OTHERS THEN PERFORM set_config('m.r',SQLERRM,true); END \$m\$;
+SELECT 'MUT#' || current_setting('m.r');
+ROLLBACK;
+MUTSQL
+)
+  [ "$R" = "MUT#PASSED" ] && ok "变异：去掉 $TB 的 trg_0_key_lock（及该表原有守卫）后改 $TB.${LAST%%=*} 成功" || bad "变异没变红：$TB key_lock 去掉后仍是 $R"
+done
+expect_allow "12 计数器正向：approval_request.version +1" "UPDATE approval_request SET version=version+1 WHERE id=1301;"
+expect_block "12 计数器只增：approval_request.version 回退" "UPDATE approval_request SET version=version-1 WHERE id=1301;" "approval_request_version_regress"
+R=$(psql -t -A <<'MUTSQL' | grep '^MUT#'
+BEGIN;
+DROP TRIGGER trg_apr_version ON approval_request;
+DO $m$ BEGIN UPDATE approval_request SET version=version-1 WHERE id=1301; PERFORM set_config('m.r','PASSED',true); EXCEPTION WHEN OTHERS THEN PERFORM set_config('m.r',SQLERRM,true); END $m$;
+SELECT 'MUT#' || current_setting('m.r');
+ROLLBACK;
+MUTSQL
+)
+[ "$R" = "MUT#PASSED" ] && ok "变异：去掉 trg_apr_version 后 version 回退成功" || bad "变异没变红：$R"
+echo "=== 2g-u. 第 12 篇用户停用 + 权限映射只经 SECURITY DEFINER 函数（PG；调用人取自会话、审计 id / node_seq 库分配、审计单次消费）==="
+seed "INSERT INTO sys_permission (id,code,name,module) VALUES (1311,'sys.user.role.grant','授角色','12'),(1312,'sys.user.role.revoke','收角色','12'),(1313,'sys.role.perm.grant','角色加权限','12'),(1314,'sys.role.perm.revoke','角色减权限','12'),(1315,'sys.user.warehouse.grant','授仓','12'),(1316,'sys.user.warehouse.revoke','收仓','12'),(1317,'x.rb.test','测试点','12');"
+seed "INSERT INTO sys_role (id,code,name) VALUES (1311,'RB_ADMIN','权限管理员'),(1312,'RB_TARGET','目标角色');"
+seed "INSERT INTO sys_role_perm (role_id,perm_id) VALUES (1311,1311),(1311,1312),(1311,1313),(1311,1314),(1311,1315),(1311,1316);"
+seed "INSERT INTO sys_user (id,username,password_hash) VALUES (1311,'rb_admin','x'),(1312,'rb_target','x'),(1313,'rb_noperm','x'),(1314,'rb_admin2','x');"
+seed "INSERT INTO sys_user_role (user_id,role_id) VALUES (1311,1311),(1314,1311),(1312,1312);"
+RBF="public.rbac_mapping_change(text,text,bigint,bigint,text,text)"
+pv() { q1 "SELECT perm_version FROM sys_user WHERE id=$1"; }
+sess() { echo "SET LOCAL wms.actor_id = '$1'; SET LOCAL wms.node_id = '13'; SET LOCAL wms.actor_perm_version = '${2:-$(pv $1)}'; SET LOCAL ROLE wms_app;"; }
+rb() {  # $1 前置 SQL，$2 表达式，$3 COMMIT|ROLLBACK
+psql -t -A <<RBSQL | grep '^RB#'
+BEGIN;
+$1
+DO \$m\$ DECLARE r text; BEGIN SELECT ($2)::text INTO r; PERFORM set_config('m.r','OK:'||coalesce(r,''),true); EXCEPTION WHEN OTHERS THEN PERFORM set_config('m.r',SQLERRM,true); END \$m\$;
+RESET ROLE;
+SELECT 'RB#' || current_setting('m.r');
+${3:-COMMIT};
+RBSQL
+}
+mutf() { echo "DO \$x\$ BEGIN EXECUTE replace(pg_get_functiondef('$RBF'::regprocedure), \$a\$$1\$a\$, \$b\$$2\$b\$); END \$x\$;"; }
+for T in "sys_user_role:1312,1311" "sys_role_perm:1312,1317" "sys_user_warehouse:1312,2"; do
+  TB=${T%%:*}; V=${T#*:}
+  expect_block "12 wms_app 直接 INSERT $TB（只留 SELECT）" "SET ROLE wms_app; INSERT INTO $TB VALUES ($V);" "permission denied for table $TB"
+  expect_block "12 wms_app 直接 DELETE $TB" "SET ROLE wms_app; DELETE FROM $TB;" "permission denied for table $TB"
+done
+R=$(psql -t -A <<'MUTSQL' | grep '^MUT#'
+BEGIN;
+GRANT DELETE ON sys_user_role TO wms_app;
+SET LOCAL ROLE wms_app;
+DELETE FROM sys_user_role WHERE user_id=1312 AND role_id=1312;
+RESET ROLE;
+SELECT 'MUT#' || count(*) FROM sys_user_role WHERE user_id=1312 AND role_id=1312;
+ROLLBACK;
+MUTSQL
+)
+[ "$R" = "MUT#0" ] && ok "变异：把 DELETE 授回 wms_app 后直接收角色成功" || bad "变异没变红：$R"
+# 调用人身份
+R=$(rb "SET LOCAL ROLE wms_app;" "public.sys_user_role_grant(1312,1311,'REQ-0','x')" ROLLBACK)
+[ "$R" = "RB#rbac_actor_unset" ] && ok "12 会话没设 wms.actor_id → rbac_actor_unset" || bad "12 未设身份：$R"
+R=$(rb "SET LOCAL wms.actor_id = '1311'; SET LOCAL wms.actor_perm_version = '$(pv 1311)'; SET LOCAL ROLE wms_app;" "public.sys_user_role_grant(1312,1311,'REQ-0','x')" ROLLBACK)
+[ "$R" = "RB#rbac_actor_unset" ] && ok "12 会话没设 wms.node_id → rbac_actor_unset" || bad "12 未设节点：$R"
+R=$(rb "$(mutf "NULLIF(current_setting('wms.actor_id', true), '')::bigint" "coalesce(NULLIF(current_setting('wms.actor_id', true), '')::bigint, 1311)") SET LOCAL wms.node_id = '13'; SET LOCAL wms.actor_perm_version = '$(pv 1311)'; SET LOCAL ROLE wms_app;" "public.sys_user_role_grant(1312,1311,'REQ-0','x')" ROLLBACK)
+[ "$R" = "RB#OK:1" ] && ok "变异：身份缺省回落到管理员后，未设身份的会话授角色成功（未设即拒的断言能抓到）" || bad "变异没变红（未设身份）：$R"
+R=$(rb "$(sess 1311 999)" "public.sys_user_role_grant(1312,1311,'REQ-0','x')" ROLLBACK)
+[ "$R" = "RB#rbac_actor_stale" ] && ok "12 劫持：应用冒充管理员 1311 但带的权限版本不对 → rbac_actor_stale" || bad "12 冒充（版本不对）：$R"
+R=$(rb "$(sess 99999 1)" "public.sys_user_role_grant(1312,1311,'REQ-0','x')" ROLLBACK)
+[ "$R" = "RB#rbac_actor_stale" ] && ok "12 劫持：应用冒充不存在的用户 99999 → rbac_actor_stale" || bad "12 冒充（不存在）：$R"
+R=$(rb "$(mutf 'IF NOT EXISTS (SELECT 1 FROM sys_user u WHERE u.id = actor' 'IF false AND NOT EXISTS (SELECT 1 FROM sys_user u WHERE u.id = actor') $(sess 1311 999)" "public.sys_user_role_grant(1312,1311,'REQ-0','x')" ROLLBACK)
+[ "$R" = "RB#OK:1" ] && ok "变异：去掉身份版本核对后，带错误版本的冒充会话授角色成功" || bad "变异没变红（版本核对）：$R"
+R=$(psql -t -A -c "SET ROLE wms_app; SELECT public.sys_user_role_grant(1311,1312,1311,13101,13,2001,'x');" 2>&1)
+case "$R" in *"does not exist"*) ok "12 应用传审计 id / node_seq / 调用人的旧签名不存在（这些值只由库和会话决定）";; *) bad "12 旧签名仍可调：$R";; esac
+# 函数路径
+P0=$(pv 1312); MAXID=$(q1 "SELECT coalesce(max(id),0) FROM audit_log"); MAXSEQ=$(q1 "SELECT coalesce(max(node_seq),0) FROM audit_log WHERE node_id=13")
+R=$(rb "$(sess 1311)" "public.sys_user_role_grant(1312,1311,'REQ-1','授角色')")
+[ "$R" = "RB#OK:1" ] && ok "12 函数路径：会话身份 1311 给 1312 授角色 1311" || bad "12 sys_user_role_grant：$R"
+R=$(q1 "SELECT (SELECT count(*) FROM sys_user_role WHERE user_id=1312 AND role_id=1311) || '#' || (SELECT perm_version FROM sys_user WHERE id=1312) - $P0 || '#' || (SELECT (id = $MAXID + 1)::text || '/' || (node_seq = $MAXSEQ + 1)::text || '/' || action || '/' || target_id || '/' || actor_id || '/' || trace_id || '/' || (abs(extract(epoch FROM occurred_at - (now() AT TIME ZONE 'UTC'))) <= 5)::text FROM audit_log WHERE action='sys.user.role.grant' AND trace_id='REQ-1')")
+[ "$R" = "1#1#true/true/sys.user.role.grant/1312:1311/1311/REQ-1/true" ] && ok "12 授角色：映射在、perm_version +1、审计 id / node_seq 由库分配（max+1）、调用人取自会话（$R）" || bad "12 授角色结果：$R"
+R=$(rb "$(sess 1311)" "public.sys_user_role_revoke(1312,1311,'REQ-2','收角色')")
+[ "$R#$(q1 "SELECT count(*) FROM sys_user_role WHERE user_id=1312 AND role_id=1311")" = "RB#OK:1#0" ] && ok "12 函数路径收角色" || bad "12 收角色：$R"
+R=$(rb "$(sess 1311)" "public.sys_user_role_grant(1312,1311,'REQ-1','重放')" ROLLBACK)
+[ "$R" = "RB#audit_log_rbac_replay" ] && ok "12 审计单次消费：同一 (授角色, 1312:1311, REQ-1) 重放 → audit_log_rbac_replay（40910 RBAC_AUDIT）" || bad "12 重放：$R"
+R=$(rb "$(mutf 'IF EXISTS (SELECT 1 FROM audit_log WHERE action = perm' 'IF false AND EXISTS (SELECT 1 FROM audit_log WHERE action = perm') $(sess 1311)" "public.sys_user_role_grant(1312,1311,'REQ-1','重放')" ROLLBACK)
+case "$R" in *uq_audit_rbac_once*) ok "12 去掉函数内重放检查后，uq_audit_rbac_once 兜底仍拒（$R）";; *) bad "12 uq_audit_rbac_once 兜底：$R";; esac
+R=$(rb "DROP INDEX uq_audit_rbac_once; $(mutf 'IF EXISTS (SELECT 1 FROM audit_log WHERE action = perm' 'IF false AND EXISTS (SELECT 1 FROM audit_log WHERE action = perm') $(sess 1311)" "public.sys_user_role_grant(1312,1311,'REQ-1','重放')" ROLLBACK)
+[ "$R" = "RB#OK:1" ] && ok "变异：去掉重放检查和 uq_audit_rbac_once 后同一请求号重放成功" || bad "变异没变红（单次消费）：$R"
+R=$(rb "$(sess 1311)" "public.sys_user_role_grant(1312,1311,'REQ-3','换请求号再授')")
+[ "$R" = "RB#OK:1" ] && ok "12 换新请求号可以再次授同一角色（单次消费只针对同一请求）" || bad "12 新请求号再授：$R"
+R=$(rb "$(sess 1311)" "public.sys_user_role_revoke(1312,1312,'REQ-4','x')" COMMIT)
+R=$(rb "$(sess 1311)" "public.sys_user_role_revoke(1312,1312,'REQ-5','再收')" ROLLBACK)
+[ "$R" = "RB#sys_user_role_absent" ] && ok "12 收不存在的角色 → sys_user_role_absent" || bad "12 收不存在：$R"
+R=$(rb "$(sess 1313)" "public.sys_user_role_grant(1312,1312,'REQ-6','x')" ROLLBACK)
+[ "$R" = "RB#rbac_perm_not_held" ] && ok "12 会话身份 1313 无 sys.user.role.grant → rbac_perm_not_held" || bad "12 无权限点：$R"
+R=$(rb "$(sess 1311)" "public.sys_user_role_grant(1311,1312,'REQ-6','x')" ROLLBACK)
+[ "$R" = "RB#rbac_self_change" ] && ok "12 给自己授角色 → rbac_self_change" || bad "12 自授：$R"
+R=$(rb "$(sess 1311)" "public.sys_role_perm_grant(1311,1317,'REQ-6','x')" ROLLBACK)
+[ "$R" = "RB#rbac_self_change" ] && ok "12 给自己所在角色加权限 → rbac_self_change" || bad "12 自加权限：$R"
+P0=$(pv 1312)
+R=$(rb "$(sess 1311)" "public.sys_role_perm_grant(1311,1317,'REQ-7','x')" ROLLBACK)
+R=$(rb "$(sess 1311)" "public.sys_user_role_grant(1312,1312,'REQ-8','x')")
+P0=$(pv 1312)
+R=$(rb "$(sess 1311)" "public.sys_role_perm_grant(1312,1317,'REQ-9','加权限')")
+[ "$R#$(( $(pv 1312) - P0 ))" = "RB#OK:1#1" ] && ok "12 角色加权限：持有该角色的用户 perm_version +1" || bad "12 sys_role_perm_grant：$R"
+R=$(rb "$(sess 1311)" "public.sys_role_perm_revoke(1312,1317,'REQ-10','减权限')")
+[ "$R" = "RB#OK:1" ] && ok "12 角色减权限" || bad "12 sys_role_perm_revoke：$R"
+R=$(rb "$(sess 1311)" "public.sys_user_warehouse_grant(1312,2,'REQ-11','授仓')"); R2=$(rb "$(sess 1311)" "public.sys_user_warehouse_revoke(1312,2,'REQ-12','收仓')")
+[ "$R#$R2" = "RB#OK:1#RB#OK:1" ] && ok "12 用户-仓授 / 收经函数" || bad "12 sys_user_warehouse_*：$R $R2"
+R=$(rb "$(mutf 'IF NOT EXISTS (SELECT 1 FROM sys_user u JOIN' 'IF false AND NOT EXISTS (SELECT 1 FROM sys_user u JOIN') $(sess 1313)" "public.sys_user_role_grant(1314,1312,'REQ-90','x')" ROLLBACK)
+[ "$R" = "RB#OK:1" ] && ok "变异：去掉权限点检查后无权限的 1313 授角色成功" || bad "变异没变红（权限点）：$R"
+R=$(rb "$(mutf "IF (p_kind <> 'ROLE_PERM' AND p_a = actor)" "IF false AND (p_kind <> 'ROLE_PERM' AND p_a = actor)") $(sess 1311)" "public.sys_user_role_grant(1311,1312,'REQ-90','x')" ROLLBACK)
+[ "$R" = "RB#OK:1" ] && ok "变异：去掉自改检查后给自己授角色成功" || bad "变异没变红（自改）：$R"
+R=$(psql -t -A <<MUTSQL | grep '^MUT#'
+BEGIN;
+DO \$x\$ BEGIN EXECUTE regexp_replace(pg_get_functiondef('$RBF'::regprocedure), 'UPDATE sys_user SET perm_version = perm_version \\+ 1 WHERE id = p_a;\\s+/\\*BUMP\\*/', '/*BUMP removed*/'); END \$x\$;
+$(sess 1311)
+SELECT public.sys_user_role_grant(1314,1312,'REQ-91','x');
+RESET ROLE;
+SELECT 'MUT#' || (SELECT perm_version FROM sys_user WHERE id=1314) - $(pv 1314);
+ROLLBACK;
+MUTSQL
+)
+[ "$R" = "MUT#0" ] && ok "变异：去掉 perm_version +1 后授角色不递增" || bad "变异没变红（递增）：$R"
+R=$(psql -t -A <<MUTSQL | grep '^MUT#'
+BEGIN;
+DO \$x\$ BEGIN EXECUTE replace(replace(pg_get_functiondef('$RBF'::regprocedure), 'INSERT INTO audit_log (id,', 'IF false THEN INSERT INTO audit_log (id,'), 'p_reason, node, aseq);', 'p_reason, node, aseq); END IF;'); END \$x\$;
+$(sess 1311)
+SELECT public.sys_user_role_grant(1314,1312,'REQ-92','x');
+RESET ROLE;
+SELECT 'MUT#' || count(*) FROM audit_log WHERE trace_id='REQ-92';
+ROLLBACK;
+MUTSQL
+)
+[ "$R" = "MUT#0" ] && ok "变异：去掉审计写入后授角色没有审计行" || bad "变异没变红（审计）：$R"
+# 停用
+P0=$(pv 1314)
+psql -q -c "SET ROLE wms_app; UPDATE sys_user SET status='DISABLED' WHERE id=1314;" >/dev/null
+[ "$(( $(pv 1314) - P0 ))" = "1" ] && ok "12 停用用户 1314：perm_version 由库 +1" || bad "12 停用没有递增 perm_version"
+R=$(rb "$(sess 1314)" "public.sys_user_role_grant(1312,1311,'REQ-13','x')" ROLLBACK)
+[ "$R" = "RB#rbac_perm_not_held" ] && ok "12 停用的管理员 1314（会话版本已更新）不能再授角色" || bad "12 停用管理员：$R"
+R=$(rb "$(sess 1314 $(( $(pv 1314) - 1 )))" "public.sys_user_role_grant(1312,1311,'REQ-13','x')" ROLLBACK)
+[ "$R" = "RB#rbac_actor_stale" ] && ok "12 停用前签发的会话（旧权限版本）→ rbac_actor_stale" || bad "12 停用前会话：$R"
+R=$(psql -t -A <<'MUTSQL' | grep '^MUT#'
+BEGIN;
+DROP TRIGGER trg_user_status_bump ON sys_user;
+CREATE TEMP TABLE pv0 AS SELECT perm_version FROM sys_user WHERE id=1313;
+UPDATE sys_user SET status='DISABLED' WHERE id=1313;
+SELECT 'MUT#' || (SELECT perm_version FROM sys_user WHERE id=1313) - (SELECT perm_version FROM pv0);
+ROLLBACK;
+MUTSQL
+)
+[ "$R" = "MUT#0" ] && ok "变异：去掉 trg_user_status_bump 后停用不递增 perm_version" || bad "变异没变红：$R"
+expect_block "12 登录名不可改（释放旧名）" "SET ROLE wms_app; UPDATE sys_user SET username='rb_x' WHERE id=1314;" "sys_user_key_immutable"
+expect_block "12 登录名不可复用（停用后同名新用户）" "SET ROLE wms_app; INSERT INTO sys_user (id,username,password_hash) VALUES (1319,'rb_admin2','x');" "uq_user_name"
+# pg_temp 劫持：临时表伪造 1313 持有 sys.user.role.grant
+R=$(psql -q -t -A <<PTSQL | grep '^PT#'
+BEGIN;
+$(sess 1313)
+CREATE TEMP TABLE sys_user (id BIGINT, status TEXT, deleted_at TIMESTAMP, perm_version BIGINT) ON COMMIT DROP;
+CREATE TEMP TABLE sys_user_role (user_id BIGINT, role_id BIGINT) ON COMMIT DROP;
+CREATE TEMP TABLE sys_role_perm (role_id BIGINT, perm_id BIGINT) ON COMMIT DROP;
+CREATE TEMP TABLE sys_permission (id BIGINT, code TEXT) ON COMMIT DROP;
+INSERT INTO pg_temp.sys_user VALUES (1313,'ACTIVE',NULL,$(pv 1313)); INSERT INTO pg_temp.sys_user_role VALUES (1313,9); INSERT INTO pg_temp.sys_role_perm VALUES (9,9); INSERT INTO pg_temp.sys_permission VALUES (9,'sys.user.role.grant');
+GRANT ALL ON pg_temp.sys_user, pg_temp.sys_user_role, pg_temp.sys_role_perm, pg_temp.sys_permission TO PUBLIC;
+SET LOCAL search_path = public;
+CREATE FUNCTION pg_temp.pt_try(q text, k text) RETURNS void LANGUAGE plpgsql AS \$f\$ BEGIN BEGIN EXECUTE q; RAISE EXCEPTION 'PT_PASSED'; EXCEPTION WHEN OTHERS THEN PERFORM set_config(k, SQLERRM, true); END; END \$f\$;
+SELECT pg_temp.pt_try(\$q\$SELECT public.sys_user_role_grant(1312,1312,'REQ-98','x')\$q\$, 'pt.a0');
+RESET ROLE;
+ALTER FUNCTION $RBF SET search_path = pg_catalog, public;
+SET LOCAL ROLE wms_app;
+SET LOCAL search_path = public;
+SELECT pg_temp.pt_try(\$q\$SELECT public.sys_user_role_grant(1312,1312,'REQ-98','x')\$q\$, 'pt.a1');
+RESET ROLE;
+SELECT 'PT#' || current_setting('pt.a0') || '#' || current_setting('pt.a1');
+ROLLBACK;
+PTSQL
+)
+IFS='#' read -r _ A0 A1 <<< "$R"
+[ "$A0" = "rbac_perm_not_held" ] && ok "pg_temp 劫持 rbac_mapping_change：临时表伪造 1313 持有权限点，函数仍读 public → $A0" || bad "rbac pg_temp 劫持：$A0"
+[ -n "$A1" ] && [ "$A1" != "$A0" ] && ok "变异：rbac_mapping_change 去掉 pg_temp 后劫持生效（$A1）" || bad "变异没变红：rbac 去掉 pg_temp 后仍是 $A1"
+R=$(q1 "SELECT count(*) || '/' || count(*) FILTER (WHERE 'search_path=pg_catalog, public, pg_temp' = ANY(p.proconfig)) || '/' || count(*) FILTER (WHERE p.prosecdef) || '/' || count(*) FILTER (WHERE pg_get_userbyid(p.proowner)='wms_rbac_owner') FROM pg_proc p WHERE p.pronamespace='public'::regnamespace AND p.proname IN ('trg_user_status_bump','rbac_mapping_change','sys_user_role_grant','sys_user_role_revoke','sys_role_perm_grant','sys_role_perm_revoke','sys_user_warehouse_grant','sys_user_warehouse_revoke')")
+[ "$R" = "8/8/6/7" ] && ok "12 新函数 8 个都 search_path 含 pg_temp；6 个包装 SECURITY DEFINER；7 个属主 wms_rbac_owner（$R）" || bad "12 rbac 函数目录：$R（期望 8/8/6/7）"
+R=$(q1 "SELECT has_function_privilege('wms_app','$RBF','EXECUTE')::text || '/' || has_function_privilege('wms_app','public.sys_user_role_revoke(bigint,bigint,text,text)','EXECUTE')::text")
+[ "$R" = "false/true" ] && ok "12 wms_app 不能直接调核心函数、只能调包装（$R）" || bad "12 EXECUTE 授权：$R"
+# 第 12 篇触发器 / 索引名冻结基线（缺任何一个就红；新增要同步补进基线）
+T12="'sys_user','sys_role','sys_permission','sys_user_role','sys_role_perm','sys_user_warehouse','api_credential','user_device_binding','offline_token','approval_request','device_reconnect'"
+TRG12_BASE="api_credential.trg_0_key_lock approval_request.trg_0_key_lock approval_request.trg_apr_final approval_request.trg_apr_insert approval_request.trg_apr_no_delete approval_request.trg_apr_no_truncate approval_request.trg_apr_version approval_request.trg_apr_zclock audit_log.trg_audit_append_only audit_log.trg_audit_node_required device_reconnect.trg_drc_append_only device_reconnect.trg_drc_guard device_reconnect.trg_drc_no_truncate offline_token.trg_0_key_lock offline_token.trg_offline_guard offline_token.trg_offline_zclock sys_permission.trg_0_key_lock sys_role.trg_0_key_lock sys_role_perm.trg_0_key_lock sys_user.trg_0_key_lock sys_user.trg_user_no_delete sys_user.trg_user_no_truncate sys_user.trg_user_perm_ver sys_user.trg_user_status_bump sys_user_role.trg_0_key_lock sys_user_warehouse.trg_0_key_lock user_device_binding.trg_0_key_lock user_device_binding.trg_udb_guard user_device_binding.trg_udb_no_delete user_device_binding.trg_udb_no_truncate user_device_binding.trg_udb_zclock"
+IDX12_BASE="api_credential.api_credential_pkey api_credential.uq_api_key approval_request.approval_request_pkey approval_request.ix_apr_requester approval_request.ix_apr_wh approval_request.uq_apr_code approval_request.uq_apr_open audit_log.uq_audit_node_seq device_reconnect.device_reconnect_pkey device_reconnect.ix_drc_binding device_reconnect.ix_drc_jti device_reconnect.uq_drc_id_binding offline_token.ix_offline_binding offline_token.offline_token_pkey offline_token.uq_offline_jti sys_permission.sys_permission_pkey sys_permission.uq_perm_code sys_role.sys_role_pkey sys_role.uq_role_code sys_role_perm.sys_role_perm_pkey sys_user.ix_user_openid sys_user.sys_user_pkey sys_user.uq_user_name sys_user_role.sys_user_role_pkey sys_user_warehouse.sys_user_warehouse_pkey user_device_binding.ix_udb_user user_device_binding.uq_udb_active user_device_binding.user_device_binding_pkey"
+TRG12_NOW=$(q1 "SELECT string_agg(c.relname || '.' || t.tgname, ' ' ORDER BY 1) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal AND (c.relname IN ($T12) OR (c.relname = 'audit_log' AND t.tgname IN ('trg_audit_node_required','trg_audit_append_only')))")
+IDX12_NOW=$(q1 "SELECT string_agg(tablename || '.' || indexname, ' ' ORDER BY 1) FROM pg_indexes WHERE schemaname = 'public' AND (tablename IN ($T12) OR indexname = 'uq_audit_node_seq')")
+MISS=""; for x in $TRG12_BASE $IDX12_BASE; do case " $TRG12_NOW $IDX12_NOW " in *" $x "*) ;; *) MISS="$MISS $x";; esac; done
+[ -z "$MISS" ] && [ -n "$TRG12_BASE" ] && ok "12 触发器 / 索引冻结基线齐全（$(wc -w <<< "$TRG12_BASE") 触发器、$(wc -w <<< "$IDX12_BASE") 索引）" || bad "12 冻结基线缺：$MISS ｜实测触发器：$TRG12_NOW ｜实测索引：$IDX12_NOW"
+R=$(psql -t -A <<'MUTSQL' | grep '^MUT#'
+BEGIN;
+DROP TRIGGER trg_drc_append_only ON device_reconnect;
+SELECT 'MUT#' || count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE c.relname = 'device_reconnect' AND t.tgname = 'trg_drc_append_only';
+ROLLBACK;
+MUTSQL
+)
+[ "$R" = "MUT#0" ] && case " $TRG12_BASE " in *" device_reconnect.trg_drc_append_only "*) ok "变异：删 trg_drc_append_only 后它在基线里、实测里没有 → 基线断言会变红";; *) bad "基线里没有 device_reconnect.trg_drc_append_only";; esac || bad "基线变异前置：$R"
+expect_block "12 计数器行：属主 DELETE sys_user" "DELETE FROM sys_user WHERE id=1301;" "append_only_violation: sys_user"
+expect_block "12 计数器行：属主 TRUNCATE sys_user" "TRUNCATE sys_user CASCADE;" "append_only_violation: sys_user"
+R=$(psql -t -A <<'MUTSQL' | grep '^MUT#'
+BEGIN;
+DROP TRIGGER trg_user_no_delete ON sys_user;
+DO $m$ BEGIN DELETE FROM sys_user WHERE id=1305; PERFORM set_config('m.r','PASSED',true); EXCEPTION WHEN OTHERS THEN PERFORM set_config('m.r',SQLERRM,true); END $m$;
+SELECT 'MUT#' || current_setting('m.r');
+ROLLBACK;
+MUTSQL
+)
+[ "$R" = "MUT#PASSED" ] && ok "变异：去掉 trg_user_no_delete 后属主删用户成功" || bad "变异没变红：$R"
+R=$(q1 "SELECT count(*) FROM pg_proc p WHERE p.pronamespace='public'::regnamespace AND p.proname IN ('trg_12_key_lock','trg_apr_version') AND 'search_path=pg_catalog, public, pg_temp' = ANY(p.proconfig)")
+[ "$R" = "2" ] && ok "12 trg_12_key_lock / trg_apr_version search_path 含 pg_temp（$R/2）" || bad "12 key_lock 函数 search_path $R/2"
+echo "=== 2g-fa. audit_log 外键（Doro 裁定：fk_audit_actor 在 12_auth 末尾 ALTER；fk_audit_approval 在 12b）==="
+R=$(psql -t -A -c "SELECT string_agg(conname || ':' || confrelid::regclass::text, ' ' ORDER BY conname) FROM pg_constraint WHERE conrelid = 'audit_log'::regclass AND contype = 'f' AND conname IN ('fk_audit_actor','fk_audit_approval')")
+[ "$R" = "fk_audit_actor:sys_user fk_audit_approval:approval_request" ] && ok "audit_log 外键已声明：$R" || bad "audit_log 外键缺：$R"
+expect_block "12 外键：audit_log.actor_id 指向不存在的用户" "INSERT INTO audit_log (id,actor_id,action,node_id,node_seq) VALUES (779801,999999,'t12.fk',7,779801);" "fk_audit_actor"
+expect_block "12 外键：audit_log.approval_id 指向不存在的审批单" "INSERT INTO audit_log (id,approval_id,action,node_id,node_seq) VALUES (779802,999999,'t12.fk',7,779802);" "fk_audit_approval"
 echo "=== 汇总 ==="
 echo "  通过 $pass 项 / 失败 $fail 项"
 cleanup
