@@ -18,7 +18,7 @@
 
 ### 1.1 负责
 
-1. 分拣员、复核员、仓管员、加工/活鲜作业员在现场使用的 H5 应用：领任务、三步扫码拣货、缺货上报、撤销确认、提交任务、复核、装箱、集货、收货、上架、盲收登记、纸单补录、待回库闭环。
+1. 分拣员、复核员、仓管员、加工/活鲜作业员在现场使用的 H5 应用：领任务、三步扫码拣货、缺货上报、撤销确认、提交任务、复核、装箱、集货、收货、上架、盲收登记、纸单补录、待回库闭环；加工/活鲜作业员另有领料、报工（含 `LOSS` 行）、冲回与批次追溯查询（17 §7.2）。
 2. **离线优先**：任务包本地缓存、本地 outbox、重连后按本地顺序补交，冲突不静默合并。
 3. 现场交互硬性要求：扫码输入、震动/声音反馈、大按钮单手操作、不弹阻断式对话框。
 4. 设备绑定、离线令牌、写节点地址缓存与切换的端上行为（§9.5、§9.7）。
@@ -103,7 +103,7 @@ Hash 路由（WebView 兼容）。权限点为渲染依据，实际以服务端�
 | `/move` | 同仓移库；跨仓调拨 | `inventory.move.view` / `.confirm`（07 §10，已合 main；原 `inventory.move.execute` 作废） | 同仓可离线；跨仓调拨按 `paused_actions` 的 `TRANSFER` 置灰、不重试（11 §6.6） |
 | `/offline/paper` | 纸单补录（恢复联网后 24 h 内） | `offline.paper.backfill` | 必须在线 |
 | `/sync` | 补交队列（待上传 / 失败红条 / 已完成） | — | 离线可看 |
-| `/processing/issue`、`/processing/receipt`、`/processing/loss` | 加工领料 / 成品入库 / 损耗 | `process.order.issue` / `process.order.report`（草稿 17） | 待 Q8 |
+| `/processing/issue`、`/processing/receipt`、`/processing/loss` | 加工领料 / 成品入库 / 损耗 | `process.order.issue` / `process.order.report` / `process.order.reverse`（17 §7.2 / §10，**草稿待合**） | 损耗**无独立路径**（报工带 `LOSS` 行，17 §7.2）；离线可用性见 Q8 |
 | `/live/patrol`、`/live/death`、`/live/weigh-out` | 巡池 / 死亡登记 / 出池称重 | `live.inspect.submit` / `live.death.report` / `live.weigh.submit`（18 §7） | 巡检、死亡登记可离线；出池称重看 `paused_actions` |
 | `/settings` | 声音/震动、扫码模式、设备信息、离线令牌剩余 | — | 离线可用 |
 
@@ -179,7 +179,7 @@ Hash 路由（WebView 兼容）。权限点为渲染依据，实际以服务端�
 | 收货 | 退货预约收货 | `POST /api/v1/returns/reservations/{id}/receive`（**10 §7.2 已合 main：`10:176`**；契约见 §6.2） | `Idempotency-Key` |
 | 上架 | 上架扫码 | `POST /api/v1/inbound/receipts/{id}/putaways`（03 §7，已合 main） | `op_key` / 四元组 |
 | 纸单补录 | 提交 | `POST /api/v1/offline/paper-records` `{action_type, occurred_at, operator_id, payload, photo_ids[]}`（11 §7，已合 main） | `Idempotency-Key` |
-| 加工 | 领料 / 报工 / 冲回 | *`POST /api/v1/process/orders/{id}/issues`*、*`/reports`*、*`/reversals`*（草稿 17） | `issue_client_id` / `report_client_id` |
+| 加工 | 领料 / 报工 / 冲回 | *`POST /api/v1/processing/orders/{id}/issues`*、*`/reports`*、*`/reversals`*（17 §7.2，**草稿待合**；前缀按 17 Q6 = `processing`） | 业务键 `issue_client_id` / `report_client_id` / `reversal_client_id` + `Idempotency-Key` |
 | 活鲜 | 巡检 / 死亡登记 | `POST /api/v1/live/inspections`、`POST /api/v1/live/deaths`（18 §7） | `(device_instance_id, client_op_id)` |
 | 活鲜 | 出池称重 | `POST /api/v1/live/weighs`（18 §7） | `(task_kind, task_id, weigh_client_id)` |
 | 活鲜 | 阈值下发包 | `GET /api/v1/live/pda-package?warehouse_code=`（18 §7） | — |
@@ -230,7 +230,7 @@ Hash 路由（WebView 兼容）。权限点为渲染依据，实际以服务端�
   - 入库：`inbound.receive`、`inbound.putaway`（03 §10）、`inbound.return.blind`（盲收登记；**00 §6.6 第 3 篇清单第 10 个已登记**，12 篇 §4.2 收录）。
   - 离线：`offline.paper.backfill`（11 / 00 §6.6.1）。
   - 主数据：`master.sku.view`（条码解析，01 §7 已合 main）。**主数据停用挂起 / 软删两段式 / 字典接口一期未建**（01 §7），端上不出现对应入口；`40962` / `42221` / `42220` 保留文案但不做可达路径。
-  - 加工 / 活鲜：`process.order.issue`、`process.order.report`（17 草稿）、`live.inspect.submit`、`live.death.report`、`live.weigh.submit`（18 §10）。
+  - 加工 / 活鲜：`process.order.issue`、`process.order.report`、`process.order.reverse`（`REWORK` 冲回另需 `process.rework.approve`，不能自批）、`process.trace.view`（17 §7.2，**草稿待合**）；`live.inspect.submit`、`live.death.report`、`live.weigh.submit`（18 §10）。
   - 设备：`device.binding.view`、`device.binding.approve`、`device.binding.revoke`（**12 §4.2，已合 main**；PDA 侧只在绑定等待页查 `DEVICE_BIND` 审批状态与展示结果）。
 - **补交账号必须与产生操作的账号一致**：outbox 按 `user_id` 隔离（§9.3）；服务端以令牌里的 `device_instance_id` 为准，忽略请求体中的值。
 
@@ -345,7 +345,7 @@ outbox 每条：`{ op_id(uuid), local_seq, format_version, idem_key, device_inst
 | 幂等命中 / 业务键重放（同四元组同内容） | 已处理过 | 视为成功 |
 | `40910` `key_type=IDEMPOTENCY_KEY` | 同 Key 不同 body（本地数据异常） | `failed`，不重试，上报日志 |
 | `40910` `key_type=PDA_OP` | 同四元组不同内容 | `failed`，交主管 |
-| `40910` `key_type` 为其他已知值（`POD_OP`、`POD_CORRECT`、`SOURCE_ORDER` 等，PDA 不应收到） | 契约异常 | 同下行处理 |
+| `40910` `key_type=PROCESS_REPORT` / `PROCESS_REVERSAL`（17 §7.3） | 加工报工 / 冲回同键异 body（`request_hash` 不符） | `failed` 红条，**不重试、不换 client_id**，交主管 |
 | `40910` `key_type` 缺失/未知 | 服务端违反契约（必填） | `failed` 红条，**不自动重试、不生成新 Key**，交人工，上报日志 |
 | `50000` | 服务端异常 | 通用错误 + `trace_id`；条目保持 `pending` 退避重试（不缓存，重新执行，业务键兜底） |
 | `50010` | 不变量违反 / 撞 CHECK | 通用错误 + `trace_id`；**不自动重试**，置 `failed` 红条交主管 |
@@ -541,9 +541,9 @@ stateDiagram-v2
 
 | 流程 | 现场动作 | 接口 |
 |---|---|---|
-| `/processing/issue` | 加工领料：扫加工单 → 扫原料批次/库位 → 录数量（3 位小数） | *`POST /process/orders/{id}/issues`*（`issue_client_id`） |
-| `/processing/receipt` | 成品入库：扫加工单 → 录成品数量/重量 → 打印批次标签 → 上架 | *`POST /process/orders/{id}/reports`* |
-| `/processing/loss` | 损耗登记（超得率容差提示） | 同上（报工带损耗） |
+| `/processing/issue` | 加工领料：扫加工单 → 扫原料批次/库位 → 录数量（3 位小数） | *`POST /api/v1/processing/orders/{id}/issues`*（`issue_client_id`；活鲜池另带 `live_weigh_id` + `issue_count`，按件 SKU 带单件净重） |
+| `/processing/receipt` | 成品入库：扫加工单 → 录成品数量/重量 → 打印批次标签 → 上架 | *`POST /api/v1/processing/orders/{id}/reports`*（`report_client_id` + `lines[{output_role, sku_id, lot_id?, to_location_id?, gross_qty_milli, tare_qty_milli, loss_reason?}]`） |
+| `/processing/loss` | 损耗登记（超得率容差提示） | **同一报工接口**，`lines[].output_role=LOSS`（17 §7.2：不另立路径） |
 | `/live/patrol` | 水质/水温巡检：扫池位 → 录指标 → 超限长鸣 | `POST /live/inspections` |
 | `/live/death` | 死亡登记：扫池位 → 录重量 + 尾数 → 拍照 → 生成报损 | `POST /live/deaths` |
 | `/live/weigh-out` | 出池称重：扫池位 → 电子秤取重 + 录尾数 → 确认 | `POST /live/weighs`（`weigh_client_id`） |
@@ -554,7 +554,7 @@ stateDiagram-v2
 - **称重幂等**：每次称重生成 `weigh_client_id`（uuid），与结果一起持久化到 outbox；超时、重连、重启后的重试复用同一个，**只有重新称一次才生成新值**。业务键 `(task_kind, task_id, weigh_client_id)`；同键不同内容返回 `40910`，`detail.key_type=LIVE_WEIGH` → 红条「这次称重和之前提交的内容不一致」，不重试、不换键，交主管。
 - **死亡登记**：走 09 报损（来源 `LIVE_DEATH`）；池被 `LIVE_HOLD` 锁定时仍可登记。单池单日超阈值时服务端转 `LIVE_DEATH_OVER` 审批（`40938` 表示未带有效审批），PDA 显示「待审批」。离线/暂停期间按 18 §7.2「先落后扣」处理，PDA 只显示扣减状态为待补。
 - **巡检**：超限即长鸣告警；连续 2 次超限或严重超限后整池锁定 `LIVE_HOLD`，PDA 显示锁定且无解锁按钮，复检合格后自动解除；该池已分配未称重的出库会被重新分配，PDA 上对应称重任务消失或改派（按服务端返回）。
-- **加工**：领料按净量；成品入库后服务端校验守恒（不平衡 `42218`），得率超界不拦截（转 `PROCESS_YIELD_DEVIATION` 审批），PDA 只提示；冲回超量 `42214` `reason=OVER_REVERSE`；已发货成品不显示冲回。接口、业务键、离线可用性见 Q8。
+- **加工**（17 §5.1 / §6）：加工单状态 `CREATED → RELEASED → IN_PROGRESS → COMPLETED`（越界先 `PENDING_APPROVAL`，驳回回 `IN_PROGRESS`；PDA 只显示状态与可否作业，不自行推进）；领料按净量（按件 SKU 必带单件净重与整件数，缺一 `40001`）；报工由服务端校验守恒（不平衡 `42218`），出成率 / 损耗越界**不拦截**、加工单转 `PENDING_APPROVAL` 并挂 `PROCESS_YIELD_DEVIATION` 审批（12 h），PDA 只提示；冲回三型 `ISSUE` / `OUTPUT`（`SCRAP` / `REWORK`）/ `LOSS`，超量 `42214` `reason=OVER_REVERSE`，`REWORK` 需审批且不能自批（`40312`）；已发货成品不显示冲回。PDA 离线可报工入 outbox，重放按 `report_client_id` 回放首次响应（17 §6.3）；`process_report` / `process_lot_trace` / `process_reversal` 是 append-only，**重放不得用 REPLACE**（17 §13 WP-B12）。
 
 ---
 
@@ -593,7 +593,7 @@ stateDiagram-v2
 | Q5 | PDA 壳选型及扫码事件 id、打印、电子秤接口 | 采购 / 05 | `bridge/` |
 | Q6 | 批量补交接口及其部分失败语义 | 05 / 11 | `/sync` 同步器 |
 | Q7 | 心跳接口路径与响应字段清单（00 §6.6.2 只说「终端心跳」；**12 篇 §8 只给了 `GET /api/v1/me`，没有心跳路径**） | 12 篇增量 / 00 登记 | §9.10；一期端上只轮询 `/me`，心跳作为可选优化，不阻塞 |
-| Q8 | 加工（17）与活鲜（18）在 PDA 的可离线范围、成品标签打印接口 | 17 / 18 | `/processing/*`、`/live/*` |
+| Q8 | 加工 / 活鲜在 PDA 的离线范围与成品标签打印接口 —— **17 已给**：报工可离线入 outbox 并按 `report_client_id` 回放（17 §6.3）；领料 / 冲回的离线可用性与标签打印接口待 17 定 | 17（草稿）/ 18（已合 main） | §9.12 |
 | Q9 | 键盘楔入去抖阈值的配置来源 —— 原依赖 01 字典接口，**字典一期未建**（01 §7「显式延期」/ §12 Q9） | 01 增量 | §8.3；一期用编译期默认值（可由任务包下发），不依赖字典 |
 | Q10 | 「交给主管」的接管流程（主管在 PDA 登录确认 / 后台接管）与审计字段 | 12 篇 §8 + 13/14 篇 | §9.3；存储与审计字段以 12 篇 `system.audit.*` 为准 |
 | Q11 | ~~同仓移库 / 跨仓调拨的权限点定名~~ **已定**：07 §10 给 `inventory.move.view` / `.create` / `.confirm` / `.cancel`（无 `.execute`） | 已关闭 | `/move` |
@@ -622,3 +622,4 @@ stateDiagram-v2
 | F-A13 | 强制更新 | 迁移失败条目被丢弃；更新后 outbox 被清空 |
 | F-A14 | 一期不存在的分支 | 把 `42221` / `40962` / `42220` 当可达提示写进交互（01 一期没有停用挂起 / 边缘守卫 / 司机台账）；端上做「主数据申请删除 / 撤销停用」入口 |
 | F-A15 | 离线令牌 `exp` | 按带时区 ISO 串或设备本地时区解析 `exp`，导致倒计时偏移、过早或过晚提示重新登录（12 篇 Δ1 已明确为 UTC 整秒） |
+| F-A16 | 加工报工/冲回重放 | 同一 `report_client_id` / `reversal_client_id` 改数量重放（应 `40910 PROCESS_REPORT` / `PROCESS_REVERSAL`）；本地用 REPLACE 覆盖 outbox 条目造成隐式删除（17 §13 WP-B6 / WP-B12） |
