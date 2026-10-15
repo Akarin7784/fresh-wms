@@ -304,6 +304,9 @@ _MASTER_MIN = ["INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (1,'WHSH
 print("=== 2. 库层不变量断言（与 verify.sh 同一套）===")
 seed = [
     "INSERT INTO warehouse (id,code,name,cutoff_time,work_date_offset) VALUES (1,'WHSH01','上海青浦仓','20:00',-1)",
+    # 跨篇 FK 收口（Chief 2026-10-16）：03/10 supplier_id 与 04 customer_id 的既有种子用 501 / 1，**父行必须最先建**
+    "INSERT INTO supplier (id,code,name) VALUES (501,'SUP501','跨篇 FK 收口父行')",
+    "INSERT INTO customer (id,code,name) VALUES (1,'STORE0001','跨篇 FK 收口父行')",
     # 第 12 篇 FK 底数（权限表加外键后，审批人 / 申请人 / 映射里引用的用户必须存在）：102–199、201–299 号测试用户
     "WITH RECURSIVE n(i) AS (SELECT 102 UNION ALL SELECT i + 1 FROM n WHERE i < 299) INSERT INTO sys_user (id,username,password_hash) SELECT i, 'seed' || i, 'x' FROM n WHERE i <> 200",
     "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type,temp_min_c10,temp_max_c10) VALUES (1,1,'Z-C1','冷藏拣货区','CHILLED','PICK',20,80),(2,1,'Z-C2','冷藏存储区','CHILLED','STORAGE',20,80)",
@@ -3961,6 +3964,23 @@ expect_block_tx("01 拒绝：uq_driver_phone 手机号重复（守卫先命中�
 expect_block_tx("01 拒绝：uq_device_instance 实例号重复（守卫先命中）", ["INSERT INTO device (id,device_instance_id,device_type,warehouse_id) VALUES (8835,'D-PDA-8805','PDA',1)"], "master_duplicate: device.device_instance_id")
 _idx01 = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='index' AND name='ix_lot_supplier'").fetchone()[0]
 ok("01 目录断言：ix_lot_supplier（lot.supplier_id 外键列索引）存在（1）") if _idx01 == 1 else bad(f"01 ix_lot_supplier 缺：{_idx01}")
+
+print("=== 2a-FK. 跨篇 FK 收口（03 supplier / 10 supplier / 04 customer+driver / 12b device）===")
+expect_block_tx("跨篇 FK：inbound_order.supplier_id 指向不存在的供应商",
+                ["INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,supplier_id,status,work_date) VALUES (8901,'INB-FK1',1,'PURCHASE','ERP','PO-FK1','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',999999,'RECEIVING','2026-10-15')"], "FOREIGN KEY constraint failed")
+expect_allow_tx("跨篇 FK 正向：inbound_order.supplier_id = 501（父行在种子里）",
+                ["INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,supplier_id,status,work_date) VALUES (8902,'INB-FK2',1,'PURCHASE','ERP','PO-FK2','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',501,'RECEIVING','2026-10-15')"])
+expect_block_tx("跨篇 FK：supplier_return.supplier_id 指向不存在的供应商",
+                ["INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (8903,'SRN-8903',1,999999,14,1,1,5000,'SLOW_MOVING','CT-FK',0,'DISCOUNT','FRESH',datetime('now'),NULL,31)"], "FOREIGN KEY constraint failed")
+expect_block_tx("跨篇 FK：outbound_order.customer_id 指向不存在的客户",
+                ["INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (8904,'OBT-FK1',1,'SALE','MALL','M-FK1','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',999999,'CREATED','2026-10-16')"], "FOREIGN KEY constraint failed")
+expect_block_tx("跨篇 FK：outbound_order.driver_id 指向不存在的司机",
+                ["INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,driver_id,status,work_date) VALUES (8905,'OBT-FK2',1,'SALE','MALL','M-FK2','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,999999,'CREATED','2026-10-16')"], "FOREIGN KEY constraint failed")
+expect_block_tx("跨篇 FK：user_device_binding.device_id 指向不存在的设备",
+                ["INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id,device_id) VALUES (8906,'DEV-FK1','PDA',101,1,999999)"], "FOREIGN KEY constraint failed")
+expect_allow_tx("跨篇 FK 正向：user_device_binding.device_id 指向同批新建的设备",
+                ["INSERT INTO device (id,device_instance_id,device_type,warehouse_id) VALUES (8907,'D-FK-8907','PDA',1)",
+                 "INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id,device_id) VALUES (8908,'DEV-FK2','PDA',101,1,8907)"])
 
 print("=== 2j. 第 7 篇补货与移库（任务 / 任务行 / 需求 / 移库 / 候选视图）===")
 # 种子已在最前面写入（replenish_task 701/702、replenish_task_line 7101、replenish_demand 7201、
