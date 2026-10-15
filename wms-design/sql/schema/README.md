@@ -9,7 +9,7 @@
 | 文件 | 内容 |
 |---|---|
 | `00_preamble.sql` | 文件头、`BEGIN`、角色 `wms_app`（必须先于任何 GRANT） |
-| `01_master.sql` | 仓库、库区、库位、SKU、批次，含 `sell_deadline` 不可回溯 |
+| `01_master.sql` | 第 1 篇主数据：仓库（`ck_wh_code`）、库区 / 温区（`temp_min_c10` / `temp_max_c10` + `ck_zone_temp`，0.1 ℃）、库位（`min_level_milli` / `max_level_milli` + `ck_loc_level`）、SKU（`sell_days` + `ck_sku_sell_days` + `ck_sku_sell_days_req`、`natural_loss_tolerance_ppm` + `ck_sku_loss_ppm`、`ck_sku_shelf_life`）、条码、单位换算（`base_qty_milli` + `ck_unit_ratio`）、批次（`sell_deadline` 不可回溯）；7 张表的 10 个时间列默认 UTC 整秒（00 §6.8）；`sku_unit` 仍在 00 §6.10 `REPLACE_OK` 名单里（表级豁免，理由见 docs/01 §4.6 / §12 Q8） |
 | `02_inventory.sql` | 库存、占用、冻结、流水、快照、对账 |
 | `03_inbound.sql` | 第 3 篇入库：入库单 / 入库行（milli 三列与 ck_inbl_int/ck_inbl_qc/ck_inb_rtn_src 仍由 10 ALTER）、到货测温、收货记录、收货更正单 `inbound_correction`（关单后正/反向 ADJUST 流水，24h 主管 / 7d 双审 / 超窗或已对账转 08，收货人不能审批）、上架记录、入库后质量反馈（报损/退供待处置走 hold(SCRAP_PENDING)）；已关单单头与行锁定 |
 | `04_outbound.sql` | 出库单 / 出库行 |
