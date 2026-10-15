@@ -3658,6 +3658,41 @@ expect_block "06 拒绝：fk_bxl_box 箱明细挂不存在的箱" "INSERT INTO p
 mut06 "fk_bxl_box" "pack_box_line" "INSERT INTO pack_box_line (id,box_id,sku_id,lot_id,qty_milli,uom) VALUES (9202,999999,1,0,1000,'KG');"
 expect_block "06 拒绝：fk_bxl_sku 箱明细挂不存在的 SKU" "INSERT INTO pack_box_line (id,box_id,sku_id,lot_id,qty_milli,uom) VALUES (9203,9201,999999,0,1000,'KG');" "fk_bxl_sku"
 mut06 "fk_bxl_sku" "pack_box_line" "INSERT INTO pack_box_line (id,box_id,sku_id,lot_id,qty_milli,uom) VALUES (9203,9201,999999,0,1000,'KG');"
+echo "=== 2g-12t. 第 12 篇时间加固第二轮：正向放行 + 反向按名拦截 + 变异（两库对称）==="
+# 三件套：① 正向（非属主写入被库覆盖成 now）② 反向（按错误名精确命中）③ 变异（去掉守卫后原被拒语句必须通过）
+# 触发器只对非属主生效（属主 = 迁移/种子角色，有意豁免），所以全部用 SET LOCAL ROLE wms_app。
+R=$(psql -t -A -c "BEGIN; SET LOCAL ROLE wms_app; INSERT INTO sys_user (id,username,password_hash,created_at) VALUES (779901,'t12t1','x','2000-01-01 00:00:00'); SELECT 'TS#' || (created_at = date_trunc('second', now() AT TIME ZONE 'UTC'))::text FROM sys_user WHERE id = 779901; ROLLBACK;" | grep '^TS#')
+[ "$R" = "TS#true" ] && ok "12t 正向：wms_app 建号 created_at 传 2000 → 由库写为 now" || bad "12t 正向 created_at 未被库写：$R"
+R=$(psql -t -A -c "BEGIN; SET LOCAL ROLE wms_app; INSERT INTO sys_user (id,username,password_hash) VALUES (779902,'t12t2','x'); UPDATE sys_user SET last_login_at = date_trunc('second', now() AT TIME ZONE 'UTC') WHERE id = 779902; SELECT 'TS#' || (last_login_at = date_trunc('second', now() AT TIME ZONE 'UTC'))::text FROM sys_user WHERE id = 779902; ROLLBACK;" | grep '^TS#')
+[ "$R" = "TS#true" ] && ok "12t 正向：wms_app 写登录时间 = now → 通过且与库值一致" || bad "12t 正向 last_login_at：$R"
+R=$(psql -t -A -c "BEGIN; SET LOCAL ROLE wms_app; INSERT INTO sys_user (id,username,password_hash) VALUES (779903,'t12t3','x'); UPDATE sys_user SET deleted_at = date_trunc('second', now() AT TIME ZONE 'UTC') WHERE id = 779903; SELECT 'TS#' || (deleted_at = date_trunc('second', now() AT TIME ZONE 'UTC'))::text FROM sys_user WHERE id = 779903; ROLLBACK;" | grep '^TS#')
+[ "$R" = "TS#true" ] && ok "12t 正向：wms_app 写停用时间 = now → 通过；trg_user_status_bump 同步升 perm_version" || bad "12t 正向 deleted_at：$R"
+expect_block "12t 反向：INSERT sys_user 带 last_login_at（新用户没登录过）" "BEGIN; SET LOCAL ROLE wms_app; INSERT INTO sys_user (id,username,password_hash,last_login_at) VALUES (779904,'t12t4','x','2000-01-01 00:00:00'); ROLLBACK;" "sys_user_insert_time_set"
+expect_block "12t 反向：INSERT sys_user 带 deleted_at（新用户不是停用态）" "BEGIN; SET LOCAL ROLE wms_app; INSERT INTO sys_user (id,username,password_hash,deleted_at) VALUES (779905,'t12t5','x','2000-01-01 00:00:00'); ROLLBACK;" "sys_user_insert_time_set"
+expect_block "12t 反向：UPDATE sys_user 改建号时间（created_at 不可改）" "BEGIN; SET LOCAL ROLE wms_app; INSERT INTO sys_user (id,username,password_hash) VALUES (779906,'t12t6','x'); UPDATE sys_user SET created_at = '2000-01-01 00:00:00' WHERE id = 779906; ROLLBACK;" "sys_user_created_at_immutable"
+expect_block "12t 反向：UPDATE sys_user 清空停用时间（停用是事实，不可回退）" "BEGIN; SET LOCAL ROLE wms_app; INSERT INTO sys_user (id,username,password_hash) VALUES (779907,'t12t7','x'); UPDATE sys_user SET deleted_at = date_trunc('second', now() AT TIME ZONE 'UTC') WHERE id = 779907; UPDATE sys_user SET deleted_at = NULL WHERE id = 779907; ROLLBACK;" "sys_user_deleted_at_immutable"
+expect_block "12t 反向：INSERT api_credential 带 last_used_at（新凭证没用过）" "BEGIN; SET LOCAL ROLE wms_app; INSERT INTO api_credential (id,api_key,secret_encrypted,source_system,last_used_at) VALUES (779908,'K779908','s','ERP','2000-01-01 00:00:00'); ROLLBACK;" "api_credential_insert_time_set"
+expect_block "12t 反向：属主建号 created_at 带小数秒（属主豁免覆盖，但整秒 CHECK 仍管）" "INSERT INTO sys_user (id,username,password_hash,created_at) VALUES (779909,'t12t9','x','2026-10-15 08:00:00.5');" "ck_user_ts"
+R=$(psql -t -A <<MUT12T | grep '^MUT#'
+BEGIN;
+DROP TRIGGER trg_user_zclock ON sys_user;
+SET LOCAL ROLE wms_app;
+INSERT INTO sys_user (id,username,password_hash,last_login_at) VALUES (779911,'t12tm1','x','2000-01-01 00:00:00');
+SELECT 'MUT#PASSED';
+ROLLBACK;
+MUT12T
+)
+[ "$R" = "MUT#PASSED" ] && ok "变异：去掉 trg_user_zclock 后带 last_login_at 的 INSERT 通过（断言能抓到）" || bad "变异没变红：trg_user_zclock → $R"
+R=$(psql -t -A <<MUT12T | grep '^MUT#'
+BEGIN;
+DROP TRIGGER trg_api_zclock ON api_credential;
+SET LOCAL ROLE wms_app;
+INSERT INTO api_credential (id,api_key,secret_encrypted,source_system,last_used_at) VALUES (779912,'K779912','s','ERP','2000-01-01 00:00:00');
+SELECT 'MUT#PASSED';
+ROLLBACK;
+MUT12T
+)
+[ "$R" = "MUT#PASSED" ] && ok "变异：去掉 trg_api_zclock 后带 last_used_at 的 INSERT 通过（断言能抓到）" || bad "变异没变红：trg_api_zclock → $R"
 echo "=== 汇总 ==="
 echo "  通过 $pass 项 / 失败 $fail 项"
 cleanup

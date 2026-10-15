@@ -3959,6 +3959,51 @@ expect_block_tx("06 拒绝：fk_bxl_box 箱明细挂不存在的箱", ["INSERT I
 _m06_fk("fk_bxl_box", ["INSERT INTO pack_box_line (id,box_id,sku_id,lot_id,qty_milli,uom) VALUES (9202,999999,1,0,1000,'KG')"])
 expect_block_tx("06 拒绝：fk_bxl_sku 箱明细挂不存在的 SKU", ["INSERT INTO pack_box_line (id,box_id,sku_id,lot_id,qty_milli,uom) VALUES (9203,9201,999999,0,1000,'KG')"], "FOREIGN KEY constraint failed")
 _m06_fk("fk_bxl_sku", ["INSERT INTO pack_box_line (id,box_id,sku_id,lot_id,qty_milli,uom) VALUES (9203,9201,999999,0,1000,'KG')"])
+print("=== 2g-12t. 第 12 篇时间加固第二轮：正向放行 + 反向按名拦截 + 变异（两库对称）===")
+# 三件套：① 正向（窗口内时间落库）② 反向（按错误名精确命中）③ 变异（去掉守卫后原被拒语句必须通过）
+expect_allow_tx("12t 正向：建号 created_at = datetime('now') → 通过",
+                ["INSERT INTO sys_user (id,username,password_hash,created_at) VALUES (779901,'t12t1','x',datetime('now'))"])
+expect_allow_tx("12t 正向：写登录时间 = datetime('now') → 通过",
+                ["INSERT INTO sys_user (id,username,password_hash) VALUES (779902,'t12t2','x')",
+                 "UPDATE sys_user SET last_login_at = datetime('now') WHERE id = 779902"])
+expect_allow_tx("12t 正向：写停用时间 = datetime('now') → 通过",
+                ["INSERT INTO sys_user (id,username,password_hash) VALUES (779903,'t12t3','x')",
+                 "UPDATE sys_user SET deleted_at = datetime('now') WHERE id = 779903"])
+expect_block_tx("12t 反向：INSERT sys_user 带 last_login_at（新用户没登录过）",
+                ["INSERT INTO sys_user (id,username,password_hash,last_login_at) VALUES (779904,'t12t4','x','2000-01-01 00:00:00')"],
+                "sys_user_insert_time_set")
+expect_block_tx("12t 反向：INSERT sys_user 带 deleted_at（新用户不是停用态）",
+                ["INSERT INTO sys_user (id,username,password_hash,deleted_at) VALUES (779905,'t12t5','x','2000-01-01 00:00:00')"],
+                "sys_user_insert_time_set")
+expect_block_tx("12t 反向：UPDATE sys_user 改建号时间（created_at 不可改）",
+                ["INSERT INTO sys_user (id,username,password_hash) VALUES (779906,'t12t6','x')",
+                 "UPDATE sys_user SET created_at = '2000-01-01 00:00:00' WHERE id = 779906"],
+                "sys_user_created_at_immutable")
+expect_block_tx("12t 反向：UPDATE sys_user 清空停用时间（停用是事实，不可回退）",
+                ["INSERT INTO sys_user (id,username,password_hash) VALUES (779907,'t12t7','x')",
+                 "UPDATE sys_user SET deleted_at = datetime('now') WHERE id = 779907",
+                 "UPDATE sys_user SET deleted_at = NULL WHERE id = 779907"],
+                "sys_user_deleted_at_immutable")
+expect_block_tx("12t 反向：INSERT sys_user created_at 与 now 相差 > 300 s（时钟偏移）",
+                ["INSERT INTO sys_user (id,username,password_hash,created_at) VALUES (779908,'t12t8','x','2000-01-01 00:00:00')"],
+                "sys_user_clock_skew")
+expect_block_tx("12t 反向：INSERT api_credential 带 last_used_at（新凭证没用过）",
+                ["INSERT INTO api_credential (id,api_key,secret_encrypted,source_system,last_used_at) VALUES (779909,'K779909','s','ERP','2000-01-01 00:00:00')"],
+                "api_credential_insert_time_set")
+for _tg12t, _sql12t in [
+    ("trg_user_ins_time_set", "INSERT INTO sys_user (id,username,password_hash,last_login_at) VALUES (779911,'t12tm1','x','2000-01-01 00:00:00')"),
+    ("trg_api_ins_time_set", "INSERT INTO api_credential (id,api_key,secret_encrypted,source_system,last_used_at) VALUES (779912,'K779912','s','ERP','2000-01-01 00:00:00')"),
+]:
+    conn.execute("SAVEPOINT mut12t")
+    conn.execute(f"DROP TRIGGER {_tg12t}")
+    _passed12t = False
+    try:
+        conn.execute(_sql12t)
+        _passed12t = True
+    except sqlite3.Error:
+        _passed12t = False
+    conn.execute("ROLLBACK TO mut12t"); conn.execute("RELEASE mut12t")
+    ok(f"变异：去掉 {_tg12t} 后原被拒语句通过（断言能抓到）") if _passed12t else bad(f"变异没变红：{_tg12t}")
 print("=== 汇总 ===")
 print(f"  通过 {passed} 项 / 失败 {failed} 项")
 conn.close()
