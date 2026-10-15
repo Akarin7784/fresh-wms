@@ -41,9 +41,10 @@ SCHEMA_PARTS=(
 # 退供（pr-supplier-return，基于 30041054）：+supplier_return（PK、uq_srtn_code、ix_srtn_due）+ uq_srtn_scrap、uq_scr_srtn → 73 表 / 218 索引。
 # docs/03：+5 表（测温/收货/更正单/上架/质量反馈），索引 +25
 EXPECT_TABLES=79
-EXPECT_INDEXES=249
+EXPECT_INDEXES=255
 # 第 12 篇：+device_reconnect（PK、uq_drc_id_binding、ix_drc_binding、ix_drc_jti）+ audit_log.uq_audit_rbac_once → 79 表 / 248 索引（PG16 实测）
 # docs/05（长流）：+ix_pt_handover（pick_task 交接任务来源的部分索引）→ 249 索引
+# docs/08（长流）：+ix_cnt_wh、ix_adj_wh、ix_adj_src、uq_adjl、ix_cnt_line_count、ix_cnt_line_loc → 255 索引（249 + 6）
 EXPECT_VIEWS=2
 
 CTR=wms-pg-verify
@@ -1403,6 +1404,7 @@ IFS='#' read -r _ HB HF HM HC0 HC1 <<< "$R"
 [ -n "$HB" ] && [ "$HF" = "$HB" ] && ok "劫持：wms_app 在自建 schema hj_evil 建同名表 outbox_event 并置于 search_path 首位，trg_outbox_order_guard() 仍读 public（结果与无劫持一致：$HB）" || bad "劫持后行为改变：无劫持=$HB / 劫持=$HF"
 [ "$HC1" = "1/6" ] && [ "$HM" != "$HB" ] && ok "变异检查：RESET trg_outbox_order_guard() 的 search_path 后，目录断言变红（$HC1）且劫持生效（$HM），两条断言都能抓到" || bad "变异检查没变红：目录=$HC1 劫持后=$HM 基准=$HB"
 echo "=== 3. §5.6 盘点差异生成列（实盘 − 基准账面 − 期间流水）==="
+seed "INSERT INTO count_order (id,code,warehouse_id,count_type,scope_json,status,book_at) VALUES (1,'CNT-SH01-0001-20261015-000001',1,'FULL','{}','DRAFT','2026-10-15 02:00:00');"   # 长流：count_line.count_id 加外键后的父行
 seed "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000);"
 assert_n "种子 count_line" "SELECT count(*) FROM count_line" 1
 D=$(psql -t -A -c "SELECT diff_qty_milli FROM count_line WHERE id=1")
