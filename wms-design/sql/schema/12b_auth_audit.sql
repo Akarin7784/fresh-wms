@@ -16,7 +16,7 @@ ALTER TABLE audit_log ADD COLUMN approval_id BIGINT;   -- @pg-only
 CREATE UNIQUE INDEX uq_audit_node_seq ON audit_log(node_id, node_seq);
 CREATE INDEX ix_audit_wh ON audit_log(warehouse_id, occurred_at DESC);
 -- Doro 定：DEFAULT 0 只为兼容存量行；新写入 node_id/node_seq 必须 > 0（应用层映射 40001 PARAM_INVALID）
-CREATE FUNCTION trg_audit_node_required() RETURNS trigger LANGUAGE plpgsql AS $$                             -- @pg-only
+CREATE FUNCTION trg_audit_node_required() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$                             -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF NEW.node_id <= 0 OR NEW.node_seq <= 0 THEN                                                             -- @pg-only
         RAISE EXCEPTION 'audit_node_required: 40001' USING ERRCODE = '23514';                                -- @pg-only
@@ -28,7 +28,7 @@ CREATE TRIGGER trg_audit_node_required BEFORE INSERT ON audit_log FOR EACH ROW E
 -- @sqlite-only WHEN NEW.node_id <= 0 OR NEW.node_seq <= 0
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'audit_node_required: 40001'); END;
 -- audit_log 只追加（docs/12 §6.4）：行级 UPDATE/DELETE 与 TRUNCATE 都拦；归档走按月导出 + 维护窗口内专用角色
-CREATE FUNCTION trg_audit_append_only() RETURNS trigger LANGUAGE plpgsql AS $$                             -- @pg-only
+CREATE FUNCTION trg_audit_append_only() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$                             -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     RAISE EXCEPTION 'append_only_violation: audit_log' USING ERRCODE = '42501';                             -- @pg-only
 END $$;                                                                                                       -- @pg-only
@@ -161,7 +161,7 @@ CREATE INDEX ix_apr_wh ON approval_request(warehouse_id, status, created_at);
 CREATE INDEX ix_apr_requester ON approval_request(requested_by, status, created_at);   -- GET /approvals?mine=true
 
 -- ===== 小赵 I1/I2/I5：审批只能 INSERT 成 PENDING；迁移单向；审批人写入后不可改；过期不能再审；FAILOVER 确认人必须真持有角色 =====
-CREATE FUNCTION trg_apr_insert() RETURNS trigger LANGUAGE plpgsql AS $$                                     -- @pg-only
+CREATE FUNCTION trg_apr_insert() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$                                     -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF NEW.status <> 'PENDING' OR NEW.first_approver_id IS NOT NULL OR NEW.second_approver_id IS NOT NULL      -- @pg-only
        OR NEW.decided_at IS NOT NULL OR NEW.result_ref IS NOT NULL THEN                                      -- @pg-only
@@ -182,7 +182,7 @@ BEGIN                                                                           
     RETURN NEW;                                                                                               -- @pg-only
 END $$;                                                                                                       -- @pg-only
 CREATE TRIGGER trg_apr_insert BEFORE INSERT ON approval_request FOR EACH ROW EXECUTE FUNCTION trg_apr_insert();  -- @pg-only
-CREATE FUNCTION trg_apr_final() RETURNS trigger LANGUAGE plpgsql AS $$                                      -- @pg-only
+CREATE FUNCTION trg_apr_final() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$                                      -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF OLD.status IN ('APPROVED','REJECTED','EXPIRED','WITHDRAWN')                                            -- @pg-only
        OR NEW.payload_hash IS DISTINCT FROM OLD.payload_hash OR NEW.payload_json IS DISTINCT FROM OLD.payload_json  -- @pg-only
@@ -320,7 +320,7 @@ CREATE TRIGGER trg_apr_final BEFORE UPDATE ON approval_request FOR EACH ROW EXEC
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'approval_role_not_held'); END;
 
 -- ===== 小赵 I3 + S1：设备绑定 INSERT 只能 PENDING；REVOKED 终态；身份列不可改；激活必须有本绑定的已通过 DEVICE_BIND 审批，审批人 ≠ 使用人 =====
-CREATE FUNCTION trg_udb_guard() RETURNS trigger LANGUAGE plpgsql AS $$                                      -- @pg-only
+CREATE FUNCTION trg_udb_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$                                      -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF TG_OP = 'INSERT' THEN                                                                                  -- @pg-only
         IF NEW.status <> 'PENDING' OR NEW.approval_id IS NOT NULL THEN                                        -- @pg-only
@@ -344,7 +344,7 @@ BEGIN                                                                           
     RETURN NEW;                                                                                               -- @pg-only
 END $$;                                                                                                       -- @pg-only
 CREATE TRIGGER trg_udb_guard BEFORE INSERT OR UPDATE ON user_device_binding FOR EACH ROW EXECUTE FUNCTION trg_udb_guard();  -- @pg-only
-CREATE FUNCTION trg_no_delete_12() RETURNS trigger LANGUAGE plpgsql AS $$                                   -- @pg-only
+CREATE FUNCTION trg_no_delete_12() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$                                   -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     RAISE EXCEPTION 'append_only_violation: %', TG_TABLE_NAME USING ERRCODE = '42501';                       -- @pg-only
 END $$;                                                                                                       -- @pg-only
@@ -375,7 +375,7 @@ CREATE TRIGGER trg_apr_no_truncate BEFORE TRUNCATE ON approval_request FOR EACH 
 -- @sqlite-only CREATE TRIGGER trg_apr_no_delete BEFORE DELETE ON approval_request BEGIN SELECT RAISE(ABORT, 'append_only_violation: approval_request'); END;
 
 -- ===== 小赵 I4：离线令牌只能写一次 revoked_at；其余列不可改；SQLite 防 REPLACE =====
-CREATE FUNCTION trg_offline_guard() RETURNS trigger LANGUAGE plpgsql AS $$                                  -- @pg-only
+CREATE FUNCTION trg_offline_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$                                  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF OLD.revoked_at IS NOT NULL OR NEW.jti IS DISTINCT FROM OLD.jti OR NEW.binding_id IS DISTINCT FROM OLD.binding_id  -- @pg-only
        OR NEW.user_id IS DISTINCT FROM OLD.user_id OR NEW.device_instance_id IS DISTINCT FROM OLD.device_instance_id  -- @pg-only
@@ -398,7 +398,7 @@ CREATE TRIGGER trg_offline_guard BEFORE UPDATE ON offline_token FOR EACH ROW EXE
 
 -- sys_user.perm_version 只升不降（撤权必须让旧令牌失效）；SQLite 防 REPLACE 把版本打回 1（小赵 I7）。
 -- 下发应用 USER_PERM 一律"UPDATE，0 行再 INSERT"，不用 REPLACE / UPSERT（docs/12 §4.3）
-CREATE FUNCTION trg_user_perm_ver() RETURNS trigger LANGUAGE plpgsql AS $$                                  -- @pg-only
+CREATE FUNCTION trg_user_perm_ver() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$                                  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF NEW.perm_version < OLD.perm_version THEN                                                               -- @pg-only
         RAISE EXCEPTION 'perm_version_rewind' USING ERRCODE = '23514';                                       -- @pg-only
