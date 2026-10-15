@@ -144,7 +144,7 @@ NI = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='index' AND sql
 NV = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='view'").fetchone()[0]
 print(f"  → 表 {NT} 张 / 手工建索引 {NI} 个 / 视图 {NV} 个")
 # 期望值：main 8ed5f0c 为 38 表；docs/02 新增 stock_hold、stock_recon_alert、stock_movement_key、stock_ledger_line → 42 表（PG 分区子表不计）。改表数必须同步改这里和 verify.sh
-EXPECT_TABLES, EXPECT_VIEWS= 70, 2  # docs/12 +3；第 10 篇 +exception_code、exception_case、return_reservation、return_reservation_line、return_blind_receipt；第 9 篇 +scrap_order、scrap_line；第 17 篇 +8 张 process_*；docs/18 加 9 表 + v_live_death_in_transit
+EXPECT_TABLES, EXPECT_VIEWS= 72, 2  # docs/12 +3；第 10 篇 +exception_code、exception_case、return_reservation、return_reservation_line、return_blind_receipt；第 9 篇 +scrap_order、scrap_line；第 17 篇 +8 张 process_*；docs/18 加 9 表 + v_live_death_in_transit
 ok(f"表数 = {NT}（期望 {EXPECT_TABLES}）") if NT == EXPECT_TABLES else bad(f"表数 = {NT}，期望 {EXPECT_TABLES}")
 ok(f"视图数 = {NV}") if NV == EXPECT_VIEWS else bad(f"视图数 = {NV}，期望 {EXPECT_VIEWS}")
 
@@ -480,7 +480,7 @@ _OB_TRG = one("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_
 def outbox_seed_begin(): conn.execute("DROP TRIGGER trg_outbox_insert_pending"); conn.commit()
 def outbox_seed_end(): conn.execute(_OB_TRG); conn.commit()
 outbox_seed_begin()
-expect_allow_tx('Q2 准备：去重记录（未过期/已过期）+ outbox（PENDING / 8 天前 SENT / 刚 SENT）', ["INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,expires_at) VALUES ('live','h','{}',200,datetime('now','+1 day')),('dead','h','{}',200,datetime('now','-1 hour'))", "INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at) VALUES (8801,'t','k','{}','PENDING',NULL),(8802,'t','k','{}','SENT',datetime('now','-8 days')),(8803,'t','k','{}','SENT',datetime('now'))"])
+expect_allow_tx('Q2 准备：去重记录（未过期/已过期）+ outbox（PENDING / 8 天前 SENT / 刚 SENT）', ["INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,expires_at) VALUES ('live','h','{}',200,datetime('now','+1 day')),('dead','h','{}',200,datetime('now','-1 hour'))", "INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at,ack_kind) VALUES (8801,'t','k','{}','PENDING',NULL,NULL),(8802,'t','k','{}','SENT',datetime('now','-8 days'),'2XX'),(8803,'t','k','{}','SENT',datetime('now'),'2XX')"])
 expect_block_tx('Q2 删未过期去重记录', ["DELETE FROM idempotency_record WHERE idem_key = 'live'"], 'purge_not_allowed: idempotency_record')
 expect_block_tx('Q2 删 PENDING 事件', ["DELETE FROM outbox_event WHERE id = 8801"], 'purge_not_allowed: outbox_event')
 expect_block_tx('Q2 删刚投递（未过保留期）事件', ["DELETE FROM outbox_event WHERE id = 8803"], 'purge_not_allowed: outbox_event')
@@ -491,8 +491,8 @@ r = (one("SELECT group_concat(idem_key) FROM idempotency_record")[0], one("SELEC
 ok(f"Q2 清理后剩余 idem={r[0]} outbox={r[1]}（只删了 dead、8802）") if r == ('live', '8801,8803') else bad(f"Q2 清理后 {r}")
 
 print("=== 2c3b. 九轮 P1–P3：UTC 清理、过期列只许往后改、SENT 必带 sent_at ===")
-expect_block_tx('P3 status=SENT 但 sent_at 为空', ["INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at) VALUES (8804,'t','k','{}','SENT',NULL)"], 'ck_outbox_sent')
-expect_allow_tx('P3 正向：PENDING 不带 sent_at、SENT 带 sent_at', ["INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at) VALUES (8805,'t','k','{}','PENDING',NULL),(8806,'t','k','{}','SENT',datetime('now'))"])
+expect_block_tx('P3 status=SENT 但 sent_at 为空', ["INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at,ack_kind) VALUES (8804,'t','k','{}','SENT',NULL,'2XX')"], 'ck_outbox_sent')
+expect_allow_tx('P3 正向：PENDING 不带 sent_at、SENT 带 sent_at', ["INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at,ack_kind) VALUES (8805,'t','k','{}','PENDING',NULL,NULL),(8806,'t','k','{}','SENT',datetime('now'),'2XX')"])
 outbox_seed_end()
 r = one("SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name='trg_outbox_insert_pending'")[0]
 ok("种子路径结束后 trg_outbox_insert_pending 已重建") if r == 1 else bad("trg_outbox_insert_pending 未重建")
@@ -515,12 +515,12 @@ def allow_rb(desc, stmts):
     finally:
         conn.execute("ROLLBACK TO p2"); conn.execute("RELEASE p2")
 allow_rb('P2 正向：idem expires_at 往后延', ["UPDATE idempotency_record SET expires_at = datetime('now','+2 days') WHERE idem_key = 'live'"])
-allow_rb('P2 正向：outbox sent_at 往后改、PENDING → SENT 写当前时间', ["UPDATE outbox_event SET sent_at = datetime('now','+1 minute') WHERE id = 8803", "UPDATE outbox_event SET status = 'SENT', sent_at = datetime('now') WHERE id = 8801"])
+allow_rb('P2 正向：outbox sent_at 往后改、PENDING → SENT 写当前时间', ["UPDATE outbox_event SET sent_at = datetime('now','+1 minute') WHERE id = 8803", "UPDATE outbox_event SET status = 'SENT', ack_kind = '2XX', sent_at = datetime('now') WHERE id = 8801"])
 expect_block_tx('R1 PENDING → SENT 时 sent_at 写成 1 小时前', ["UPDATE outbox_event SET status = 'SENT', sent_at = datetime('now','-1 hour') WHERE id = 8801"], 'sent_at_not_now')
 expect_block_tx('R1 PENDING → SENT 时 sent_at 写成 1 小时后', ["UPDATE outbox_event SET status = 'SENT', sent_at = datetime('now','+1 hour') WHERE id = 8801"], 'sent_at_not_now')
-allow_rb('R1 正向：PENDING → SENT 写当前 UTC（容差内 +3 秒）', ["UPDATE outbox_event SET status = 'SENT', sent_at = datetime('now','+3 seconds') WHERE id = 8801"])
-expect_block_tx("S1 outbox sent_at 写 'garbage'（julianday 为 NULL，sent_at_not_now 不触发）", ["UPDATE outbox_event SET status = 'SENT', sent_at = 'garbage' WHERE id = 8801"], 'ck_outbox_ts')
-expect_block_tx('S1 outbox sent_at 写 T 格式（文本比较永远大于 now-7d）', ["UPDATE outbox_event SET status = 'SENT', sent_at = strftime('%Y-%m-%dT%H:%M:%S','now') WHERE id = 8801"], 'ck_outbox_ts')
+allow_rb('R1 正向：PENDING → SENT 写当前 UTC（容差内 +3 秒）', ["UPDATE outbox_event SET status = 'SENT', ack_kind = '2XX', sent_at = datetime('now','+3 seconds') WHERE id = 8801"])
+expect_block_tx("S1 outbox sent_at 写 'garbage'（julianday 为 NULL，sent_at_not_now 不触发）", ["UPDATE outbox_event SET status = 'SENT', ack_kind = '2XX', sent_at = 'garbage' WHERE id = 8801"], 'ck_outbox_ts')
+expect_block_tx('S1 outbox sent_at 写 T 格式（文本比较永远大于 now-7d）', ["UPDATE outbox_event SET status = 'SENT', ack_kind = '2XX', sent_at = strftime('%Y-%m-%dT%H:%M:%S','now') WHERE id = 8801"], 'ck_outbox_ts')
 expect_block_tx('S1 outbox next_retry_at 写整数', ['UPDATE outbox_event SET next_retry_at = 1800000000 WHERE id = 8801'], 'ck_outbox_ts')
 expect_block_tx('S1 idem expires_at 写整数 1800000000（原可直接 DELETE）', ["INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,expires_at) VALUES ('s1int','h','{}',200,1800000000)"], 'ck_idem_ts')
 expect_block_tx('S1 idem expires_at 非真实日期 2026-02-30', ["INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,expires_at) VALUES ('s1feb','h','{}',200,'2026-02-30 00:00:00')"], 'ck_idem_ts')
@@ -1423,6 +1423,84 @@ _ix = one("SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_exc_ldt
 _ix = _ix[0] if _ix else None
 ok("18 依赖的 uq_exc_ldth_key：UNIQUE (source_key) WHERE source_type = 'LIVE_DEATH'") if _ix and ' '.join(_ix.split()) == "CREATE UNIQUE INDEX uq_exc_ldth_key ON exception_case(source_key) WHERE source_type = 'LIVE_DEATH'" else bad(f"uq_exc_ldth_key 目录：{_ix}")
 
+print("=== 2i. docs/11 集成：outbox 节点序号、入站报文 ===")
+expect_allow('11 outbox 事件（node 3, seq 1）', "INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (100,'wms.shipment.completed','SHP1','{}',1,3,1)")
+expect_block('11 同节点 seq 重复（回传顺序被破坏）', "INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (101,'wms.shipment.completed','SHP2','{}',1,3,1)", 'outbox_event.node_id, outbox_event.seq')
+expect_allow('11 不同节点同 seq 合法', "INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (102,'wms.shipment.completed','SHP3','{}',1,4,1)")
+expect_block('11 outbox 非法状态', "UPDATE outbox_event SET status='LOST' WHERE id=100", 'ck_outbox_status')
+expect_allow('11 入站报文落库', "INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha) VALUES (100,'ERP','SALES_ORDER','SO-1','{}','h1')")
+expect_block('11 同源同单号重复落库', "INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha) VALUES (101,'ERP','SALES_ORDER','SO-1','{}','h2')", 'inbound_message.source, inbound_message.biz_type, inbound_message.external_no')
+expect_block('11 入站报文非法状态', "UPDATE inbound_message SET status='OK' WHERE id=100", 'ck_in_msg_status')
+
+expect_allow("11 推送日志：同单号重推各记一行（只追加，不唯一；保留 90 天）", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,warehouse_id,payload_sha,payload,received_at,result_status,retain_until) VALUES (1,'ERP','SALES_ORDER','SO-1',1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2027-01-13 01:00:00'),(2,'ERP','SALES_ORDER','SO-1',1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:05:00','DUPLICATE','2027-01-13 01:05:00')")
+expect_block("11 推送日志结果取值", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (3,'ERP','SALES_ORDER','SO-3','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','OK','2027-01-13 01:00:00')", 'ck_upl_result')
+expect_block("11 I1 保留期等于接收时间", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (4,'ERP','SALES_ORDER','SO-4','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2026-10-15 01:00:00')", 'ck_upl_retain')
+expect_block("11 I1 保留期只有 1 秒", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (5,'ERP','SALES_ORDER','SO-5','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2026-10-15 01:00:01')", 'ck_upl_retain')
+expect_block("11 I1 保留期 7 天（旧口径，现低于 90 天下限）", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (6,'ERP','SALES_ORDER','SO-6','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2026-10-22 01:00:00')", 'ck_upl_retain')
+expect_block("11 I1 保留期 90 天差 1 秒", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (7,'ERP','SALES_ORDER','SO-7','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2027-01-13 00:59:59')", 'ck_upl_retain')
+expect_allow("11 I1 保留期恰好 90 天（边界放行）", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (8,'ERP','SALES_ORDER','SO-8','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2027-01-13 01:00:00')")
+expect_block("11 payload_sha 大写 hex", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (9,'ERP','SALES_ORDER','SO-9','AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA','{}','2026-10-15 01:00:00','ACCEPTED','2027-01-13 01:00:00')", 'ck_upl_sha')
+expect_block("11 payload_sha 长度 63", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (10,'ERP','SALES_ORDER','SO-10','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2027-01-13 01:00:00')", 'ck_upl_sha')
+expect_block("11 payload_sha 非 hex（z）", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (11,'ERP','SALES_ORDER','SO-11','zaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2027-01-13 01:00:00')", 'ck_upl_sha')
+expect_block_tx("11 B1 只追加：UPDATE 推送日志（改结果+原文）", ["UPDATE upstream_push_log SET result_status='REJECTED', payload='x' WHERE id=1"], 'append_only_violation: upstream_push_log')
+expect_block_tx("11 B1 只追加：DELETE 推送日志", ["DELETE FROM upstream_push_log WHERE id=1"], 'append_only_violation: upstream_push_log')
+expect_allow("11 写一条已过保留期的旧日志（归档用例）", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (20,'ERP','SALES_ORDER','SO-OLD','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','{}','2020-01-01 00:00:00','ACCEPTED','2020-04-01 00:00:00')")
+expect_block_tx("11 B1 SQLite 删已过期行也拦（边缘无角色，清理走维护脚本）", ["DELETE FROM upstream_push_log WHERE id=20"], 'append_only_violation: upstream_push_log')
+expect_block("11 I1 SQLite 保留期写成不可解析的字符串", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (12,'ERP','SALES_ORDER','SO-12','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','never')", 'ck_upl_retain')
+expect_block("11 I1 SQLite 接收时间写成不可解析的字符串", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (13,'ERP','SALES_ORDER','SO-13','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','garbage','ACCEPTED','2027-01-13 01:00:00')", 'ck_upl_retain')
+expect_allow("11 I1 SQLite ISO T 写法 90 天同样放行", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (14,'ERP','SALES_ORDER','SO-14','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15T01:00:00','ACCEPTED','2027-01-13T01:00:00')")
+expect_block("11 I1 SQLite ISO T 写法 89 天", "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (15,'ERP','SALES_ORDER','SO-15','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15T01:00:00','ACCEPTED','2027-01-12T01:00:00')", 'ck_upl_retain')
+r = one("SELECT count(*) FROM upstream_push_log WHERE id IN (1,2,8,20)")
+ok(f"11 B1 绕过尝试后日志仍在（{r[0]} 行）") if r[0] == 4 else bad(f"11 日志被动过：{r}")
+print("=== 2i2. docs/11 小吴 C1 死信阻塞同 biz_key / C2 409 判定 / C3 形态 A relay 补 seq ===")
+expect_allow_tx('C1 同一单 3 个事件入队（OBT-C1：创建/变更/取消）', ["INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (9101,'wms.outbound.changed','OBT-C1','{}',1,0,0),(9102,'wms.outbound.changed','OBT-C1','{}',1,0,0),(9103,'wms.outbound.changed','OBT-C1','{}',1,0,0)"])
+expect_allow_tx('C1 第 1 个事件投递成功（SENDING→SENT 2XX）', ["UPDATE outbox_event SET status='SENDING' WHERE id=9101", "UPDATE outbox_event SET status='SENT', ack_kind='2XX', sent_at=datetime('now') WHERE id=9101"])
+expect_allow_tx('C1 第 2 个事件进死信（SENDING→FAILED→DEAD）', ["UPDATE outbox_event SET status='SENDING' WHERE id=9102", "UPDATE outbox_event SET status='FAILED' WHERE id=9102", "UPDATE outbox_event SET status='DEAD' WHERE id=9102"])
+expect_block_tx('C1 第 3 个事件在前序 DEAD 时不能投递（验收用例）', ["UPDATE outbox_event SET status='SENDING' WHERE id=9103"], 'outbox_bizkey_blocked')
+outbox_seed_begin()  # DEAD 种子走种子路径（应用只能插入 PENDING）
+expect_block_tx('C1 同一 biz_key 第二条 DEAD', ["INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq,status) VALUES (9104,'wms.outbound.changed','OBT-C1','{}',1,0,0,'DEAD')"], 'outbox_event.biz_key')
+outbox_seed_end()
+expect_block_tx('C1 跳过不带审计（无人、无时间、无原因）', ["UPDATE outbox_event SET status='SKIPPED' WHERE id=9102"], 'ck_outbox_skip')
+expect_block_tx('C1 跳过原因过短', ["UPDATE outbox_event SET status='SKIPPED', skipped_by=7, skipped_at='2026-10-15 03:00:00', skip_reason='x' WHERE id=9102"], 'ck_outbox_skip')
+expect_block_tx('C1 非 DEAD 事件不能直接跳过（PENDING→SKIPPED）', ["UPDATE outbox_event SET status='SKIPPED', skipped_by=7, skipped_at='2026-10-15 03:00:00', skip_reason='下游已手工补录' WHERE id=9103"], 'outbox_illegal_transition')
+expect_block_tx('C1 非 SKIPPED 行不能带跳过审计字段', ["UPDATE outbox_event SET skip_reason='下游已手工补录' WHERE id=9103"], 'ck_outbox_skip')
+expect_allow_tx('C1 人工跳过死信（谁/何时/原因齐全）', ["UPDATE outbox_event SET status='SKIPPED', skipped_by=7, skipped_at='2026-10-15 03:00:00', skip_reason='下游已手工补录' WHERE id=9102"])
+expect_allow_tx('C1 跳过后第 3 个事件放行', ["UPDATE outbox_event SET status='SENDING' WHERE id=9103"])
+expect_block_tx('C1 SKIPPED 是终态（不能改回 PENDING）', ["UPDATE outbox_event SET status='PENDING', skipped_by=NULL, skipped_at=NULL, skip_reason=NULL WHERE id=9102"], 'outbox_illegal_transition')
+outbox_seed_begin()  # DEAD 种子走种子路径（应用只能插入 PENDING）
+expect_allow_tx('C1 另一单：头事件 DEAD、后续 PENDING', ["INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq,status) VALUES (9201,'wms.outbound.changed','OBT-C1B','{}',1,0,0,'DEAD')", "INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (9202,'wms.outbound.changed','OBT-C1B','{}',1,0,0)"])
+outbox_seed_end()
+expect_block_tx('C1 重放前后续事件被阻塞', ["UPDATE outbox_event SET status='SENDING' WHERE id=9202"], 'outbox_bizkey_blocked')
+expect_allow_tx('C1 重放死信成功（DEAD→PENDING→SENDING→SENT，replay_count+1）', ["UPDATE outbox_event SET status='PENDING', replay_count=replay_count+1 WHERE id=9201", "UPDATE outbox_event SET status='SENDING' WHERE id=9201", "UPDATE outbox_event SET status='SENT', ack_kind='2XX', sent_at=datetime('now') WHERE id=9201"])
+expect_allow_tx('C1 重放成功后后续事件放行', ["UPDATE outbox_event SET status='SENDING' WHERE id=9202"])
+expect_block_tx('C2 SENT 不注明依据', ["UPDATE outbox_event SET status='SENT', sent_at=datetime('now') WHERE id=9202"], 'ck_outbox_ack')
+expect_block_tx('C2 SENT 依据为任意 409', ["UPDATE outbox_event SET status='SENT', ack_kind='409', sent_at=datetime('now') WHERE id=9202"], 'ck_outbox_ack')
+expect_block_tx('C2 非 SENT 行带 ack_kind', ["UPDATE outbox_event SET status='FAILED', ack_kind='DUP_409' WHERE id=9202"], 'ck_outbox_ack')
+expect_allow_tx('C2 下游 409 且识别为同一请求重复 → SENT(DUP_409)', ["UPDATE outbox_event SET status='SENT', ack_kind='DUP_409', sent_at=datetime('now') WHERE id=9202"])
+expect_block_tx('C2 SENT 是终态（不能改回 PENDING 重发；合并 02 后先由 02 的 SENT 终态守卫拦）', ["UPDATE outbox_event SET status='PENDING', ack_kind=NULL WHERE id=9202"], 'expiry_backdate: outbox_event')
+expect_allow_tx('C3 形态 A 业务事务只写 seq=0（不碰 numbering_segment）', ["INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (9301,'wms.outbound.changed','OBT-C3-9301','{}',1,9,0),(9302,'wms.outbound.changed','OBT-C3-9302','{}',1,9,0),(9303,'wms.outbound.changed','OBT-C3-9303','{}',1,9,0)"])
+expect_allow_tx('C3 relay 提交后补号', ['UPDATE outbox_event SET seq = m.b + r.rn FROM (SELECT id, row_number() OVER (ORDER BY id) AS rn FROM outbox_event WHERE node_id = 9 AND seq = 0) r, (SELECT COALESCE(MAX(seq), 0) AS b FROM outbox_event WHERE node_id = 9) m WHERE outbox_event.id = r.id'])
+expect_block_tx('C3 已补的 seq 不可改', ['UPDATE outbox_event SET seq=100 WHERE id=9301'], 'outbox_seq_immutable')
+expect_block_tx('C3 已补的 seq 不可清零重补', ['UPDATE outbox_event SET seq=0 WHERE id=9301'], 'outbox_seq_immutable')
+r = one("SELECT group_concat(id || ':' || seq, ',') FROM outbox_event WHERE node_id = 9 ")[0]
+ok(f"C3 relay 按 id 顺序补 1..3（{r}）") if r == "9301:1,9302:2,9303:3" else bad(f"C3 relay 补号：{r}")
+expect_allow_tx("C3 relay 重跑幂等（无 seq=0 行则不动）", ['UPDATE outbox_event SET seq = m.b + r.rn FROM (SELECT id, row_number() OVER (ORDER BY id) AS rn FROM outbox_event WHERE node_id = 9 AND seq = 0) r, (SELECT COALESCE(MAX(seq), 0) AS b FROM outbox_event WHERE node_id = 9) m WHERE outbox_event.id = r.id'])
+r = one("SELECT count(*) FROM numbering_segment WHERE biz_prefix LIKE 'OUTBOX%'")[0]
+ok("C3 形态 A 不再写 numbering_segment(OUTBOX:node)") if r == 0 else bad(f"numbering_segment 出现 OUTBOX 行：{r}")
+
+print("=== 2i3. 第 11 篇 Q1：离线纸质单补录 offline_paper_record（PAPER_BACKFILL）===")
+expect_allow_tx("Q1 正向：提交 PENDING（恢复联网后 14h，窗口内）", ["INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (11,1,'PDA-07','PICK_CONFIRM','PK-L1','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 10:00:00','PENDING',NULL,'PAPER_BACKFILL')"])
+expect_allow_tx("Q1 正向：主管（≠ 申请人）审批通过", ["UPDATE offline_paper_record SET status='APPROVED', approver_id=8, approved_at='2026-10-15 11:00:00' WHERE id=11"])
+expect_allow_tx("Q1 正向：过期补录落 EXPIRED 并挂异常单", ["INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (12,1,'PDA-07','PICK_CONFIRM','PK-L2','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 21:00:00','EXPIRED',5001,'PAPER_BACKFILL')"])
+expect_block_tx("Q1 反向：自批（审批人 = 申请人）", ["INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (13,1,'PDA-07','PICK_CONFIRM','PK-L3','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 10:00:00','PENDING',NULL,'PAPER_BACKFILL')", "UPDATE offline_paper_record SET status='APPROVED', approver_id=7, approved_at='2026-10-15 11:00:00' WHERE id=13"], "ck_paper_sod")
+expect_block_tx("Q1 反向：backfill_deadline_at ≠ 恢复联网 + 24h（写成 +12h）", ["INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (14,1,'PDA-07','PICK_CONFIRM','PK-L4','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 08:00:00','2026-10-15 07:00:00','PENDING',NULL,'PAPER_BACKFILL')"], "ck_paper_deadline")
+expect_block_tx("Q1 反向：过期后仍以 PENDING 提交", ["INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (15,1,'PDA-07','PICK_CONFIRM','PK-L5','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 21:00:00','PENDING',NULL,'PAPER_BACKFILL')"], "ck_paper_expired")
+expect_block_tx("Q1 反向：过期但不挂异常单", ["INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (16,1,'PDA-07','PICK_CONFIRM','PK-L6','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 21:00:00','EXPIRED',NULL,'PAPER_BACKFILL')"], "ck_paper_expired")
+expect_block_tx("Q1 反向：审批类型不是 PAPER_BACKFILL", ["INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (17,1,'PDA-07','PICK_CONFIRM','PK-L7','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 10:00:00','PENDING',NULL,'SCRAP_MISREPORT')"], "ck_paper_type")
+expect_block_tx("Q1 反向：APPROVED 不带审批人", ["INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (18,1,'PDA-07','PICK_CONFIRM','PK-L8','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 10:00:00','PENDING',NULL,'PAPER_BACKFILL')", "UPDATE offline_paper_record SET status='APPROVED' WHERE id=18"], "ck_paper_approve")
+expect_block_tx("Q1 反向：同仓同 biz_key 重复补录", ["INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (19,1,'PDA-07','PICK_CONFIRM','PK-L1','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 10:00:00','PENDING',NULL,'PAPER_BACKFILL')"], "offline_paper_record.warehouse_id, offline_paper_record.biz_key")
+r = one("SELECT group_concat(id || ':' || status) FROM (SELECT id, status FROM offline_paper_record ORDER BY id)")[0]
+ok("Q1 反向用例全部回滚，只剩 11:APPROVED、12:EXPIRED") if r == "11:APPROVED,12:EXPIRED" else bad(f"Q1 残留：{r}")
 print("=== 3. §4.4 FEFO 候选池排序（视图 + 排序键）===")
 rows = conn.execute(
     """
@@ -1737,6 +1815,46 @@ else:
     b17('17×12 返工：无 process.rework.approve 的人（1732 仓库主管）批 PROCESS_REWORK', "UPDATE approval_request SET status='APPROVED', first_approver_id=1732, first_approver_role='WH_SUPERVISOR_17', first_approved_at='2026-10-15 05:40:00', decided_at='2026-10-15 05:40:00' WHERE id=1735", 'approval_perm_not_held')
     b17('17×12 返工 SoD：发起人 1734 自己批（即使持 process.rework.approve）', "UPDATE approval_request SET status='APPROVED', first_approver_id=1734, first_approver_role='PROC_REWORKER', first_approved_at='2026-10-15 05:40:00', decided_at='2026-10-15 05:40:00' WHERE id=1735", 'ck_apr_sod')
     expect_allow_tx('17×12 返工：加工主管 1733 批 PROCESS_REWORK', ["UPDATE approval_request SET status='APPROVED', first_approver_id=1733, first_approver_role='PROC_LEAD', first_approved_at='2026-10-15 05:40:00', decided_at='2026-10-15 05:40:00' WHERE id=1735"])
+print("=== 6. 小吴 C3 形态 A 并发：业务事务只写 seq=0，relay 提交后补号 ===")
+conn.commit()  # 前面第 5 节在主连接上留有隐式事务，先提交释放写锁
+RELAY8 = 'UPDATE outbox_event SET seq = m.b + r.rn FROM (SELECT id, row_number() OVER (ORDER BY id) AS rn FROM outbox_event WHERE node_id = 8 AND seq = 0) r, (SELECT COALESCE(MAX(seq), 0) AS b FROM outbox_event WHERE node_id = 8) m WHERE outbox_event.id = r.id'
+cc_err = []
+def cc_ins(i):
+    wc = sqlite3.connect(dbf, timeout=30, isolation_level=None)
+    wc.execute("PRAGMA busy_timeout = 30000")
+    try:
+        wc.execute("BEGIN IMMEDIATE")
+        wc.execute(f"INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES ({9500+i},'t','OBT-CC-{i}','{{}}',1,8,0)")
+        wc.execute("COMMIT")
+    except sqlite3.Error as e:
+        cc_err.append(str(e))
+    finally:
+        wc.close()
+def cc_relay():
+    wc = sqlite3.connect(dbf, timeout=30, isolation_level=None)
+    wc.execute("PRAGMA busy_timeout = 30000")
+    try:
+        wc.execute("BEGIN IMMEDIATE"); wc.execute(RELAY8); wc.execute("COMMIT")
+    except sqlite3.Error as e:
+        cc_err.append(str(e))
+    finally:
+        wc.close()
+ths = [threading.Thread(target=cc_ins, args=(i,)) for i in range(1, 41)] + [threading.Thread(target=cc_relay) for _ in range(5)]
+for t in ths: t.start()
+for t in ths: t.join()
+cc_relay()
+conn = sqlite3.connect(dbf)
+r = one("SELECT count(*) || '/' || count(DISTINCT seq) || '/' || min(seq) || '/' || max(seq) || '/' || sum(CASE WHEN seq = 0 THEN 1 ELSE 0 END) FROM outbox_event WHERE node_id = 8")[0]
+ok(f"C3 40 并发事务 + 5 个并发 relay：seq 连续 1..40、无重复、无漏补、无报错（{r}）") if r == "40/40/1/40/0" and not cc_err else bad(f"C3 并发补号：{r} {cc_err[:3]}")
+r = one("SELECT count(*) FROM numbering_segment WHERE biz_prefix LIKE 'OUTBOX%'")[0]
+ok("C3 并发期间业务事务未触碰 numbering_segment（无单行热点）") if r == 0 else bad(f"numbering_segment 出现 OUTBOX 行：{r}")
+try:
+    conn.execute("UPDATE outbox_event SET seq = 1 WHERE id = (SELECT id FROM outbox_event WHERE node_id = 8 AND seq = 2)"); conn.commit()
+    bad("C3 并发补号后改 seq 未拦截")
+except sqlite3.IntegrityError as e:
+    conn.rollback()
+    ok(f"C3 并发补号后重复 seq（同节点） → 已拦截（{e}）") if "outbox_seq_immutable" in str(e) else bad(f"C3 改 seq 拦错：{e}")
+# 边缘 SQLite 单写者：BEGIN IMMEDIATE 串行，业务事务内取号不会出现"小 seq 后提交"；文档 §4.3 说明
 print("=== 汇总 ===")
 print(f"  通过 {passed} 项 / 失败 {failed} 项")
 conn.close()
