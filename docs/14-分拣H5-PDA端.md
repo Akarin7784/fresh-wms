@@ -5,12 +5,12 @@
 | 编号 | 14 |
 | 作者 | 界面（前端与端上） |
 | 评审 | 待定：1 名测试 + 1 名非作者开发（§12 攻击面逐条打） |
-| 基线 | `origin/main@13ffef8`；总体设计 §6.4 错误码、§6.5 幂等、§6.6.2 离线/暂停下发、§6.8 时间、§8 前端模板、§9.1 部署形态 |
-| 依赖 | 02 库存核心（原语、系统冻结）；03 入库（收货、上架，**已合 main**）；04 出库与分配（待回库记录，**已合 main**）；05 波次与拣货（**草稿 `origin/docs/05-wave-picking@7f83be0`，未合 main**）；06 复核装箱发货（**草稿 `origin/docs/06-check-pack-ship@4252986`，未合 main**）；11 集成（纸单补录、outbox，**已合 main**）；12 权限与审计（**md 未合 main，见 §11 Q1**）；17 加工中心（草稿）；18 活鲜暂存（**已合 main**） |
+| 基线 | `origin/main@fac0f98`（01 / 05 / 06 / 07 / 08 / 11 / 12 均已合入）；总体设计 §6.4 错误码、§6.5 幂等、§6.6.1 审批类型、§6.6.2 离线/暂停下发、§6.6.5 缺口登记、§6.8 时间、§8 前端模板、§9.1 部署形态 |
+| 依赖 | 01 主数据（**已合 main**：条码解析 `GET /master/barcodes/{barcode}` 可用，端上不缓存条码表；主数据停用/软删一期未建）；02 库存核心（原语、系统冻结）；03 入库（收货、上架，**已合 main**）；04 出库与分配（待回库记录，**已合 main**）；05 波次与拣货（**已合 main**）；06 复核装箱发货（**已合 main**）；07 补货与移库（**已合 main**）；08 盘点（**已合 main**）；10 退货与异常（**已合 main**，退货预约收货待 #40）；11 集成（纸单补录、outbox，**已合 main**，含非计划切换 §7.3）；12 权限与审计（**已合 main**：`exp` 整秒、`/me` 六字段、`device.binding.*`）；17 加工中心（草稿）；18 活鲜暂存（**已合 main**） |
 | 技术栈 | Vue 3 + TypeScript + Vite + Vant，H5 打包；PDA 用 WebView 壳或自带浏览器，壳能力（扫码广播、蓝牙打印、电子秤）走 `bridge/` 适配层 |
-| 状态 | 新稿（界面，2026-10-15）。从 `docs/frontend-detail-design` 搬运后按当前 main 逐条重核 |
+| 状态 | 新稿（界面，2026-10-15）。从 `docs/frontend-detail-design` 搬运后按当前 main 逐条重核；**对齐轮第一批（2026-10-15）**：按 00 已定口径、12 篇、01 已合 main 的现状改 §1.3 / §6 / §6.2 / §7 / §9.7 / §11（等 05/06/16/17 的第二批） |
 
-> **引用口径**：凡接口路径、权限点、错误码，以「已合 main」的 02/03/04/09/10/11/18 与 00 为准；05/06/12/17 尚未合并，正文引用处一律标「（草稿）」，定稿后以定稿为准。旧稿里的业务码用法全部重核过，差异见 §1.3。**本篇引用 00 §6.4 / §6.5 的权威定义，12 篇正文定稿后如有差异以 12 篇为准。**
+> **引用口径**：凡接口路径、权限点、错误码，以已合 main 的 01–12、18 与 00 为准；**只剩 16/17 是草稿**，正文引用处标「（草稿）」。旧稿里的业务码用法全部重核过，差异见 §1.3。**本篇引用 00 §6.4 / §6.5 的权威定义；12 篇与 00 冲突处以 00 为准。**
 
 ---
 
@@ -31,8 +31,8 @@
 | 库存扣减、FEFO 选批、任务分配、状态迁移合法性 | 服务端（02 / 04 / 05 / 06）。本地只做**预校验**（库位匹配、任务包 `expected_barcodes[]`），以服务端判定为准 |
 | 「只看自己的任务」「仓数据权限」「SoD」的安全边界 | 服务端 `require_perm` + 数据层注入；前端隐藏按钮不是安全边界 |
 | 权限点定义与角色矩阵 | 12（00 §6.6 只登记命名规则） |
-| 三层扫码的业务规则（拣货三步各步的守卫） | 05（草稿） |
-| 复核通过条件、封箱人规则、箱作废审批 | 06（草稿）+ 00 §6.6.1 |
+| 三层扫码的业务规则（拣货三步各步的守卫） | 05（已合 main） |
+| 复核通过条件、封箱人规则、箱作废审批 | 06（已合 main）+ 00 §6.6.1 |
 | 待回库记录的库存口径与并发 | 04 §7.3（已合 main） |
 | 司机装车/签收、商城下单 | 15（前端）、16（后端） |
 | 加工报工守恒校验、活鲜锁池判定 | 17（草稿）、18（已合 main） |
@@ -41,7 +41,7 @@
 
 | # | 旧稿 | 新稿 | 原因 |
 |---|---|---|---|
-| Δ1 | 任务、复核相关接口写「待对齐：见第 5 / 6 篇」 | 填上 05 / 06 草稿的路径、权限点、错误码 | 05 `7f83be0` §7、06 `4252986` §7 已给出 |
+| Δ1 | 任务、复核相关接口写「待对齐：见第 5 / 6 篇」 | 填上 05 / 06 的路径、权限点、错误码 | 05 §7、06 §7（均已合 main） |
 | Δ2 | 领任务权限点写 `picking.task.claim` | `picking.task.execute` | 05 §7 / §10 没有 `picking.task.claim`，claim 也走 `picking.task.execute` |
 | Δ3 | `paused_actions` 写「三个」「八个值」 | **九个值**（含 `LIVE_WEIGH_OUT`） | 00 §6.6.2 已登记 9 个；11 篇、14 旧稿的「八个」是旧口径 |
 | Δ4 | `40312` 提示显示 `detail.rule` | 只认 **`detail.reason`** | 00 §6.4 `SOD_VIOLATION` 明确不再使用 `detail.rule` |
@@ -49,6 +49,9 @@
 | Δ6 | 盲收 / 预约收货路径当成已定 | 保留流程，给出前端消费契约（§6.2），后端侧待登记 | main 的 03/10 均无 `/inbound/returns/blind`、`/returns/reservations/{id}/receive` |
 | Δ7 | 旧稿示例的 `client_time` 用带 `T`/`Z` 的 ISO 写法 | 客户端时间统一 `YYYY-MM-DD HH:MM:SS` UTC 整秒 | 00 §6.8 第 4 条；带 `T`/`Z` 或小数秒在 SQLite 侧被拒 → 40003 |
 | Δ8 | 「PDA 心跳」被当成已知接口 | 路径待定（Q7） | 00 §6.6.2 只说「`/me` 和终端心跳响应」，未定路径 |
+| Δ9 | 离线令牌 `exp` 当 ISO 8601 带时区解析，`/me` 缺 00 §6.6.2 的四项 | `exp` 按 **UTC 整秒 `YYYY-MM-DD HH:MM:SS`** 解析，端上不得按时区换算；`/me` 六字段（`stale_policy` / `paused` / `offline_since` / `paused_actions[]` / `offline_deadline_at` / `backfill_deadline_at`）按 12 篇 §8 | 12 篇 Δ1（`12:10` / `12:91-94`）与 §8（`12:435-447`）；00 §6.6.2 是 400 级硬契约 |
+| Δ10 | 盲收错误码列 `42221 MASTER_DISABLED`，当成可达 | 01 一期**没有停用生命周期**，`42221` / `40962` / `42220` 均未建（01 §7.1）：保留文案分支但**不做可达路径**；盲收本身不写主数据表 | 01 §7.1「未建」/ §7「未建接口」 |
+| Δ11 | 设备与权限点引用 12 草稿 | 按 12 篇 §4.2：`device.binding.view` / `.approve` / `.revoke`、`inbound.return.blind`、`returns.reservation.*` 均为已登记口径 | 12 篇 §4.2；00 §6.6 第 3 篇清单第 10 个 |
 
 ---
 
@@ -56,16 +59,16 @@
 
 | 编号 | 角色 | 用例 | 入口路由 | 关键服务端契约 |
 |---|---|---|---|---|
-| P1 | 分拣员 | 设备登录（账号 + `device_instance_id`），未绑定走等待审批页 | `/login` → `/binding-pending` | `POST /auth/device-login`（草稿 12）；未绑定 40111 `detail.reason` |
-| P2 | 分拣员 | 看我的任务 / 可领任务，领取 | `/pick/tasks` | `GET /picking/tasks?mine=1&status=`、`POST /picking/tasks/{id}/claim`（草稿 05）；抢领冲突 40923 |
-| P3 | 分拣员 | 任务包预下载（离线可用） | `/pick/tasks/:id` | `GET /picking/tasks?mine=1&preload=1`（草稿 05） |
+| P1 | 分拣员 | 设备登录（账号 + `device_instance_id`），未绑定走等待审批页 | `/login` → `/binding-pending` | `POST /auth/device-login`（12 §8）；未绑定 40111 `detail.reason` |
+| P2 | 分拣员 | 看我的任务 / 可领任务，领取 | `/pick/tasks` | `GET /picking/tasks?mine=1&status=`、`POST /picking/tasks/{id}/claim`（05 已合 main）；抢领冲突 40923 |
+| P3 | 分拣员 | 任务包预下载（离线可用） | `/pick/tasks/:id` | `GET /picking/tasks?mine=1&preload=1`（05 已合 main） |
 | P4 | 分拣员 | 逐行三步扫码：扫库位 → 扫商品 → 输数量 → 确认 | `/pick/tasks/:id` | `POST /picking/tasks/{id}/lines/{seq}/confirm`；42212 库位不对、42210 条码不符、42214 `OVER_PICK` |
 | P5 | 分拣员 | 缺货上报，跳过该行继续 | `/pick/tasks/:id/short` | `POST /picking/tasks/{id}/lines/{seq}/short`；必填原因（40002） |
 | P6 | 分拣员 | 撤销上一次确认（30 秒内自撤；超时需主管） | 同行 | `POST /picking/tasks/{id}/lines/{seq}/undo`；超 30 s 需 `picking.task.undo_any`；超量 42214 `OVER_REVERSE` |
 | P7 | 分拣员 | 任务汇总与提交 | `/pick/tasks/:id/summary` | `POST /picking/tasks/{id}/complete` |
 | P8 | 分拣员 | 补交被拒（改派/取消/关闭）后处理待回库 | `/sync`、`/return/:returnRecordId` | 40920/40921/40922 + `returnRecordId`；04 §7.3 |
-| P9 | 复核员 | 扫筐拉清单、逐件复核、称重 | `/check`、`/check/:orderCode` | `POST /outbound-orders/{code}/checks`、`POST /checks/{code}/scans`、`/submit`（草稿 06） |
-| P10 | 复核员 | 开箱、装箱、封箱、打印箱码 | `/pack/:orderCode` | `POST /outbound-orders/{code}/boxes`、`PUT /boxes/{code}/lines`、`POST /boxes/{code}/seal`（草稿 06） |
+| P9 | 复核员 | 扫筐拉清单、逐件复核、称重 | `/check`、`/check/:orderCode` | `POST /outbound-orders/{code}/checks`、`POST /checks/{code}/scans`、`/submit`（06 已合 main） |
+| P10 | 复核员 | 开箱、装箱、封箱、打印箱码 | `/pack/:orderCode` | `POST /outbound-orders/{code}/boxes`、`PUT /boxes/{code}/lines`、`POST /boxes/{code}/seal`（06 已合 main） |
 | P11 | 复核员 | 集货（扫箱码 + 集货位） | `/pack/:orderCode` | `POST /boxes/{code}/stage`；42215 温区不符 |
 | P12 | 复核员 | 封箱后丢箱/破损，发起箱作废申请 | 箱详情 | `POST /pack/boxes/{box_id}/void-request`；审批在后台（13 篇） |
 | P13 | 仓管员 | 收货登记、上架扫码 | `/receive`、`/putaway` | `POST /inbound/lines/{id}/receipts`、`POST /inbound/receipts/{id}/putaways`（03 §7，已合 main） |
@@ -88,7 +91,7 @@ Hash 路由（WebView 兼容）。权限点为渲染依据，实际以服务端�
 | `/pick/tasks/:id` | 任务执行（逐行三步扫码） | `picking.task.execute` | 离线可用（已领任务） |
 | `/pick/tasks/:id/short` | 缺货原因选择 | `picking.task.execute` | 离线可用 |
 | `/pick/tasks/:id/summary` | 任务汇总与提交 | `picking.task.execute` | 离线可用（入 outbox） |
-| `/check` | 扫筐/箱 | `outbound.check.execute`（草稿 06） | 可离线（扫码入 outbox）；开复核单需在线 |
+| `/check` | 扫筐/箱 | `outbound.check.execute`（06 已合 main） | 可离线（扫码入 outbox）；开复核单需在线 |
 | `/check/:orderCode` | 逐件复核、称重（`weight_g`） | `outbound.check.execute` | 扫码可离线，提交需在线 |
 | `/pack/:orderCode` | 开箱、装箱、封箱、打印箱码、集货 | `outbound.pack.execute` / `outbound.stage.execute` | 需在线（取冻结期望数） |
 | `/pack/boxes/:boxId` | 箱详情、申请作废、看审批状态 | `pack.box.void.request`（申请）/ `outbound.order.view`（查看） | 需在线 |
@@ -97,7 +100,7 @@ Hash 路由（WebView 兼容）。权限点为渲染依据，实际以服务端�
 | `/receive/blind` | 盲收登记 | `inbound.return.blind`（契约见 §6.2） | 可离线（入 outbox） |
 | `/receive/reservations` | 退货预约收货 | `returns.reservation.receive` / `.view`（契约见 §6.2） | 可离线（入 outbox） |
 | `/putaway` | 上架扫码 | `inbound.putaway` | 可离线（入 outbox） |
-| `/move` | 同仓移库；跨仓调拨 | `inventory.move.execute`（待第 7 篇定名） | 同仓可离线；跨仓置灰 |
+| `/move` | 同仓移库；跨仓调拨 | `inventory.move.view` / `.confirm`（07 §10，已合 main；原 `inventory.move.execute` 作废） | 同仓可离线；跨仓调拨按 `paused_actions` 的 `TRANSFER` 置灰、不重试（11 §6.6） |
 | `/offline/paper` | 纸单补录（恢复联网后 24 h 内） | `offline.paper.backfill` | 必须在线 |
 | `/sync` | 补交队列（待上传 / 失败红条 / 已完成） | — | 离线可看 |
 | `/processing/issue`、`/processing/receipt`、`/processing/loss` | 加工领料 / 成品入库 / 损耗 | `process.order.issue` / `process.order.report`（草稿 17） | 待 Q8 |
@@ -144,19 +147,19 @@ Hash 路由（WebView 兼容）。权限点为渲染依据，实际以服务端�
 
 ## 6. 页面 → 接口映射
 
-斜体标注的接口来自尚未合并 main 的草稿（05 / 06 / 12 / 17），定稿后需复核。
+斜体标注的接口只剩草稿篇 **16 / 17**（05 / 06 / 08 / 12 已合 main），定稿后需复核。**01 已合 main**：条码解析 `GET /api/v1/master/barcodes/{barcode}` 是已定接口（端上仍不缓存条码表）；主数据的停用挂起、软删两段式、字典接口**一期未建**（01 §7「未建接口」/「显式延期」），端上不依赖。
 
 | 页面 | 动作 | 接口 | 幂等键 |
 |---|---|---|---|
-| 登录 | 设备登录 | *`POST /api/v1/auth/device-login`* `{login_type, username\|phone, password\|sms_code, device_instance_id, client_type}` | — |
-| 登录 | 签发离线令牌 | *`POST /api/v1/auth/offline-token`* → `{token, exp, ttl_seconds}` | — |
-| 登录 | 刷新 / 登出 | *`POST /api/v1/auth/refresh`、`POST /api/v1/auth/logout`* | — |
-| 登录 | 当前用户 / 权限 / 仓 / 暂停动作 / 写节点窗口 | `GET /api/v1/me`（含 `perm_version`、`paused`、`paused_actions[]`、`offline_deadline_at`、`backfill_deadline_at`，00 §6.6.2） | — |
+| 登录 | 设备登录 | *`POST /api/v1/auth/device-login`* `{login_type, username\|phone, password\|sms_code, device_instance_id, client_type}`（12 篇 §8） | — |
+| 登录 | 签发离线令牌 | *`POST /api/v1/auth/offline-token`* → `{token, exp, ttl_seconds}`；**`exp` 是 UTC 整秒 `YYYY-MM-DD HH:MM:SS`**（12 篇 Δ1；端上不得按带时区 ISO 或本地时区解析） | — |
+| 登录 | 刷新 / 登出 | *`POST /api/v1/auth/refresh`、`POST /api/v1/auth/logout`*（12 篇 §8） | — |
+| 登录 | 当前用户 / 权限 / 仓 / 暂停动作 / 写节点窗口 | `GET /api/v1/me`（含 `perm_version`、`stale_policy`、`paused`、`offline_since`、`paused_actions[]`、`offline_deadline_at`、`backfill_deadline_at`，00 §6.6.2 硬契约；**12 篇 §8 已补全**） | — |
 | 等待审批 | 查审批状态 | *`GET /api/v1/approvals/{approval_id}`*（凭 `binding_id + device_instance_id`） | — |
 | 任务列表 | 我的任务 / 可领任务 | *`GET /api/v1/picking/tasks?mine=1&status=&page=`* | — |
 | 任务列表 | 领取任务 | *`POST /api/v1/picking/tasks/{id}/claim`*，body 带 `device_instance_id` | `Idempotency-Key` |
 | 任务执行 | 任务包预下载 | *`GET /api/v1/picking/tasks?mine=1&preload=1`* | — |
-| 任务执行 | 扫商品码解析（在线） | *`GET /api/v1/master/barcodes/{barcode}`*（第 1 篇；边缘节点本地可用） | — |
+| 任务执行 | 扫商品码解析（在线） | **`GET /api/v1/master/barcodes/{barcode}`**（01 §7 已合 main；权限 `master.sku.view`；边缘节点本地可用；**端上不缓存条码表**） | — |
 | 任务执行 | 拣货行确认 | *`POST /api/v1/picking/tasks/{id}/lines/{seq}/confirm`* `{device_instance_id, op_seq, scanned_location_code, scanned_barcode, lot_code, confirmed_qty, uom, scan_event_id, client_time}` | `Idempotency-Key` + 四元组 |
 | 任务执行 | 缺货上报 | *`POST /api/v1/picking/tasks/{id}/lines/{seq}/short`* `{reason_code, …}` | 同上 |
 | 任务执行 | 撤销上一次确认 | *`POST /api/v1/picking/tasks/{id}/lines/{seq}/undo`* | 同上 |
@@ -170,10 +173,10 @@ Hash 路由（WebView 兼容）。权限点为渲染依据，实际以服务端�
 | 复核 | 提交（带 `version`） | *`POST /api/v1/checks/{code}/submit`* | `Idempotency-Key` + version |
 | 装箱 | 开箱 / 整体替换箱明细 / 封箱 | *`POST /api/v1/outbound-orders/{code}/boxes`*、*`PUT /api/v1/boxes/{code}/lines`*、*`POST /api/v1/boxes/{code}/seal`* | `Idempotency-Key`（+version） |
 | 集货 | 扫箱码 + 集货位 | *`POST /api/v1/boxes/{code}/stage`* | 四元键 |
-| 箱作废 | 申请作废 / 查箱详情 | `POST /api/v1/pack/boxes/{box_id}/void-request`、`GET /api/v1/pack/boxes/{box_id}`（00 §6.6.1 / 草稿 06） | `Idempotency-Key` |
+| 箱作废 | 申请作废 / 查箱详情 | `POST /api/v1/pack/boxes/{box_id}/void-request`、`GET /api/v1/pack/boxes/{box_id}`（00 §6.6.1 / 06 §7.3） | `Idempotency-Key` |
 | 收货 | 收货登记 | `POST /api/v1/inbound/lines/{id}/receipts`（03 §7，已合 main） | `op_key` / 四元组 |
-| 收货 | 盲收登记 | `POST /api/v1/inbound/returns/blind`（契约见 §6.2） | `Idempotency-Key` + 四元组 |
-| 收货 | 退货预约收货 | `POST /api/v1/returns/reservations/{id}/receive`（契约见 §6.2） | `Idempotency-Key` |
+| 收货 | 盲收登记 | `POST /api/v1/inbound/returns/blind`（契约见 §6.2；**权限点 `inbound.return.blind` 已由 00 §6.6 第 3 篇清单第 10 个登记**，12 §4.2 收录；**03 §7 已合 main：`03:260`**） | `Idempotency-Key` + 四元组 |
+| 收货 | 退货预约收货 | `POST /api/v1/returns/reservations/{id}/receive`（**10 §7.2 已合 main：`10:176`**；契约见 §6.2） | `Idempotency-Key` |
 | 上架 | 上架扫码 | `POST /api/v1/inbound/receipts/{id}/putaways`（03 §7，已合 main） | `op_key` / 四元组 |
 | 纸单补录 | 提交 | `POST /api/v1/offline/paper-records` `{action_type, occurred_at, operator_id, payload, photo_ids[]}`（11 §7，已合 main） | `Idempotency-Key` |
 | 加工 | 领料 / 报工 / 冲回 | *`POST /api/v1/process/orders/{id}/issues`*、*`/reports`*、*`/reversals`*（草稿 17） | `issue_client_id` / `report_client_id` |
@@ -187,7 +190,7 @@ Hash 路由（WebView 兼容）。权限点为渲染依据，实际以服务端�
 
 ### 6.2 盲收与退货预约收货的端上契约
 
-> 这两条接口在 main 的 03/10 篇里都没有定义。下面是**前端消费契约**：PDA 按此实现与 MSW mock，后端语义与落库由 03/10 篇定；字段名以后端定稿为准，形状有变本篇同步对齐。数量 3 位小数字符串，时间 UTC 整秒 `YYYY-MM-DD HH:MM:SS`。
+> 这两条接口在 main 上**已定义**（盲收 03 §7：`03:260`；退货预约 10 §7.2：`10:173-176`），权限点也已登记。下面是**端上消费要点与离线约定**：PDA 按此实现与 MSW mock，后端语义与落库由 03/10 篇定；字段名以后端定稿为准，形状有变本篇同步对齐。数量 3 位小数字符串，时间 UTC 整秒 `YYYY-MM-DD HH:MM:SS`。
 
 **盲收登记**（`POST /api/v1/inbound/returns/blind`，权限 `inbound.return.blind`）
 
@@ -200,7 +203,7 @@ Hash 路由（WebView 兼容）。权限点为渲染依据，实际以服务端�
 
 - 必填：`sku_id`、`qty`、`reason_code`、`container_code`；`store_code`、`photo_ids` 可选；头带 `Idempotency-Key`、`X-Warehouse-Id`、`X-Write-Epoch`。
 - 响应 200：`{"receipt_id": "…", "inbound_order_id": "…", "inbound_order_code": "RTN-WHSH01-0003-20261015-000031", "exception_no": "EXC-…", "link_deadline_at": "2026-10-17 02:31:00"}`。`link_deadline_at` = 创建 + 48 h（UTC），前端**只读、不推算**（剩余 < 4 h 标橙、超时标红）。
-- 错误：`40001`（缺 `reason_code` / `container_code`，`detail` 带字段名）、`40010`（数量格式）、`40910`（`key_type` 按 00 §6.5）、`42221`（引用了已停用主数据）、`50304`（`RECEIVE` 暂停，`detail.action`）、`40111` / `40112`（设备与令牌）。
+- 错误：`40001`（缺 `reason_code` / `container_code`，`detail` 带字段名）、`40010`（数量格式）、`40910`（`key_type` 按 00 §6.5）、`50304`（`RECEIVE` 暂停，`detail.action`）、`40111` / `40112`（设备与令牌）。**`42221 MASTER_DISABLED` 一期未建**（01 §7.1：没有停用生命周期与动作白名单）：保留文案分支但**不做可达路径**，真收到按未知码通用处理。
 - 离线：入 outbox（入队前做同样的必填校验），联网后按 §9.3 补交；补交成功才显示两个单号（§9.11）。
 
 **退货预约收货与查询**（`POST /api/v1/returns/reservations/{id}/receive`，权限 `returns.reservation.receive`；`GET /api/v1/returns/reservations`、`GET /api/v1/returns/reservations/{id}`，权限 `returns.reservation.view`）
@@ -221,14 +224,14 @@ Hash 路由（WebView 兼容）。权限点为渲染依据，实际以服务端�
 - 首页宫格与路由按 `permissions` 与 `paused_actions[]` 渲染；无权限不显示按钮。
 - **前端隐藏不是安全措施**：任务归属、仓库范围、SoD 全由服务端强制；离线补交时服务端仍按当前令牌与任务归属校验，前端不能凭本地缓存越权提交。
 - 本篇涉及权限点（归属篇见括号）：
-  - 拣货：`picking.task.execute`（含 claim / confirm / short / undo / complete）、`picking.task.undo_any`（主管，超 30 s）、`picking.task.reassign`、`picking.task.close`（05 草稿）。
+  - 拣货：`picking.task.execute`（含 claim / confirm / short / undo / complete）、`picking.task.undo_any`（主管，超 30 s）、`picking.task.reassign`、`picking.task.close`（05 §10，已合 main）。
   - 待回库：`picking.return_record.view`、`picking.return_record.resolve`（04 §10）；confirm / putback-ack 只允许**原拣货人**。
-  - 复核装箱：`outbound.check.execute`、`outbound.pack.execute`、`outbound.pack.unseal`、`outbound.stage.execute`、`pack.box.void.request`（06 草稿 / 00 §6.6.1）。
-  - 入库：`inbound.receive`、`inbound.putaway`（03 §10）。
+  - 复核装箱：`outbound.check.execute`、`outbound.pack.execute`、`outbound.pack.unseal`、`outbound.stage.execute`、`pack.box.void.request`（06 §10 / 00 §6.6.1）。
+  - 入库：`inbound.receive`、`inbound.putaway`（03 §10）、`inbound.return.blind`（盲收登记；**00 §6.6 第 3 篇清单第 10 个已登记**，12 篇 §4.2 收录）。
   - 离线：`offline.paper.backfill`（11 / 00 §6.6.1）。
-  - 主数据：`master.sku.view`（条码解析，01 §7）。
+  - 主数据：`master.sku.view`（条码解析，01 §7 已合 main）。**主数据停用挂起 / 软删两段式 / 字典接口一期未建**（01 §7），端上不出现对应入口；`40962` / `42221` / `42220` 保留文案但不做可达路径。
   - 加工 / 活鲜：`process.order.issue`、`process.order.report`（17 草稿）、`live.inspect.submit`、`live.death.report`、`live.weigh.submit`（18 §10）。
-  - 设备：`device.binding.view`、`device.binding.revoke`（12 草稿，后台侧）。
+  - 设备：`device.binding.view`、`device.binding.approve`、`device.binding.revoke`（**12 §4.2，已合 main**；PDA 侧只在绑定等待页查 `DEVICE_BIND` 审批状态与展示结果）。
 - **补交账号必须与产生操作的账号一致**：outbox 按 `user_id` 隔离（§9.3）；服务端以令牌里的 `device_instance_id` 为准，忽略请求体中的值。
 
 ---
@@ -257,7 +260,7 @@ Hash 路由（WebView 兼容）。权限点为渲染依据，实际以服务端�
 | 场景 | 处理 |
 |---|---|
 | 非计件模式（扫库位、扫商品定位、扫筐）下扫码枪抖动 | 同一次触发的重复广播丢弃（有壳按壳事件 id）；键盘楔入按两次回车间隔判断，默认 150 ms，可配置（Q9） |
-| **计件模式**逐件扫，每扫一次 +1 | **不做时间窗去抖**。每次扫码生成唯一 `scan_event_id`（有壳用壳事件 id，否则本地 uuid），按事件 id 去重；同码快速连扫都算合法 +1，超过应拣量长鸣阻止。服务端 `uq_pick_op_scan` 防同一扫码事件重复入账（05 草稿 §8） |
+| **计件模式**逐件扫，每扫一次 +1 | **不做时间窗去抖**。每次扫码生成唯一 `scan_event_id`（有壳用壳事件 id，否则本地 uuid），按事件 id 去重；同码快速连扫都算合法 +1，超过应拣量长鸣阻止。服务端 `uq_pick_op_scan` 防同一扫码事件重复入账（05 §8） |
 | 已确认的行再次扫同一库位/商品 | 提示「该行已完成」，不生成新操作 |
 | 确认按钮连点 | 写 outbox 是本地事务，按钮在写完前禁用；同一行同一 `op_seq` 只生成一条 |
 
@@ -440,7 +443,7 @@ stateDiagram-v2
 - **`50302 ID_CLOCK_BACKWARD`**（发号时钟回拨）**不触发**重取地址：按普通 503 处理，条目保持 `pending` 退避重试，不标红。
 - **`50304 STALE_STOCK_PAUSED`**：见 §9.10，**不重取写地址**。
 - **继承**：幂等记录、四元组唯一键、待回库记录随权威库迁移，新写节点直接继承；切换完成前旧节点只读。切换前已成功的操作重提交得到重放结果，不重复扣减。
-- **非计划切换（边缘硬件故障）**：从备份恢复到备用机，RPO 窗口内的写入可能丢失；PDA 只需重取地址，outbox 按原业务键重提交补数。新节点可能使用新节点号，对 PDA 无影响。对账（动碰盘点）完成前若服务端不开放作业，写请求按 503 处理，条目保持 `pending`。
+- **非计划切换（边缘硬件故障）**：从备份恢复到备用机，RPO 窗口内的写入可能丢失；PDA 只需重取地址，outbox 按原业务键重提交补数。新节点可能使用新节点号，对 PDA 无影响。对账（动碰盘点）完成前若服务端不开放作业，写请求按 503 处理，条目保持 `pending`。**审批流程在服务端**：审批类型 `UNPLANNED_FAILOVER`（00 §6.6.1，`ck_apr_ttl` 上限 1 h），确认接口 `POST /api/v1/failover/{warehouse_code}/confirm`，**共三人**（1 人发起 + 仓库主管与中心运维各确认一次，发起人不能兼任确认人）；PDA 不参与确认，只在切换完成后重取 `write-endpoint`（旧节点 epoch +1、旧节点只读）。
 
 ### 9.6 条码解析与离线预校验
 
@@ -454,10 +457,10 @@ stateDiagram-v2
 - `device_instance_id` 首次安装生成并存安全存储，**重装即变**（四元组成员）。登录走 `POST /api/v1/auth/device-login`。
 - **首次绑定**：服务端建立 PENDING 绑定并生成 `DEVICE_BIND` 审批；主管在后台审批中心通过后转 ACTIVE。审批前登录返回 `40111`、`detail.reason=BINDING_PENDING`（另带 `approval_id`、`binding_id`）：PDA 进 `/binding-pending`（设备实例短码、账号、仓库、刷新按钮），**不进入作业、不写 outbox**；可用 `GET /api/v1/approvals/{approval_id}` 查询状态。驳回时提示联系主管。
 - 同一设备换人登录：服务端吊销旧绑定、建立新绑定；前端要求上一账号 outbox 已清空或已交主管（§9.3）。
-- 在线登录后调用 `POST /api/v1/auth/offline-token` 取离线令牌（`{token, exp, ttl_seconds}`，默认 **12 小时**，覆盖一个班次），存安全存储。失联时继续作业、操作入 outbox；补交时服务端校验离线令牌，失败按 `40112` 处理。
-- 顶栏显示离线令牌剩余时间，取响应 `exp`；剩余 < 1 小时提醒「请尽快联网」；已过期仍允许记录 outbox（不丢现场数据），但提示「联网后需重新登录才能补交」。
+- 在线登录后调用 `POST /api/v1/auth/offline-token` 取离线令牌（`{token, exp, ttl_seconds}`，默认 **12 小时**、库层上限同为 12 h，覆盖一个班次），存安全存储。**`exp` 是 UTC 整秒 `YYYY-MM-DD HH:MM:SS`**（12 篇 Δ1）：解析与倒计时都按 UTC 与服务器时间比对，**不得用设备本地时区换算、不得当带时区 ISO 串解析**。失联时继续作业、操作入 outbox；补交时服务端校验离线令牌，失败按 `40112` 处理。
+- 顶栏显示离线令牌剩余时间，取响应 `exp`（12 篇 §3.3：`issued_at` / `expires_at` 由库写）；剩余 < 1 小时提醒「请尽快联网」；已过期仍允许记录 outbox（不丢现场数据），但提示「联网后需重新登录才能补交」。
 - 设备挂失（`device.status=LOST`）后绑定与离线令牌全部吊销，补交返回 `40112 REVOKED`，outbox 保留交主管。
-- **注意**：00 §6.6.2 要求 `/me` 与心跳返回 `paused`、`paused_actions[]`、`offline_deadline_at`、`backfill_deadline_at`，但 12 草稿的 `/me` 响应示例里没有这些字段，属待补齐项（Q1）。
+- **`/me` 六字段已闭环（原 Q1 关闭）**：00 §6.6.2 是 400 级硬契约，**12 篇 §8 的 `/me` 示例已写全** `stale_policy` / `paused` / `offline_since` / `paused_actions[]` / `offline_deadline_at` / `backfill_deadline_at`。端上按这六项渲染置灰与倒计时；返回缺字段时上报并退回上一份缓存，不自行推断。
 
 ### 9.8 重连
 
@@ -469,7 +472,7 @@ stateDiagram-v2
 
 ### 9.9 复核、装箱与集货
 
-- 开复核单、提交、装箱、封箱、集货只能在线（需取冻结期望数）；复核扫码 / 撤销一扫可离线入 outbox（四元键去重）。接口见 06 草稿 §7。
+- 开复核单、提交、装箱、封箱、集货只能在线（需取冻结期望数）；复核扫码 / 撤销一扫可离线入 outbox（四元键去重）。接口见 06 §7。
 - **复核人 = 任一拣货人**：`40312`，`detail.reason=CHECK_SOD`（另带 `checker_id`、`picker_ids[]`）。前端按「码 + reason」分支：`CHECK_SOD` → 红条「你拣过此单，不能复核，请换人」，不重试；其他 reason → 按 `detail.reason` 通用提示。复核人必须与该单**所有**拣货人不同；该单没有任何拣货人记录时一律拒绝，前端不做本地放行判断。
 - **多扫**：`42214`，`detail.reason=OVER_CHECK` → 长鸣 + 红条，不自动重试；文案与 `OVER_PICK`、`OVER_REVERSE` 分开。
 - **批次已过可售期**：`42214`，`detail.reason=SELL_EXPIRED` → 长鸣 + 红条，不重试，引导主管发起拣后取消（`CANCEL_AFTER_PICK`）；PDA 不提供绕过入口。
@@ -583,19 +586,20 @@ stateDiagram-v2
 
 | # | 问题 | 依赖 | 影响 |
 |---|---|---|---|
-| Q1 | 第 12 篇 md 当前不在 main（`docs/12-权限与审计.md` 于 `7241e9f` 被删除，DDL 保留）；`/me` 响应示例也没有 00 §6.6.2 要求的 `paused` / `paused_actions` / `offline_deadline_at` / `backfill_deadline_at`（**00 §6.6.2 已定，本篇按它写全**） | 12 篇定稿 | 登录、设备绑定、置灰与倒计时字段；**本篇引用 00 §6.4/§6.5 的权威定义，12 篇定稿后如有差异以 12 篇为准** |
-| Q2 | 盲收与退货预约收货的**前端契约见 §6.2**；后端语义、字段与 48 h 口径由后端定 | 03 / 10 篇 | **后端侧待 03 / 10 篇补登记** |
-| Q3 | 拣货任务接口（含 `preload` 任务包格式、任务版本号字段、`seq` 与四元组里 `line_no` 的对应）以 05 草稿为临时依据，未合 main | 05 篇 | §6 全部任务行 |
+| Q1 | ~~12 篇 md 当前不在 main，`/me` 响应缺 00 §6.6.2 的四项~~ **已闭环**：12 篇§4.2 给出权限点矩阵，§8 的 `/me` 示例写全 `stale_policy` / `paused` / `offline_since` / `paused_actions[]` / `offline_deadline_at` / `backfill_deadline_at`；`exp` 为 UTC 整秒（Δ1） | 已关闭 | 登录、设备绑定、置灰与倒计时字段；12 与 00 冲突以 00 为准 |
+| Q2 | ~~盲收与退货预约收货的后端缺口~~ **已闭合**：盲收 03 §7（`03:260`）、退货预约 10 §7.2（`10:173-176`）已合 main；端上字段按 §6.2 对齐 | 已关闭 | §6 / §6.2 |
+| Q3 | 拣货任务接口（含 `preload` 任务包格式、任务版本号字段、`seq` 与四元组里 `line_no` 的对应）以 05 §7/§10 为依据（**已合 main**） | 已关闭 | §6 全部任务行 |
 | Q4 | 离线回收阈值（原文 2 h）是否配置下发 | 00 / 05 | 重连提示 |
 | Q5 | PDA 壳选型及扫码事件 id、打印、电子秤接口 | 采购 / 05 | `bridge/` |
 | Q6 | 批量补交接口及其部分失败语义 | 05 / 11 | `/sync` 同步器 |
-| Q7 | 心跳接口路径与响应字段清单（00 §6.6.2 只说「终端心跳」） | 00 / 12 | §9.10 |
+| Q7 | 心跳接口路径与响应字段清单（00 §6.6.2 只说「终端心跳」；**12 篇 §8 只给了 `GET /api/v1/me`，没有心跳路径**） | 12 篇增量 / 00 登记 | §9.10；一期端上只轮询 `/me`，心跳作为可选优化，不阻塞 |
 | Q8 | 加工（17）与活鲜（18）在 PDA 的可离线范围、成品标签打印接口 | 17 / 18 | `/processing/*`、`/live/*` |
-| Q9 | 键盘楔入去抖阈值的配置来源 | 01 字典 | §8.3 |
-| Q10 | 「交给主管」的接管流程（主管在 PDA 登录确认 / 后台接管）与审计字段 | 12 篇 | §9.3 |
-| Q11 | 同仓移库 / 跨仓调拨的权限点定名（旧稿用 `inventory.move.execute`，07 篇未定稿） | 07 篇 | `/move` |
+| Q9 | 键盘楔入去抖阈值的配置来源 —— 原依赖 01 字典接口，**字典一期未建**（01 §7「显式延期」/ §12 Q9） | 01 增量 | §8.3；一期用编译期默认值（可由任务包下发），不依赖字典 |
+| Q10 | 「交给主管」的接管流程（主管在 PDA 登录确认 / 后台接管）与审计字段 | 12 篇 §8 + 13/14 篇 | §9.3；存储与审计字段以 12 篇 `system.audit.*` 为准 |
+| Q11 | ~~同仓移库 / 跨仓调拨的权限点定名~~ **已定**：07 §10 给 `inventory.move.view` / `.create` / `.confirm` / `.cancel`（无 `.execute`） | 已关闭 | `/move` |
 | Q12 | 共享 `utils/format.ts` 的方式（monorepo 包 / 复制） | 工程结构 | 13/14/15 共用 |
 | Q13 | ~~客户端时间格式~~ **已裁决**：全按 00 §6.8 用 `YYYY-MM-DD HH:MM:SS` UTC 整秒；05 篇 confirm 示例带 `T`/`Z` 的 ISO 写法不采用，05 篇侧同步改 | 已关闭 | 40003 风险消除 |
+| Q14 | 01 增量（`md_version`、停用挂起、软删、字典、伙伴/车队/设备台账、节点号）落地时间 | 磐石 / Chief | 端上按本批标注「不做入口」；字典落地前 §8.3 的去抖阈值与心跳配置仍用默认值 |
 
 ---
 
@@ -616,3 +620,5 @@ stateDiagram-v2
 | F-A11 | 扫码去抖 | 计件模式被时间窗去抖少记数量；非计件模式重复广播多记一件；`scan_event_id` 复用 |
 | F-A12 | 数量口径 | 用 JS `Number` 做数量运算导致 0.1+0.2 漂移；前端四舍五入掩盖 3 位小数校验；`"-0.000"` |
 | F-A13 | 强制更新 | 迁移失败条目被丢弃；更新后 outbox 被清空 |
+| F-A14 | 一期不存在的分支 | 把 `42221` / `40962` / `42220` 当可达提示写进交互（01 一期没有停用挂起 / 边缘守卫 / 司机台账）；端上做「主数据申请删除 / 撤销停用」入口 |
+| F-A15 | 离线令牌 `exp` | 按带时区 ISO 串或设备本地时区解析 `exp`，导致倒计时偏移、过早或过晚提示重新登录（12 篇 Δ1 已明确为 UTC 整秒） |
