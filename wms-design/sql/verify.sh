@@ -41,8 +41,9 @@ SCHEMA_PARTS=(
 # 退供（pr-supplier-return，基于 30041054）：+supplier_return（PK、uq_srtn_code、ix_srtn_due）+ uq_srtn_scrap、uq_scr_srtn → 73 表 / 218 索引。
 # docs/03：+5 表（测温/收货/更正单/上架/质量反馈），索引 +25
 EXPECT_TABLES=79
-EXPECT_INDEXES=248
+EXPECT_INDEXES=249
 # 第 12 篇：+device_reconnect（PK、uq_drc_id_binding、ix_drc_binding、ix_drc_jti）+ audit_log.uq_audit_rbac_once → 79 表 / 248 索引（PG16 实测）
+# docs/05（长流）：+ix_pt_handover（pick_task 交接任务来源的部分索引）→ 249 索引
 EXPECT_VIEWS=2
 
 CTR=wms-pg-verify
@@ -3554,6 +3555,63 @@ ROLLBACK;
 MUTSQL
 )
 [ "$R" = "MUT#9" ] && ok "变异：把 sku.updated_at 改回裸 now() → 合规时间默认值 10 → 9（断言能抓到）" || bad "变异没变红：$R"
+echo "=== 2t. docs/05 波次与拣货：本轮新增 12 个 CHECK / 8 个外键 / ix_pt_handover 的三件套（正向 / 按名拒绝 / 变异）==="
+# 变异 = 同一事务里去掉该约束再执行原被拒语句，必须变成通过，然后 ROLLBACK（证明拒绝确实来自该约束）
+mut05() { expect_allow "05 变异：去掉 $1 后，原被拒语句通过（随后回滚）" "BEGIN; ALTER TABLE $2 DROP CONSTRAINT $1; $3 ROLLBACK;"; }
+seed "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status) VALUES (9101,'W-9101',1,'2026-10-15','CHILLED','R1','PLANNED');"
+expect_allow "05 正向：波次 + 任务 + 任务行（12 个 CHECK / 8 个外键全满足）" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,task_type,zone_id,status,assigned_to,device_instance_id,line_count,done_count) VALUES (9101,'PT-9101',9101,1,'PICK',1,'EXECUTING',41,'D9101',1,0); INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,outbound_line_id,planned_qty_milli,confirmed_qty_milli,uom,status) VALUES (9101,9101,1,1,1,1,11,1,1000,1000,'KG','DONE');"
+expect_block "05 拒绝：ck_wave_status 非法状态值" "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status) VALUES (9102,'W-9102',1,'2026-10-15','CHILLED','R1','BOGUS');" "ck_wave_status"
+mut05 "ck_wave_status" "wave" "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,status) VALUES (9102,'W-9102',1,'2026-10-15','CHILLED','R1','BOGUS');"
+expect_block "05 拒绝：ck_wave_strategy 非法拣货策略" "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,pick_strategy) VALUES (9103,'W-9103',1,'2026-10-15','CHILLED','R1','BOGUS');" "ck_wave_strategy"
+mut05 "ck_wave_strategy" "wave" "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,pick_strategy) VALUES (9103,'W-9103',1,'2026-10-15','CHILLED','R1','BOGUS');"
+expect_block "05 拒绝：ck_wave_parent 自指父波次" "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,parent_wave_id) VALUES (9104,'W-9104',1,'2026-10-15','CHILLED','R1',9104);" "ck_wave_parent"
+mut05 "ck_wave_parent" "wave" "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,parent_wave_id) VALUES (9104,'W-9104',1,'2026-10-15','CHILLED','R1',9104);"
+expect_block "05 拒绝：ck_wave_count 汇总量为负" "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,order_count) VALUES (9105,'W-9105',1,'2026-10-15','CHILLED','R1',-1);" "ck_wave_count"
+mut05 "ck_wave_count" "wave" "INSERT INTO wave (id,code,warehouse_id,work_date,temperature_zone,route_code,order_count) VALUES (9105,'W-9105',1,'2026-10-15','CHILLED','R1',-1);"
+expect_block "05 拒绝：ck_pt_type 非法任务类型" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,task_type) VALUES (9104,'PT-9104',9101,1,'BOGUS');" "ck_pt_type"
+mut05 "ck_pt_type" "pick_task" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,task_type) VALUES (9104,'PT-9104',9101,1,'BOGUS');"
+expect_block "05 拒绝：ck_pt_status 非法任务状态" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,status) VALUES (9105,'PT-9105',9101,1,'BOGUS');" "ck_pt_status"
+mut05 "ck_pt_status" "pick_task" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,status) VALUES (9105,'PT-9105',9101,1,'BOGUS');"
+expect_block "05 拒绝：ck_pt_exec EXECUTING 没有持有人与设备" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,status) VALUES (9106,'PT-9106',9101,1,'EXECUTING');" "ck_pt_exec"
+mut05 "ck_pt_exec" "pick_task" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,status) VALUES (9106,'PT-9106',9101,1,'EXECUTING');"
+expect_block "05 拒绝：ck_pt_count done_count 大于 line_count" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,line_count,done_count) VALUES (9107,'PT-9107',9101,1,1,2);" "ck_pt_count"
+mut05 "ck_pt_count" "pick_task" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,line_count,done_count) VALUES (9107,'PT-9107',9101,1,1,2);"
+expect_block "05 拒绝：ck_pt_handover 交接来源指向自身" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,handover_from_task_id) VALUES (9108,'PT-9108',9101,1,9108);" "ck_pt_handover"
+mut05 "ck_pt_handover" "pick_task" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,handover_from_task_id) VALUES (9108,'PT-9108',9101,1,9108);"
+expect_block "05 拒绝：ck_ptl_status 非法任务行状态" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom,status) VALUES (9102,9101,2,1,1,1,11,1000,'KG','BOGUS');" "ck_ptl_status"
+mut05 "ck_ptl_status" "pick_task_line" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom,status) VALUES (9102,9101,2,1,1,1,11,1000,'KG','BOGUS');"
+expect_block "05 拒绝：ck_ptl_short SHORT 行缺原因码" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom,status) VALUES (9103,9101,3,1,1,1,11,1000,'KG','SHORT');" "ck_ptl_short"
+mut05 "ck_ptl_short" "pick_task_line" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom,status) VALUES (9103,9101,3,1,1,1,11,1000,'KG','SHORT');"
+expect_block "05 拒绝：ck_ptl_short 原因码不在白名单" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom,short_reason_code) VALUES (9105,9101,5,1,1,1,11,1000,'KG','BOGUS');" "ck_ptl_short"
+mut05 "ck_ptl_short" "pick_task_line" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom,short_reason_code) VALUES (9105,9101,5,1,1,1,11,1000,'KG','BOGUS');"
+expect_block "05 拒绝：ck_ptl_override 越权原因缺越权人" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom,override_reason) VALUES (9104,9101,4,1,1,1,11,1000,'KG','FEFO_SKIP');" "ck_ptl_override"
+mut05 "ck_ptl_override" "pick_task_line" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom,override_reason) VALUES (9104,9101,4,1,1,1,11,1000,'KG','FEFO_SKIP');"
+expect_block "05 拒绝：fk_pt_wave 任务挂不存在的波次" "INSERT INTO pick_task (id,code,wave_id,warehouse_id) VALUES (9109,'PT-9109',999999,1);" "fk_pt_wave"
+mut05 "fk_pt_wave" "pick_task" "INSERT INTO pick_task (id,code,wave_id,warehouse_id) VALUES (9109,'PT-9109',999999,1);"
+expect_block "05 拒绝：fk_pt_zone 任务挂不存在的库区" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,zone_id) VALUES (9110,'PT-9110',9101,1,999999);" "fk_pt_zone"
+mut05 "fk_pt_zone" "pick_task" "INSERT INTO pick_task (id,code,wave_id,warehouse_id,zone_id) VALUES (9110,'PT-9110',9101,1,999999);"
+expect_block "05 拒绝：fk_ptl_task 任务行挂不存在的任务" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom) VALUES (9106,999999,1,1,1,1,11,1000,'KG');" "fk_ptl_task"
+mut05 "fk_ptl_task" "pick_task_line" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom) VALUES (9106,999999,1,1,1,1,11,1000,'KG');"
+expect_block "05 拒绝：fk_ptl_stock 任务行挂不存在的库存行" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom) VALUES (9107,9101,6,1,1,1,999999,1000,'KG');" "fk_ptl_stock"
+mut05 "fk_ptl_stock" "pick_task_line" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom) VALUES (9107,9101,6,1,1,1,999999,1000,'KG');"
+expect_block "05 拒绝：fk_ptl_location 任务行挂不存在的库位" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom) VALUES (9108,9101,7,999999,1,1,11,1000,'KG');" "fk_ptl_location"
+mut05 "fk_ptl_location" "pick_task_line" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom) VALUES (9108,9101,7,999999,1,1,11,1000,'KG');"
+expect_block "05 拒绝：fk_ptl_sku 任务行挂不存在的 SKU" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom) VALUES (9109,9101,8,1,999999,1,11,1000,'KG');" "fk_ptl_sku"
+mut05 "fk_ptl_sku" "pick_task_line" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom) VALUES (9109,9101,8,1,999999,1,11,1000,'KG');"
+expect_block "05 拒绝：fk_ptl_lot 任务行挂不存在的批次" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom) VALUES (9110,9101,9,1,1,999999,11,1000,'KG');" "fk_ptl_lot"
+mut05 "fk_ptl_lot" "pick_task_line" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,uom) VALUES (9110,9101,9,1,1,999999,11,1000,'KG');"
+expect_block "05 拒绝：fk_ptl_obl 任务行挂不存在的出库行" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,outbound_line_id,planned_qty_milli,uom) VALUES (9111,9101,10,1,1,1,11,999999,1000,'KG');" "fk_ptl_obl"
+mut05 "fk_ptl_obl" "pick_task_line" "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,outbound_line_id,planned_qty_milli,uom) VALUES (9111,9101,10,1,1,1,11,999999,1000,'KG');"
+R=$(psql -t -A -c "SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexname='ix_pt_handover' AND indexdef LIKE '%handover_from_task_id IS NOT NULL%'")
+[ "$R" = "1" ] && ok "05 目录：ix_pt_handover 存在且是 handover_from_task_id 的部分索引" || bad "05 目录：ix_pt_handover = $R"
+expect_allow "05 变异：去掉 ix_pt_handover 后，目录断言会变红（随后回滚）" "BEGIN; DROP INDEX ix_pt_handover; ROLLBACK;"
+# P25-2（可证伪）：SKIP / ABNORMAL 行不算完成——任务不得凭它们进 DONE（否则该行余量既不 release 也不转 SHORT，04 会当成拣满）
+seed "INSERT INTO pick_task (id,code,wave_id,warehouse_id,status,assigned_to,device_instance_id,line_count,done_count) VALUES (9301,'PT-9301',9101,1,'EXECUTING',41,'D9101',1,0);"
+seed "INSERT INTO pick_task_line (id,pick_task_id,seq,location_id,sku_id,lot_id,stock_id,planned_qty_milli,confirmed_qty_milli,uom,status) VALUES (9301,9301,1,1,1,1,11,1000,0,'KG','SKIP');"
+R=$(psql -t -A -c "WITH u AS (UPDATE pick_task SET status='DONE' WHERE id=9301 AND status='EXECUTING' AND NOT EXISTS (SELECT 1 FROM pick_task_line l WHERE l.pick_task_id=9301 AND l.status IN ('PENDING','SKIP','ABNORMAL')) RETURNING 1) SELECT count(*) FROM u")
+[ "$R" = "0" ] && ok "05 P25-2：任务里有 SKIP 行（confirmed < planned）时 T-done 守卫命中 0 行（不得进 DONE）" || bad "05 P25-2：T-done 守卫 = $R 行（期望 0）"
+R=$(psql -t -A -c "WITH u AS (UPDATE pick_task SET status='DONE' WHERE id=9301 AND status='EXECUTING' RETURNING 1) SELECT count(*) FROM u")
+[ "$R" = "1" ] && ok "05 P25-2 变异：去掉 NOT EXISTS 守卫后同一 UPDATE 命中 1 行（守卫是拦它的那条）" || bad "05 P25-2 变异：$R 行（期望 1）"
 echo "=== 汇总 ==="
 echo "  通过 $pass 项 / 失败 $fail 项"
 cleanup
