@@ -815,8 +815,11 @@ CREATE TABLE inbound_temp_check (
     CONSTRAINT ck_itc_scope CHECK ((scope = 'ZONE' AND inbound_line_id IS NULL) OR (scope = 'LINE' AND inbound_line_id IS NOT NULL)),
     CONSTRAINT ck_itc_tz   CHECK (temp_zone IN ('AMBIENT','CHILLED','FROZEN','FRESH')),
     CONSTRAINT fk_itc_wh FOREIGN KEY (warehouse_id) REFERENCES warehouse(id),   -- R3：补外键（小玛丽 r12）
+    -- 严格方案（Chief 三次确认，03+10 增量）：非 AMBIENT 温区测温**两端都必须有快照**，只给一端算快照不完整。
+    -- 旧写法是 OR（只给一端就放行），配合 ck_itc_result 的 `min IS NULL OR ...` 等于没有另一端界限：
+    -- 冷藏只给上限 max=-150（-15.0 ℃）时，一箱 measured=-600（-60 ℃）的冻货照样判 PASS。AMBIENT 仍允许两端全空。
     CONSTRAINT ck_itc_range CHECK (measured_c10 BETWEEN -600 AND 600 AND (min_c10 IS NULL OR max_c10 IS NULL OR min_c10 <= max_c10)
-        AND (temp_zone = 'AMBIENT' OR (min_c10 IS NOT NULL OR max_c10 IS NOT NULL))),
+        AND (temp_zone = 'AMBIENT' OR (min_c10 IS NOT NULL AND max_c10 IS NOT NULL))),
     CONSTRAINT ck_itc_result CHECK (
         (result = 'PASS' AND (min_c10 IS NULL OR measured_c10 >= min_c10) AND (max_c10 IS NULL OR measured_c10 <= max_c10))
         OR (result = 'FAIL' AND ((min_c10 IS NOT NULL AND measured_c10 < min_c10) OR (max_c10 IS NOT NULL AND measured_c10 > max_c10)))),
