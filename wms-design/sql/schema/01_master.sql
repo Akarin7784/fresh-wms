@@ -46,8 +46,10 @@ CREATE TABLE zone (
     updated_at      TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
     deleted_at      TIMESTAMP,
     CONSTRAINT uq_zone_code UNIQUE (warehouse_id, code),
-    -- 有温度要求的库区必须给出上下限，且下限严格小于上限（相等等于没有区间）
-    CONSTRAINT ck_zone_temp CHECK ((temp_min_c10 IS NULL AND temp_max_c10 IS NULL)
+    -- 控温库区（CHILLED/FROZEN）必须给出温区上下限且下限严格小于上限；**空区间只允许 AMBIENT**（不控温库区）。
+    -- 理由（镜鉴 I-2）：两列全空放行时，应用层取不到区间快照，冷链测温校验会被当成"无区间"而失效。
+    CONSTRAINT ck_zone_temp CHECK (
+        (temp_min_c10 IS NULL AND temp_max_c10 IS NULL AND temp_zone = 'AMBIENT')
         OR (temp_min_c10 IS NOT NULL AND temp_max_c10 IS NOT NULL AND temp_min_c10 < temp_max_c10))
 );
 CREATE INDEX ix_zone_wh_type ON zone(warehouse_id, zone_type, temp_zone);
@@ -109,6 +111,10 @@ CREATE TABLE sku (
     updated_at                  TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
     deleted_at                  TIMESTAMP,
     CONSTRAINT uq_sku_code UNIQUE (code),
+    -- 取值域（镜鉴 I-1）：只允许 5 个已登记取值。大小写不同 / 尾空格 / 拼错的值一律拒 ——
+    -- 否则 ck_sku_sell_days_req 的精确匹配会被 'chilled'、'FROZEN '、'CHILL' 绕过，冷链 SKU 没有 sell_deadline。
+    -- LIVE 是第 18 篇活鲜的正式取值，必须在取值域内。
+    CONSTRAINT ck_sku_temp CHECK (temperature_required IN ('AMBIENT','CHILLED','FROZEN','FRESH','LIVE')),
     CONSTRAINT ck_sku_shelf_life CHECK (shelf_life_days >= 0 AND receive_min_shelf_life >= 0 AND ship_min_shelf_life >= 0
         AND (shelf_life_days = 0 OR (receive_min_shelf_life <= shelf_life_days AND ship_min_shelf_life <= shelf_life_days))),
     -- 可售天数必须落在保质期内；保质期未登记（=0）的 SKU 不允许设 sell_days

@@ -296,7 +296,7 @@ def expect_allow_tx(desc: str, stmts: list[str]) -> None:
 # 2. 同一套断言
 # ---------------------------------------------------------------------------
 _MASTER_MIN = ["INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (1,'WHSH01','x','20:00')",
-               "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (1,1,'Z-C1','x','CHILLED','PICK'),(2,1,'Z-C2','x','CHILLED','STORAGE')",
+               "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type,temp_min_c10,temp_max_c10) VALUES (1,1,'Z-C1','x','CHILLED','PICK',20,80),(2,1,'Z-C2','x','CHILLED','STORAGE',20,80)",
                "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (1,1,1,'A01','BIN',2,'A010'),(2,1,1,'A02','BIN',2,'A020'),(3,1,2,'B01','PALLET',8,'B010')",
                "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,sell_days) VALUES (1,'SKU-APPLE','x','KG','CHILLED',30,14)"]   # 第十三轮：01/02 补了外键，内存库变异也要有父行；第 1 篇 sell_days 冷藏必填
 print("=== 2. 库层不变量断言（与 verify.sh 同一套）===")
@@ -304,7 +304,7 @@ seed = [
     "INSERT INTO warehouse (id,code,name,cutoff_time,work_date_offset) VALUES (1,'WHSH01','上海青浦仓','20:00',-1)",
     # 第 12 篇 FK 底数（权限表加外键后，审批人 / 申请人 / 映射里引用的用户必须存在）：102–199、201–299 号测试用户
     "WITH RECURSIVE n(i) AS (SELECT 102 UNION ALL SELECT i + 1 FROM n WHERE i < 299) INSERT INTO sys_user (id,username,password_hash) SELECT i, 'seed' || i, 'x' FROM n WHERE i <> 200",
-    "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (1,1,'Z-C1','冷藏拣货区','CHILLED','PICK'),(2,1,'Z-C2','冷藏存储区','CHILLED','STORAGE')",
+    "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type,temp_min_c10,temp_max_c10) VALUES (1,1,'Z-C1','冷藏拣货区','CHILLED','PICK',20,80),(2,1,'Z-C2','冷藏存储区','CHILLED','STORAGE',20,80)",
     "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (1,1,1,'A01-02-03','BIN',2,'A010'),(2,1,1,'A01-03-01','BIN',2,'A020'),(3,1,2,'B02-01-05','PALLET',8,'B010')",
     "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life,sell_days) VALUES (1,'SKU-APPLE','山东红富士 80#','KG','CHILLED',30,10,14)",
     "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life,sell_days) VALUES (2,'SKU-PEAR','砀山酥梨','KG','CHILLED',30,10,14)",   # 第十三轮：stock/lot 用例引用 sku 2，补外键父行
@@ -2865,7 +2865,7 @@ _copy_row("process_issue", "id = 1722", id=1798, line_no=98, op_key="PRCI:1711:0
 _copy_row("process_report", "id = 1744", id=1798, report_seq=8, report_client_id="00000000-0000-4000-8000-000000009998")
 _li = conn.execute("SELECT id FROM live_inspection ORDER BY id DESC LIMIT 1").fetchone()[0]
 _copy_row("live_inspection", f"id = {_li}", id=90001, client_op_id="00000000-0000-4000-8000-000000090001")   # 无子行（不被 live_tank_hold 引用）
-conn.execute("INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (90001,1,'Z-RP','无库位','CHILLED','STORAGE')")   # 无子库位
+conn.execute("INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type,temp_min_c10,temp_max_c10) VALUES (90001,1,'Z-RP','无库位','CHILLED','STORAGE',20,80)")   # 无子库位
 conn.commit()
 # 生成器的"只撞目标键"造不出时的手写实打（不是豁免：同样两段——带守卫必须被拒且原行在，去掉全部触发器后必须通过且原行被删；任一不满足 = 红）。
 # 两条都是"同主键、其余唯一键也落在同一行"：REPLACE 只会删这一行，原值被覆盖（小玛丽 r12 gap_probe2 的打法）
@@ -2900,7 +2900,7 @@ _T03 = {n: one("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", 
 def _p03(l): return [(_T03[x[10:]] if x.startswith('@RECREATE ') else ('DROP TRIGGER ' + x[6:] if x.startswith('@DROP ') else x)) for x in l]
 for _n in _TOL03: conn.execute('DROP TRIGGER ' + _n)
 conn.commit()
-expect_allow_tx('03 种子：冷藏收货区/暂存位/存储位、SKU 冷鲜猪里脊、批次、两条库存行、采购入库单 + 行（订 100 KG）', ["INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (31,1,'Z-RCV','冷藏收货区','CHILLED','RECEIVE')", "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (31,1,31,'RCV-01','FLOOR',99,'R010'),(32,1,2,'B31-01-01','PALLET',8,'B310')", "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life,sell_days) VALUES (31,'SKU-PORK','冷鲜猪里脊','KG','CHILLED',5,2,3)", "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (303,31,'L-PORK1','2026-10-20','2026-10-15')", "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (3101,1,31,31,303,'KG',0),(3102,1,32,31,303,'KG',0)", "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,supplier_id,status,work_date,arrived_at,unload_start_at) VALUES (3100,'INB-SH01-0001-20261015-000001',1,'PURCHASE','ERP','PO-3100','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',501,'RECEIVING','2026-10-15','2026-10-15 01:00:00','2026-10-15 01:05:00')", "INSERT INTO inbound_line (id,inbound_id,line_no,sku_id,uom,temp_zone,ordered_qty_milli,lot_id,expiry_date) VALUES (3110,3100,1,31,'KG','CHILLED',100000,303,'2026-10-20')"])
+expect_allow_tx('03 种子：冷藏收货区/暂存位/存储位、SKU 冷鲜猪里脊、批次、两条库存行、采购入库单 + 行（订 100 KG）', ["INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type,temp_min_c10,temp_max_c10) VALUES (31,1,'Z-RCV','冷藏收货区','CHILLED','RECEIVE',20,80)", "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (31,1,31,'RCV-01','FLOOR',99,'R010'),(32,1,2,'B31-01-01','PALLET',8,'B310')", "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life,sell_days) VALUES (31,'SKU-PORK','冷鲜猪里脊','KG','CHILLED',5,2,3)", "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (303,31,'L-PORK1','2026-10-20','2026-10-15')", "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (3101,1,31,31,303,'KG',0),(3102,1,32,31,303,'KG',0)", "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,supplier_id,status,work_date,arrived_at,unload_start_at) VALUES (3100,'INB-SH01-0001-20261015-000001',1,'PURCHASE','ERP','PO-3100','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',501,'RECEIVING','2026-10-15','2026-10-15 01:00:00','2026-10-15 01:05:00')", "INSERT INTO inbound_line (id,inbound_id,line_no,sku_id,uom,temp_zone,ordered_qty_milli,lot_id,expiry_date) VALUES (3110,3100,1,31,'KG','CHILLED',100000,303,'2026-10-20')"])
 expect_block_tx('03 单头状态白名单', ["INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,status,work_date,closed_at) VALUES (3195,'INB-X1',1,'PURCHASE','ERP','PO-X1',NULL,'DONE','2026-10-15',NULL)"], 'ck_inb_status')
 expect_block_tx('03 source_hash 大写 hex', ["INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,status,work_date,closed_at) VALUES (3195,'INB-X1',1,'PURCHASE','ERP','PO-X1','AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA','CREATED','2026-10-15',NULL)"], 'ck_inb_hash')
 expect_block_tx('03 退货入库来源白名单（#5 的 ck_inb_rtn_src，10 ALTER，基线已有）', ["INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,status,work_date,closed_at) VALUES (3195,'RTN-X1',1,'RETURN','WHATEVER','X-1',NULL,'CREATED','2026-10-15',NULL)"], 'ck_inb_rtn_src')
@@ -3727,6 +3727,16 @@ expect_block_tx("01 冷藏 SKU 没有 sell_days（sell_deadline 会永远为空�
 expect_allow_tx("01 常温 SKU 允许不设 sell_days", [_sku_ins(8015, 'SKU-T-SD5', temp='AMBIENT', sell=None)])
 expect_allow_tx("01 损耗容差正好 50000 ppm（5%）", [_sku_ins(8016, 'SKU-T-PPM', ppm=50000)])
 expect_block_tx("01 损耗容差 50001 ppm（绕过 09 报损审批）", [_sku_ins(8017, 'SKU-T-PPM2', ppm=50001)], "ck_sku_loss_ppm")
+# 镜鉴 I-1（食品安全）：取值域 CHECK —— 大小写 / 尾空格 / 未知值一律拒，别再靠精确匹配的 ck_sku_sell_days_req 兜
+expect_allow_tx("01 SKU 温区取值域内 5 个值全放行（AMBIENT / CHILLED / FROZEN / FRESH / LIVE）",
+                [_sku_ins(8021, 'SKU-T-T1', temp='AMBIENT', sell=None), _sku_ins(8022, 'SKU-T-T2', temp='CHILLED'),
+                 _sku_ins(8023, 'SKU-T-T3', temp='FROZEN'), _sku_ins(8024, 'SKU-T-T4', temp='FRESH', sell=None),
+                 _sku_ins(8025, 'SKU-T-T5', temp='LIVE', sell=None)])
+for _bad in ('chilled', 'FROZEN ', 'CHILL'):
+    expect_block_tx(f"01 SKU 温区绕过值 {_bad!r}（小写 / 尾空格 / 未知值，且不填 sell_days）",
+                    [_sku_ins(8030, 'SKU-T-TB', temp=_bad, sell=None)], "ck_sku_temp")
+for _bad in ('chilled', 'FROZEN ', 'CHILL'):
+    _ttl_mut(f"SKU 温区绕过值 {_bad!r} 被放行", "ck_sku_temp", _sku_ins(8095, 'SKU-MT', temp=_bad, sell=None))
 expect_block_tx("01 禁发期 6 天 > 保质期 5 天", [_sku_ins(8018, 'SKU-T-SL', shelf=5, sell=1, ship=6)], "ck_sku_shelf_life")
 expect_allow_tx("01 禁发期与收货允收期都等于保质期（放行）",
                 ["INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,receive_min_shelf_life,ship_min_shelf_life,sell_days) "
@@ -3743,6 +3753,11 @@ expect_block_tx("01 温区上下限相等（等于没有区间）", [_zone_ins.f
 expect_block_tx("01 温区只给下限不给上限", [_zone_ins.format(i=8103, c='Z-T3', lo=-180, hi='NULL')], "ck_zone_temp")
 expect_block_tx("01 温区下限大于上限", [_zone_ins.format(i=8104, c='Z-T4', lo=-150, hi=-180)], "ck_zone_temp")
 expect_allow_tx("01 温区两列都为空（不控温库区）", ["INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (8105,1,'Z-T5','x','AMBIENT','STAGE')"])
+# 镜鉴 I-2：空区间只允许 AMBIENT；控温库区（CHILLED/FROZEN）必须给区间
+expect_block_tx("01 控温库区 CHILLED 不给温度区间", ["INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (8106,1,'Z-T6','x','CHILLED','STORAGE')"], "ck_zone_temp")
+expect_block_tx("01 控温库区 FROZEN 不给温度区间", ["INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (8107,1,'Z-T7','x','FROZEN','STORAGE')"], "ck_zone_temp")
+expect_block_tx("01 空区间只允许 AMBIENT（FRESH 也不例外）", ["INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (8108,1,'Z-T8','x','FRESH','STORAGE')"], "ck_zone_temp")
+_ttl_mut("CHILLED 库区不给温度区间被放行", "ck_zone_temp", "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (8094,1,'Z-M2','x','CHILLED','STORAGE')")
 _ttl_mut("温区上下限相等被放行", "ck_zone_temp", _zone_ins.format(i=8096, c='Z-M1', lo=-150, hi=-150))
 
 _loc_ins = ("INSERT INTO location (id,warehouse_id,zone_id,code,location_type,min_level_milli,max_level_milli) "
