@@ -38,8 +38,8 @@ SCHEMA_PARTS=(
 # 分区子表及其继承来的索引不计）/ 1 视图。二轮 C2 加 uq_mvk_mv（外键被引用键）→ 115；A3 加 stock_hold_release（PK、uq_hr_op、ix_hr_hold）→ 43 表 / 118。ix_hold_from（from_hold_id 部分索引，非唯一）→ 119。ix_mv_hold（hold_id 部分索引）→ 120。改 DDL 必须同步改这里。
 # 必须用新建的空库跑（DROP SCHEMA public 重建会丢 wms_app 的 USAGE；schema 里已 GRANT USAGE 兜底，小赵 C6）。
 # docs/12 的 DDL 在 12b_auth_audit.sql：在 43 表 / 119 索引上增加 user_device_binding、offline_token、approval_request（3 主键 + uq_offline_jti + uq_apr_code + uq_audit_node_seq + 7 个显式索引）→ 46 表 / 132 索引；合入 1d907031（#2 第四轮 ix_mv_hold，43/120）后 → 46 表 / 133 索引（PG16.15 实测）。以 PG 实测为准。
-EXPECT_TABLES=70
-EXPECT_INDEXES=204
+EXPECT_TABLES=72
+EXPECT_INDEXES=213
 EXPECT_VIEWS=2
 
 CTR=wms-pg-verify
@@ -140,7 +140,7 @@ echo "  → 表 $T 张 / 索引 $I 个 / 视图 $V 个"
 [ "$V" = "$EXPECT_VIEWS" ]   && ok "视图数 = $V" || bad "视图数 = $V，期望 $EXPECT_VIEWS"
 
 # 小赵 S4：按期望权限矩阵逐表核对 wms_app（表、分区父表、视图、物化视图；序列查 USAGE），多给、少给、漏表都失败
-EXPECT_PRIVS="adjust_line:SELECT,INSERT,UPDATE adjust_order:SELECT,INSERT,UPDATE api_credential:SELECT,INSERT,UPDATE approval_request:SELECT,INSERT audit_log:SELECT,INSERT count_line:SELECT,INSERT,UPDATE count_order:SELECT,INSERT,UPDATE exception_case:SELECT,INSERT,UPDATE exception_code:SELECT,INSERT,UPDATE idempotency_record:SELECT,INSERT,UPDATE inbound_line:SELECT,INSERT,UPDATE inbound_message:SELECT,INSERT,UPDATE inbound_order:SELECT,INSERT,UPDATE live_count_ledger:SELECT,INSERT live_death:SELECT,INSERT live_inspection:SELECT,INSERT live_shrink_settlement:SELECT,INSERT live_stock_count:SELECT,INSERT,UPDATE live_tank:SELECT,INSERT,UPDATE live_tank_hold:SELECT,INSERT live_weigh:SELECT,INSERT location:SELECT,INSERT,UPDATE lot:SELECT,INSERT,UPDATE numbering_segment:SELECT,INSERT,UPDATE offline_token:SELECT,INSERT outbound_line:SELECT,INSERT,UPDATE outbound_order:SELECT,INSERT,UPDATE outbox_event:SELECT,INSERT,UPDATE pack_box:SELECT,INSERT,UPDATE pack_box_line:SELECT,INSERT,UPDATE pick_task:SELECT,INSERT,UPDATE pick_task_line:SELECT,INSERT,UPDATE process_bom:SELECT,INSERT,UPDATE process_bom_line:SELECT,INSERT,UPDATE process_issue:SELECT,INSERT,UPDATE process_lot_trace:SELECT,INSERT process_order:SELECT,INSERT,UPDATE process_output:SELECT,INSERT,UPDATE process_report:SELECT,INSERT process_reversal:SELECT,INSERT return_blind_receipt:SELECT,INSERT return_reservation:SELECT,INSERT,UPDATE return_reservation_line:SELECT,INSERT,UPDATE scrap_line:SELECT,INSERT,UPDATE scrap_order:SELECT,INSERT,UPDATE shipment:SELECT,INSERT,UPDATE shipment_order:SELECT,INSERT,UPDATE sku:SELECT,INSERT,UPDATE sku_barcode:SELECT,INSERT,UPDATE sku_live_param:SELECT,INSERT,UPDATE sku_unit:SELECT,INSERT,UPDATE stock:SELECT,INSERT,UPDATE stock_hold:SELECT,INSERT stock_hold_release:SELECT,INSERT stock_ledger_line:SELECT,INSERT stock_movement:SELECT,INSERT stock_movement_key:SELECT,INSERT stock_recon_alert:SELECT,INSERT,UPDATE stock_reservation:SELECT,INSERT,UPDATE stock_snapshot_daily:SELECT,INSERT sys_permission:SELECT,INSERT,UPDATE sys_role:SELECT,INSERT,UPDATE sys_role_perm:SELECT,INSERT,UPDATE sys_user:SELECT,INSERT,UPDATE sys_user_role:SELECT,INSERT,UPDATE sys_user_warehouse:SELECT,INSERT,UPDATE user_device_binding:SELECT,INSERT v_live_death_in_transit:SELECT v_stock_available:SELECT warehouse:SELECT,INSERT,UPDATE wave:SELECT,INSERT,UPDATE zone:SELECT,INSERT,UPDATE"
+EXPECT_PRIVS="adjust_line:SELECT,INSERT,UPDATE adjust_order:SELECT,INSERT,UPDATE api_credential:SELECT,INSERT,UPDATE approval_request:SELECT,INSERT audit_log:SELECT,INSERT count_line:SELECT,INSERT,UPDATE count_order:SELECT,INSERT,UPDATE exception_case:SELECT,INSERT,UPDATE exception_code:SELECT,INSERT,UPDATE idempotency_record:SELECT,INSERT,UPDATE inbound_line:SELECT,INSERT,UPDATE inbound_message:SELECT,INSERT,UPDATE inbound_order:SELECT,INSERT,UPDATE live_count_ledger:SELECT,INSERT live_death:SELECT,INSERT live_inspection:SELECT,INSERT live_shrink_settlement:SELECT,INSERT live_stock_count:SELECT,INSERT,UPDATE live_tank:SELECT,INSERT,UPDATE live_tank_hold:SELECT,INSERT live_weigh:SELECT,INSERT location:SELECT,INSERT,UPDATE lot:SELECT,INSERT,UPDATE numbering_segment:SELECT,INSERT,UPDATE offline_paper_record:SELECT,INSERT,UPDATE offline_token:SELECT,INSERT outbound_line:SELECT,INSERT,UPDATE outbound_order:SELECT,INSERT,UPDATE outbox_event:SELECT,INSERT,UPDATE pack_box:SELECT,INSERT,UPDATE pack_box_line:SELECT,INSERT,UPDATE pick_task:SELECT,INSERT,UPDATE pick_task_line:SELECT,INSERT,UPDATE process_bom:SELECT,INSERT,UPDATE process_bom_line:SELECT,INSERT,UPDATE process_issue:SELECT,INSERT,UPDATE process_lot_trace:SELECT,INSERT process_order:SELECT,INSERT,UPDATE process_output:SELECT,INSERT,UPDATE process_report:SELECT,INSERT process_reversal:SELECT,INSERT return_blind_receipt:SELECT,INSERT return_reservation:SELECT,INSERT,UPDATE return_reservation_line:SELECT,INSERT,UPDATE scrap_line:SELECT,INSERT,UPDATE scrap_order:SELECT,INSERT,UPDATE shipment:SELECT,INSERT,UPDATE shipment_order:SELECT,INSERT,UPDATE sku:SELECT,INSERT,UPDATE sku_barcode:SELECT,INSERT,UPDATE sku_live_param:SELECT,INSERT,UPDATE sku_unit:SELECT,INSERT,UPDATE stock:SELECT,INSERT,UPDATE stock_hold:SELECT,INSERT stock_hold_release:SELECT,INSERT stock_ledger_line:SELECT,INSERT stock_movement:SELECT,INSERT stock_movement_key:SELECT,INSERT stock_recon_alert:SELECT,INSERT,UPDATE stock_reservation:SELECT,INSERT,UPDATE stock_snapshot_daily:SELECT,INSERT sys_permission:SELECT,INSERT,UPDATE sys_role:SELECT,INSERT,UPDATE sys_role_perm:SELECT,INSERT,UPDATE sys_user:SELECT,INSERT,UPDATE sys_user_role:SELECT,INSERT,UPDATE sys_user_warehouse:SELECT,INSERT,UPDATE upstream_push_log:SELECT,INSERT user_device_binding:SELECT,INSERT v_live_death_in_transit:SELECT v_stock_available:SELECT warehouse:SELECT,INSERT,UPDATE wave:SELECT,INSERT,UPDATE zone:SELECT,INSERT,UPDATE"
 ACT=$(psql -t -A -c "SELECT string_agg(x, ' ' ORDER BY x) FROM (SELECT c.relname || ':' || COALESCE(NULLIF(concat_ws(',', CASE WHEN c.relkind='S' THEN (CASE WHEN has_sequence_privilege('wms_app', c.oid, 'USAGE') THEN 'USAGE' END) ELSE (CASE WHEN has_table_privilege('wms_app', c.oid, 'SELECT') THEN 'SELECT' END) END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'INSERT') THEN 'INSERT' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'UPDATE') THEN 'UPDATE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'DELETE') THEN 'DELETE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'TRUNCATE') THEN 'TRUNCATE' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'REFERENCES') THEN 'REFERENCES' END, CASE WHEN c.relkind<>'S' AND has_table_privilege('wms_app', c.oid, 'TRIGGER') THEN 'TRIGGER' END), ''), 'NONE') AS x FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','S') AND NOT c.relispartition) t")
 if [ "$ACT" = "$EXPECT_PRIVS" ]; then ok "S4 wms_app 权限矩阵与期望逐表一致（$(echo "$ACT" | wc -w) 个对象，含 TRIGGER/REFERENCES；列级 UPDATE 另测）"
 else bad "S4 wms_app 权限矩阵不符：$(diff <(echo "$EXPECT_PRIVS" | tr ' ' '\n') <(echo "$ACT" | tr ' ' '\n') | grep '^[<>]' | tr '\n' ' ')"; fi
@@ -453,7 +453,7 @@ R=$(psql -t -A -c "SELECT count(*) FROM (SELECT h.id FROM stock_hold h WHERE h.h
 [ "$R" = "0" ] && ok "S6 I3e 对账：RETURN_QC 已释放 = Σ释放记录 + 转报损量（无差异行）" || bad "I3e 差异行 $R"
 R=$(psql -t -A -c "BEGIN; INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (55,41,'RETURN_QC','RETURN_QC','QC',7003,'RQC:7003',2000,0,'HELD',0); UPDATE stock_hold SET released_qty_milli = 500, version = version + 1 WHERE id = 55; SELECT 'ids=' || string_agg(id::text, ',') FROM (SELECT h.id FROM stock_hold h WHERE h.hold_type = 'RETURN_QC' AND h.released_qty_milli <> COALESCE((SELECT SUM(r.qty_milli) FROM stock_hold_release r WHERE r.hold_id = h.id), 0) + COALESCE((SELECT SUM(c.hold_qty_milli) FROM stock_hold c WHERE c.from_hold_id = h.id), 0)) t; ROLLBACK;" | grep '^ids=')
 [ "$R" = "ids=55" ] && ok "S6 I3e 反向：绕过释放记录直接 UPDATE 释放 → 对账查出 hold 55" || bad "I3e 未查出：$R"
-expect_allow "Q2 准备：去重记录（未过期/已过期）+ outbox（PENDING / 8 天前 SENT / 刚 SENT）" "BEGIN; INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,expires_at) VALUES ('live','h','{}',200,now()+interval '1 day'),('dead','h','{}',200,now()-interval '1 hour'); INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at) VALUES (8801,'t','k','{}','PENDING',NULL),(8802,'t','k','{}','SENT',now()-interval '8 days'),(8803,'t','k','{}','SENT',now()); COMMIT;"
+expect_allow "Q2 准备：去重记录（未过期/已过期）+ outbox（PENDING / 8 天前 SENT / 刚 SENT）" "BEGIN; INSERT INTO idempotency_record (idem_key,req_hash,response,status_code,expires_at) VALUES ('live','h','{}',200,now()+interval '1 day'),('dead','h','{}',200,now()-interval '1 hour'); INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at,ack_kind) VALUES (8801,'t','k','{}','PENDING',NULL,NULL),(8802,'t','k','{}','SENT',now()-interval '8 days','2XX'),(8803,'t','k','{}','SENT',now(),'2XX'); COMMIT;"
 OUT=$(psql_capture "SET ROLE wms_app; DELETE FROM idempotency_record WHERE idem_key='dead';")
 case "$OUT" in *"permission denied for table idempotency_record"*) ok "Q2 wms_app DELETE idempotency_record → permission denied";; *) bad "wms_app DELETE idem 未被拒：$OUT";; esac
 OUT=$(psql_capture "SET ROLE wms_app; DELETE FROM outbox_event WHERE id=8802;")
@@ -475,7 +475,8 @@ R=$(psql -t -A -c "SELECT p.prosecdef::text || '/' || array_to_string(p.proconfi
 role_matrix() {  # $1 角色名（public 用小写）：列出有任一权限的对象，无则输出 NONE
   psql -t -A -c "SELECT COALESCE(string_agg(x, ' ' ORDER BY x), 'NONE') FROM (SELECT c.relname || ':' || concat_ws(',', CASE WHEN has_table_privilege('$1', c.oid, 'SELECT') THEN 'SELECT' END, CASE WHEN has_table_privilege('$1', c.oid, 'INSERT') THEN 'INSERT' END, CASE WHEN has_table_privilege('$1', c.oid, 'UPDATE') THEN 'UPDATE' END, CASE WHEN has_table_privilege('$1', c.oid, 'DELETE') THEN 'DELETE' END, CASE WHEN has_table_privilege('$1', c.oid, 'TRUNCATE') THEN 'TRUNCATE' END, CASE WHEN has_table_privilege('$1', c.oid, 'REFERENCES') THEN 'REFERENCES' END, CASE WHEN has_table_privilege('$1', c.oid, 'TRIGGER') THEN 'TRIGGER' END) AS x FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m') AND NOT c.relispartition) t WHERE x NOT LIKE '%:'"
 }
-for spec in "wms_cleaner|NONE" "wms_purge_owner|idempotency_record:SELECT,DELETE outbox_event:SELECT,DELETE" "public|NONE"; do
+# upstream_push_log:SELECT,DELETE 由 #2 99_grants 的目录检查授予（4e3a7efb 起）
+for spec in "wms_cleaner|NONE" "wms_purge_owner|idempotency_record:SELECT,DELETE outbox_event:SELECT,DELETE upstream_push_log:SELECT,DELETE" "public|NONE"; do
   RL=${spec%%|*}; EXP=${spec#*|}; GOT=$(role_matrix "$RL")
   [ "$GOT" = "$EXP" ] && ok "S2 $RL 表权限矩阵 = $EXP" || bad "S2 $RL 表权限矩阵：期望 $EXP，实际 $GOT"
 done
@@ -488,8 +489,8 @@ R=$(psql -t -A -c "SET ROLE wms_cleaner; SELECT idem_deleted || '/' || outbox_de
 R=$(psql -t -A -c "SELECT (SELECT string_agg(idem_key, ',') FROM idempotency_record) || '|' || (SELECT string_agg(id::text, ',' ORDER BY id) FROM outbox_event)")
 [ "$R" = "live|8801,8803" ] && ok "Q2 清理后剩余 $R（未过期、PENDING、未过保留期的都在）" || bad "Q2 清理后：$R"
 echo "=== 2f2b. 九轮 P1–P3：UTC 清理、过期列只许往后改、SENT 必带 sent_at ==="
-expect_block "P3 status=SENT 但 sent_at 为空" "INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at) VALUES (8804,'t','k','{}','SENT',NULL);" "ck_outbox_sent"
-expect_allow "P3 正向：PENDING 不带 sent_at、SENT 带 sent_at" "BEGIN; INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at) VALUES (8805,'t','k','{}','PENDING',NULL),(8806,'t','k','{}','SENT',now() AT TIME ZONE 'UTC'); ROLLBACK;"
+expect_block "P3 status=SENT 但 sent_at 为空" "INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at,ack_kind) VALUES (8804,'t','k','{}','SENT',NULL,'2XX');" "ck_outbox_sent"
+expect_allow "P3 正向：PENDING 不带 sent_at、SENT 带 sent_at" "BEGIN; INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at,ack_kind) VALUES (8805,'t','k','{}','PENDING',NULL,NULL),(8806,'t','k','{}','SENT',now() AT TIME ZONE 'UTC','2XX'); ROLLBACK;"
 expect_block "P2 wms_app 把 idem expires_at 改早" "SET ROLE wms_app; UPDATE idempotency_record SET expires_at='2000-01-01' WHERE idem_key='live';" "expiry_backdate: expires_at"
 expect_block "P2 idem created_at 被改" "UPDATE idempotency_record SET created_at='2000-01-01' WHERE idem_key='live';" "expiry_backdate: created_at"
 expect_block "P2 wms_app 把 outbox sent_at 改早" "SET ROLE wms_app; UPDATE outbox_event SET sent_at=(now() AT TIME ZONE 'UTC') - interval '30 days' WHERE id=8803;" "expiry_backdate: sent_at"
@@ -497,13 +498,13 @@ expect_block "P2 outbox sent_at 清空（SENT 仍在）" "UPDATE outbox_event SE
 expect_block "P2 wms_app PENDING → SENT 时 sent_at 倒填 2000-01-01（R1 起先由 sent_at_not_now 拦）" "SET ROLE wms_app; UPDATE outbox_event SET status='SENT', sent_at='2000-01-01' WHERE id=8801;" "sent_at_not_now"
 expect_block "P2 SENT 退回 PENDING" "UPDATE outbox_event SET status='PENDING' WHERE id=8803;" "expiry_backdate: status"
 expect_allow "P2 正向：idem expires_at 往后延" "BEGIN; SET LOCAL ROLE wms_app; UPDATE idempotency_record SET expires_at=(now() AT TIME ZONE 'UTC') + interval '2 days' WHERE idem_key='live'; ROLLBACK;"
-expect_allow "P2 正向：sent_at 往后改、PENDING → SENT 写当前 UTC" "BEGIN; SET LOCAL ROLE wms_app; UPDATE outbox_event SET sent_at=sent_at + interval '1 minute' WHERE id=8803; UPDATE outbox_event SET status='SENT', sent_at=now() AT TIME ZONE 'UTC' WHERE id=8801; ROLLBACK;"
+expect_allow "P2 正向：sent_at 往后改、PENDING → SENT 写当前 UTC" "BEGIN; SET LOCAL ROLE wms_app; UPDATE outbox_event SET sent_at=sent_at + interval '1 minute' WHERE id=8803; UPDATE outbox_event SET status='SENT', ack_kind='2XX', sent_at=now() AT TIME ZONE 'UTC' WHERE id=8801; ROLLBACK;"
 expect_block "R1 补洞：wms_app 以 SENT 状态插入 outbox（sent_at 倒写 1 天前）" "BEGIN; SET LOCAL ROLE wms_app; INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at) VALUES (8811,'t','k','{}','SENT',(now() AT TIME ZONE 'UTC') - interval '1 day'); ROLLBACK;" "outbox_insert_not_pending"
 expect_block "R1 补洞：wms_app 以 PENDING 插入但带过去的 sent_at" "BEGIN; SET LOCAL ROLE wms_app; INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at) VALUES (8812,'t','k','{}','PENDING',(now() AT TIME ZONE 'UTC') - interval '8 days'); ROLLBACK;" "outbox_insert_not_pending"
 expect_allow "R1 补洞正向：wms_app 以 PENDING 插入（不带 sent_at）" "BEGIN; SET LOCAL ROLE wms_app; INSERT INTO outbox_event (id,topic,biz_key,payload) VALUES (8813,'t','k','{}'); ROLLBACK;"
 expect_block "R1 PENDING → SENT 时 sent_at 写成 1 小时前" "BEGIN; SET LOCAL ROLE wms_app; UPDATE outbox_event SET status='SENT', sent_at=(now() AT TIME ZONE 'UTC') - interval '1 hour' WHERE id=8801; ROLLBACK;" "sent_at_not_now"
 expect_block "R1 PENDING → SENT 时 sent_at 写成 1 小时后" "BEGIN; SET LOCAL ROLE wms_app; UPDATE outbox_event SET status='SENT', sent_at=(now() AT TIME ZONE 'UTC') + interval '1 hour' WHERE id=8801; ROLLBACK;" "sent_at_not_now"
-expect_allow "R1 正向：PENDING → SENT 写当前 UTC（容差内 +3 秒）" "BEGIN; SET LOCAL ROLE wms_app; UPDATE outbox_event SET status='SENT', sent_at=(now() AT TIME ZONE 'UTC') + interval '3 seconds' WHERE id=8801; ROLLBACK;"
+expect_allow "R1 正向：PENDING → SENT 写当前 UTC（容差内 +3 秒）" "BEGIN; SET LOCAL ROLE wms_app; UPDATE outbox_event SET status='SENT', ack_kind='2XX', sent_at=(now() AT TIME ZONE 'UTC') + interval '3 seconds' WHERE id=8801; ROLLBACK;"
 echo "=== 2f2c. search_path 钉死；登录角色劫持同名对象；非属主插入 FAILED ==="
 # #2 定义的 10 个函数。proconfig 要正好是 search_path=pg_catalog, public（与 purge_expired 已有断言同一写法）。
 R=$(psql -t -A -c "SELECT count(*)::text || '/' || (count(*) FILTER (WHERE p.proconfig = ARRAY['search_path=pg_catalog, public']::text[]))::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname IN ('purge_expired','trg_append_only','trg_expiry_forward','trg_hold_immutable','trg_hold_no_delete','trg_lot_sell_deadline','trg_mvk_line_kind','trg_outbox_insert_pending','trg_purge_guard','trg_sll_immutable')")
@@ -1114,6 +1115,177 @@ IFS='#' read -r _ HB HF HM HC0 HC1 <<< "$R"
 [ "$HC0" = "0/6" ] && ok "本 PR 新增/重定义的 6 个 PL/pgSQL 函数 proconfig 都含 search_path=pg_catalog, public（缺失/总数 = $HC0）" || bad "search_path 目录断言：缺失/总数 = $HC0（期望 0/6）"
 [ -n "$HB" ] && [ "$HF" = "$HB" ] && ok "劫持：wms_app 在自建 schema hj_evil 建同名表 process_bom 并置于 search_path 首位，trg_pboml_frozen() 仍读 public（结果与无劫持一致：$HB）" || bad "劫持后行为改变：无劫持=$HB / 劫持=$HF"
 [ "$HC1" = "1/6" ] && [ "$HM" != "$HB" ] && ok "变异检查：RESET trg_pboml_frozen() 的 search_path 后，目录断言变红（$HC1）且劫持生效（$HM），两条断言都能抓到" || bad "变异检查没变红：目录=$HC1 劫持后=$HM 基准=$HB"
+echo "=== 2i. docs/11 集成：outbox 节点序号、入站报文 ==="
+expect_allow "11 outbox 事件（node 3, seq 1）" \
+  "INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (100,'wms.shipment.completed','SHP1','{}',1,3,1);"
+expect_block "11 同节点 seq 重复（回传顺序被破坏）" \
+  "INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (101,'wms.shipment.completed','SHP2','{}',1,3,1);" \
+  "uq_outbox_seq"
+expect_allow "11 不同节点同 seq 合法" \
+  "INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (102,'wms.shipment.completed','SHP3','{}',1,4,1);"
+expect_block "11 outbox 非法状态" \
+  "UPDATE outbox_event SET status='LOST' WHERE id=100;" \
+  "ck_outbox_status"
+expect_allow "11 入站报文落库" \
+  "INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha) VALUES (100,'ERP','SALES_ORDER','SO-1','{}','h1');"
+expect_block "11 同源同单号重复落库" \
+  "INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha) VALUES (101,'ERP','SALES_ORDER','SO-1','{}','h2');" \
+  "uq_in_msg"
+expect_block "11 入站报文非法状态" \
+  "UPDATE inbound_message SET status='OK' WHERE id=100;" \
+  "ck_in_msg_status"
+
+expect_allow "11 推送日志：同单号重推各记一行（只追加，不唯一；保留 90 天）" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,warehouse_id,payload_sha,payload,received_at,result_status,retain_until) VALUES (1,'ERP','SALES_ORDER','SO-1',1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2027-01-13 01:00:00'),(2,'ERP','SALES_ORDER','SO-1',1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:05:00','DUPLICATE','2027-01-13 01:05:00');"
+expect_block "11 推送日志结果取值" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (3,'ERP','SALES_ORDER','SO-3','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','OK','2027-01-13 01:00:00');" \
+  "ck_upl_result"
+expect_block "11 I1 保留期等于接收时间" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (4,'ERP','SALES_ORDER','SO-4','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2026-10-15 01:00:00');" \
+  "ck_upl_retain"
+expect_block "11 I1 保留期只有 1 秒" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (5,'ERP','SALES_ORDER','SO-5','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2026-10-15 01:00:01');" \
+  "ck_upl_retain"
+expect_block "11 I1 保留期 7 天（旧口径，现低于 90 天下限）" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (6,'ERP','SALES_ORDER','SO-6','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2026-10-22 01:00:00');" \
+  "ck_upl_retain"
+expect_block "11 I1 保留期 90 天差 1 秒" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (7,'ERP','SALES_ORDER','SO-7','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2027-01-13 00:59:59');" \
+  "ck_upl_retain"
+expect_allow "11 I1 保留期恰好 90 天（边界放行）" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (8,'ERP','SALES_ORDER','SO-8','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2027-01-13 01:00:00');"
+expect_block "11 payload_sha 大写 hex" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (9,'ERP','SALES_ORDER','SO-9','AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA','{}','2026-10-15 01:00:00','ACCEPTED','2027-01-13 01:00:00');" \
+  "ck_upl_sha"
+expect_block "11 payload_sha 长度 63" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (10,'ERP','SALES_ORDER','SO-10','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2027-01-13 01:00:00');" \
+  "ck_upl_sha"
+expect_block "11 payload_sha 非 hex（z）" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (11,'ERP','SALES_ORDER','SO-11','zaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}','2026-10-15 01:00:00','ACCEPTED','2027-01-13 01:00:00');" \
+  "ck_upl_sha"
+expect_block "11 B1 只追加：UPDATE 推送日志（改结果+原文）" \
+  "UPDATE upstream_push_log SET result_status='REJECTED', payload='x' WHERE id=1;" \
+  "append_only_violation: upstream_push_log"
+expect_block "11 B1 只追加：DELETE 推送日志" \
+  "DELETE FROM upstream_push_log WHERE id=1;" \
+  "append_only_violation: upstream_push_log"
+expect_allow "11 写一条已过保留期的旧日志（归档用例）" \
+  "INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (20,'ERP','SALES_ORDER','SO-OLD','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','{}','2020-01-01 00:00:00','ACCEPTED','2020-04-01 00:00:00');"
+expect_block "11 B1 超级用户 DELETE 已过期行（非归档角色也拦）" \
+  "DELETE FROM upstream_push_log WHERE id=20;" \
+  "append_only_violation: upstream_push_log"
+expect_block "11 B1 TRUNCATE 推送日志" \
+  "TRUNCATE upstream_push_log;" \
+  "append_only_violation: upstream_push_log"
+OUT=$(psql_capture "SET ROLE wms_app; INSERT INTO upstream_push_log (id,source_system,biz_type,source_order_no,payload_sha,payload,received_at,result_status,retain_until) VALUES (21,'ERP','SALES_ORDER','SO-21','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','{}','2026-10-15 02:00:00','ACCEPTED','2027-01-13 02:00:00');")
+case "$OUT" in *ERROR*) bad "I2 wms_app INSERT 推送日志被拒：$OUT";; *) ok "I2 wms_app 可 INSERT 推送日志";; esac
+OUT=$(psql -q -t -A -c "SET ROLE wms_app; SELECT count(*) FROM upstream_push_log;")
+case "$OUT" in *ERROR*) bad "I2 wms_app SELECT 推送日志被拒：$OUT";; *) ok "I2 wms_app 可 SELECT 推送日志";; esac
+OUT=$(psql_capture "SET ROLE wms_app; UPDATE upstream_push_log SET result_status='REJECTED' WHERE id=1;")
+case "$OUT" in *"permission denied for table upstream_push_log"*) ok "B1 wms_app UPDATE 推送日志 → permission denied";; *) bad "wms_app UPDATE 未被拒：$OUT";; esac
+OUT=$(psql_capture "SET ROLE wms_app; DELETE FROM upstream_push_log WHERE id=20;")
+case "$OUT" in *"permission denied for table upstream_push_log"*) ok "B1 wms_app DELETE（即使已过期）→ permission denied";; *) bad "wms_app DELETE 未被拒：$OUT";; esac
+OUT=$(psql_capture "SET ROLE wms_app; TRUNCATE upstream_push_log;")
+case "$OUT" in *"permission denied for table upstream_push_log"*) ok "B1 wms_app TRUNCATE → permission denied";; *) bad "wms_app TRUNCATE 未被拒：$OUT";; esac
+OUT=$(psql_capture "SET ROLE wms_cleaner; DELETE FROM upstream_push_log WHERE id=20;")
+case "$OUT" in *"permission denied for table upstream_push_log"*) ok "B1 wms_cleaner 直接 DELETE 推送日志 → permission denied（只能 EXECUTE 函数）";; *) bad "wms_cleaner 直删未被拒：$OUT";; esac
+OUT=$(psql_capture "SET ROLE wms_cleaner; DELETE FROM upstream_push_log WHERE id=1;")
+case "$OUT" in *"permission denied for table upstream_push_log"*) ok "B1 wms_cleaner 直接 DELETE 未过期日志（id=1）→ permission denied";; *) bad "wms_cleaner 删未过期日志未被拒：$OUT";; esac
+OUT=$(psql_capture "SET ROLE wms_cleaner; UPDATE upstream_push_log SET result_status='REJECTED' WHERE id=20;")
+case "$OUT" in *"permission denied for table upstream_push_log"*) ok "B1 wms_cleaner 直接 UPDATE 推送日志 → permission denied";; *) bad "wms_cleaner UPDATE 未被拒：$OUT";; esac
+OUT=$(psql_capture "SET ROLE wms_purge_owner; DELETE FROM upstream_push_log WHERE id=1;")
+case "$OUT" in *"append_only_violation: upstream_push_log"*) ok "B1 wms_purge_owner 删未过期日志 → 触发器 append_only_violation（只放行过期行的 DELETE）";; *) bad "wms_purge_owner 删未过期未被拦：$OUT";; esac
+OUT=$(psql_capture "SET ROLE wms_purge_owner; UPDATE upstream_push_log SET result_status='REJECTED' WHERE id=20;")
+case "$OUT" in *"append_only_violation: upstream_push_log"*|*"permission denied for table upstream_push_log"*) ok "B1 wms_purge_owner UPDATE 过期日志 → 被拒";; *) bad "wms_purge_owner UPDATE 未被拒：$OUT";; esac
+OUT=$(psql_capture "SET ROLE wms_app; SELECT * FROM purge_push_log();")
+case "$OUT" in *"permission denied for function purge_push_log"*) ok "B1 wms_app 调 purge_push_log() → permission denied";; *) bad "wms_app 调函数未被拒：$OUT";; esac
+R=$(psql -t -A -c "SELECT p.prosecdef::text || '/' || array_to_string(p.proconfig, ',') || '/' || r.rolname || '/' || has_function_privilege('public', p.oid, 'EXECUTE')::text FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner WHERE p.proname = 'purge_push_log'")
+[ "${R%%/*}/$(echo "$R" | cut -d/ -f2)/${R##*/}" = "true/search_path=pg_catalog, public/false" ] && ok "B1 purge_push_log：SECURITY DEFINER、固定 search_path、PUBLIC 无 EXECUTE（属主 $(echo "$R" | cut -d/ -f3)；属主改 wms_purge_owner 由 #2 99 授予）" || bad "purge_push_log 属性：$R"
+OUT=$(psql -q -t -A -c "SET ROLE wms_cleaner; SELECT push_log_deleted FROM purge_push_log();" 2>&1)
+R2=$(psql -t -A -c "SELECT count(*) FROM upstream_push_log WHERE retain_until < (now() AT TIME ZONE 'UTC')")
+[ "$OUT/$R2" = "1/0" ] && ok "B1 wms_cleaner 调 purge_push_log() 只删 1 条已过 retain_until 的日志，未过期行都在（$OUT/$R2）" || bad "purge_push_log 结果：$OUT / 剩余过期 $R2（期望 1/0）"
+N=$(psql -t -A -c "SELECT count(*) FROM upstream_push_log WHERE id IN (1,2,8,21)")
+[ "$N" = "4" ] && ok "B1 各种绕过后未到期日志仍在（4 行）" || bad "未到期日志被动过：$N"
+
+# round 8 语义（不改触发器）：继承 wms_app 的登录角色直接登录（不 SET ROLE），PENDING 但带 sent_at → outbox_insert_not_pending
+R=$(psql -U wms_login_test -t -A -c "SELECT current_user || '/' || session_user || '/' || pg_has_role('wms_app','member')::text" 2>&1)
+[ "$R" = "wms_login_test/wms_login_test/true" ] && ok "11 登录角色直连（不 SET ROLE）：current_user=session_user=wms_login_test，继承 wms_app" || bad "11 登录角色直连失败：$R"
+OUT=$(psql -U wms_login_test -q -c "INSERT INTO outbox_event (id,topic,biz_key,payload,status,sent_at) VALUES (19960,'t','OBT-LOGIN-1','{}','PENDING',now() AT TIME ZONE 'UTC');" 2>&1)
+case "$OUT" in *outbox_insert_not_pending*) ok "11 登录角色直连插 PENDING 但带 sent_at → outbox_insert_not_pending";; *) bad "11 登录角色直连插 PENDING+sent_at 未按 outbox_insert_not_pending 拦下：$OUT"; psql -q -c "DELETE FROM outbox_event WHERE id=19960" >/dev/null 2>&1;; esac
+echo "=== 2i2. docs/11 小吴 C1 死信阻塞同 biz_key / C2 409 判定 / C3 形态 A relay 补 seq ==="
+expect_allow "C1 同一单 3 个事件入队（OBT-C1：创建/变更/取消）" "BEGIN; INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (9101,'wms.outbound.changed','OBT-C1','{}',1,0,0),(9102,'wms.outbound.changed','OBT-C1','{}',1,0,0),(9103,'wms.outbound.changed','OBT-C1','{}',1,0,0); COMMIT;"
+expect_allow "C1 第 1 个事件投递成功（SENDING→SENT 2XX）" "BEGIN; UPDATE outbox_event SET status='SENDING' WHERE id=9101; UPDATE outbox_event SET status='SENT', ack_kind='2XX', sent_at=(now() AT TIME ZONE 'UTC') WHERE id=9101; COMMIT;"
+expect_allow "C1 第 2 个事件进死信（SENDING→FAILED→DEAD）" "BEGIN; UPDATE outbox_event SET status='SENDING' WHERE id=9102; UPDATE outbox_event SET status='FAILED' WHERE id=9102; UPDATE outbox_event SET status='DEAD' WHERE id=9102; COMMIT;"
+expect_block "C1 第 3 个事件在前序 DEAD 时不能投递（验收用例）" "BEGIN; UPDATE outbox_event SET status='SENDING' WHERE id=9103; COMMIT;" "outbox_bizkey_blocked"
+expect_block "C1 同一 biz_key 第二条 DEAD" "BEGIN; INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq,status) VALUES (9104,'wms.outbound.changed','OBT-C1','{}',1,0,0,'DEAD'); COMMIT;" "uq_outbox_dead_bizkey"
+expect_block "C1 跳过不带审计（无人、无时间、无原因）" "BEGIN; UPDATE outbox_event SET status='SKIPPED' WHERE id=9102; COMMIT;" "ck_outbox_skip"
+expect_block "C1 跳过原因过短" "BEGIN; UPDATE outbox_event SET status='SKIPPED', skipped_by=7, skipped_at='2026-10-15 03:00:00', skip_reason='x' WHERE id=9102; COMMIT;" "ck_outbox_skip"
+expect_block "C1 非 DEAD 事件不能直接跳过（PENDING→SKIPPED）" "BEGIN; UPDATE outbox_event SET status='SKIPPED', skipped_by=7, skipped_at='2026-10-15 03:00:00', skip_reason='下游已手工补录' WHERE id=9103; COMMIT;" "outbox_illegal_transition"
+expect_block "C1 非 SKIPPED 行不能带跳过审计字段" "BEGIN; UPDATE outbox_event SET skip_reason='下游已手工补录' WHERE id=9103; COMMIT;" "ck_outbox_skip"
+expect_allow "C1 人工跳过死信（谁/何时/原因齐全）" "BEGIN; UPDATE outbox_event SET status='SKIPPED', skipped_by=7, skipped_at='2026-10-15 03:00:00', skip_reason='下游已手工补录' WHERE id=9102; COMMIT;"
+expect_allow "C1 跳过后第 3 个事件放行" "BEGIN; UPDATE outbox_event SET status='SENDING' WHERE id=9103; COMMIT;"
+expect_block "C1 SKIPPED 是终态（不能改回 PENDING）" "BEGIN; UPDATE outbox_event SET status='PENDING', skipped_by=NULL, skipped_at=NULL, skip_reason=NULL WHERE id=9102; COMMIT;" "outbox_illegal_transition"
+expect_allow "C1 另一单：头事件 DEAD、后续 PENDING" "BEGIN; INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq,status) VALUES (9201,'wms.outbound.changed','OBT-C1B','{}',1,0,0,'DEAD'); INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (9202,'wms.outbound.changed','OBT-C1B','{}',1,0,0); COMMIT;"
+expect_block "C1 重放前后续事件被阻塞" "BEGIN; UPDATE outbox_event SET status='SENDING' WHERE id=9202; COMMIT;" "outbox_bizkey_blocked"
+expect_allow "C1 重放死信成功（DEAD→PENDING→SENDING→SENT，replay_count+1）" "BEGIN; UPDATE outbox_event SET status='PENDING', replay_count=replay_count+1 WHERE id=9201; UPDATE outbox_event SET status='SENDING' WHERE id=9201; UPDATE outbox_event SET status='SENT', ack_kind='2XX', sent_at=(now() AT TIME ZONE 'UTC') WHERE id=9201; COMMIT;"
+expect_allow "C1 重放成功后后续事件放行" "BEGIN; UPDATE outbox_event SET status='SENDING' WHERE id=9202; COMMIT;"
+expect_block "C2 SENT 不注明依据" "BEGIN; UPDATE outbox_event SET status='SENT', sent_at=(now() AT TIME ZONE 'UTC') WHERE id=9202; COMMIT;" "ck_outbox_ack"
+expect_block "C2 SENT 依据为任意 409" "BEGIN; UPDATE outbox_event SET status='SENT', ack_kind='409', sent_at=(now() AT TIME ZONE 'UTC') WHERE id=9202; COMMIT;" "ck_outbox_ack"
+expect_block "C2 非 SENT 行带 ack_kind" "BEGIN; UPDATE outbox_event SET status='FAILED', ack_kind='DUP_409' WHERE id=9202; COMMIT;" "ck_outbox_ack"
+expect_allow "C2 下游 409 且识别为同一请求重复 → SENT(DUP_409)" "BEGIN; UPDATE outbox_event SET status='SENT', ack_kind='DUP_409', sent_at=(now() AT TIME ZONE 'UTC') WHERE id=9202; COMMIT;"
+expect_block "C2 SENT 是终态（不能改回 PENDING 重发；合并 02 后先由 02 的 SENT 终态守卫拦）" "BEGIN; UPDATE outbox_event SET status='PENDING', ack_kind=NULL WHERE id=9202; COMMIT;" "expiry_backdate: status"
+expect_allow "C3 形态 A 业务事务只写 seq=0（不碰 numbering_segment）" "BEGIN; INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (9301,'wms.outbound.changed','OBT-C3-9301','{}',1,9,0),(9302,'wms.outbound.changed','OBT-C3-9302','{}',1,9,0),(9303,'wms.outbound.changed','OBT-C3-9303','{}',1,9,0); COMMIT;"
+expect_allow "C3 relay 提交后补号" "BEGIN; UPDATE outbox_event SET seq = m.b + r.rn FROM (SELECT id, row_number() OVER (ORDER BY id) AS rn FROM outbox_event WHERE node_id = 9 AND seq = 0) r, (SELECT COALESCE(MAX(seq), 0) AS b FROM outbox_event WHERE node_id = 9) m WHERE outbox_event.id = r.id; COMMIT;"
+expect_block "C3 已补的 seq 不可改" "BEGIN; UPDATE outbox_event SET seq=100 WHERE id=9301; COMMIT;" "outbox_seq_immutable"
+expect_block "C3 已补的 seq 不可清零重补" "BEGIN; UPDATE outbox_event SET seq=0 WHERE id=9301; COMMIT;" "outbox_seq_immutable"
+R=$(psql -q -t -A -c "SELECT string_agg(id || ':' || seq, ',' ORDER BY id) FROM outbox_event WHERE node_id = 9")
+[ "$R" = "9301:1,9302:2,9303:3" ] && ok "C3 relay 按 id 顺序补 1..3（$R）" || bad "C3 relay 补号：$R"
+expect_allow "C3 relay 重跑幂等（无 seq=0 行则不动）" "UPDATE outbox_event SET seq = m.b + r.rn FROM (SELECT id, row_number() OVER (ORDER BY id) AS rn FROM outbox_event WHERE node_id = 9 AND seq = 0) r, (SELECT COALESCE(MAX(seq), 0) AS b FROM outbox_event WHERE node_id = 9) m WHERE outbox_event.id = r.id;"
+R=$(psql -q -t -A -c "SELECT count(*) FROM numbering_segment WHERE biz_prefix LIKE 'OUTBOX%'")
+[ "$R" = "0" ] && ok "C3 形态 A 不再写 numbering_segment(OUTBOX:node)" || bad "numbering_segment 出现 OUTBOX 行：$R"
+
+echo "=== 2i3. 第 11 篇 Q1：离线纸质单补录 offline_paper_record（PAPER_BACKFILL）==="
+expect_allow "Q1 正向：提交 PENDING（恢复联网后 14h，窗口内）" "BEGIN; INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (11,1,'PDA-07','PICK_CONFIRM','PK-L1','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 10:00:00','PENDING',NULL,'PAPER_BACKFILL'); COMMIT;"
+expect_allow "Q1 正向：主管（≠ 申请人）审批通过" "BEGIN; UPDATE offline_paper_record SET status='APPROVED', approver_id=8, approved_at='2026-10-15 11:00:00' WHERE id=11; COMMIT;"
+expect_allow "Q1 正向：过期补录落 EXPIRED 并挂异常单" "BEGIN; INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (12,1,'PDA-07','PICK_CONFIRM','PK-L2','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 21:00:00','EXPIRED',5001,'PAPER_BACKFILL'); COMMIT;"
+expect_block "Q1 反向：自批（审批人 = 申请人）" "BEGIN; INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (13,1,'PDA-07','PICK_CONFIRM','PK-L3','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 10:00:00','PENDING',NULL,'PAPER_BACKFILL'); UPDATE offline_paper_record SET status='APPROVED', approver_id=7, approved_at='2026-10-15 11:00:00' WHERE id=13; COMMIT;" "ck_paper_sod"
+expect_block "Q1 反向：backfill_deadline_at ≠ 恢复联网 + 24h（写成 +12h）" "BEGIN; INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (14,1,'PDA-07','PICK_CONFIRM','PK-L4','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 08:00:00','2026-10-15 07:00:00','PENDING',NULL,'PAPER_BACKFILL'); COMMIT;" "ck_paper_deadline"
+expect_block "Q1 反向：过期后仍以 PENDING 提交" "BEGIN; INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (15,1,'PDA-07','PICK_CONFIRM','PK-L5','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 21:00:00','PENDING',NULL,'PAPER_BACKFILL'); COMMIT;" "ck_paper_expired"
+expect_block "Q1 反向：过期但不挂异常单" "BEGIN; INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (16,1,'PDA-07','PICK_CONFIRM','PK-L6','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 21:00:00','EXPIRED',NULL,'PAPER_BACKFILL'); COMMIT;" "ck_paper_expired"
+expect_block "Q1 反向：审批类型不是 PAPER_BACKFILL" "BEGIN; INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (17,1,'PDA-07','PICK_CONFIRM','PK-L7','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 10:00:00','PENDING',NULL,'SCRAP_MISREPORT'); COMMIT;" "ck_paper_type"
+expect_block "Q1 反向：APPROVED 不带审批人" "BEGIN; INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (18,1,'PDA-07','PICK_CONFIRM','PK-L8','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 10:00:00','PENDING',NULL,'PAPER_BACKFILL'); UPDATE offline_paper_record SET status='APPROVED' WHERE id=18; COMMIT;" "ck_paper_approve"
+expect_block "Q1 反向：同仓同 biz_key 重复补录" "BEGIN; INSERT INTO offline_paper_record (id,warehouse_id,device_id,action_type,biz_key,occurred_at,operator_id,payload,applicant_id,offline_since,reconnected_at,backfill_deadline_at,submitted_at,status,exception_case_id,approval_type) VALUES (19,1,'PDA-07','PICK_CONFIRM','PK-L1','2026-10-14 10:00:00',11,'{}',7,'2026-10-14 08:00:00','2026-10-14 20:00:00','2026-10-15 20:00:00','2026-10-15 10:00:00','PENDING',NULL,'PAPER_BACKFILL'); COMMIT;" "uq_paper_bizkey"
+R=$(psql -t -A -c "SELECT string_agg(id || ':' || status, ',' ORDER BY id) FROM offline_paper_record")
+[ "$R" = "11:APPROVED,12:EXPIRED" ] && ok "Q1 反向用例全部回滚，只剩 11:APPROVED、12:EXPIRED" || bad "Q1 残留：$R"
+echo "=== 2i-sp. search_path 固定（pg_catalog, public）：目录断言 + 同名表劫持 + 变异检查（PG）==="
+R=$(psql -q -t -A <<'HJSQL' | grep '^HJ#'
+BEGIN;
+INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (19950,'t','HJ-1','{}',1,3,0);
+CREATE SCHEMA hj_evil AUTHORIZATION wms_app;
+SET LOCAL ROLE wms_app;
+CREATE TABLE hj_evil.outbox_event (id BIGINT, biz_key TEXT, status TEXT);
+INSERT INTO hj_evil.outbox_event VALUES (1,'HJ-1','PENDING');
+SET LOCAL search_path = public;
+DO $hj$ BEGIN UPDATE public.outbox_event SET status='SENDING' WHERE id=19950; RAISE EXCEPTION 'HJ_OK'; EXCEPTION WHEN OTHERS THEN PERFORM set_config('hj.base', SQLERRM, true); END $hj$;
+SET LOCAL search_path = hj_evil, public;
+DO $hj$ BEGIN UPDATE public.outbox_event SET status='SENDING' WHERE id=19950; RAISE EXCEPTION 'HJ_OK'; EXCEPTION WHEN OTHERS THEN PERFORM set_config('hj.fixed', SQLERRM, true); END $hj$;
+RESET ROLE;
+SET LOCAL search_path = public;
+SELECT set_config('hj.cat0', (SELECT count(*) FILTER (WHERE NOT COALESCE(proconfig,'{}'::text[]) @> ARRAY['search_path=pg_catalog, public']) || '/' || count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('trg_upl_append_only','purge_push_log','trg_outbox_order_guard','trg_purge_guard','trg_expiry_forward','trg_outbox_insert_pending')), true);
+ALTER FUNCTION public.trg_outbox_order_guard() RESET search_path;
+SELECT set_config('hj.cat1', (SELECT count(*) FILTER (WHERE NOT COALESCE(proconfig,'{}'::text[]) @> ARRAY['search_path=pg_catalog, public']) || '/' || count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('trg_upl_append_only','purge_push_log','trg_outbox_order_guard','trg_purge_guard','trg_expiry_forward','trg_outbox_insert_pending')), true);
+SET LOCAL ROLE wms_app;
+SET LOCAL search_path = hj_evil, public;
+DO $hj$ BEGIN UPDATE public.outbox_event SET status='SENDING' WHERE id=19950; RAISE EXCEPTION 'HJ_OK'; EXCEPTION WHEN OTHERS THEN PERFORM set_config('hj.mut', SQLERRM, true); END $hj$;
+RESET ROLE;
+SELECT 'HJ#' || current_setting('hj.base') || '#' || current_setting('hj.fixed') || '#' || current_setting('hj.mut') || '#' || current_setting('hj.cat0') || '#' || current_setting('hj.cat1');
+ROLLBACK;
+HJSQL
+)
+IFS='#' read -r _ HB HF HM HC0 HC1 <<< "$R"
+[ "$HC0" = "0/6" ] && ok "本 PR 新增/重定义的 6 个 PL/pgSQL 函数 proconfig 都含 search_path=pg_catalog, public（缺失/总数 = $HC0）" || bad "search_path 目录断言：缺失/总数 = $HC0（期望 0/6）"
+[ -n "$HB" ] && [ "$HF" = "$HB" ] && ok "劫持：wms_app 在自建 schema hj_evil 建同名表 outbox_event 并置于 search_path 首位，trg_outbox_order_guard() 仍读 public（结果与无劫持一致：$HB）" || bad "劫持后行为改变：无劫持=$HB / 劫持=$HF"
+[ "$HC1" = "1/6" ] && [ "$HM" != "$HB" ] && ok "变异检查：RESET trg_outbox_order_guard() 的 search_path 后，目录断言变红（$HC1）且劫持生效（$HM），两条断言都能抓到" || bad "变异检查没变红：目录=$HC1 劫持后=$HM 基准=$HB"
 echo "=== 3. §5.6 盘点差异生成列（实盘 − 基准账面 − 期间流水）==="
 seed "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000);"
 assert_n "种子 count_line" "SELECT count(*) FROM count_line" 1
@@ -1579,6 +1751,31 @@ fi
 R=$(psql -t -A -c "SELECT s.version||'/'||s.on_hand_qty_milli||'/'||s.hold_qty_milli||'/'||h.status||'/'||h.version||'/'||(SELECT count(*) FROM stock_hold_release WHERE op_key='LTH:7902:9002:171')||'/'||(SELECT qty_milli FROM stock_hold_release WHERE id=192) FROM stock s JOIN stock_hold h ON h.id=171 WHERE s.id=62")
 [ "$R" = "1/3000/0/RELEASED/1/1/3000" ] && ok "N-2 并发后 version/on_hand/hold_qty/状态/明细 version/释放行数/释放量 = $R（没有第二次释放）" || bad "N-2 并发后 = $R（期望 1/3000/0/RELEASED/1/1/3000）"
 rm -f "$REL_A" "$REL_B"
+echo "=== 6. 小吴 C3 形态 A 并发：业务事务只写 seq=0，relay 提交后补号 ==="
+# ① 小 id 后提交：T1 先插 id=9401 但晚提交，T2 插 id=9402 先提交；relay 在 T1 提交前跑一次、之后再跑一次
+psql -v ON_ERROR_STOP=1 -q -c "BEGIN; INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (9401,'t','OBT-C3-A','{}',1,8,0); SELECT pg_sleep(2); COMMIT;" >/dev/null &
+T1=$!
+sleep 0.5
+psql -v ON_ERROR_STOP=1 -q -c "INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (9402,'t','OBT-C3-B','{}',1,8,0);" >/dev/null || bad "C3 T2 插 9402失败"
+psql -v ON_ERROR_STOP=1 -q -c "BEGIN; SELECT pg_advisory_xact_lock(8); UPDATE outbox_event SET seq = m.b + r.rn FROM (SELECT id, row_number() OVER (ORDER BY id) AS rn FROM outbox_event WHERE node_id = 8 AND seq = 0) r, (SELECT COALESCE(MAX(seq), 0) AS b FROM outbox_event WHERE node_id = 8) m WHERE outbox_event.id = r.id; COMMIT;" >/dev/null || bad "C3 relay 第 1 次补号失败"
+wait $T1 || bad "C3 T1（9401 晚提交）失败"
+psql -v ON_ERROR_STOP=1 -q -c "BEGIN; SELECT pg_advisory_xact_lock(8); UPDATE outbox_event SET seq = m.b + r.rn FROM (SELECT id, row_number() OVER (ORDER BY id) AS rn FROM outbox_event WHERE node_id = 8 AND seq = 0) r, (SELECT COALESCE(MAX(seq), 0) AS b FROM outbox_event WHERE node_id = 8) m WHERE outbox_event.id = r.id; COMMIT;" >/dev/null || bad "C3 relay 第 2 次补号（T1 提交后）失败"
+R=$(psql -q -t -A -c "SELECT string_agg(id || ':' || seq, ',' ORDER BY id) FROM outbox_event WHERE node_id = 8")
+[ "$R" = "9401:2,9402:1" ] && ok "C3 小 id 后提交 → 拿到更大的 seq（$R）：seq 只按提交后补号顺序，不承诺全仓全局按 id 有序" || bad "C3 提交顺序用例：$R"
+# ② 40 个并发业务事务（各自 biz_key）+ relay 循环同时跑；结束后 seq 连续 1..42 无重复
+CC_DIR=$(mktemp -d)
+for i in $(seq 1 40); do
+  psql -q -c "BEGIN; INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES ($((9500+i)),'t','OBT-CC-$i','{}',1,8,0); SELECT pg_sleep(random()*0.2); COMMIT;" > "$CC_DIR/i_$i.out" &
+done
+for _ in $(seq 1 5); do psql -q -c "BEGIN; SELECT pg_advisory_xact_lock(8); UPDATE outbox_event SET seq = m.b + r.rn FROM (SELECT id, row_number() OVER (ORDER BY id) AS rn FROM outbox_event WHERE node_id = 8 AND seq = 0) r, (SELECT COALESCE(MAX(seq), 0) AS b FROM outbox_event WHERE node_id = 8) m WHERE outbox_event.id = r.id; COMMIT;" > "$CC_DIR/r_$_.out" & sleep 0.05; done
+wait
+psql -v ON_ERROR_STOP=1 -q -c "BEGIN; SELECT pg_advisory_xact_lock(8); UPDATE outbox_event SET seq = m.b + r.rn FROM (SELECT id, row_number() OVER (ORDER BY id) AS rn FROM outbox_event WHERE node_id = 8 AND seq = 0) r, (SELECT COALESCE(MAX(seq), 0) AS b FROM outbox_event WHERE node_id = 8) m WHERE outbox_event.id = r.id; COMMIT;" >/dev/null || bad "C3 收尾 relay 补号失败"
+ERRS=$(cat "$CC_DIR"/*.out | grep -c ERROR)
+R=$(psql -q -t -A -c "SELECT count(*) || '/' || count(DISTINCT seq) || '/' || min(seq) || '/' || max(seq) || '/' || sum(CASE WHEN seq = 0 THEN 1 ELSE 0 END) FROM outbox_event WHERE node_id = 8")
+[ "$R" = "42/42/1/42/0" ] && [ "$ERRS" = "0" ] && ok "C3 40 并发事务 + 5 个并发 relay：seq 连续 1..42、无重复、无漏补、无报错（$R）" || bad "C3 并发补号：$R，错误 $ERRS"
+R=$(psql -q -t -A -c "SELECT count(*) FROM numbering_segment WHERE biz_prefix LIKE 'OUTBOX%'")
+[ "$R" = "0" ] && ok "C3 并发期间业务事务未触碰 numbering_segment（无单行热点）" || bad "numbering_segment 出现 OUTBOX 行：$R"
+expect_block "C3 并发补号后重复 seq（同节点）" "UPDATE outbox_event SET seq = 1 WHERE id = (SELECT id FROM outbox_event WHERE node_id = 8 AND seq = 2);" "outbox_seq_immutable"
 
 echo "=== 5d. convert_hold 与 consume_live_hold 并发：先锁 stock、停在 pg_sleep、再锁 stock_hold，不死锁 ==="
 # 睡眠放在两把锁中间：转换会话只持有 stock 行锁时，消耗会话按 release/consume 的顺序去锁同一行。
