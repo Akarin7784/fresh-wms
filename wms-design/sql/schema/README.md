@@ -22,6 +22,7 @@
 | `11_integration.sql` | 幂等、入站消息、outbox、审计、取号 |
 | `12_auth.sql` | 用户、角色、权限、API 凭证 |
 | `12b_auth_audit.sql` | 设备绑定、离线令牌、审批单、设备恢复联网记录 `device_reconnect`（只追加，第 11 篇纸单补录引用）；audit_log 节点列与只追加；sys_user.perm_version；第 12 篇时间加固（服务端时间由库写：PG `trg_apr_zclock` / `trg_udb_zclock` / `trg_offline_zclock` / `trg_drc_guard` 对非表属主覆盖，表属主豁免；SQLite ±300 s 时钟窗口 + 整秒格式 CHECK；审批 `expires_at` 由库按类型补上限、只许缩短）；用户停用自动递增 perm_version；权限映射只经 6 个 SECURITY DEFINER 函数（属主 wms_rbac_owner，SQLite 为先审计后删的库强制契约）；12 张表的 FK 全部写在建表语句里（approval_request 提前到绑定表之前） |
+| `16_delivery.sql` | 第 16 篇配送与签收（本笔只建表，**未接进两个 verify 名单**，下一刀清单见本文件头注释）：运单 `waybill`（司机 / 车辆 / 发车 / 签收的权威与快照，`shipment_id` 指向 06、不反向）、配送站点 `delivery_stop`、签收聚合 `delivery_order`（`valid_pod_id` / `correct_seq`）、POD 现场操作 `pod_op`（只追加 + 回放缓存：四元组唯一 `uq_pod_op_key`、签收温度、24h 更正截止等式）、签收行 `pod_line`、更正 `pod_correction`（含容差内自动更正与三个部分唯一索引）、容差配置 `pod_tolerance_config`（`warehouse_id + sku_category`，`''` = 全品类）、回仓交接 `delivery_return` / `delivery_return_line`；9 表 / 28 索引 |
 | `17_processing.sql` | 加工 BOM、加工单、领料、产出、冲回、批次追溯 |
 | `18_live.sql` | 第 18 篇活鲜暂存：池扩展、只数账、巡检、锁池单、出池称重、死亡、日失重（只建本篇表，不改 02 约束；跨篇外键待补见 docs/18 §4.11） |
 | `90_available_view.sql` | `v_stock_available`，然后 `COMMIT` |
