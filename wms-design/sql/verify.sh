@@ -3699,6 +3699,77 @@ ROLLBACK;
 MUT12T
 )
 [ "$R" = "MUT#PASSED" ] && ok "变异：去掉 trg_api_zclock 后带 last_used_at 的 INSERT 通过（断言能抓到）" || bad "变异没变红：trg_api_zclock → $R"
+echo "=== 2v. docs/08 盘点与调整：本轮新增 10 个 CHECK / 8 个外键 / 5 条索引 + uq_adjl 的三件套（正向 / 按名拒绝 / 变异）==="
+# 变异 = 同一事务里去掉该约束再执行原被拒语句，必须变成通过，然后 ROLLBACK（证明拒绝确实来自该约束）。
+# ck_cnt_int / ck_adj_int（量必须整 milli）在 PG 侧由列类型 BIGINT 直接保证：CHECK 恒真，写 1.5 只会被四舍五入，
+# 没有可证伪的"被拒语句"，所以这两条在 PG 只做目录断言；SQLite 侧的 1.5 反证见 "2e. count_line 整数约束"。
+mut08() { expect_allow "08 变异：去掉 $1 后，原被拒语句通过（随后回滚）" "BEGIN; ALTER TABLE $2 DROP CONSTRAINT $1; $3 ROLLBACK;"; }
+expect_allow "08 正向：盘点单 + 盘点行（COUNTING/RECOUNTED，ck_cnt_*、ck_cntl_*、fk_cnt_wh/fk_cntl_* 全满足）" "INSERT INTO count_order (id,code,warehouse_id,count_type,scope_json,status,book_at,created_by) VALUES (9401,'CNT-SH01-9401-20261015-000001',1,'CYCLE','{}','COUNTING','2026-10-15 02:00:00',41); INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli,recount_qty_milli,status,counted_by,counted_at) VALUES (9411,9401,1,1,1,100000,-30000,68000,69000,'RECOUNTED',41,'2026-10-15 03:00:00');"
+expect_allow "08 正向：调整单 + 调整行（ck_adj_*、fk_adj_wh/fk_adjl_order 全满足）" "INSERT INTO adjust_order (id,code,warehouse_id,adjust_type,reason_code,status,applicant_id) VALUES (9421,'ADJ-SH01-9401-20261015-000001',1,'COUNT_LOSS','COUNT_DIFF','PENDING',41); INSERT INTO adjust_line (id,adjust_id,line_no,stock_id,delta_qty_milli) VALUES (9431,9421,1,11,-2000);"
+expect_allow "08 正向：盘点行回指调整单 + 同一调整单第 2 行（fk_cntl_adjust / uq_adjl 多行不撞）" "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli,status,counted_by,counted_at,adjust_id) VALUES (9412,9401,2,1,1,1000,0,900,'COUNTED',41,'2026-10-15 03:05:00',9421); INSERT INTO adjust_line (id,adjust_id,line_no,stock_id,delta_qty_milli) VALUES (9432,9421,2,12,3000);"
+expect_block "08 拒绝：ck_cnt_type 非法盘点类型" "INSERT INTO count_order (id,code,warehouse_id,count_type,scope_json,book_at) VALUES (9402,'CNT-SH01-9402-20261015-000002',1,'BOGUS','{}','2026-10-15 02:00:00');" "ck_cnt_type"
+mut08 "ck_cnt_type" "count_order" "INSERT INTO count_order (id,code,warehouse_id,count_type,scope_json,book_at) VALUES (9402,'CNT-SH01-9402-20261015-000002',1,'BOGUS','{}','2026-10-15 02:00:00');"
+expect_block "08 拒绝：ck_cnt_status 非法盘点单状态" "INSERT INTO count_order (id,code,warehouse_id,count_type,scope_json,status,book_at) VALUES (9403,'CNT-SH01-9403-20261015-000003',1,'FULL','{}','BOGUS','2026-10-15 02:00:00');" "ck_cnt_status"
+mut08 "ck_cnt_status" "count_order" "INSERT INTO count_order (id,code,warehouse_id,count_type,scope_json,status,book_at) VALUES (9403,'CNT-SH01-9403-20261015-000003',1,'FULL','{}','BOGUS','2026-10-15 02:00:00');"
+expect_block "08 拒绝：ck_cnt_approved 盘点审批人与创建人同一人" "INSERT INTO count_order (id,code,warehouse_id,count_type,scope_json,book_at,created_by,approved_by) VALUES (9404,'CNT-SH01-9404-20261015-000004',1,'FULL','{}','2026-10-15 02:00:00',41,41);" "ck_cnt_approved"
+mut08 "ck_cnt_approved" "count_order" "INSERT INTO count_order (id,code,warehouse_id,count_type,scope_json,book_at,created_by,approved_by) VALUES (9404,'CNT-SH01-9404-20261015-000004',1,'FULL','{}','2026-10-15 02:00:00',41,41);"
+expect_block "08 拒绝：ck_adj_type 非法调整类型" "INSERT INTO adjust_order (id,code,warehouse_id,adjust_type,reason_code,applicant_id) VALUES (9422,'ADJ-SH01-9402-20261015-000002',1,'BOGUS','COUNT_DIFF',41);" "ck_adj_type"
+mut08 "ck_adj_type" "adjust_order" "INSERT INTO adjust_order (id,code,warehouse_id,adjust_type,reason_code,applicant_id) VALUES (9422,'ADJ-SH01-9402-20261015-000002',1,'BOGUS','COUNT_DIFF',41);"
+expect_block "08 拒绝：ck_adj_status 非法调整单状态" "INSERT INTO adjust_order (id,code,warehouse_id,adjust_type,reason_code,status,applicant_id) VALUES (9423,'ADJ-SH01-9403-20261015-000003',1,'MANUAL','COUNT_DIFF','BOGUS',41);" "ck_adj_status"
+mut08 "ck_adj_status" "adjust_order" "INSERT INTO adjust_order (id,code,warehouse_id,adjust_type,reason_code,status,applicant_id) VALUES (9423,'ADJ-SH01-9403-20261015-000003',1,'MANUAL','COUNT_DIFF','BOGUS',41);"
+expect_block "08 拒绝：ck_adj_sod 调整单审批人与申请人同一人" "INSERT INTO adjust_order (id,code,warehouse_id,adjust_type,reason_code,applicant_id,approver_id) VALUES (9424,'ADJ-SH01-9404-20261015-000004',1,'MANUAL','COUNT_DIFF',41,41);" "ck_adj_sod"
+mut08 "ck_adj_sod" "adjust_order" "INSERT INTO adjust_order (id,code,warehouse_id,adjust_type,reason_code,applicant_id,approver_id) VALUES (9424,'ADJ-SH01-9404-20261015-000004',1,'MANUAL','COUNT_DIFF',41,41);"
+expect_block "08 拒绝：ck_adj_delta 调整量为 0（既不盘盈也不盘亏）" "INSERT INTO adjust_line (id,adjust_id,line_no,stock_id,delta_qty_milli) VALUES (9433,9421,3,11,0);" "ck_adj_delta"
+mut08 "ck_adj_delta" "adjust_line" "INSERT INTO adjust_line (id,adjust_id,line_no,stock_id,delta_qty_milli) VALUES (9433,9421,3,11,0);"
+expect_block "08 拒绝：ck_cntl_status 非法盘点行状态" "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli,status,counted_by,counted_at) VALUES (9413,9401,3,1,2,1000,0,1000,'BOGUS',41,'2026-10-15 03:10:00');" "ck_cntl_status"
+mut08 "ck_cntl_status" "count_line" "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli,status,counted_by,counted_at) VALUES (9413,9401,3,1,2,1000,0,1000,'BOGUS',41,'2026-10-15 03:10:00');"
+expect_block "08 拒绝：ck_cntl_counted 已盘点却没写实盘量" "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,status,counted_at) VALUES (9414,9401,3,2,1,1000,0,'COUNTED','2026-10-15 03:15:00');" "ck_cntl_counted"
+mut08 "ck_cntl_counted" "count_line" "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,status,counted_at) VALUES (9414,9401,3,2,1,1000,0,'COUNTED','2026-10-15 03:15:00');"
+expect_block "08 拒绝：ck_cntl_recount 未实盘就写复盘量" "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,recount_qty_milli) VALUES (9415,9401,2,1,2,1000,0,1000);" "ck_cntl_recount"
+mut08 "ck_cntl_recount" "count_line" "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,recount_qty_milli) VALUES (9415,9401,2,1,2,1000,0,1000);"
+R=$(psql -t -A -c "SELECT count(*) FROM pg_constraint WHERE conname='ck_cnt_int' AND contype='c'")
+[ "$R" = "1" ] && ok "08 目录：ck_cnt_int 存在（基准/期间/实盘/复盘量必须是整 milli；SQLite 侧另有 1.5 反证）" || bad "08 目录：ck_cnt_int = $R"
+R=$(psql -t -A -c "SELECT count(*) FROM pg_constraint WHERE conname='ck_adj_int' AND contype='c'")
+[ "$R" = "1" ] && ok "08 目录：ck_adj_int 存在（调整量必须是整 milli；SQLite 侧另有 1.5 反证）" || bad "08 目录：ck_adj_int = $R"
+expect_block "08 拒绝：fk_cnt_wh 盘点单挂不存在的仓" "INSERT INTO count_order (id,code,warehouse_id,count_type,scope_json,book_at) VALUES (9405,'CNT-SH01-9405-20261015-000005',999999,'FULL','{}','2026-10-15 02:00:00');" "fk_cnt_wh"
+mut08 "fk_cnt_wh" "count_order" "INSERT INTO count_order (id,code,warehouse_id,count_type,scope_json,book_at) VALUES (9405,'CNT-SH01-9405-20261015-000005',999999,'FULL','{}','2026-10-15 02:00:00');"
+expect_block "08 拒绝：fk_adj_wh 调整单挂不存在的仓" "INSERT INTO adjust_order (id,code,warehouse_id,adjust_type,reason_code,applicant_id) VALUES (9425,'ADJ-SH01-9405-20261015-000005',999999,'MANUAL','COUNT_DIFF',41);" "fk_adj_wh"
+mut08 "fk_adj_wh" "adjust_order" "INSERT INTO adjust_order (id,code,warehouse_id,adjust_type,reason_code,applicant_id) VALUES (9425,'ADJ-SH01-9405-20261015-000005',999999,'MANUAL','COUNT_DIFF',41);"
+expect_block "08 拒绝：fk_adjl_order 调整行挂不存在的调整单" "INSERT INTO adjust_line (id,adjust_id,line_no,stock_id,delta_qty_milli) VALUES (9434,999999,9,11,100);" "fk_adjl_order"
+mut08 "fk_adjl_order" "adjust_line" "INSERT INTO adjust_line (id,adjust_id,line_no,stock_id,delta_qty_milli) VALUES (9434,999999,9,11,100);"
+expect_block "08 拒绝：fk_cntl_count 盘点行挂不存在的盘点单" "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli) VALUES (9416,999999,1,1,1,1000);" "fk_cntl_count"
+mut08 "fk_cntl_count" "count_line" "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli) VALUES (9416,999999,1,1,1,1000);"
+expect_block "08 拒绝：fk_cntl_adjust 盘点行挂不存在的调整单" "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,adjust_id) VALUES (9417,9401,3,1,3,1000,999999);" "fk_cntl_adjust"
+mut08 "fk_cntl_adjust" "count_line" "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,adjust_id) VALUES (9417,9401,3,1,3,1000,999999);"
+expect_block "08 拒绝：fk_cntl_loc 盘点行挂不存在的库位" "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli) VALUES (9418,9401,999999,1,1,1000);" "fk_cntl_loc"
+mut08 "fk_cntl_loc" "count_line" "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli) VALUES (9418,9401,999999,1,1,1000);"
+expect_block "08 拒绝：fk_cntl_sku 盘点行挂不存在的 SKU" "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli) VALUES (9419,9401,1,999999,1,1000);" "fk_cntl_sku"
+mut08 "fk_cntl_sku" "count_line" "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli) VALUES (9419,9401,1,999999,1,1000);"
+expect_block "08 拒绝：fk_cntl_lot 盘点行挂不存在的批次" "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli) VALUES (9420,9401,1,1,999999,1000);" "fk_cntl_lot"
+mut08 "fk_cntl_lot" "count_line" "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli) VALUES (9420,9401,1,1,999999,1000);"
+expect_block "08 拒绝：uq_adjl 同一调整单同一 line_no 重复（02 记账幂等键 {biz_no}:{line_no}）" "INSERT INTO adjust_line (id,adjust_id,line_no,stock_id,delta_qty_milli) VALUES (9435,9421,1,13,500);" "uq_adjl"
+R=$(psql -t -A -c "SELECT count(*) FROM pg_constraint WHERE conname='uq_adjl' AND contype='u'")
+[ "$R" = "1" ] && ok "08 目录：uq_adjl 存在（02 记账幂等键 {biz_no}:{line_no}:D{op_no}:{leg} 的行号唯一）" || bad "08 目录：uq_adjl = $R"
+R=$(psql -t -A -c "SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexname='ix_cnt_wh' AND tablename='count_order' AND indexdef LIKE '%(warehouse_id, status, created_at)%'")
+[ "$R" = "1" ] && ok "08 目录：ix_cnt_wh 存在且挂在 count_order(warehouse_id, status, created_at)" || bad "08 目录：ix_cnt_wh = $R"
+R=$(psql -t -A -c "BEGIN; DROP INDEX ix_cnt_wh; SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexname='ix_cnt_wh'; ROLLBACK;" | sed -n 's/^\([0-9][0-9]*\)$/\1/p' | tail -1)
+[ "$R" = "0" ] && ok "08 变异：去掉 ix_cnt_wh 后目录断言命中 0（随后回滚）" || bad "08 变异：去掉 ix_cnt_wh 后 = $R"
+R=$(psql -t -A -c "SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexname='ix_adj_wh' AND tablename='adjust_order' AND indexdef LIKE '%(warehouse_id, status, created_at)%'")
+[ "$R" = "1" ] && ok "08 目录：ix_adj_wh 存在且挂在 adjust_order(warehouse_id, status, created_at)" || bad "08 目录：ix_adj_wh = $R"
+R=$(psql -t -A -c "BEGIN; DROP INDEX ix_adj_wh; SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexname='ix_adj_wh'; ROLLBACK;" | sed -n 's/^\([0-9][0-9]*\)$/\1/p' | tail -1)
+[ "$R" = "0" ] && ok "08 变异：去掉 ix_adj_wh 后目录断言命中 0（随后回滚）" || bad "08 变异：去掉 ix_adj_wh 后 = $R"
+R=$(psql -t -A -c "SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexname='ix_adj_src' AND tablename='adjust_order' AND indexdef LIKE '%(source_type, source_id)%'")
+[ "$R" = "1" ] && ok "08 目录：ix_adj_src 存在且挂在 adjust_order(source_type, source_id)" || bad "08 目录：ix_adj_src = $R"
+R=$(psql -t -A -c "BEGIN; DROP INDEX ix_adj_src; SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexname='ix_adj_src'; ROLLBACK;" | sed -n 's/^\([0-9][0-9]*\)$/\1/p' | tail -1)
+[ "$R" = "0" ] && ok "08 变异：去掉 ix_adj_src 后目录断言命中 0（随后回滚）" || bad "08 变异：去掉 ix_adj_src 后 = $R"
+R=$(psql -t -A -c "SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexname='ix_cnt_line_count' AND tablename='count_line' AND indexdef LIKE '%(count_id, status)%'")
+[ "$R" = "1" ] && ok "08 目录：ix_cnt_line_count 存在且挂在 count_line(count_id, status)" || bad "08 目录：ix_cnt_line_count = $R"
+R=$(psql -t -A -c "BEGIN; DROP INDEX ix_cnt_line_count; SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexname='ix_cnt_line_count'; ROLLBACK;" | sed -n 's/^\([0-9][0-9]*\)$/\1/p' | tail -1)
+[ "$R" = "0" ] && ok "08 变异：去掉 ix_cnt_line_count 后目录断言命中 0（随后回滚）" || bad "08 变异：去掉 ix_cnt_line_count 后 = $R"
+R=$(psql -t -A -c "SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexname='ix_cnt_line_loc' AND tablename='count_line' AND indexdef LIKE '%(location_id)%'")
+[ "$R" = "1" ] && ok "08 目录：ix_cnt_line_loc 存在且挂在 count_line(location_id)" || bad "08 目录：ix_cnt_line_loc = $R"
+R=$(psql -t -A -c "BEGIN; DROP INDEX ix_cnt_line_loc; SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexname='ix_cnt_line_loc'; ROLLBACK;" | sed -n 's/^\([0-9][0-9]*\)$/\1/p' | tail -1)
+[ "$R" = "0" ] && ok "08 变异：去掉 ix_cnt_line_loc 后目录断言命中 0（随后回滚）" || bad "08 变异：去掉 ix_cnt_line_loc 后 = $R"
 echo "=== 汇总 ==="
 echo "  通过 $pass 项 / 失败 $fail 项"
 cleanup
