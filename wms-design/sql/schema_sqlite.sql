@@ -297,6 +297,7 @@ CREATE TABLE lot (
 );
 CREATE INDEX ix_lot_expiry ON lot(sku_id, expiry_date) WHERE quality_status = 'QUALIFIED';
 CREATE INDEX ix_lot_aging  ON lot(remaining_life_days, sku_id);
+CREATE INDEX ix_lot_supplier ON lot(supplier_id);   -- 外键列索引（01 增量：供应商反查批次；Chief 2026-10-16 定，与其他 FK 一致）
 -- [SQLite] 两个部分索引均支持；ix_lot_aging 支撑效期预警列表
 -- sell_deadline 建档固定、不回溯：其余列仍可更新，只有这一列（含 NULL）写入后不可改
 -- search_path 固定为 pg_catalog, public。IS DISTINCT FROM 用的 =(date,date) 来自 pg_catalog，调用方 schema 里的同名运算符不生效。

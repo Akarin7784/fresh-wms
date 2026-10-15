@@ -3959,6 +3959,8 @@ expect_block_tx("01 拒绝：uq_customer_code 门店编码重复（守卫先命�
 expect_block_tx("01 拒绝：uq_vehicle_plate 车牌重复（守卫先命中）", ["INSERT INTO vehicle (id,plate_no,vehicle_type) VALUES (8833,'沪A12345','VAN')"], "master_duplicate: vehicle.plate_no")
 expect_block_tx("01 拒绝：uq_driver_phone 手机号重复（守卫先命中）", ["INSERT INTO driver (id,name,phone) VALUES (8834,'赵师傅','13800138000')"], "master_duplicate: driver.phone")
 expect_block_tx("01 拒绝：uq_device_instance 实例号重复（守卫先命中）", ["INSERT INTO device (id,device_instance_id,device_type,warehouse_id) VALUES (8835,'D-PDA-8805','PDA',1)"], "master_duplicate: device.device_instance_id")
+_idx01 = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='index' AND name='ix_lot_supplier'").fetchone()[0]
+ok("01 目录断言：ix_lot_supplier（lot.supplier_id 外键列索引）存在（1）") if _idx01 == 1 else bad(f"01 ix_lot_supplier 缺：{_idx01}")
 
 print("=== 2j. 第 7 篇补货与移库（任务 / 任务行 / 需求 / 移库 / 候选视图）===")
 # 种子已在最前面写入（replenish_task 701/702、replenish_task_line 7101、replenish_demand 7201、
