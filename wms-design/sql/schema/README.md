@@ -18,7 +18,6 @@
 | `08_count.sql` | 盘点、调整 |
 | `11_integration.sql` | 幂等、入站消息、outbox、审计、取号 |
 | `12_auth.sql` | 用户、角色、权限、API 凭证 |
-| `12b_auth_audit.sql` | 设备绑定、离线令牌、审批单；audit_log 节点列与只追加；sys_user.perm_version |
 | `90_available_view.sql` | `v_stock_available`，然后 `COMMIT` |
 | `99_grants.sql` | 事务外执行：`wms_purge_owner` / `wms_cleaner` / `purge_expired()` |
 
@@ -26,10 +25,18 @@
 
 ## 跨篇加列
 
-需要给别篇的表加列时，在**自己的** `NN_*.sql` 里写 `ALTER TABLE`（PostgreSQL 和 SQLite 两条都要写，SQLite 侧用 `-- @sqlite-only` / `-- @pg-only` 拆开），并在下面的登记表写上列名和原因。不要直接改那张表所在的篇文件。
+需要给别篇的表加列或加约束时，在**自己的** `NN_*.sql` 里写 `ALTER TABLE`（PostgreSQL 和 SQLite 两条都要写，SQLite 侧用 `-- @sqlite-only` / `-- @pg-only` 拆开），并在下面的登记表写上名字和原因。不要直接改那张表所在的篇文件。
 
-| 列 | 表 | 由哪一篇的文件 ALTER | 原因 | 状态 |
+| 对象 | 表 | 由哪一篇的文件 ALTER | 原因 | 状态 |
 |---|---|---|---|---|
-| `received_qty_milli`、`qc_passed_qty_milli`、`qc_failed_qty_milli` | `inbound_line` | 第 10 篇 `10_returns.sql`（尚未加入加载列表） | 02 §7.1.3 `release_qc_hold` 按这些 milli 列累加质检合格量。`03_inbound.sql` 里现有的 `received_qty` 仍是 `NUMERIC(14,3)`，本篇不改 03 | 待 #5 落库 |
-| `node_id`、`node_seq`、`device_instance_id`、`approval_id` | `audit_log` | 第 12 篇 `12b_auth_audit.sql` | 边缘回传按 (node_id,node_seq) 去重、审批关联（12 §6）；DEFAULT 0 只兼容存量，新插入 ≤0 由 trg_audit_node_required 拦（40001） | 已落库 |
-| `approval_no` → `approval_request.code` | `stock_hold` | 第 12 篇 `12b_auth_audit.sql` | 00 审批单号关联真实审批单。PG 外键 `fk_hold_approval_no`；SQLite 用 AFTER INSERT/UPDATE 触发器（不能 ALTER 加外键） | 已落库 |
+| `received_qty_milli`、`qc_passed_qty_milli`、`qc_failed_qty_milli` | `inbound_line` | 第 10 篇 `10_returns.sql`（尚未加入加载列表） | 02 §7.1.3 `release_qc_hold` 按这三列累加质检合格量。不登记 `claimed_qty_milli`。`03_inbound.sql` 里现有的 `received_qty` 仍是 `NUMERIC(14,3)`，本篇不改 03 | 待 #5 落库 |
+| `ck_inbl_int`、`ck_inbl_qc` | `inbound_line` | 第 10 篇 `10_returns.sql` | `ck_inbl_int`：上述 milli 列为整数。`ck_inbl_qc`：非负，且 `qc_passed_qty_milli + qc_failed_qty_milli ≤ received_qty_milli` | 待 #5 落库 |
+| `ck_inb_rtn_src` | `inbound_order` | 第 10 篇 `10_returns.sql`（对 03 入库单 ALTER） | 限制退货入库来源。PostgreSQL 用 CHECK；SQLite 用触发器 | 待 #5 落库 |
+| `upstream_push_log` 的 SELECT、DELETE 给 `wms_purge_owner`；`purge_push_log()` 的 EXECUTE 给 `wms_cleaner` | `upstream_push_log` | `99_grants.sql`（目录检查，表或函数不存在则跳过） | 第 11 篇清理角色。本分支还没有这张表和这个函数，两笔 GRANT 当前都跳过 | 待 #11 落库（当前跳过） |
+| `ALTER FUNCTION purge_push_log() OWNER TO wms_purge_owner` | `purge_push_log()` | `99_grants.sql`（`to_regprocedure` 查目录，函数不存在则跳过） | 第 11 篇 `trg_upl_append_only` 只放行 `current_user = wms_purge_owner` 删除已过 `retain_until` 的行。函数是 SECURITY DEFINER，属主才是触发器看到的当前用户。角色在本文件开头创建，表上的 SELECT、DELETE 已按目录检查授予。函数体和触发器归第 11 篇，本文件不建 | 待 #11 落库（当前跳过） |
+
+## 触发器 search_path 与 outbox 插入
+
+本篇定义的 10 个函数都固定 `SET search_path = pg_catalog, public`。`purge_expired()` 原本就有。另外 9 个是触发器函数，不是 SECURITY DEFINER，按调用方身份执行：`trg_mvk_line_kind`、`trg_sll_immutable`、`trg_hold_immutable`、`trg_hold_no_delete`、`trg_append_only`（`02_inventory.sql`），`trg_lot_sell_deadline`（`01_master.sql`），`trg_purge_guard`、`trg_expiry_forward`、`trg_outbox_insert_pending`（`11_integration.sql`）。
+
+`trg_outbox_insert_pending` 不按 `current_user = 'wms_app'` 判断。`wms_app` 是 NOLOGIN，应用用继承它的登录角色。不是 `outbox_event` 表属主的角色，插入时 `status` 必须是 `PENDING` 且 `sent_at` 为空，否则拒绝（`outbox_insert_not_pending`），不把状态改写成 `PENDING`。表属主可以插入其他状态，供种子和迁移使用。SQLite 没有角色，也没有 search_path；同名触发器拒绝一切非 PENDING 或带 `sent_at` 的插入，包括 `FAILED`。
