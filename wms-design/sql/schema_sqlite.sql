@@ -1,8 +1,8 @@
 -- 本文件由 sql/verify_sqlite.py 从 sql/schema/*.sql 按加载顺序机械生成，请勿手改。
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
---   2. 39 处 DEFAULT now()、3 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
---   3. 方言专属行：删除 180 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 65 行 @sqlite-only（等价触发器）
+--   2. 43 处 DEFAULT now()、5 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
+--   3. 方言专属行：删除 519 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 338 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -923,6 +923,379 @@ CREATE TABLE adjust_line (
     delta_qty       NUMERIC(14,3)   NOT NULL,   -- 正入负出
     CONSTRAINT ck_adj_delta CHECK (delta_qty <> 0)
 );
+-- 第 10 篇 退货与异常（#5）。本文件只建第 10 篇自己的表；对第 3 篇 inbound_order / inbound_line 的改动一律用 ALTER 写在这里，
+-- 并登记在 README「跨篇 ALTER 登记表」（不改 03_inbound.sql 的 CREATE TABLE）。
+-- ① inbound_order：退货入库单（RTN）来源白名单。WMS_DELIVERY=第 16 篇拒收回仓；STORE_RETURN=门店退货回仓；STORE_BLIND=盲收；
+--    SCRAP_MISREPORT=第 9 篇交接误报回转的质检单（不 post_in）；MALL/ERP=客户退货经第 11 篇
+CREATE TRIGGER trg_inb_rtn_src_ins BEFORE INSERT ON inbound_order
+WHEN NEW.order_type = 'RETURN' AND NEW.source_system NOT IN ('WMS_DELIVERY','STORE_RETURN','STORE_BLIND','SCRAP_MISREPORT','MALL','ERP')
+BEGIN SELECT RAISE(ABORT, 'ck_inb_rtn_src'); END;
+CREATE TRIGGER trg_inb_rtn_src_upd BEFORE UPDATE ON inbound_order
+WHEN NEW.order_type = 'RETURN' AND NEW.source_system NOT IN ('WMS_DELIVERY','STORE_RETURN','STORE_BLIND','SCRAP_MISREPORT','MALL','ERP')
+BEGIN SELECT RAISE(ABORT, 'ck_inb_rtn_src'); END;
+-- ② inbound_line：03 里只有 NUMERIC 的 received_qty，没有任何 *_qty_milli 列。这里只补 02 §7.1.3 release_qc_hold 用到的三列
+--    received / qc_passed / qc_failed（与 README 跨篇 ALTER 登记表一致）。对方声称数不放在 inbound_line：门店退货在
+--    return_reservation_line.qty_milli，拒收差异在 exception_case.claimed_qty_milli。
+--    退货入库（docs/10 I3）数量一律 *_qty_milli（00 R2）。第 3 篇的 NUMERIC 列按 00 §9.2「加列 → 双写 → 删旧」迁移；
+--    退货（order_type='RETURN'）只读写这三列，入账 post_in 只用 received_qty_milli；质检通过 release_qc_hold 与 qc_passed 累加同事务。
+--    SQLite 的 ALTER 不能加表级约束，两条 CHECK 挂在最后一列上（SQLite 允许列级 CHECK 引用同表其他列），约束名两库一致。
+ALTER TABLE inbound_line ADD COLUMN received_qty_milli  BIGINT NOT NULL DEFAULT 0;   -- 仓管实点（入账以此为准）
+ALTER TABLE inbound_line ADD COLUMN qc_passed_qty_milli BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE inbound_line ADD COLUMN qc_failed_qty_milli BIGINT NOT NULL DEFAULT 0
+    CONSTRAINT ck_inbl_int CHECK (received_qty_milli = CAST(received_qty_milli AS BIGINT) AND qc_passed_qty_milli = CAST(qc_passed_qty_milli AS BIGINT) AND qc_failed_qty_milli = CAST(qc_failed_qty_milli AS BIGINT))
+    CONSTRAINT ck_inbl_qc CHECK (received_qty_milli >= 0 AND qc_passed_qty_milli >= 0 AND qc_failed_qty_milli >= 0 AND qc_passed_qty_milli + qc_failed_qty_milli <= received_qty_milli);
+-- CAST 对 BIGINT 在 PG 上恒为真，只在 SQLite（REAL/TEXT 亲和）起作用，写法与 02 相同
+-- ③ 质检通过走第 2 篇 release_qc_hold(hold_id, inbound_order_id, inbound_line_id, qty, op_key)：RETURN_QC 冻结 source_type='QC'、
+--    source_id = inbound_order.id（RTN 单头 id，不是行 id，也没有 qc_line 表）；op_key = QCR:{inbound_line_id}:{op_seq}。
+
+-- 第 10 篇 退货与异常：异常码字典 + 异常单（EXC）。退货入库单复用 inbound_order(order_type='RETURN')。
+CREATE TABLE exception_code (
+    code            VARCHAR(32)     PRIMARY KEY,   -- SHORT_STOCK/DAMAGED/EXPIRED/WRONG_LOC/WRONG_SKU/CUSTOMER_REJECT/RETURN_COUNT_DIFF/TEMP_BREACH ...
+    name            VARCHAR(64)     NOT NULL,
+    action          VARCHAR(32)     NOT NULL,      -- NONE/ADJUST/SCRAP/REPLENISH/NOTIFY_PURCHASE
+    liability       VARCHAR(16)     NOT NULL,      -- WAREHOUSE/SUPPLIER/CARRIER/CUSTOMER/UNKNOWN
+    escalate_minutes INT            NOT NULL DEFAULT 240,
+    is_active       SMALLINT        NOT NULL DEFAULT 1,
+    CONSTRAINT ck_exc_liab CHECK (liability IN ('WAREHOUSE','SUPPLIER','CARRIER','CUSTOMER','UNKNOWN'))
+);
+
+CREATE TABLE exception_case (
+    id              BIGINT          PRIMARY KEY,
+    code            VARCHAR(64)     NOT NULL,      -- EXC-{仓}-{节点}-{作业日}-{序号}
+    warehouse_id    BIGINT          NOT NULL,
+    exception_code  VARCHAR(32)     NOT NULL REFERENCES exception_code(code),   -- I1：外键到字典
+    source_type     VARCHAR(24)     NOT NULL,      -- 取值见 ck_exc_src_type
+    source_key      VARCHAR(96)     NOT NULL,      -- DELIVERY_RETURN：POD:{pod_id}:{correct_seq}（16，首签 0）；FAILOVER_GAP：FG:{failover_id}:{source_system}:{source_order_no}
+    source_hash     VARCHAR(64)     NOT NULL,      -- 规范化内容 SHA-256：同键不同内容 → 40910 SOURCE_ORDER
+    sku_id          BIGINT          NOT NULL DEFAULT 0,
+    lot_id          BIGINT          NOT NULL DEFAULT 0,
+    claimed_qty_milli  BIGINT       NOT NULL DEFAULT 0,   -- 对方声称（如司机拒收登记数）
+    counted_qty_milli  BIGINT       NOT NULL DEFAULT 0,   -- 仓库实点数（以此为准）
+    diff_qty_milli  BIGINT          NOT NULL DEFAULT 0,   -- counted − claimed，应用层写入
+    liable_party    VARCHAR(16)     NOT NULL DEFAULT 'UNKNOWN',   -- 责任方：WAREHOUSE/CARRIER/STORE/UNKNOWN（字典 exception_code.liability 只是建议值，落单时映射）
+    link_deadline_at TIMESTAMP,                    -- UTC；关联单据截止：盲收 = created_at + 48h，超时升级主管（escalated=1）；只能往后改
+    status          VARCHAR(16)     NOT NULL DEFAULT 'OPEN',
+    escalated       SMALLINT        NOT NULL DEFAULT 0,
+    due_at          TIMESTAMP       NOT NULL,
+    assignee_id     BIGINT,
+    resolution      VARCHAR(32),                   -- ACCEPT_COUNT/ADJUST/SCRAP/CLAIM_CARRIER/CLAIM_CUSTOMER/NO_ACTION
+    resolution_doc  VARCHAR(64),                   -- 生成的调整单/报损单号
+    reporter_id     BIGINT          NOT NULL,
+    closed_by       BIGINT,
+    closed_at       TIMESTAMP,
+    version         BIGINT          NOT NULL DEFAULT 0,
+    created_at      TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT uq_exc_code   UNIQUE (code),
+    CONSTRAINT uq_exc_src    UNIQUE (source_type, source_key),
+    CONSTRAINT ck_exc_status CHECK (status IN ('OPEN','PROCESSING','RESOLVED','CLOSED','CANCELLED')),
+    CONSTRAINT ck_exc_int    CHECK (counted_qty_milli = CAST(counted_qty_milli AS BIGINT) AND diff_qty_milli = CAST(diff_qty_milli AS BIGINT)),
+    CONSTRAINT ck_exc_diff   CHECK (diff_qty_milli = counted_qty_milli - claimed_qty_milli),
+    CONSTRAINT ck_exc_close  CHECK (status NOT IN ('RESOLVED','CLOSED') OR (resolution IS NOT NULL AND closed_by IS NOT NULL)),
+    -- 小赵复评建议 1：处置结论取值；调整 / 报损必须带生成的单号
+    CONSTRAINT ck_exc_resol  CHECK (resolution IS NULL OR resolution IN ('ACCEPT_COUNT','ADJUST','SCRAP','CLAIM_CARRIER','CLAIM_CUSTOMER','NO_ACTION')),
+    CONSTRAINT ck_exc_resdoc CHECK (resolution IS NULL OR resolution NOT IN ('ADJUST','SCRAP') OR (resolution_doc IS NOT NULL AND length(resolution_doc) > 0)),
+    CONSTRAINT ck_exc_liable CHECK (liable_party IN ('WAREHOUSE','CARRIER','STORE','UNKNOWN')),
+    CONSTRAINT ck_exc_blind  CHECK (source_type <> 'BLIND_RETURN' OR link_deadline_at IS NOT NULL),
+    CONSTRAINT ck_exc_src_type CHECK (source_type IN ('DELIVERY_RETURN','STORE_RETURN','BLIND_RETURN','SCRAP_MISREPORT','RETURN_INBOUND','RR_HOLD_FAILED','FAILOVER_GAP','PICK','COUNT','MANUAL','PROCESS_LOSS','LIVE_DEATH')),
+    -- 第 17 篇加工损耗未获批部分（审批 REJECTED / 12h 过期 EXPIRED_TO_EXCEPTION）转本篇异常：source_type 与 00 报损来源同名 PROCESS_LOSS，
+    -- source_key = PRCL:{process_output.id}（损耗行 id，一行只转一次，uq_exc_src 去重）；转异常后损耗结论以本篇为准（ERP 等 wms.exception.closed）
+    -- 第 18 篇活鲜死亡延迟扣减任务（deduct_status = EXCEPTION）转本篇异常：source_type 与 00 报损来源同名 LIVE_DEATH，
+    -- source_key = LDTH:{live_death.id}（死亡登记 id，一条只转一次，uq_exc_ldth_key 去重；幂等返回规则同 PROCESS_LOSS）
+    -- 键格式：前缀后必须是不带前导零的正整数 [1-9][0-9]*（PG 正则；SQLite 用 substr + GLOB 等价判断）
+    CONSTRAINT ck_exc_ldth_key CHECK (source_type <> 'LIVE_DEATH' OR (substr(source_key, 1, 5) = 'LDTH:' AND length(source_key) >= 6 AND substr(source_key, 6, 1) BETWEEN '1' AND '9' AND substr(source_key, 6) NOT GLOB '*[^0-9]*' AND sku_id > 0)),
+    CONSTRAINT ck_exc_pl_key CHECK (source_type <> 'PROCESS_LOSS' OR (substr(source_key, 1, 5) = 'PRCL:' AND length(source_key) >= 6 AND substr(source_key, 6, 1) BETWEEN '1' AND '9' AND substr(source_key, 6) NOT GLOB '*[^0-9]*' AND sku_id > 0)),
+    CONSTRAINT ck_exc_hash   CHECK (length(source_hash) = 64 AND lower(source_hash) = source_hash AND replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(source_hash,'0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9',''),'a',''),'b',''),'c',''),'d',''),'e',''),'f','') = '')
+);
+CREATE INDEX ix_exc_wh_status ON exception_case(warehouse_id, status, due_at);
+-- 第 17 篇加工损耗转异常的幂等键（Doro 定）：一条损耗行 PRCL:{process_output.id} 只有一张异常单（两库同一部分唯一索引）。
+-- 审批驳回回调（含重放）与 12h 过期任务可能并发处理同一损耗行：后到者不报错，返回已存在的 exception_no，且不再写 outbox。
+--   PG：INSERT … ON CONFLICT (source_key) WHERE source_type = 'PROCESS_LOSS' DO NOTHING RETURNING code → 0 行则 SELECT code；
+--   SQLite（单写者，BEGIN IMMEDIATE 串行）：INSERT … SELECT … WHERE NOT EXISTS (…) → changes() = 0 则 SELECT code。
+--   （SQLite 的 trg_exc_no_replace 会让 INSERT OR IGNORE / ON CONFLICT DO NOTHING 直接 ABORT，所以 SQLite 侧不用 DO NOTHING。）
+--   wms.process.loss_settled 只由真正插入异常单的一方在同事务写出 → 每条损耗行只发一次。
+CREATE UNIQUE INDEX uq_exc_pl_key ON exception_case(source_key) WHERE source_type = 'PROCESS_LOSS';
+-- 第 18 篇活鲜死亡（LDTH:{live_death.id}）同一套：部分唯一索引兜底，后到者返回已有 exception_no、不报错
+CREATE UNIQUE INDEX uq_exc_ldth_key ON exception_case(source_key) WHERE source_type = 'LIVE_DEATH';
+-- 异常单库层守卫（小赵 I2 / 复评 L1–L3，大肥鱼定案）
+-- L1 状态白名单：OPEN→PROCESSING/RESOLVED/CANCELLED，PROCESSING→RESOLVED/CANCELLED，RESOLVED→CLOSED；其余一律拒（含 RESOLVED→PROCESSING、
+--    OPEN/PROCESSING→CLOSED）。下游单据被驳回（原 X4）不再退回处理中，而是新开一张异常单（source_type=MANUAL，payload 引用原单号）。
+-- L2 建单后 code / warehouse_id / exception_code / source_type / source_key / source_hash / reporter_id 不可改；
+--    进入 RESOLVED 后声称、实点、差异、处置结论、处置单号、责任方、关闭人不可改，closed_at 只能从 NULL 写一次；CLOSED / CANCELLED 整行只读（含 version）。
+-- L3 不许 DELETE / TRUNCATE；SQLite 另拦 REPLACE（id 或 (source_type, source_key) 已存在即拒），去重键永不释放。
+-- 建议 2：SQLite 外键依赖 PRAGMA foreign_keys=ON，边缘连接漏开也要拦：exception_code 存在性用触发器再校验一次。
+CREATE TRIGGER trg_exc_forward BEFORE UPDATE ON exception_case
+WHEN NEW.status <> OLD.status AND NEW.status IN ('OPEN','PROCESSING','RESOLVED','CLOSED','CANCELLED') AND NOT ((OLD.status = 'OPEN' AND NEW.status IN ('PROCESSING','RESOLVED','CANCELLED'))
+  OR (OLD.status = 'PROCESSING' AND NEW.status IN ('RESOLVED','CANCELLED'))
+  OR (OLD.status = 'RESOLVED' AND NEW.status = 'CLOSED'))
+BEGIN SELECT RAISE(ABORT, 'exc_state_forward_only'); END;
+CREATE TRIGGER trg_exc_immutable BEFORE UPDATE ON exception_case
+WHEN NEW.code IS NOT OLD.code OR NEW.warehouse_id IS NOT OLD.warehouse_id OR NEW.exception_code IS NOT OLD.exception_code
+  OR NEW.source_type IS NOT OLD.source_type OR NEW.source_key IS NOT OLD.source_key OR NEW.source_hash IS NOT OLD.source_hash
+  OR NEW.reporter_id IS NOT OLD.reporter_id
+  OR (OLD.status IN ('CLOSED','CANCELLED') AND (NEW.code IS NOT OLD.code OR NEW.warehouse_id IS NOT OLD.warehouse_id
+  OR NEW.exception_code IS NOT OLD.exception_code OR NEW.source_type IS NOT OLD.source_type
+  OR NEW.source_key IS NOT OLD.source_key OR NEW.source_hash IS NOT OLD.source_hash OR NEW.sku_id IS NOT OLD.sku_id
+  OR NEW.lot_id IS NOT OLD.lot_id OR NEW.claimed_qty_milli IS NOT OLD.claimed_qty_milli
+  OR NEW.counted_qty_milli IS NOT OLD.counted_qty_milli OR NEW.diff_qty_milli IS NOT OLD.diff_qty_milli
+  OR NEW.liable_party IS NOT OLD.liable_party OR NEW.escalated IS NOT OLD.escalated
+  OR NEW.due_at IS NOT OLD.due_at OR NEW.assignee_id IS NOT OLD.assignee_id OR NEW.resolution IS NOT OLD.resolution
+  OR NEW.resolution_doc IS NOT OLD.resolution_doc OR NEW.reporter_id IS NOT OLD.reporter_id
+  OR NEW.closed_by IS NOT OLD.closed_by OR NEW.closed_at IS NOT OLD.closed_at OR NEW.version IS NOT OLD.version
+  OR NEW.link_deadline_at IS NOT OLD.link_deadline_at OR NEW.created_at IS NOT OLD.created_at))
+  OR (OLD.status = 'RESOLVED' AND (NEW.claimed_qty_milli IS NOT OLD.claimed_qty_milli OR NEW.counted_qty_milli IS NOT OLD.counted_qty_milli
+      OR NEW.diff_qty_milli IS NOT OLD.diff_qty_milli OR NEW.resolution IS NOT OLD.resolution OR NEW.resolution_doc IS NOT OLD.resolution_doc
+      OR NEW.liable_party IS NOT OLD.liable_party OR NEW.closed_by IS NOT OLD.closed_by
+      OR (OLD.closed_at IS NOT NULL AND NEW.closed_at IS NOT OLD.closed_at)))
+BEGIN SELECT RAISE(ABORT, 'exc_immutable'); END;
+CREATE TRIGGER trg_exc_no_delete BEFORE DELETE ON exception_case BEGIN SELECT RAISE(ABORT, 'exc_no_delete'); END;
+CREATE TRIGGER trg_exc_no_replace BEFORE INSERT ON exception_case
+WHEN EXISTS (SELECT 1 FROM exception_case e WHERE e.id = NEW.id OR (e.source_type = NEW.source_type AND e.source_key = NEW.source_key))
+BEGIN SELECT RAISE(ABORT, 'exc_duplicate'); END;
+CREATE TRIGGER trg_exc_code_ins BEFORE INSERT ON exception_case
+WHEN NOT EXISTS (SELECT 1 FROM exception_code c WHERE c.code = NEW.exception_code)
+BEGIN SELECT RAISE(ABORT, 'exc_code_unknown'); END;
+-- 盲收异常单：link_deadline_at 建单时必须 = created_at + 48h（截止只能往后改，见 trg_exc_forward / trg_exc_deadline）
+CREATE TRIGGER trg_exc_blind_ins BEFORE INSERT ON exception_case
+WHEN NEW.source_type = 'BLIND_RETURN' AND NEW.link_deadline_at IS NOT NULL AND NEW.link_deadline_at IS NOT datetime(NEW.created_at, '+48 hours')
+BEGIN SELECT RAISE(ABORT, 'exc_blind_deadline'); END;
+CREATE TRIGGER trg_exc_deadline BEFORE UPDATE ON exception_case
+WHEN OLD.link_deadline_at IS NOT NULL AND (NEW.link_deadline_at IS NULL OR NEW.link_deadline_at < OLD.link_deadline_at)
+BEGIN SELECT RAISE(ABORT, 'exc_deadline_backward'); END;
+-- I4：授权。字典只读写不删；异常单不删（取消走状态）
+-- -----------------------------------------------------------------------------
+-- 第 10 篇：门店退货「退货预约 + 盲收」（大肥鱼定案，对标盒马）
+--   原因码与容器码必填；没有容器码的货现场补贴新标签再收。
+-- -----------------------------------------------------------------------------
+-- 退货预约：门店建（returns.reservation.create），仓库收货员收（returns.reservation.receive），收货后库存挂 RETURN_QC。
+-- 状态：CREATED → RECEIVED / CANCELLED，只进不退；建单键不可改；终态整行只读；不许 DELETE / TRUNCATE；SQLite 另拦 REPLACE。
+CREATE TABLE return_reservation (
+    id                  BIGINT          PRIMARY KEY,
+    code                VARCHAR(32)     NOT NULL,      -- RSV-{yyyyMMdd}-{seq}
+    warehouse_id        BIGINT          NOT NULL,
+    store_code          VARCHAR(32)     NOT NULL,
+    outbound_order_id   BIGINT          NOT NULL,      -- 原出库单（门店只能退本店收过的单，服务端校验）
+    status              VARCHAR(16)     NOT NULL DEFAULT 'CREATED',
+    rtn_inbound_id      BIGINT,                        -- 收货生成的 RTN（inbound_order，source_system=STORE_RETURN）
+    created_by          BIGINT          NOT NULL,
+    received_by         BIGINT,
+    received_at         TIMESTAMP,
+    version             BIGINT          NOT NULL DEFAULT 0,
+    created_at          TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT uq_rrsv_code   UNIQUE (code),
+    CONSTRAINT ck_rrsv_status CHECK (status IN ('CREATED','RECEIVED','CANCELLED')),
+    CONSTRAINT ck_rrsv_store  CHECK (length(store_code) > 0),
+    CONSTRAINT ck_rrsv_recv   CHECK ((status = 'RECEIVED') = (rtn_inbound_id IS NOT NULL AND received_by IS NOT NULL AND received_at IS NOT NULL))
+);
+CREATE INDEX ix_rrsv_store ON return_reservation(warehouse_id, store_code, status);
+CREATE TABLE return_reservation_line (
+    id                  BIGINT          PRIMARY KEY,
+    reservation_id      BIGINT          NOT NULL REFERENCES return_reservation(id),
+    line_no             INTEGER         NOT NULL,
+    sku_id              BIGINT          NOT NULL,
+    qty_milli           BIGINT          NOT NULL,
+    reason_code         VARCHAR(24)     NOT NULL,
+    container_code      VARCHAR(64)     NOT NULL,
+    received_qty_milli  BIGINT,                        -- 收货时写一次（实点）
+    CONSTRAINT uq_rrsl_line   UNIQUE (reservation_id, line_no),
+    CONSTRAINT ck_rrsl_qty    CHECK (qty_milli > 0 AND qty_milli = CAST(qty_milli AS BIGINT)
+                                     AND (received_qty_milli IS NULL OR (received_qty_milli >= 0 AND received_qty_milli = CAST(received_qty_milli AS BIGINT)))),
+    CONSTRAINT ck_rrsl_ctn    CHECK (length(container_code) > 0),
+    CONSTRAINT ck_rrsl_reason CHECK (reason_code IN ('QUALITY','DAMAGED','EXPIRED','NEAR_EXPIRY','WRONG_ITEM','OVERSTOCK','TEMP_ABNORMAL','PACKAGING','OTHER'))
+);
+-- 盲收记录：不预约直接收（inbound.return.blind），只追加：整行不可改、不可删；同事务生成 RTN（source_system=STORE_BLIND）与异常单（source_type=BLIND_RETURN）。
+CREATE TABLE return_blind_receipt (
+    id                  BIGINT          PRIMARY KEY,
+    code                VARCHAR(32)     NOT NULL,      -- BRC-{yyyyMMdd}-{seq}，接口返回的收货记录号
+    warehouse_id        BIGINT          NOT NULL,
+    sku_id              BIGINT          NOT NULL,
+    qty_milli           BIGINT          NOT NULL,
+    store_code          VARCHAR(32),                   -- 可空：不知道哪家门店
+    container_code      VARCHAR(64)     NOT NULL,
+    reason_code         VARCHAR(24)     NOT NULL,
+    photo_ids           TEXT            NOT NULL DEFAULT '[]',   -- JSON 数组，第 12 篇文件服务 id
+    rtn_inbound_id      BIGINT          NOT NULL,
+    exception_case_id   BIGINT          NOT NULL,
+    op_key              VARCHAR(80)     NOT NULL,      -- Idempotency-Key
+    received_by         BIGINT          NOT NULL,
+    created_at          TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT uq_rbr_code    UNIQUE (code),
+    CONSTRAINT uq_rbr_op      UNIQUE (op_key),
+    CONSTRAINT ck_rbr_qty     CHECK (qty_milli > 0 AND qty_milli = CAST(qty_milli AS BIGINT)),
+    CONSTRAINT ck_rbr_ctn     CHECK (length(container_code) > 0 AND (store_code IS NULL OR length(store_code) > 0)),
+    CONSTRAINT ck_rbr_reason  CHECK (reason_code IN ('QUALITY','DAMAGED','EXPIRED','NEAR_EXPIRY','WRONG_ITEM','OVERSTOCK','TEMP_ABNORMAL','PACKAGING','OTHER'))
+);
+CREATE TRIGGER trg_rrsv_forward BEFORE UPDATE ON return_reservation
+WHEN NEW.status <> OLD.status AND NOT (OLD.status = 'CREATED' AND NEW.status IN ('RECEIVED','CANCELLED'))
+BEGIN SELECT RAISE(ABORT, 'rrsv_state_forward_only'); END;
+CREATE TRIGGER trg_rrsv_immutable BEFORE UPDATE ON return_reservation
+WHEN NEW.code IS NOT OLD.code OR NEW.warehouse_id IS NOT OLD.warehouse_id OR NEW.store_code IS NOT OLD.store_code
+  OR NEW.outbound_order_id IS NOT OLD.outbound_order_id OR NEW.created_by IS NOT OLD.created_by OR NEW.created_at IS NOT OLD.created_at
+  OR (OLD.status <> 'CREATED' AND NEW.status = OLD.status AND (NEW.rtn_inbound_id IS NOT OLD.rtn_inbound_id
+      OR NEW.received_by IS NOT OLD.received_by OR NEW.received_at IS NOT OLD.received_at OR NEW.version IS NOT OLD.version))
+BEGIN SELECT RAISE(ABORT, 'rrsv_immutable'); END;
+CREATE TRIGGER trg_rrsv_no_delete BEFORE DELETE ON return_reservation BEGIN SELECT RAISE(ABORT, 'return_no_delete'); END;
+CREATE TRIGGER trg_rrsv_no_replace BEFORE INSERT ON return_reservation
+WHEN EXISTS (SELECT 1 FROM return_reservation r WHERE r.id = NEW.id OR r.code = NEW.code)
+BEGIN SELECT RAISE(ABORT, 'rrsv_duplicate'); END;
+CREATE TRIGGER trg_rrsl_ins BEFORE INSERT ON return_reservation_line
+WHEN EXISTS (SELECT 1 FROM return_reservation_line l WHERE l.id = NEW.id OR (l.reservation_id = NEW.reservation_id AND l.line_no = NEW.line_no))
+  OR NOT EXISTS (SELECT 1 FROM return_reservation r WHERE r.id = NEW.reservation_id AND r.status = 'CREATED')
+BEGIN SELECT RAISE(ABORT, 'rrsl_locked'); END;
+CREATE TRIGGER trg_rrsl_upd BEFORE UPDATE ON return_reservation_line
+WHEN NEW.id IS NOT OLD.id OR NEW.reservation_id IS NOT OLD.reservation_id OR NEW.line_no IS NOT OLD.line_no
+  OR NEW.sku_id IS NOT OLD.sku_id OR NEW.qty_milli IS NOT OLD.qty_milli OR NEW.reason_code IS NOT OLD.reason_code
+  OR NEW.container_code IS NOT OLD.container_code OR OLD.received_qty_milli IS NOT NULL
+  OR NOT EXISTS (SELECT 1 FROM return_reservation r WHERE r.id = OLD.reservation_id AND r.status = 'CREATED')
+BEGIN SELECT RAISE(ABORT, 'rrsl_locked'); END;
+CREATE TRIGGER trg_rrsl_no_delete BEFORE DELETE ON return_reservation_line BEGIN SELECT RAISE(ABORT, 'return_no_delete'); END;
+CREATE TRIGGER trg_rbr_no_upd BEFORE UPDATE ON return_blind_receipt BEGIN SELECT RAISE(ABORT, 'rbr_immutable'); END;
+CREATE TRIGGER trg_rbr_no_del BEFORE DELETE ON return_blind_receipt BEGIN SELECT RAISE(ABORT, 'rbr_immutable'); END;
+CREATE TRIGGER trg_rbr_no_replace BEFORE INSERT ON return_blind_receipt
+WHEN EXISTS (SELECT 1 FROM return_blind_receipt b WHERE b.id = NEW.id OR b.code = NEW.code OR b.op_key = NEW.op_key)
+BEGIN SELECT RAISE(ABORT, 'rbr_immutable'); END;
+-- =============================================================================
+-- 09_scrap.sql —— 第 9 篇 效期与损耗（PR #4，米雪儿接手）自有 DDL
+-- 加载顺序：08_count.sql 之后、11_integration.sql 之前。不改别篇文件；本篇没有跨篇 ALTER。
+-- 基线 #2 6008032：convert_hold(hold_id, qty, to_hold_type, to_source, op_key) 支持部分转换；可售期到期（SELL_EXPIRED）按 02（6008032）§表 SCRAP_PENDING 行：直接 hold(SCRAP_PENDING)（op_key=SELLEXP:{lot_id}:{date}，operator_id=0），不走 convert_hold，也不走 place_hold（place_hold 只收 PROCESSING / LIVE_HOLD）。
+-- 记账型来源（record_only）：PROCESS_LOSS（第 17 篇，原料已随报工 consume_process_hold 扣过）、LIVE_DEATH / LIVE_SHRINK（第 18 篇 consume_live_hold 直接扣，Doro P1）
+--   —— 报损单只记账：不冻结（hold_id=0）、行 ledger_mode=NONE、过账不调 post_out。
+-- =============================================================================
+-- 第 9 篇 效期与损耗：报损单（SCR）。审批通过后由服务端按行调 02 原语 post_out(SCRAP)；
+-- SCRAP_PENDING 冻结 source_type='SCRAP'、source_id=本表 id（04 N2）（op_key = SCRH:{scrap_line_id}），审批出账与解冻同事务。
+CREATE TABLE scrap_order (
+    id              BIGINT          PRIMARY KEY,
+    code            VARCHAR(64)     NOT NULL,   -- SCR-{仓}-{节点}-{作业日}-{序号}
+    warehouse_id    BIGINT          NOT NULL,
+    source_type     VARCHAR(24)     NOT NULL,   -- 取值见 ck_scr_src_type；SELL_EXPIRED：可售天数到期扫描（source_id=lot_id，来源键 SELL_EXPIRED:{lot_id}:{date}，落库 source_id=lot_id + source_date=作业日，见 uq_scr_source；冻结 op_key SELLEXP:{lot_id}:{date}）；RETURN_HANDOVER：04 交接，source_id=待回库记录 id；RETURN_QC：10 质检不合格，source_id=inbound_line.id
+    source_id       BIGINT          NOT NULL DEFAULT 0,
+    source_date     DATE            NOT NULL DEFAULT '1970-01-01',   -- 00 §6.4 D3：按日去重白名单（SELL_EXPIRED / LIVE_SHRINK）写仓库作业日；其余来源固定 '1970-01-01'
+    reason_code     VARCHAR(24)     NOT NULL,   -- 取值见 ck_scr_reason
+    status          VARCHAR(16)     NOT NULL DEFAULT 'DRAFT',
+    work_date       DATE            NOT NULL,   -- 仓库时区作业日
+    amount_impact   BIGINT          NOT NULL DEFAULT 0,   -- 分
+    applicant_id    BIGINT          NOT NULL,
+    approver_id     BIGINT,
+    approved_at     TIMESTAMP,
+    posted_at       TIMESTAMP,
+    void_approval_no VARCHAR(64),
+    void_ref        VARCHAR(80),                -- PROCESS_LOSS 作废：17 process_reversal.op_key（PRCR:{order}:{uuid}）
+    record_only     BOOLEAN         GENERATED ALWAYS AS (source_type IN ('PROCESS_LOSS','LIVE_DEATH','LIVE_SHRINK')) STORED,   -- 记账型（不冻结、不出账）；由来源推出，应用写不进               -- 交接误报作废（SCRAP_MISREPORT 审批单号，第 12 篇）；只有 VOIDED 才有
+    version         BIGINT          NOT NULL DEFAULT 0,
+    created_at      TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT uq_scr_code   UNIQUE (code),
+    CONSTRAINT ck_scr_status CHECK (status IN ('DRAFT','PENDING_APPROVAL','APPROVED','POSTED','REJECTED','CANCELLED','VOIDED')),
+    CONSTRAINT ck_scr_void   CHECK ((status = 'VOIDED') = ((void_approval_no IS NOT NULL AND length(void_approval_no) > 0) OR void_ref IS NOT NULL)),
+    -- 审批单号全局格式 APR-{仓库编码 [A-Z0-9]{2,16}}-{yyyyMMdd}-{6位序号}（Q17，与 02 ck_hold_approval_no 一致）
+    CONSTRAINT ck_scr_apr_fmt CHECK (void_approval_no IS NULL OR (length(void_approval_no) BETWEEN 22 AND 36 AND void_approval_no GLOB 'APR-?*-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]' AND substr(void_approval_no, 5, length(void_approval_no) - 20) NOT GLOB '*[^A-Z0-9]*')),
+    CONSTRAINT ck_scr_sod    CHECK (approver_id IS NULL OR approver_id <> applicant_id),
+    -- 小赵复评 S1：审批 / 过账后的人员与时间必须齐
+    -- 记账型在容差内可 DRAFT → POSTED 直接过账（无人审）；超容差走 PENDING_APPROVAL（PROCESS_LOSS 的审批即 17 的 PROCESS_YIELD_DEVIATION 合并单）
+    CONSTRAINT ck_scr_appr   CHECK (status NOT IN ('APPROVED','POSTED') OR (approver_id IS NOT NULL AND approved_at IS NOT NULL)
+                                    OR (record_only AND status = 'POSTED' AND approver_id IS NULL AND approved_at IS NULL)),
+    CONSTRAINT ck_scr_posted CHECK (status <> 'POSTED' OR posted_at IS NOT NULL),
+    CONSTRAINT ck_scr_src_type CHECK (source_type IN ('EXPIRY_SCAN','SELL_EXPIRED','MANUAL','RETURN_QC','RETURN_HANDOVER','COUNT','EXCEPTION','LIVE_DEATH','LIVE_SHRINK','PROCESS_LOSS')),
+    -- 00 §6.4 D3（大肥鱼定）：按日去重白名单 SELL_EXPIRED / LIVE_SHRINK 的 source_date = work_date；其余来源（含 LIVE_DEATH）固定 '1970-01-01'
+    CONSTRAINT ck_scr_src_date CHECK (CASE WHEN source_type IN ('SELL_EXPIRED','LIVE_SHRINK') THEN source_date = work_date ELSE source_date = '1970-01-01' END),
+    CONSTRAINT ck_scr_reason CHECK (reason_code IN ('EXPIRED','NEAR_EXPIRY','SELL_EXPIRED','DAMAGED','QC_REJECT','NATURAL_LOSS','OTHER',
+                                                  'TRIM','DRIP','WEIGH_DIFF','DEFECT','LIVE_DEATH')),
+    -- 加工损耗原因只给 PROCESS_LOSS 用；PROCESS_LOSS 只收这 4 个（17 process_output.loss_reason 一一对应，不再映射成 NATURAL_LOSS）
+    CONSTRAINT ck_scr_reason_src CHECK (
+        (source_type = 'PROCESS_LOSS') = (reason_code IN ('TRIM','DRIP','WEIGH_DIFF','DEFECT'))
+        AND (reason_code <> 'LIVE_DEATH' OR source_type = 'LIVE_DEATH')
+    ),
+    -- PROCESS_LOSS 作废（17 损耗改原因/改数量）挂 17 冲回键 void_ref=PRCR:…，不走 SCRAP_MISREPORT
+    CONSTRAINT ck_scr_void_ref CHECK (void_ref IS NULL OR (source_type = 'PROCESS_LOSS' AND status = 'VOIDED' AND void_ref LIKE 'PRCR:%'))
+);
+CREATE INDEX ix_scr_wh_status ON scrap_order(warehouse_id, status, work_date);
+-- 00 §6.4 D3：三列唯一，对所有来源生效；SELL_EXPIRED 靠 source_date 实现「同一批次同一天一张」
+CREATE UNIQUE INDEX uq_scr_source ON scrap_order(source_type, source_id, source_date) WHERE source_id <> 0 AND status NOT IN ('REJECTED','CANCELLED');
+-- ↑ 同一来源（效期扫描任务、待回库记录等）最多一张有效报损单
+
+CREATE TABLE scrap_line (
+    id              BIGINT          PRIMARY KEY,
+    scrap_id        BIGINT          NOT NULL REFERENCES scrap_order(id),
+    line_no         INT             NOT NULL,
+    stock_id        BIGINT          NOT NULL,
+    sku_id          BIGINT          NOT NULL,
+    lot_id          BIGINT          NOT NULL,
+    scrap_qty_milli BIGINT          NOT NULL,
+    hold_id         BIGINT          NOT NULL DEFAULT 0,   -- SCRAP_PENDING 冻结；0 = 已出库待报损（不冻结）
+    ledger_mode     VARCHAR(16)     NOT NULL DEFAULT 'POST_OUT',   -- POST_OUT 出账 / NONE 已扣账只记损耗
+    cost_amount     BIGINT          NOT NULL DEFAULT 0,
+    CONSTRAINT uq_scr_line   UNIQUE (scrap_id, line_no),
+    CONSTRAINT ck_scrl_int   CHECK (scrap_qty_milli = CAST(scrap_qty_milli AS BIGINT)),   -- CAST 只在 SQLite 起作用，PG 恒真
+    CONSTRAINT ck_scrl_qty   CHECK (scrap_qty_milli > 0),
+    CONSTRAINT ck_scrl_mode  CHECK (ledger_mode IN ('POST_OUT','NONE'))
+);
+CREATE INDEX ix_scrl_stock ON scrap_line(stock_id);
+-- 报损单库层守卫（小赵 I3 / 复评 K1–K4、S1；大肥鱼定案）
+-- 状态白名单：DRAFT→PENDING_APPROVAL/CANCELLED，PENDING_APPROVAL→APPROVED/REJECTED/DRAFT，APPROVED→POSTED；POSTED/REJECTED/CANCELLED/VOIDED 是终态。
+-- K1：锁定来源 = RETURN_HANDOVER（待回库交接）和 RETURN_QC（质检不合格）：不许撤回 / 取消 / 驳回（scrap_handover_no_revoke → 40930），
+--     release_scrap_hold(REVOKED) 也拒绝（02 f802a41）；质检或交接判错只走 SCRAP_MISREPORT 审批 → VOIDED（与 convert_hold SCRAP_PENDING→RETURN_QC 同事务）。
+-- K3：code / warehouse_id / source_* / applicant_id 建单后不可改；approver_id / approved_at / posted_at 只能从 NULL 写一次；终态整行只读。
+-- S1：INSERT 只能是 DRAFT。K2：不许 DELETE / TRUNCATE（PG 兜超级用户和迁移脚本），SQLite 另拦 REPLACE。
+-- 报损行（K3/K4）：只能在 DRAFT 单下新增或修改；单据离开 DRAFT 后整行只读；
+-- 带冻结的行（hold_id≠0）数量必须等于冻结余量、库存一致；锁定来源（交接 / 质检）的行冻结写定后数量、库存、hold_id 都不能改
+CREATE TRIGGER trg_scr_handover BEFORE UPDATE ON scrap_order
+WHEN OLD.source_type IN ('RETURN_HANDOVER','RETURN_QC') AND NEW.status <> OLD.status AND NEW.status IN ('DRAFT','CANCELLED','REJECTED')
+BEGIN SELECT RAISE(ABORT, 'scrap_handover_no_revoke'); END;
+CREATE TRIGGER trg_scr_forward BEFORE UPDATE ON scrap_order
+WHEN (NEW.status <> OLD.status AND NOT ((OLD.status = 'DRAFT' AND NEW.status IN ('PENDING_APPROVAL','CANCELLED'))
+       OR (OLD.status = 'PENDING_APPROVAL' AND NEW.status IN ('APPROVED','REJECTED','DRAFT'))
+       OR (OLD.status = 'APPROVED' AND NEW.status = 'POSTED')
+       OR (OLD.record_only AND OLD.status = 'DRAFT' AND NEW.status = 'POSTED')
+       OR (OLD.source_type IN ('RETURN_HANDOVER','RETURN_QC') AND OLD.status IN ('DRAFT','PENDING_APPROVAL','APPROVED') AND NEW.status = 'VOIDED')
+       OR (OLD.source_type = 'PROCESS_LOSS' AND OLD.status IN ('DRAFT','PENDING_APPROVAL','APPROVED','POSTED') AND NEW.status = 'VOIDED')))
+  OR NEW.source_type IS NOT OLD.source_type OR NEW.source_id IS NOT OLD.source_id OR NEW.source_date IS NOT OLD.source_date
+BEGIN SELECT RAISE(ABORT, 'scrap_state_forward_only'); END;
+CREATE TRIGGER trg_scr_immutable BEFORE UPDATE ON scrap_order
+WHEN NEW.code IS NOT OLD.code OR NEW.warehouse_id IS NOT OLD.warehouse_id OR NEW.applicant_id IS NOT OLD.applicant_id
+  OR (OLD.approver_id IS NOT NULL AND NEW.approver_id IS NOT OLD.approver_id)
+  OR (OLD.approved_at IS NOT NULL AND NEW.approved_at IS NOT OLD.approved_at)
+  OR (OLD.posted_at IS NOT NULL AND NEW.posted_at IS NOT OLD.posted_at)
+  OR (OLD.status IN ('POSTED','REJECTED','CANCELLED','VOIDED') AND (NEW.reason_code IS NOT OLD.reason_code
+      OR NEW.amount_impact IS NOT OLD.amount_impact OR NEW.void_approval_no IS NOT OLD.void_approval_no OR NEW.work_date IS NOT OLD.work_date))
+BEGIN SELECT RAISE(ABORT, 'scrap_immutable'); END;
+CREATE TRIGGER trg_scr_ins_draft BEFORE INSERT ON scrap_order
+WHEN NEW.status <> 'DRAFT' AND NEW.status IN ('PENDING_APPROVAL','APPROVED','POSTED','REJECTED','CANCELLED','VOIDED')
+BEGIN SELECT RAISE(ABORT, 'scrap_insert_draft_only'); END;
+CREATE TRIGGER trg_scr_no_replace BEFORE INSERT ON scrap_order
+WHEN EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'scrap_duplicate'); END;
+CREATE TRIGGER trg_scr_no_delete BEFORE DELETE ON scrap_order BEGIN SELECT RAISE(ABORT, 'scrap_no_delete'); END;
+CREATE TRIGGER trg_scrl_no_replace BEFORE INSERT ON scrap_line
+WHEN EXISTS (SELECT 1 FROM scrap_line l WHERE l.id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'scrap_duplicate'); END;
+CREATE TRIGGER trg_scrl_no_delete BEFORE DELETE ON scrap_line BEGIN SELECT RAISE(ABORT, 'scrap_no_delete'); END;
+CREATE TRIGGER trg_scrl_draft_ins BEFORE INSERT ON scrap_line
+WHEN NOT EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = NEW.scrap_id AND o.status = 'DRAFT')
+BEGIN SELECT RAISE(ABORT, 'scrap_line_locked'); END;
+CREATE TRIGGER trg_scrl_draft_upd BEFORE UPDATE ON scrap_line
+WHEN (NEW.scrap_id IS NOT OLD.scrap_id OR NEW.line_no IS NOT OLD.line_no OR NEW.stock_id IS NOT OLD.stock_id OR NEW.sku_id IS NOT OLD.sku_id
+      OR NEW.lot_id IS NOT OLD.lot_id OR NEW.scrap_qty_milli IS NOT OLD.scrap_qty_milli OR NEW.hold_id IS NOT OLD.hold_id
+      OR NEW.ledger_mode IS NOT OLD.ledger_mode OR NEW.cost_amount IS NOT OLD.cost_amount)
+  AND NOT EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = OLD.scrap_id AND o.status = 'DRAFT')
+BEGIN SELECT RAISE(ABORT, 'scrap_line_locked'); END;
+CREATE TRIGGER trg_scrl_hold_lock BEFORE UPDATE ON scrap_line
+WHEN OLD.hold_id <> 0 AND (NEW.scrap_qty_milli <> OLD.scrap_qty_milli OR NEW.stock_id <> OLD.stock_id OR NEW.hold_id <> OLD.hold_id)
+  AND EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = OLD.scrap_id AND o.source_type IN ('RETURN_HANDOVER','RETURN_QC'))
+BEGIN SELECT RAISE(ABORT, 'scrap_line_hold_locked'); END;
+CREATE TRIGGER trg_scrl_record_only BEFORE INSERT ON scrap_line
+WHEN (NEW.hold_id <> 0 OR NEW.ledger_mode <> 'NONE') AND EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = NEW.scrap_id AND o.record_only)
+BEGIN SELECT RAISE(ABORT, 'scrap_line_record_only'); END;
+CREATE TRIGGER trg_scrl_record_only_u BEFORE UPDATE ON scrap_line
+WHEN (NEW.hold_id <> 0 OR NEW.ledger_mode <> 'NONE') AND EXISTS (SELECT 1 FROM scrap_order o WHERE o.id = NEW.scrap_id AND o.record_only)
+BEGIN SELECT RAISE(ABORT, 'scrap_line_record_only'); END;
+CREATE TRIGGER trg_scrl_hold_ins BEFORE INSERT ON scrap_line
+WHEN NEW.hold_id <> 0 AND NOT EXISTS (SELECT 1 FROM stock_hold h WHERE h.id = NEW.hold_id AND h.stock_id = NEW.stock_id
+      AND h.status = 'HELD' AND h.hold_qty_milli - h.released_qty_milli = NEW.scrap_qty_milli)
+BEGIN SELECT RAISE(ABORT, 'scrap_line_hold_mismatch'); END;
+CREATE TRIGGER trg_scrl_hold_upd BEFORE UPDATE ON scrap_line
+WHEN NEW.hold_id <> 0 AND OLD.hold_id = 0
+  AND NOT EXISTS (SELECT 1 FROM stock_hold h WHERE h.id = NEW.hold_id AND h.stock_id = NEW.stock_id
+      AND h.status = 'HELD' AND h.hold_qty_milli - h.released_qty_milli = NEW.scrap_qty_milli)
+BEGIN SELECT RAISE(ABORT, 'scrap_line_hold_mismatch'); END;
+-- 授权（I4）：不给 DELETE/TRUNCATE，作废走状态
 -- -----------------------------------------------------------------------------
 -- 幂等 / 集成 / 审计
 -- -----------------------------------------------------------------------------
@@ -1085,6 +1458,278 @@ CREATE TABLE api_credential (
     last_used_at     TIMESTAMP,
     CONSTRAINT uq_api_key UNIQUE (api_key)
 );
+-- =============================================================================
+-- 12b_auth_audit.sql —— 第 12 篇（权限与审计，PR #9）自有 DDL
+-- 加载顺序：紧跟 12_auth.sql 之后、90_available_view.sql 之前。
+-- 跨篇加列一律 ALTER（README「跨篇 ALTER 登记表」已登记）。
+-- =============================================================================
+
+-- [跨篇 ALTER] audit_log（表主人：11_integration.sql）
+ALTER TABLE audit_log ADD COLUMN node_id INT NOT NULL DEFAULT 0;            -- 0 = 未登记节点，应用层必填真实 node_id
+ALTER TABLE audit_log ADD COLUMN node_seq BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE audit_log ADD COLUMN device_instance_id VARCHAR(64);
+ALTER TABLE audit_log ADD COLUMN approval_id BIGINT;
+CREATE UNIQUE INDEX uq_audit_node_seq ON audit_log(node_id, node_seq);
+CREATE INDEX ix_audit_wh ON audit_log(warehouse_id, occurred_at DESC);
+-- Doro 定：DEFAULT 0 只为兼容存量行；新写入 node_id/node_seq 必须 > 0（应用层映射 40001 PARAM_INVALID）
+CREATE TRIGGER trg_audit_node_required BEFORE INSERT ON audit_log
+WHEN NEW.node_id <= 0 OR NEW.node_seq <= 0
+BEGIN SELECT RAISE(ABORT, 'audit_node_required: 40001'); END;
+-- audit_log 只追加（docs/12 §6.4）：行级 UPDATE/DELETE 与 TRUNCATE 都拦；归档走按月导出 + 维护窗口内专用角色
+CREATE TRIGGER trg_audit_no_update BEFORE UPDATE ON audit_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: audit_log'); END;
+CREATE TRIGGER trg_audit_no_delete BEFORE DELETE ON audit_log BEGIN SELECT RAISE(ABORT, 'append_only_violation: audit_log'); END;
+-- 小赵 B1：SQLite REPLACE 删旧行不触发 DELETE 触发器（recursive_triggers=OFF），id 或 (node_id,node_seq) 已存在就直接 ABORT
+CREATE TRIGGER trg_audit_no_replace BEFORE INSERT ON audit_log
+WHEN EXISTS (SELECT 1 FROM audit_log a WHERE a.id = NEW.id OR (a.node_id = NEW.node_id AND a.node_seq = NEW.node_seq))
+BEGIN SELECT RAISE(ABORT, 'append_only_violation: audit_log'); END;
+
+-- [本篇表，12_auth.sql 由 #2 拆分建立] sys_user 加 perm_version
+ALTER TABLE sys_user ADD COLUMN perm_version BIGINT NOT NULL DEFAULT 1 CONSTRAINT ck_user_perm_ver CHECK (perm_version > 0);
+
+-- -----------------------------------------------------------------------------
+-- docs/12 权限与审计：设备绑定、离线令牌、主管审批
+-- -----------------------------------------------------------------------------
+
+-- 设备实例绑定：device_instance_id（App 安装实例）↔ 账号 + 仓。一个实例同时最多一条 PENDING/ACTIVE 绑定
+CREATE TABLE user_device_binding (
+    id                  BIGINT       PRIMARY KEY,
+    device_instance_id  VARCHAR(64)  NOT NULL,
+    device_id           BIGINT,                      -- 第 1 篇 device 台账；司机自有手机可为空
+    client_type         VARCHAR(16)  NOT NULL,       -- PDA / DRIVER_APP
+    user_id             BIGINT       NOT NULL,
+    warehouse_id        BIGINT       NOT NULL,
+    status              VARCHAR(16)  NOT NULL DEFAULT 'PENDING',   -- PENDING（待主管确认）/ ACTIVE / REVOKED（终态）
+    approval_id         BIGINT,                      -- DEVICE_BIND 审批单
+    bound_at            TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- UTC
+    activated_at        TIMESTAMP,
+    revoked_at          TIMESTAMP,
+    revoked_by          BIGINT,
+    revoke_reason       VARCHAR(64),
+    CONSTRAINT ck_udb_client CHECK (client_type IN ('PDA','DRIVER_APP')),
+    CONSTRAINT ck_udb_status CHECK ((status = 'PENDING' AND revoked_at IS NULL AND activated_at IS NULL)
+        OR (status = 'ACTIVE' AND revoked_at IS NULL AND activated_at IS NOT NULL AND approval_id IS NOT NULL)
+        OR (status = 'REVOKED' AND revoked_at IS NOT NULL))
+);
+-- 同一设备实例同时最多一条未吊销绑定（PENDING 或 ACTIVE）
+CREATE UNIQUE INDEX uq_udb_active ON user_device_binding(device_instance_id) WHERE status IN ('PENDING','ACTIVE');
+CREATE INDEX ix_udb_user ON user_device_binding(user_id, status);
+
+-- 离线令牌：断网时边缘节点/终端本地校验用。签名在应用层，库里只存 jti 与吊销状态
+CREATE TABLE offline_token (
+    id                  BIGINT       PRIMARY KEY,
+    jti                 VARCHAR(64)  NOT NULL,
+    binding_id          BIGINT       NOT NULL,       -- user_device_binding.id
+    user_id             BIGINT       NOT NULL,
+    device_instance_id  VARCHAR(64)  NOT NULL,
+    warehouse_id        BIGINT       NOT NULL,
+    perm_version        BIGINT       NOT NULL,       -- 签发时的权限版本，权限变更后旧令牌联网即失效
+    issued_at           TIMESTAMP    NOT NULL,
+    expires_at          TIMESTAMP    NOT NULL,
+    revoked_at          TIMESTAMP,
+    CONSTRAINT uq_offline_jti UNIQUE (jti),
+    CONSTRAINT ck_offline_ttl CHECK (expires_at > issued_at),
+    -- 有效期上限 12 小时（docs/12 §3.3，小赵 I4）
+    CONSTRAINT ck_offline_max_ttl CHECK (datetime(expires_at) <= datetime(issued_at, '+12 hours'))
+);
+CREATE INDEX ix_offline_binding ON offline_token(binding_id) WHERE revoked_at IS NULL;
+
+-- 主管审批（docs/12 §5）
+CREATE TABLE approval_request (
+    id                  BIGINT       PRIMARY KEY,
+    code                VARCHAR(64)  NOT NULL,       -- 审批单号 APR-{warehouse_code}-{yyyyMMdd}-{6 位序号}（ck_apr_code）；02 stock_hold.approval_no 存本列
+    approval_type       VARCHAR(32)  NOT NULL,       -- POD_CORRECT / CANCEL_AFTER_PICK / UNPLANNED_FAILOVER / DEVICE_BIND / SCRAP_MISREPORT
+    warehouse_id        BIGINT       NOT NULL,
+    target_type         VARCHAR(32)  NOT NULL,
+    target_id           VARCHAR(64)  NOT NULL,
+    payload_json        TEXT         NOT NULL,       -- 申请时的完整命令，审批通过后原样执行
+    payload_hash        CHAR(64)     NOT NULL,
+    reason              VARCHAR(256) NOT NULL,
+    requested_by        BIGINT       NOT NULL,
+    status              VARCHAR(16)  NOT NULL DEFAULT 'PENDING',
+    first_approver_id   BIGINT,
+    first_approver_role VARCHAR(32),                 -- 审批时实际使用的角色（服务端写入，FAILOVER 由触发器核对）
+    first_approved_at   TIMESTAMP,
+    second_approver_id  BIGINT,                      -- 仅 UNPLANNED_FAILOVER
+    second_approver_role VARCHAR(32),
+    second_approved_at  TIMESTAMP,
+    result_ref          VARCHAR(64),                 -- 执行结果引用：如 POD 更正的新 pod_id + correct_seq（服务端执行时分配）
+    decided_at          TIMESTAMP,
+    reject_reason       VARCHAR(256),
+    expires_at          TIMESTAMP    NOT NULL,
+    version             INT          NOT NULL DEFAULT 0,
+    created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),   -- UTC；expires_at 等时间列一律存 UTC（对齐 02 ad8ec1b P1）
+    CONSTRAINT uq_apr_code UNIQUE (code),
+    CONSTRAINT ck_apr_type CHECK (approval_type IN ('POD_CORRECT','CANCEL_AFTER_PICK','UNPLANNED_FAILOVER','DEVICE_BIND','SCRAP_MISREPORT',
+        'PAPER_BACKFILL','BOX_VOID','PROCESS_YIELD_DEVIATION','LIVE_DEATH_OVER','PROCESS_REWORK')),   -- 【ck_apr_type 变更】00 已登记的 4 类 + PROCESS_REWORK（Doro 06:16）
+    -- 非计划切换 = 发起人 + 仓库主管 + 中心运维三人（00 §9.1），角色字符串固定；是否真持有该角色由 trg_apr_transition 查 sys_user_role
+    CONSTRAINT ck_apr_failover_roles CHECK (approval_type <> 'UNPLANNED_FAILOVER'
+        OR ((first_approver_id IS NULL OR first_approver_role = 'WH_SUPERVISOR')
+            AND (second_approver_id IS NULL OR second_approver_role = 'CENTER_OPS'))),
+    CONSTRAINT ck_apr_status CHECK (status IN ('PENDING','PARTIAL','APPROVED','REJECTED','EXPIRED','WITHDRAWN')),
+    CONSTRAINT ck_apr_sod CHECK (first_approver_id IS NULL OR first_approver_id <> requested_by),
+    CONSTRAINT ck_apr_dual CHECK (second_approver_id IS NULL
+        OR (approval_type = 'UNPLANNED_FAILOVER' AND second_approver_id <> requested_by AND second_approver_id <> first_approver_id)),
+    CONSTRAINT ck_apr_done CHECK (status <> 'APPROVED' OR (first_approver_id IS NOT NULL
+        AND (approval_type <> 'UNPLANNED_FAILOVER' OR second_approver_id IS NOT NULL))),
+    CONSTRAINT ck_apr_hash CHECK (length(payload_hash) = 64),
+    -- 小赵 I2：审批人三列成组；PARTIAL 只用于 FAILOVER 且只有第一人；APPROVED/REJECTED 必有 decided_at，未决不能有
+    CONSTRAINT ck_apr_pair CHECK (
+        ((first_approver_id IS NULL AND first_approver_role IS NULL AND first_approved_at IS NULL)
+          OR (first_approver_id IS NOT NULL AND first_approver_role IS NOT NULL AND first_approved_at IS NOT NULL))
+        AND ((second_approver_id IS NULL AND second_approver_role IS NULL AND second_approved_at IS NULL)
+          OR (second_approver_id IS NOT NULL AND second_approver_role IS NOT NULL AND second_approved_at IS NOT NULL))),
+    CONSTRAINT ck_apr_partial CHECK (status <> 'PARTIAL'
+        OR (approval_type = 'UNPLANNED_FAILOVER' AND first_approver_id IS NOT NULL AND second_approver_id IS NULL)),
+    CONSTRAINT ck_apr_decided CHECK ((status IN ('APPROVED','REJECTED') AND decided_at IS NOT NULL)
+        OR (status IN ('PENDING','PARTIAL') AND decided_at IS NULL)
+        OR status IN ('EXPIRED','WITHDRAWN')),
+    -- 审批单号统一格式 APR-{warehouse_code}-{yyyyMMdd}-{6 位序号}（所有审批类型共用；02 stock_hold.approval_no 存的就是它）。
+    -- 小赵 T1：仓库编码段收紧为 [A-Z0-9]{2,16}（与 #8 ck_wh_code 一致），写法对齐 02 ck_hold_approval_no @92e1477：PG 用 ~，SQLite 用 GLOB + 总长 22–36
+    CONSTRAINT ck_apr_code CHECK (
+        length(code) BETWEEN 22 AND 36 AND substr(code, 1, 4) = 'APR-'
+        AND substr(code, 5, length(code) - 20) NOT GLOB '*[^A-Z0-9]*'
+        AND substr(code, -16) GLOB '-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]'
+        AND (substr(code, -11, 2) GLOB '0[1-9]' OR substr(code, -11, 2) GLOB '1[0-2]')
+        AND (substr(code, -9, 2) GLOB '0[1-9]' OR substr(code, -9, 2) GLOB '[12][0-9]' OR substr(code, -9, 2) GLOB '3[01]')),
+    -- SCRAP_MISREPORT 审批人：质检主管或中心运维（是否真持有由 trg_apr_final / trg_apr_role 查 sys_user_role）
+    CONSTRAINT ck_apr_scrap_roles CHECK (approval_type <> 'SCRAP_MISREPORT'
+        OR first_approver_id IS NULL OR first_approver_role IN ('QC_SUPERVISOR','CENTER_OPS'))
+);
+CREATE UNIQUE INDEX uq_apr_open ON approval_request(approval_type, target_type, target_id) WHERE status IN ('PENDING','PARTIAL');
+CREATE INDEX ix_apr_wh ON approval_request(warehouse_id, status, created_at);
+CREATE INDEX ix_apr_requester ON approval_request(requested_by, status, created_at);   -- GET /approvals?mine=true
+
+-- ===== 小赵 I1/I2/I5：审批只能 INSERT 成 PENDING；迁移单向；审批人写入后不可改；过期不能再审；FAILOVER 确认人必须真持有角色 =====
+CREATE TRIGGER trg_apr_no_replace BEFORE INSERT ON approval_request
+WHEN EXISTS (SELECT 1 FROM approval_request a WHERE a.id = NEW.id OR a.code = NEW.code
+  OR (a.status IN ('PENDING','PARTIAL') AND a.approval_type = NEW.approval_type AND a.target_type = NEW.target_type AND a.target_id = NEW.target_id))
+BEGIN SELECT RAISE(ABORT, 'approval_duplicate'); END;
+CREATE TRIGGER trg_apr_insert BEFORE INSERT ON approval_request
+WHEN NEW.status <> 'PENDING' OR NEW.first_approver_id IS NOT NULL OR NEW.second_approver_id IS NOT NULL
+  OR NEW.decided_at IS NOT NULL OR NEW.result_ref IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'approval_insert_not_pending'); END;
+CREATE TRIGGER trg_apr_code_wh BEFORE INSERT ON approval_request
+WHEN length(NEW.code) BETWEEN 22 AND 36 AND substr(NEW.code, 1, 4) = 'APR-'
+  AND substr(NEW.code, 5, length(NEW.code) - 20) NOT GLOB '*[^A-Z0-9]*'
+  AND substr(NEW.code, -16) GLOB '-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]'
+  AND NOT EXISTS (SELECT 1 FROM warehouse w WHERE w.id = NEW.warehouse_id AND w.code = substr(NEW.code, 5, length(NEW.code) - 20))
+BEGIN SELECT RAISE(ABORT, 'approval_code_warehouse_mismatch'); END;
+CREATE TRIGGER trg_apr_insert_role BEFORE INSERT ON approval_request
+WHEN NEW.approval_type = 'SCRAP_MISREPORT' AND NOT EXISTS (
+    SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
+     JOIN sys_user_warehouse uw ON uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id
+     WHERE ur.user_id = NEW.requested_by AND r.code = 'WH_SUPERVISOR')
+BEGIN SELECT RAISE(ABORT, 'approval_role_not_held'); END;
+CREATE TRIGGER trg_apr_final BEFORE UPDATE ON approval_request
+WHEN OLD.status IN ('APPROVED','REJECTED','EXPIRED','WITHDRAWN')
+  OR NEW.payload_hash IS NOT OLD.payload_hash OR NEW.payload_json IS NOT OLD.payload_json
+  OR NEW.requested_by IS NOT OLD.requested_by OR NEW.approval_type IS NOT OLD.approval_type
+  OR NEW.code IS NOT OLD.code OR NEW.warehouse_id IS NOT OLD.warehouse_id
+  OR NEW.target_type IS NOT OLD.target_type OR NEW.target_id IS NOT OLD.target_id
+  OR NEW.expires_at IS NOT OLD.expires_at OR NEW.created_at IS NOT OLD.created_at
+BEGIN SELECT RAISE(ABORT, 'approval_final'); END;
+CREATE TRIGGER trg_apr_transition BEFORE UPDATE ON approval_request
+WHEN OLD.status IN ('PENDING','PARTIAL') AND NOT ((OLD.status = NEW.status AND NEW.status IN ('PENDING','PARTIAL'))
+  OR (OLD.status = 'PENDING' AND NEW.status IN ('PARTIAL','APPROVED','REJECTED','EXPIRED','WITHDRAWN'))
+  OR (OLD.status = 'PARTIAL' AND NEW.status IN ('APPROVED','REJECTED','EXPIRED','WITHDRAWN')))
+BEGIN SELECT RAISE(ABORT, 'approval_transition_invalid'); END;
+CREATE TRIGGER trg_apr_approver_immutable BEFORE UPDATE ON approval_request
+WHEN (OLD.first_approver_id IS NOT NULL AND (NEW.first_approver_id IS NOT OLD.first_approver_id
+    OR NEW.first_approver_role IS NOT OLD.first_approver_role OR NEW.first_approved_at IS NOT OLD.first_approved_at))
+  OR (OLD.second_approver_id IS NOT NULL AND NEW.second_approver_id IS NOT OLD.second_approver_id)
+BEGIN SELECT RAISE(ABORT, 'approval_approver_immutable'); END;
+CREATE TRIGGER trg_apr_expired BEFORE UPDATE ON approval_request
+WHEN NEW.status IN ('PARTIAL','APPROVED') AND NEW.status <> OLD.status AND COALESCE(datetime(OLD.expires_at) <= datetime('now'), 0)
+BEGIN SELECT RAISE(ABORT, 'approval_expired'); END;
+CREATE TRIGGER trg_apr_role BEFORE UPDATE ON approval_request
+WHEN NEW.approval_type = 'UNPLANNED_FAILOVER' AND (
+    (NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL AND NOT EXISTS (
+       SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
+        JOIN sys_user_warehouse uw ON uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id
+        WHERE ur.user_id = NEW.first_approver_id AND r.code = 'WH_SUPERVISOR'))
+ OR (NEW.second_approver_id IS NOT NULL AND OLD.second_approver_id IS NULL AND NOT EXISTS (
+       SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
+        WHERE ur.user_id = NEW.second_approver_id AND r.code = 'CENTER_OPS')))
+BEGIN SELECT RAISE(ABORT, 'approval_role_not_held'); END;
+CREATE TRIGGER trg_apr_perm BEFORE UPDATE ON approval_request
+WHEN NEW.approval_type IN ('DEVICE_BIND','POD_CORRECT','CANCEL_AFTER_PICK','PAPER_BACKFILL','BOX_VOID','PROCESS_YIELD_DEVIATION','LIVE_DEATH_OVER','PROCESS_REWORK')
+  AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL AND NEW.first_approver_role IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
+      JOIN sys_role_perm rp ON rp.role_id = r.id JOIN sys_permission p ON p.id = rp.perm_id
+     WHERE ur.user_id = NEW.first_approver_id AND r.code = NEW.first_approver_role
+       AND (r.code = 'CENTER_OPS' OR EXISTS (SELECT 1 FROM sys_user_warehouse uw
+            WHERE uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id))
+       AND p.code = CASE NEW.approval_type WHEN 'DEVICE_BIND' THEN 'device.binding.approve'
+                                           WHEN 'POD_CORRECT' THEN 'delivery.pod.correct.approve'
+                                           WHEN 'PAPER_BACKFILL' THEN 'offline.paper.approve'
+                                           WHEN 'BOX_VOID' THEN 'pack.box.void.approve'
+                                           WHEN 'PROCESS_YIELD_DEVIATION' THEN 'process.yield.approve'
+                                           WHEN 'LIVE_DEATH_OVER' THEN 'live.death.approve'
+                                           WHEN 'PROCESS_REWORK' THEN 'process.rework.approve'
+                                           ELSE 'outbound.order.cancel_after_pick.approve' END)
+BEGIN SELECT RAISE(ABORT, 'approval_perm_not_held'); END;
+CREATE TRIGGER trg_apr_scrap_role BEFORE UPDATE ON approval_request
+WHEN NEW.approval_type = 'SCRAP_MISREPORT' AND NEW.first_approver_id IS NOT NULL AND OLD.first_approver_id IS NULL
+  AND NOT EXISTS (SELECT 1 FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id
+        WHERE ur.user_id = NEW.first_approver_id AND r.code = NEW.first_approver_role
+          AND (r.code = 'CENTER_OPS' OR EXISTS (SELECT 1 FROM sys_user_warehouse uw
+               WHERE uw.user_id = ur.user_id AND uw.warehouse_id = NEW.warehouse_id)))
+BEGIN SELECT RAISE(ABORT, 'approval_role_not_held'); END;
+
+-- ===== 小赵 I3 + S1：设备绑定 INSERT 只能 PENDING；REVOKED 终态；身份列不可改；激活必须有本绑定的已通过 DEVICE_BIND 审批，审批人 ≠ 使用人 =====
+CREATE TRIGGER trg_udb_no_replace BEFORE INSERT ON user_device_binding
+WHEN EXISTS (SELECT 1 FROM user_device_binding b WHERE b.id = NEW.id
+  OR (b.device_instance_id = NEW.device_instance_id AND b.status IN ('PENDING','ACTIVE')))
+BEGIN SELECT RAISE(ABORT, 'binding_duplicate'); END;
+CREATE TRIGGER trg_udb_insert BEFORE INSERT ON user_device_binding WHEN NEW.status <> 'PENDING' OR NEW.approval_id IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'binding_insert_not_pending'); END;
+CREATE TRIGGER trg_udb_immutable BEFORE UPDATE ON user_device_binding
+WHEN OLD.status = 'REVOKED' OR (OLD.status = 'ACTIVE' AND NEW.status = 'PENDING')
+  OR NEW.device_instance_id IS NOT OLD.device_instance_id OR NEW.user_id IS NOT OLD.user_id
+  OR NEW.warehouse_id IS NOT OLD.warehouse_id OR NEW.client_type IS NOT OLD.client_type
+  OR NEW.device_id IS NOT OLD.device_id OR NEW.bound_at IS NOT OLD.bound_at
+  OR (OLD.approval_id IS NOT NULL AND NEW.approval_id IS NOT OLD.approval_id)
+BEGIN SELECT RAISE(ABORT, 'binding_immutable'); END;
+CREATE TRIGGER trg_udb_activate BEFORE UPDATE ON user_device_binding
+WHEN NEW.status = 'ACTIVE' AND OLD.status = 'PENDING' AND NOT EXISTS (
+  SELECT 1 FROM approval_request a WHERE a.id = NEW.approval_id AND a.approval_type = 'DEVICE_BIND'
+    AND a.status = 'APPROVED' AND a.target_type = 'DEVICE_BINDING' AND a.target_id = CAST(NEW.id AS TEXT)
+    AND a.first_approver_id <> NEW.user_id)
+BEGIN SELECT RAISE(ABORT, 'binding_approval_invalid'); END;
+CREATE TRIGGER trg_udb_no_delete BEFORE DELETE ON user_device_binding BEGIN SELECT RAISE(ABORT, 'append_only_violation: user_device_binding'); END;
+CREATE TRIGGER trg_apr_no_delete BEFORE DELETE ON approval_request BEGIN SELECT RAISE(ABORT, 'append_only_violation: approval_request'); END;
+
+-- ===== 小赵 I4：离线令牌只能写一次 revoked_at；其余列不可改；SQLite 防 REPLACE =====
+CREATE TRIGGER trg_offline_guard BEFORE UPDATE ON offline_token
+WHEN OLD.revoked_at IS NOT NULL OR NEW.jti IS NOT OLD.jti OR NEW.binding_id IS NOT OLD.binding_id
+  OR NEW.user_id IS NOT OLD.user_id OR NEW.device_instance_id IS NOT OLD.device_instance_id
+  OR NEW.warehouse_id IS NOT OLD.warehouse_id OR NEW.perm_version IS NOT OLD.perm_version
+  OR NEW.issued_at IS NOT OLD.issued_at OR NEW.expires_at IS NOT OLD.expires_at
+BEGIN SELECT RAISE(ABORT, 'offline_token_immutable'); END;
+CREATE TRIGGER trg_offline_no_replace BEFORE INSERT ON offline_token
+WHEN EXISTS (SELECT 1 FROM offline_token t WHERE t.id = NEW.id OR t.jti = NEW.jti)
+BEGIN SELECT RAISE(ABORT, 'offline_token_duplicate'); END;
+
+-- sys_user.perm_version 只升不降（撤权必须让旧令牌失效）；SQLite 防 REPLACE 把版本打回 1（小赵 I7）。
+-- 下发应用 USER_PERM 一律"UPDATE，0 行再 INSERT"，不用 REPLACE / UPSERT（docs/12 §4.3）
+CREATE TRIGGER trg_user_perm_ver BEFORE UPDATE ON sys_user WHEN NEW.perm_version < OLD.perm_version
+BEGIN SELECT RAISE(ABORT, 'perm_version_rewind'); END;
+CREATE TRIGGER trg_user_no_replace BEFORE INSERT ON sys_user
+WHEN EXISTS (SELECT 1 FROM sys_user u WHERE u.id = NEW.id OR u.username = NEW.username)
+BEGIN SELECT RAISE(ABORT, 'sys_user_duplicate'); END;
+
+
+-- [跨篇 ALTER] stock_hold.approval_no → approval_request.code（表主人：02_inventory.sql；00 第 278 行）
+-- PG 外键引用 uq_apr_code。SQLite 不能 ALTER 加外键，用 AFTER 触发器：CHECK 先于 AFTER，格式错误仍报 ck_hold_approval_no。
+CREATE TRIGGER trg_hold_approval_fk AFTER INSERT ON stock_hold
+WHEN NEW.approval_no IS NOT NULL AND NOT EXISTS (SELECT 1 FROM approval_request a WHERE a.code = NEW.approval_no)
+BEGIN SELECT RAISE(ABORT, 'fk_hold_approval_no'); END;
+CREATE TRIGGER trg_hold_approval_fk_upd AFTER UPDATE OF approval_no ON stock_hold
+WHEN NEW.approval_no IS NOT NULL AND NOT EXISTS (SELECT 1 FROM approval_request a WHERE a.code = NEW.approval_no)
+BEGIN SELECT RAISE(ABORT, 'fk_hold_approval_no'); END;
+
+-- 授权（PG）
+-- docs/12 新表 wms_app 最小授权：不给 DELETE/TRUNCATE；离线令牌只能写吊销时间；审批只能改决策相关列
 -- -----------------------------------------------------------------------------
 -- 视图：可用量（避免每个查询手写减法，也避免算错）
 -- -----------------------------------------------------------------------------
