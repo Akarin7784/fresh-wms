@@ -2,7 +2,7 @@
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
 --   2. 14 处 DEFAULT now()、87 处 DEFAULT (now() AT TIME ZONE 'UTC') / (date_trunc('second', now() AT TIME ZONE 'UTC')) → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
---   3. 方言专属行：删除 1576 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 998 行 @sqlite-only（等价触发器）
+--   3. 方言专属行：删除 1577 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 1030 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -3289,7 +3289,7 @@ CREATE TABLE pod_op (
     http_status         INT          NOT NULL,                       -- 首次结果缓存
     biz_code            VARCHAR(16)  NOT NULL,
     response            TEXT,
-    client_created_at   TIMESTAMP,                                   -- 仅展示
+    client_occurred_at  TIMESTAMP,                                   -- 00 §6.8 第 7 条：设备原始时间（UTC 整秒），只供展示 / 排障，任何逻辑不得使用
     temperature_x10     INT,                                         -- 签收温度 0.1 ℃（POD_SIGN / POD_REJECT 必填）
     delivered_at        TIMESTAMP,                                   -- 服务端受理签收时间；失败签收为空
     correct_deadline_at TIMESTAMP,                                   -- = delivered_at + 24h（服务端写）
@@ -3315,7 +3315,8 @@ CREATE TABLE pod_op (
     CONSTRAINT ck_pod_op_cdl24 CHECK (
         (delivered_at IS NULL AND correct_deadline_at IS NULL)
      OR correct_deadline_at = datetime(delivered_at, '+24 hours')
-    )
+    ),
+    CONSTRAINT ck_pod_op_cct CHECK (client_occurred_at IS NULL OR (typeof(client_occurred_at) = 'text' AND length(client_occurred_at) = 19 AND datetime(client_occurred_at) IS client_occurred_at))
 );
 CREATE INDEX ix_pod_op_dev  ON pod_op(device_instance_id, waybill_no, stop_no, op_seq);
 CREATE INDEX ix_pod_op_stop ON pod_op(waybill_no, stop_no, created_at);
@@ -3453,6 +3454,50 @@ WHEN (NEW.driver_id IS NOT OLD.driver_id OR NEW.correction_client_id IS NOT OLD.
        OR NEW.approval_id IS NOT OLD.approval_id OR NEW.auto_tolerance IS NOT OLD.auto_tolerance
        OR NEW.corrected_pod_id IS NOT OLD.corrected_pod_id OR NEW.outbound_id IS NOT OLD.outbound_id)
 BEGIN SELECT RAISE(ABORT, 'podc_replay_immutable'); END;
+
+-- -----------------------------------------------------------------------------
+-- SQLite no-REPLACE 守卫（00 §6.10 第 3/4 条：逐唯一键，每个唯一键的每列都要在 WHEN 里）
+-- PG 侧没有 REPLACE，唯一键冲突由 ON CONFLICT / 唯一约束本身拦（应用层不用 REPLACE）。
+-- -----------------------------------------------------------------------------
+CREATE TRIGGER trg_wb_no_replace BEFORE INSERT ON waybill
+WHEN EXISTS (SELECT 1 FROM waybill w WHERE w.id = NEW.id OR w.code = NEW.code OR w.shipment_id = NEW.shipment_id)
+BEGIN SELECT RAISE(ABORT, 'waybill_duplicate'); END;
+
+CREATE TRIGGER trg_dstop_no_replace BEFORE INSERT ON delivery_stop
+WHEN EXISTS (SELECT 1 FROM delivery_stop d WHERE d.id = NEW.id OR (d.waybill_id = NEW.waybill_id AND d.stop_no = NEW.stop_no))
+BEGIN SELECT RAISE(ABORT, 'delivery_stop_duplicate'); END;
+
+CREATE TRIGGER trg_dord_no_replace BEFORE INSERT ON delivery_order
+WHEN EXISTS (SELECT 1 FROM delivery_order o WHERE o.id = NEW.id OR o.outbound_id = NEW.outbound_id)
+BEGIN SELECT RAISE(ABORT, 'delivery_order_duplicate'); END;
+
+CREATE TRIGGER trg_pod_op_no_replace BEFORE INSERT ON pod_op
+WHEN EXISTS (SELECT 1 FROM pod_op p WHERE p.id = NEW.id OR (p.waybill_no = NEW.waybill_no AND p.stop_no = NEW.stop_no AND p.device_instance_id = NEW.device_instance_id AND p.op_seq = NEW.op_seq))
+BEGIN SELECT RAISE(ABORT, 'pod_op_duplicate'); END;
+
+CREATE TRIGGER trg_podl_no_replace BEFORE INSERT ON pod_line
+WHEN EXISTS (SELECT 1 FROM pod_line l WHERE l.id = NEW.id OR (l.pod_id = NEW.pod_id AND l.outbound_line_id = NEW.outbound_line_id AND l.lot_id = NEW.lot_id))
+BEGIN SELECT RAISE(ABORT, 'pod_line_duplicate'); END;
+
+CREATE TRIGGER trg_podc_no_replace BEFORE INSERT ON pod_correction
+WHEN EXISTS (SELECT 1 FROM pod_correction c WHERE c.id = NEW.id
+  OR (c.driver_id = NEW.driver_id AND c.correction_client_id = NEW.correction_client_id)
+  OR (NEW.approval_id IS NOT NULL AND c.approval_id = NEW.approval_id)
+  OR (NEW.status = 'PENDING' AND c.status = 'PENDING' AND c.corrected_pod_id = NEW.corrected_pod_id AND c.outbound_id = NEW.outbound_id)
+  OR (NEW.status = 'APPLIED' AND c.status = 'APPLIED' AND c.outbound_id = NEW.outbound_id AND c.correct_seq = NEW.correct_seq))
+BEGIN SELECT RAISE(ABORT, 'pod_correction_duplicate'); END;
+
+CREATE TRIGGER trg_podt_no_replace BEFORE INSERT ON pod_tolerance_config
+WHEN EXISTS (SELECT 1 FROM pod_tolerance_config t WHERE t.id = NEW.id OR (t.warehouse_id = NEW.warehouse_id AND t.sku_category = NEW.sku_category))
+BEGIN SELECT RAISE(ABORT, 'pod_tolerance_config_duplicate'); END;
+
+CREATE TRIGGER trg_dret_no_replace BEFORE INSERT ON delivery_return
+WHEN EXISTS (SELECT 1 FROM delivery_return r WHERE r.id = NEW.id OR (r.waybill_id = NEW.waybill_id AND r.stop_no = NEW.stop_no AND r.handover_seq = NEW.handover_seq))
+BEGIN SELECT RAISE(ABORT, 'delivery_return_duplicate'); END;
+
+CREATE TRIGGER trg_dretl_no_replace BEFORE INSERT ON delivery_return_line
+WHEN EXISTS (SELECT 1 FROM delivery_return_line x WHERE x.id = NEW.id OR (x.delivery_return_id = NEW.delivery_return_id AND x.sku_id = NEW.sku_id AND x.lot_id = NEW.lot_id))
+BEGIN SELECT RAISE(ABORT, 'delivery_return_line_duplicate'); END;
 
 -- -----------------------------------------------------------------------------
 -- 授权（PG；pod_op 只追加，不授 UPDATE）

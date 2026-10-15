@@ -1883,7 +1883,7 @@ r = (one("SELECT client_occurred_at FROM audit_log WHERE id=9505")[0], one("SELE
 ok(f"T2 client_occurred_at 原样保留 {r}") if r == ('2000-01-01 00:00:00',) * 2 else bad(f"T2 client_occurred_at：{r}")
 expect_block_tx("T2 client_occurred_at 非标准（带 Z）", ["INSERT INTO inbound_message (id,source,biz_type,external_no,payload,payload_sha,client_occurred_at) VALUES (9506,'ERP','SALES_ORDER','SO-T9506','{}','h','2026-10-15 01:00:00Z')"], "ck_in_msg_cts")
 expect_block_tx("T2 client_occurred_at 非标准（审计，小数秒）", ["INSERT INTO audit_log (id,action,node_id,node_seq,warehouse_id,client_occurred_at) VALUES (9506,'t11.t2',7,9506,1,'2026-10-15 01:00:00.5')"], "ck_audit_cts")
-_T2Q = "SELECT count(*) FROM sqlite_master WHERE sql LIKE '%client_occurred_at%' AND NOT (type='table' AND name IN ('audit_log','inbound_message','live_inspection','live_weigh','live_death'))"
+_T2Q = "SELECT count(*) FROM sqlite_master WHERE sql LIKE '%client_occurred_at%' AND NOT (type='table' AND name IN ('audit_log','inbound_message','live_inspection','live_weigh','live_death','pod_op'))"
 r = one(_T2Q)[0]
 ok("T2 client_occurred_at 不进任何触发器（含清理守卫）、索引、视图") if r == 0 else bad(f"T2 client_occurred_at 被引用 {r} 处")
 conn.execute("SAVEPOINT t2m"); conn.execute("CREATE TRIGGER t11_bad_purge BEFORE DELETE ON audit_log WHEN OLD.client_occurred_at < datetime('now') BEGIN SELECT 1; END")
@@ -2901,6 +2901,46 @@ _li = conn.execute("SELECT id FROM live_inspection ORDER BY id DESC LIMIT 1").fe
 _copy_row("live_inspection", f"id = {_li}", id=90001, client_op_id="00000000-0000-4000-8000-000000090001")   # 无子行（不被 live_tank_hold 引用）
 conn.execute("INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type,temp_min_c10,temp_max_c10) VALUES (90001,1,'Z-RP','无库位','CHILLED','STORAGE',20,80)")   # 无子库位
 conn.commit()
+# 第 16 篇：配送与签收种子（提交；供 2z3b 逐键实打与部分唯一谓词样本）
+_HASH = "a" * 64
+for _s in [
+    "INSERT INTO shipment (id,code,warehouse_id,status) VALUES (9401,'SHP-9401',1,'CREATED')",
+    "INSERT INTO waybill (id,code,shipment_id,warehouse_id,driver_id,driver_name,work_date,status) VALUES (9401,'WB-SH01-0001-20261015-000001',9401,1,101,'司机甲','2026-10-15','CREATED')",
+    "INSERT INTO delivery_stop (id,waybill_id,stop_no,customer_id,display_status) VALUES (9401,9401,1,1,'PENDING')",
+    "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (9402,'OBT-16-9402',1,'SALE','MALL','M-16-9402','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'SHIPPED','2026-10-15')",
+    "INSERT INTO outbound_line (id,outbound_id,line_no,sku_id,order_qty_milli,picked_qty_milli,uom) VALUES (9402,9402,1,1,10000,10000,'KG')",
+    f"INSERT INTO pod_op (id,waybill_no,stop_no,device_instance_id,op_seq,op_type,req_hash,http_status,biz_code,temperature_x10,delivered_at,correct_deadline_at,client_occurred_at) VALUES (9401,'WB-SH01-0001-20261015-000001',1,'D9401',1,'POD_SIGN','{_HASH}','200','0',40,'2026-10-15 02:00:00','2026-10-16 02:00:00','2026-10-15 02:00:00')",
+    f"INSERT INTO pod_op (id,waybill_no,stop_no,device_instance_id,op_seq,op_type,req_hash,http_status,biz_code) VALUES (9402,'WB-SH01-0001-20261015-000001',0,'D9401',2,'LOAD','{_HASH}','200','0')",
+    f"INSERT INTO pod_op (id,waybill_no,stop_no,device_instance_id,op_seq,op_type,req_hash,http_status,biz_code,temperature_x10,delivered_at,correct_deadline_at) VALUES (9403,'WB-SH01-0001-20261015-000001',1,'D9402',1,'POD_SIGN','{_HASH}','200','0',35,'2026-10-15 03:00:00','2026-10-16 03:00:00')",
+    "INSERT INTO pod_line (id,pod_id,outbound_line_id,lot_id,shipped_qty_milli,rejected_qty_milli,reason_code,receive_temp_c10) VALUES (9401,9401,1,1,10000,0,NULL,40)",
+    "INSERT INTO pod_line (id,pod_id,outbound_line_id,lot_id,shipped_qty_milli,rejected_qty_milli,reason_code,receive_temp_c10) VALUES (9402,9403,9402,1,10000,2000,'QUALITY',35)",
+    "INSERT INTO delivery_order (id,outbound_id,waybill_id,stop_no,status) VALUES (9401,1,9401,1,'SHIPPED')",
+    "INSERT INTO delivery_order (id,outbound_id,waybill_id,stop_no,status,valid_pod_id,root_pod_id) VALUES (9402,9402,9401,1,'DELIVERED',9403,9403)",
+    "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (9401,'APR-WHSH01-20261015-009401','POD_CORRECT',1,'POD','9403','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','司机申请更正',101,NULL)",
+    "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,outbound_id,driver_id,correction_client_id,request_hash,status,response_http,auto_tolerance,correct_seq) VALUES (9401,9403,9401,9402,101,'00000000-0000-4000-8000-000000009401','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','PENDING',202,0,0)",
+    "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,outbound_id,driver_id,correction_client_id,request_hash,status,response_http,auto_tolerance,tolerance_version,correct_seq,decided_by,decided_at) VALUES (9402,9403,9401,9402,101,'00000000-0000-4000-8000-000000009402','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','APPLIED',200,1,1,1,102,'2026-10-15 05:00:00')",
+    "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,outbound_id,driver_id,correction_client_id,request_hash,status,approval_id,response_http,auto_tolerance,correct_seq) VALUES (9403,9403,9402,9402,102,'00000000-0000-4000-8000-000000009403','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','PENDING',9401,202,0,0)",
+    "INSERT INTO pod_tolerance_config (id,warehouse_id,sku_category,max_abs_qty_milli,max_pct_bp,version) VALUES (9401,1,'',500,100,1)",
+    "INSERT INTO pod_tolerance_config (id,warehouse_id,sku_category,max_abs_qty_milli,max_pct_bp,version) VALUES (9402,1,'VEG',200,50,1)",
+    "INSERT INTO delivery_return (id,waybill_id,stop_no,handover_seq,status) VALUES (9401,9401,1,1,'OPEN')",
+    "INSERT INTO delivery_return (id,waybill_id,stop_no,handover_seq,status,rtn_inbound_id,counted_by,counted_at) VALUES (9402,9401,1,2,'COUNTED',8001,101,'2026-10-15 04:00:00')",
+    "INSERT INTO delivery_return_line (id,delivery_return_id,sku_id,lot_id,reported_qty_milli,counted_qty_milli,exception_case_id) VALUES (9401,9402,1,1,5000,4000,100)",
+    # 2z3b 逐键实打要「无子行」样本（生成器按 rowid 倒序取）：waybill / delivery_order / pod_correction 各一条
+    "INSERT INTO shipment (id,code,warehouse_id,status) VALUES (9410,'SHP-9410',1,'CREATED')",
+    "INSERT INTO waybill (id,code,shipment_id,warehouse_id,work_date,status) VALUES (9410,'WB-SH01-0001-20261015-000010',9410,1,'2026-10-15','CREATED')",
+    "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (9410,'OBT-16-9410',1,'SALE','MALL','M-16-9410','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'SHIPPED','2026-10-15')",
+    "INSERT INTO delivery_order (id,outbound_id,waybill_id,stop_no,status) VALUES (9410,9410,9401,1,'SHIPPED')",
+    "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,outbound_id,driver_id,correction_client_id,request_hash,status,response_http,auto_tolerance,correct_seq) VALUES (9410,9402,9410,9402,103,'00000000-0000-4000-8000-000000009410','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','PENDING',202,0,0)",
+    # 生成器要能构造「只撞目标键」的冲突行：每个键至少两行可组合的样本
+    "INSERT INTO shipment (id,code,warehouse_id,status) VALUES (9411,'SHP-9411',1,'CREATED')",
+    "INSERT INTO waybill (id,code,shipment_id,warehouse_id,work_date,status) VALUES (9411,'WB-SH01-0001-20261015-000011',9411,1,'2026-10-15','CREATED')",
+    "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (9411,'OBT-16-9411',1,'SALE','MALL','M-16-9411','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'SHIPPED','2026-10-15')",
+    "INSERT INTO delivery_order (id,outbound_id,waybill_id,stop_no,status) VALUES (9411,9411,9401,1,'SHIPPED')",
+    "INSERT INTO pod_correction (id,correct_op_id,corrected_pod_id,outbound_id,driver_id,correction_client_id,request_hash,status,response_http,auto_tolerance,correct_seq) VALUES (9411,9402,9411,9402,104,'00000000-0000-4000-8000-000000009411','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','PENDING',202,0,0)",
+    f"INSERT INTO pod_op (id,waybill_no,stop_no,device_instance_id,op_seq,op_type,req_hash,http_status,biz_code) VALUES (9411,'WB-SH01-0001-20261015-000001',0,'D9411',9,'LOAD','{_HASH}','200','0')",
+]:
+    conn.execute(_s)
+conn.commit()
 # 生成器的"只撞目标键"造不出时的手写实打（不是豁免：同样两段——带守卫必须被拒且原行在，去掉全部触发器后必须通过且原行被删；任一不满足 = 红）。
 # 两条都是"同主键、其余唯一键也落在同一行"：REPLACE 只会删这一行，原值被覆盖（小玛丽 r12 gap_probe2 的打法）
 def _hand_rep(t, where, **chg):
@@ -2910,6 +2950,8 @@ def _hand_rep(t, where, **chg):
 _HAND = {
     ("live_tank_hold", ("id",)): (lambda: _hand_rep("live_tank_hold", "id = 90001", reason="CONSECUTIVE_BREACH"), "SELECT count(*) FROM live_tank_hold WHERE id = 90001 AND reason = 'SEVERE'"),
     ("process_issue", ("id",)): (lambda: _hand_rep("process_issue", "id = 1798", issue_qty_milli=conn.execute("SELECT issue_qty_milli + 1 FROM process_issue WHERE id = 1798").fetchone()[0]), "SELECT count(*) FROM process_issue WHERE id = 1798 AND issue_qty_milli = (SELECT issue_qty_milli FROM process_issue WHERE id = 1722)"),
+    # 16 的 pod_correction 有 4 个唯一键（含 3 个部分唯一）挂在同一批列上，组合枚举到 120 次仍取不到合法行（NOT NULL corrected_pod_id）→ 手写：同 id REPLACE 只把 status 改成 VOID（退出两个部分唯一谓词，不撞其它键）
+    ("pod_correction", ("id",)): (lambda: _hand_rep("pod_correction", "id = 9410", status="VOID"), "SELECT count(*) FROM pod_correction WHERE id = 9410 AND status = 'PENDING'"),
 }
 print("=== 2h-clock. 18 服务端时间（time-scan 18-1）：SQLite 只收 now ±300s ===")
 for _n in _TOL18: conn.execute(_T18[_n])
