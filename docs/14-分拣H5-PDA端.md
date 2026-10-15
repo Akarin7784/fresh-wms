@@ -5,7 +5,7 @@
 | 编号 | 14 |
 | 作者 | 界面（前端与端上） |
 | 评审 | 待定：1 名测试 + 1 名非作者开发（§12 攻击面逐条打） |
-| 基线 | `origin/main@fac0f98`（01 / 05 / 06 / 07 / 08 / 11 / 12 均已合入）；总体设计 §6.4 错误码、§6.5 幂等、§6.6.1 审批类型、§6.6.2 离线/暂停下发、§6.6.5 缺口登记、§6.8 时间、§8 前端模板、§9.1 部署形态 |
+| 基线 | `origin/main@fb7494d`（01 / 05 / 06 / 07 / 08 / 11 / 12 均已合入，含本三篇 #34）；总体设计 §6.4 错误码、§6.5 幂等、§6.6.1 审批类型、§6.6.2 离线/暂停下发、§6.6.5 缺口登记、§6.8 时间、§8 前端模板、§9.1 部署形态 |
 | 依赖 | 01 主数据（**已合 main**：条码解析 `GET /master/barcodes/{barcode}` 可用，端上不缓存条码表；主数据停用/软删一期未建）；02 库存核心（原语、系统冻结）；03 入库（收货、上架，**已合 main**）；04 出库与分配（待回库记录，**已合 main**）；05 波次与拣货（**已合 main**）；06 复核装箱发货（**已合 main**）；07 补货与移库（**已合 main**）；08 盘点（**已合 main**）；10 退货与异常（**已合 main**，退货预约收货待 #40）；11 集成（纸单补录、outbox，**已合 main**，含非计划切换 §7.3）；12 权限与审计（**已合 main**：`exp` 整秒、`/me` 六字段、`device.binding.*`）；17 加工中心（草稿）；18 活鲜暂存（**已合 main**） |
 | 技术栈 | Vue 3 + TypeScript + Vite + Vant，H5 打包；PDA 用 WebView 壳或自带浏览器，壳能力（扫码广播、蓝牙打印、电子秤）走 `bridge/` 适配层 |
 | 状态 | 新稿（界面，2026-10-15）。从 `docs/frontend-detail-design` 搬运后按当前 main 逐条重核；**对齐轮第一批（2026-10-15）**：按 00 已定口径、12 篇、01 已合 main 的现状改 §1.3 / §6 / §6.2 / §7 / §9.7 / §11（等 05/06/16/17 的第二批） |
@@ -151,28 +151,28 @@ Hash 路由（WebView 兼容）。权限点为渲染依据，实际以服务端�
 
 | 页面 | 动作 | 接口 | 幂等键 |
 |---|---|---|---|
-| 登录 | 设备登录 | *`POST /api/v1/auth/device-login`* `{login_type, username\|phone, password\|sms_code, device_instance_id, client_type}`（12 篇 §8） | — |
-| 登录 | 签发离线令牌 | *`POST /api/v1/auth/offline-token`* → `{token, exp, ttl_seconds}`；**`exp` 是 UTC 整秒 `YYYY-MM-DD HH:MM:SS`**（12 篇 Δ1；端上不得按带时区 ISO 或本地时区解析） | — |
-| 登录 | 刷新 / 登出 | *`POST /api/v1/auth/refresh`、`POST /api/v1/auth/logout`*（12 篇 §8） | — |
+| 登录 | 设备登录 | **`POST /api/v1/auth/device-login`** `{login_type, username\|phone, password\|sms_code, device_instance_id, client_type}`（12 篇 §8） | — |
+| 登录 | 签发离线令牌 | **`POST /api/v1/auth/offline-token`** → `{token, exp, ttl_seconds}`；**`exp` 是 UTC 整秒 `YYYY-MM-DD HH:MM:SS`**（12 篇 Δ1；端上不得按带时区 ISO 或本地时区解析） | — |
+| 登录 | 刷新 / 登出 | **`POST /api/v1/auth/refresh`**、**`POST /api/v1/auth/logout`**（12 篇 §8） | — |
 | 登录 | 当前用户 / 权限 / 仓 / 暂停动作 / 写节点窗口 | `GET /api/v1/me`（含 `perm_version`、`stale_policy`、`paused`、`offline_since`、`paused_actions[]`、`offline_deadline_at`、`backfill_deadline_at`，00 §6.6.2 硬契约；**12 篇 §8 已补全**） | — |
-| 等待审批 | 查审批状态 | *`GET /api/v1/approvals/{approval_id}`*（凭 `binding_id + device_instance_id`） | — |
-| 任务列表 | 我的任务 / 可领任务 | *`GET /api/v1/picking/tasks?mine=1&status=&page=`* | — |
-| 任务列表 | 领取任务 | *`POST /api/v1/picking/tasks/{id}/claim`*，body 带 `device_instance_id` | `Idempotency-Key` |
-| 任务执行 | 任务包预下载 | *`GET /api/v1/picking/tasks?mine=1&preload=1`* | — |
+| 等待审批 | 查审批状态 | **`GET /api/v1/approvals/{approval_id}`**（凭 `binding_id + device_instance_id`） | — |
+| 任务列表 | 我的任务 / 可领任务 | **`GET /api/v1/picking/tasks?mine=1&status=…`**（05 §7.1，已合 main） | — |
+| 任务列表 | 领取任务 | **`POST /api/v1/picking/tasks/{id}/claim`**，body 带 `device_instance_id` | `Idempotency-Key` |
+| 任务执行 | 任务包预下载 | **`GET /api/v1/picking/tasks?mine=1&preload=1`** | — |
 | 任务执行 | 扫商品码解析（在线） | **`GET /api/v1/master/barcodes/{barcode}`**（01 §7 已合 main；权限 `master.sku.view`；边缘节点本地可用；**端上不缓存条码表**） | — |
-| 任务执行 | 拣货行确认 | *`POST /api/v1/picking/tasks/{id}/lines/{seq}/confirm`* `{device_instance_id, op_seq, scanned_location_code, scanned_barcode, lot_code, confirmed_qty, uom, scan_event_id, client_time}` | `Idempotency-Key` + 四元组 |
-| 任务执行 | 缺货上报 | *`POST /api/v1/picking/tasks/{id}/lines/{seq}/short`* `{reason_code, …}` | 同上 |
-| 任务执行 | 撤销上一次确认 | *`POST /api/v1/picking/tasks/{id}/lines/{seq}/undo`* | 同上 |
-| 任务汇总 | 提交任务完成 | *`POST /api/v1/picking/tasks/{id}/complete`* | `Idempotency-Key` |
+| 任务执行 | 拣货行确认 | **`POST /api/v1/picking/tasks/{id}/lines/{seq}/confirm`** `{device_instance_id, op_seq, scanned_location_code, scanned_barcode, lot_code, confirmed_qty, uom, scan_event_id}`（05 §6.2 无客户端时间字段，时间由服务端写） | `Idempotency-Key` + 四元组 |
+| 任务执行 | 缺货上报 | **`POST /api/v1/picking/tasks/{id}/lines/{seq}/short`** `{short_reason_code, …}` | 同上 |
+| 任务执行 | 撤销上一次确认 | **`POST /api/v1/picking/tasks/{id}/lines/{seq}/undo`** | 同上 |
+| 任务汇总 | 提交任务完成 | **`POST /api/v1/picking/tasks/{id}/complete`** | `Idempotency-Key` |
 | 补交队列 | 批量/逐条补交、查任务状态 | 同上的各写接口（按 `local_seq` 顺序重发） | 原 Key + 原 `op_seq` |
 | 补交队列 / 红条 | 查待回库记录状态 | `GET /api/v1/return-records/{returnRecordId}`（04 §7.3，已合 main） | — |
 | 回库 | 扫原库位确认 | `POST /api/v1/return-records/{returnRecordId}/confirm` `{locationCode}` | `Idempotency-Key` |
 | 回库 | 就近放回到位确认 | `POST /api/v1/return-records/{returnRecordId}/putback-ack` `{locationCode}` | `Idempotency-Key` |
-| 复核 | 开复核单 | *`POST /api/v1/outbound-orders/{code}/checks`* | `Idempotency-Key` |
-| 复核 | 复核扫码 / 撤销一扫 | *`POST /api/v1/checks/{code}/scans`*（`line_no`、`device_instance_id`、`op_seq`、`barcode`、`qty`） | 四元键 |
-| 复核 | 提交（带 `version`） | *`POST /api/v1/checks/{code}/submit`* | `Idempotency-Key` + version |
-| 装箱 | 开箱 / 整体替换箱明细 / 封箱 | *`POST /api/v1/outbound-orders/{code}/boxes`*、*`PUT /api/v1/boxes/{code}/lines`*、*`POST /api/v1/boxes/{code}/seal`* | `Idempotency-Key`（+version） |
-| 集货 | 扫箱码 + 集货位 | *`POST /api/v1/boxes/{code}/stage`* | 四元键 |
+| 复核 | 开复核单 | **`POST /api/v1/outbound-orders/{outbound_id}/checks`**（06 §7.1，已合 main） | `Idempotency-Key` |
+| 复核 | 复核扫码 / 撤销一扫 | **`POST /api/v1/checks/{code}/scans`**（`line_no`、`device_instance_id`、`op_seq`、`barcode`、`qty`） | 四元键 |
+| 复核 | 提交（带 `version`） | **`POST /api/v1/checks/{code}/submit`** | `Idempotency-Key` + version |
+| 装箱 | 开箱 / 整体替换箱明细 / 封箱 | **`POST /api/v1/outbound-orders/{outbound_id}/boxes`**（06 §7.2，已合 main）、**`PUT /api/v1/pack/boxes/{box_id}/lines`**、**`POST /api/v1/pack/boxes/{box_id}/seal`** | `Idempotency-Key`（+version） |
+| 集货 | 扫箱码 + 集货位 | **`POST /api/v1/pack/boxes/{box_id}/stage`** | 四元键 |
 | 箱作废 | 申请作废 / 查箱详情 | `POST /api/v1/pack/boxes/{box_id}/void-request`、`GET /api/v1/pack/boxes/{box_id}`（00 §6.6.1 / 06 §7.3） | `Idempotency-Key` |
 | 收货 | 收货登记 | `POST /api/v1/inbound/lines/{id}/receipts`（03 §7，已合 main） | `op_key` / 四元组 |
 | 收货 | 盲收登记 | `POST /api/v1/inbound/returns/blind`（契约见 §6.2；**权限点 `inbound.return.blind` 已由 00 §6.6 第 3 篇清单第 10 个登记**，12 §4.2 收录；**03 §7 已合 main：`03:260`**） | `Idempotency-Key` + 四元组 |
