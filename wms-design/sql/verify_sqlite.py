@@ -3898,6 +3898,49 @@ _p25n = conn.execute("UPDATE pick_task SET status='DONE' WHERE id=9301 AND statu
 (ok if _p25n == 0 else bad)("05 P25-2：任务里有 SKIP 行（confirmed < planned）时 T-done 守卫命中 0 行（不得进 DONE）")
 _p25m = conn.execute("UPDATE pick_task SET status='DONE' WHERE id=9301 AND status='EXECUTING'").rowcount
 (ok if _p25m == 1 else bad)("05 P25-2 变异：去掉 NOT EXISTS 守卫后同一 UPDATE 命中 1 行（守卫是拦它的那条）")
+print("=== 2u. docs/06 复核装箱发货：本轮新增 4 个 CHECK / 9 个外键的三件套（正向 / 按名拒绝 / 变异）===")
+# 变异 = 模拟"去掉该约束"后再执行原被拒语句，必须变成通过，然后回滚（证明拒绝确实来自该约束）。
+def _m06_ck(name, stmts):
+    conn.execute("PRAGMA ignore_check_constraints = ON")
+    try:
+        expect_allow_tx(f"06 变异：去掉 {name} 后，原被拒语句通过（随后回滚）", stmts)
+    finally:
+        conn.execute("PRAGMA ignore_check_constraints = OFF")
+def _m06_fk(name, stmts):
+    global _fk_off_allowed
+    _fk_off_allowed = True; conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        expect_allow_tx(f"06 变异：去掉 {name} 后，原被拒语句通过（随后回滚）", stmts)
+    finally:
+        _fk_off_allowed = False; conn.execute("PRAGMA foreign_keys = ON")
+expect_allow_tx("06 正向：交接车次 HANDED_OVER + 箱 SEALED + 箱明细（4 个 CHECK / 9 个外键全满足）", ["INSERT INTO shipment (id,code,warehouse_id,status) VALUES (9201,'SHP-9201',1,'HANDED_OVER')", "INSERT INTO shipment_order (shipment_id,outbound_id) VALUES (9201,1)", "INSERT INTO pack_box (id,code,warehouse_id,outbound_id,shipment_id,stage_location_id,box_type,weight_g,sealed,checker_id,packed_at) VALUES (9201,'BOX-9201',1,1,9201,1,'CARTON',1500.00,1,41,'2026-10-15 09:00:00')", "INSERT INTO pack_box_line (id,box_id,sku_id,lot_id,qty_milli,uom) VALUES (9201,9201,1,0,1000,'KG')"])
+expect_allow_tx("06 正向：车次 CANCELLED", ["INSERT INTO shipment (id,code,warehouse_id,status) VALUES (9202,'SHP-9202',1,'CANCELLED')"])
+expect_block_tx("06 拒绝：ck_box_type 非法箱型", ["INSERT INTO pack_box (id,code,warehouse_id,outbound_id,box_type) VALUES (9203,'BOX-9203',1,1,'BOGUS')"], "ck_box_type")
+_m06_ck("ck_box_type", ["INSERT INTO pack_box (id,code,warehouse_id,outbound_id,box_type) VALUES (9203,'BOX-9203',1,1,'BOGUS')"])
+expect_block_tx("06 拒绝：ck_box_weight 重量为负", ["INSERT INTO pack_box (id,code,warehouse_id,outbound_id,weight_g) VALUES (9204,'BOX-9204',1,1,-1)"], "ck_box_weight")
+_m06_ck("ck_box_weight", ["INSERT INTO pack_box (id,code,warehouse_id,outbound_id,weight_g) VALUES (9204,'BOX-9204',1,1,-1)"])
+expect_block_tx("06 拒绝：ck_box_sealed 未封箱却标封箱", ["INSERT INTO pack_box (id,code,warehouse_id,outbound_id,sealed) VALUES (9205,'BOX-9205',1,1,1)"], "ck_box_sealed")
+_m06_ck("ck_box_sealed", ["INSERT INTO pack_box (id,code,warehouse_id,outbound_id,sealed) VALUES (9205,'BOX-9205',1,1,1)"])
+expect_block_tx("06 拒绝：ck_shp_status 非法车次状态", ["INSERT INTO shipment (id,code,warehouse_id,status) VALUES (9203,'SHP-9203',1,'BOGUS')"], "ck_shp_status")
+_m06_ck("ck_shp_status", ["INSERT INTO shipment (id,code,warehouse_id,status) VALUES (9203,'SHP-9203',1,'BOGUS')"])
+expect_block_tx("06 拒绝：fk_shp_wh 车次挂不存在的仓", ["INSERT INTO shipment (id,code,warehouse_id) VALUES (9204,'SHP-9204',999999)"], "FOREIGN KEY constraint failed")
+_m06_fk("fk_shp_wh", ["INSERT INTO shipment (id,code,warehouse_id) VALUES (9204,'SHP-9204',999999)"])
+expect_block_tx("06 拒绝：fk_sho_shipment 挂单指向不存在的车次", ["INSERT INTO shipment_order (shipment_id,outbound_id) VALUES (999999,1)"], "FOREIGN KEY constraint failed")
+_m06_fk("fk_sho_shipment", ["INSERT INTO shipment_order (shipment_id,outbound_id) VALUES (999999,1)"])
+expect_block_tx("06 拒绝：fk_sho_outbound 挂单指向不存在的出库单", ["INSERT INTO shipment_order (shipment_id,outbound_id) VALUES (9201,999999)"], "FOREIGN KEY constraint failed")
+_m06_fk("fk_sho_outbound", ["INSERT INTO shipment_order (shipment_id,outbound_id) VALUES (9201,999999)"])
+expect_block_tx("06 拒绝：fk_box_wh 箱挂不存在的仓", ["INSERT INTO pack_box (id,code,warehouse_id,outbound_id) VALUES (9206,'BOX-9206',999999,1)"], "FOREIGN KEY constraint failed")
+_m06_fk("fk_box_wh", ["INSERT INTO pack_box (id,code,warehouse_id,outbound_id) VALUES (9206,'BOX-9206',999999,1)"])
+expect_block_tx("06 拒绝：fk_box_outbound 箱挂不存在的出库单", ["INSERT INTO pack_box (id,code,warehouse_id,outbound_id) VALUES (9207,'BOX-9207',1,999999)"], "FOREIGN KEY constraint failed")
+_m06_fk("fk_box_outbound", ["INSERT INTO pack_box (id,code,warehouse_id,outbound_id) VALUES (9207,'BOX-9207',1,999999)"])
+expect_block_tx("06 拒绝：fk_box_shipment 箱挂不存在的车次", ["INSERT INTO pack_box (id,code,warehouse_id,outbound_id,shipment_id) VALUES (9208,'BOX-9208',1,1,999999)"], "FOREIGN KEY constraint failed")
+_m06_fk("fk_box_shipment", ["INSERT INTO pack_box (id,code,warehouse_id,outbound_id,shipment_id) VALUES (9208,'BOX-9208',1,1,999999)"])
+expect_block_tx("06 拒绝：fk_box_stage 箱挂不存在的集货位", ["INSERT INTO pack_box (id,code,warehouse_id,outbound_id,stage_location_id) VALUES (9209,'BOX-9209',1,1,999999)"], "FOREIGN KEY constraint failed")
+_m06_fk("fk_box_stage", ["INSERT INTO pack_box (id,code,warehouse_id,outbound_id,stage_location_id) VALUES (9209,'BOX-9209',1,1,999999)"])
+expect_block_tx("06 拒绝：fk_bxl_box 箱明细挂不存在的箱", ["INSERT INTO pack_box_line (id,box_id,sku_id,lot_id,qty_milli,uom) VALUES (9202,999999,1,0,1000,'KG')"], "FOREIGN KEY constraint failed")
+_m06_fk("fk_bxl_box", ["INSERT INTO pack_box_line (id,box_id,sku_id,lot_id,qty_milli,uom) VALUES (9202,999999,1,0,1000,'KG')"])
+expect_block_tx("06 拒绝：fk_bxl_sku 箱明细挂不存在的 SKU", ["INSERT INTO pack_box_line (id,box_id,sku_id,lot_id,qty_milli,uom) VALUES (9203,9201,999999,0,1000,'KG')"], "FOREIGN KEY constraint failed")
+_m06_fk("fk_bxl_sku", ["INSERT INTO pack_box_line (id,box_id,sku_id,lot_id,qty_milli,uom) VALUES (9203,9201,999999,0,1000,'KG')"])
 print("=== 汇总 ===")
 print(f"  通过 {passed} 项 / 失败 {failed} 项")
 conn.close()
