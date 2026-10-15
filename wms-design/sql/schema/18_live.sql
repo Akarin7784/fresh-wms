@@ -14,7 +14,7 @@ CREATE TABLE sku_live_param (
     shrink_tolerance_bp     INT      NOT NULL DEFAULT 100,   -- PM 7：每日失重容差；默认值待定（§13 Q3）
     version                 INT      NOT NULL DEFAULT 0,
     updated_by              BIGINT,
-    updated_at              TIMESTAMP NOT NULL DEFAULT now(),
+    updated_at              TIMESTAMP NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
     CONSTRAINT ck_slp_bp CHECK (weigh_tolerance_bp BETWEEN 0 AND 10000 AND death_rate_threshold_bp BETWEEN 0 AND 10000 AND shrink_tolerance_bp BETWEEN 0 AND 10000)
 -- @sqlite-only     , CONSTRAINT ck_slp_ts CHECK ((typeof(updated_at) = 'text' AND length(updated_at) = 19 AND updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(updated_at) = substr(updated_at, 1, 10) AND time(updated_at) = substr(updated_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
 );
@@ -49,7 +49,7 @@ CREATE TABLE live_tank (
     inspect_interval_min    INT      NOT NULL DEFAULT 120,  -- 巡检频率（分钟）
     status                  VARCHAR(16) NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE/DISABLED（锁池走 live_tank_hold，不在这里）
     version                 INT      NOT NULL DEFAULT 0,
-    updated_at              TIMESTAMP NOT NULL DEFAULT now(),
+    updated_at              TIMESTAMP NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
     CONSTRAINT ck_lt_status CHECK (status IN ('ACTIVE','DISABLED')),
     CONSTRAINT ck_lt_volume CHECK (water_volume_l > 0),
     CONSTRAINT ck_lt_temp CHECK (temp_severe_min_c10 <= temp_min_c10 AND temp_min_c10 < temp_max_c10 AND temp_max_c10 <= temp_severe_max_c10),
@@ -90,7 +90,7 @@ CREATE TABLE live_stock_count (
     lot_id          BIGINT   NOT NULL,
     on_hand_count   BIGINT   NOT NULL DEFAULT 0,
     version         INT      NOT NULL DEFAULT 0,
-    updated_at      TIMESTAMP NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMP NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
     CONSTRAINT ck_lsc_count CHECK (on_hand_count >= 0),
     CONSTRAINT fk_lsc_stock FOREIGN KEY (stock_id) REFERENCES stock(id),
     CONSTRAINT fk_lsc_tank FOREIGN KEY (location_id) REFERENCES live_tank(location_id),
@@ -125,7 +125,7 @@ CREATE TABLE live_count_ledger (
     count_before    BIGINT       NOT NULL,
     count_after     BIGINT       NOT NULL,
     movement_id     BIGINT,                  -- 对应重量流水（第 2 篇 stock_movement_key.movement_id）；纯只数盘点调整可空
-    created_at      TIMESTAMP    NOT NULL DEFAULT now(),
+    created_at      TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
     CONSTRAINT uq_lcl_biz UNIQUE (biz_type, biz_no, line_no, stock_id),
     CONSTRAINT ck_lcl_type CHECK (biz_type IN ('RECEIVE','WEIGH_OUT','DEATH','COUNT_ADJ','MOVE_IN','MOVE_OUT','PROCESS_OUT')),
     CONSTRAINT ck_lcl_math CHECK (delta_count <> 0 AND count_before >= 0 AND count_after >= 0 AND count_after = count_before + delta_count),
@@ -150,13 +150,14 @@ CREATE TABLE live_inspection (
     client_op_id        VARCHAR(64)  NOT NULL,
     inspector_id        BIGINT       NOT NULL,
     inspected_at        TIMESTAMP    NOT NULL,    -- 现场时间（UTC）
+    client_occurred_at  TIMESTAMP,   -- 00 §6.8 第 7 条：设备上报的原始时间（UTC），只用于展示，任何逻辑不得使用；inspected_at 由库写
     temp_c10            INT          NOT NULL,
     do_x100             INT          NOT NULL,
     ph_x100             INT          NOT NULL,
     result              VARCHAR(8)   NOT NULL,    -- NORMAL/ALARM/SEVERE（服务端按 live_tank 阈值判定，不信客户端）
     consecutive_breach  INT          NOT NULL DEFAULT 0,  -- 含本次的连续超标次数（NORMAL 为 0）
     is_recheck          BOOLEAN      NOT NULL DEFAULT false,  -- 锁池后的复检
-    created_at          TIMESTAMP    NOT NULL DEFAULT now(),
+    created_at          TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
     CONSTRAINT uq_li_op UNIQUE (device_instance_id, client_op_id),
     CONSTRAINT ck_li_result CHECK (result IN ('NORMAL','ALARM','SEVERE')),
     CONSTRAINT ck_li_breach CHECK ((result = 'NORMAL' AND consecutive_breach = 0) OR (result <> 'NORMAL' AND consecutive_breach >= 1)),
@@ -164,6 +165,7 @@ CREATE TABLE live_inspection (
     CONSTRAINT fk_li_tank FOREIGN KEY (location_id) REFERENCES live_tank(location_id),
     CONSTRAINT fk_li_warehouse FOREIGN KEY (warehouse_id) REFERENCES warehouse(id)
 -- @sqlite-only     , CONSTRAINT ck_li_ts CHECK ((typeof(inspected_at) = 'text' AND length(inspected_at) = 19 AND inspected_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(inspected_at) = substr(inspected_at, 1, 10) AND time(inspected_at) = substr(inspected_at, 12, 8)) AND (typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
+-- @sqlite-only     , CONSTRAINT ck_li_cts CHECK (client_occurred_at IS NULL OR (typeof(client_occurred_at) = 'text' AND length(client_occurred_at) = 19 AND datetime(client_occurred_at) IS client_occurred_at))
 );
 CREATE INDEX ix_li_tank ON live_inspection(location_id, inspected_at);
 CREATE TRIGGER trg_li_append_only BEFORE UPDATE OR DELETE ON live_inspection FOR EACH ROW EXECUTE FUNCTION trg_append_only();  -- @pg-only
@@ -186,13 +188,14 @@ CREATE TABLE live_tank_hold (
     status                  VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE/RELEASED
     release_inspection_id   BIGINT,
     released_at             TIMESTAMP,
-    created_at              TIMESTAMP    NOT NULL DEFAULT now(),
+    created_at              TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
     CONSTRAINT ck_lth_reason CHECK (reason IN ('CONSECUTIVE_BREACH','SEVERE')),
     CONSTRAINT ck_lth_status CHECK (status IN ('ACTIVE','RELEASED')),
     CONSTRAINT ck_lth_release CHECK ((status = 'ACTIVE' AND release_inspection_id IS NULL AND released_at IS NULL)
                                   OR (status = 'RELEASED' AND release_inspection_id IS NOT NULL AND released_at IS NOT NULL)),
     CONSTRAINT fk_lth_tank FOREIGN KEY (location_id) REFERENCES live_tank(location_id),
     CONSTRAINT fk_lth_trigger FOREIGN KEY (trigger_inspection_id) REFERENCES live_inspection(id),
+    CONSTRAINT fk_lth_wh FOREIGN KEY (warehouse_id) REFERENCES warehouse(id),   -- 03 R3：补外键（小玛丽 r12）
     CONSTRAINT fk_lth_release FOREIGN KEY (release_inspection_id) REFERENCES live_inspection(id)
 -- @sqlite-only     , CONSTRAINT ck_lth_ts CHECK ((released_at IS NULL OR (typeof(released_at) = 'text' AND length(released_at) = 19 AND released_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(released_at) = substr(released_at, 1, 10) AND time(released_at) = substr(released_at, 12, 8))) AND (typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
 );
@@ -248,7 +251,8 @@ CREATE TABLE live_weigh (
     movement_id         BIGINT,                      -- ACCEPTED 的重量流水
     weighed_by          BIGINT       NOT NULL,
     weighed_at          TIMESTAMP    NOT NULL,       -- UTC
-    created_at          TIMESTAMP    NOT NULL DEFAULT now(),
+    client_occurred_at  TIMESTAMP,   -- 00 §6.8 第 7 条：设备上报的原始时间（UTC），只用于展示，任何逻辑不得使用；weighed_at 由库写
+    created_at          TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
     CONSTRAINT ck_lw_kind CHECK (task_kind IN ('PICK','PROCESS_ISSUE')),
     CONSTRAINT ck_lw_src CHECK (reading_source IN ('SCALE','MANUAL') AND (reading_source = 'MANUAL' OR scale_id IS NOT NULL)),
     CONSTRAINT ck_lw_qty CHECK (gross_qty_milli >= 0 AND tare_qty_milli >= 0 AND net_qty_milli >= 0 AND qty_count >= 0
@@ -260,8 +264,10 @@ CREATE TABLE live_weigh (
     CONSTRAINT fk_lw_stock FOREIGN KEY (stock_id) REFERENCES stock(id),
     CONSTRAINT fk_lw_sku FOREIGN KEY (sku_id) REFERENCES sku(id),
     CONSTRAINT fk_lw_lot FOREIGN KEY (lot_id) REFERENCES lot(id),
+    CONSTRAINT fk_lw_wh FOREIGN KEY (warehouse_id) REFERENCES warehouse(id),   -- 03 R3：补外键（小玛丽 r12）
     CONSTRAINT fk_lw_mv FOREIGN KEY (movement_id) REFERENCES stock_movement_key(movement_id)
 -- @sqlite-only     , CONSTRAINT ck_lw_ts CHECK ((typeof(weighed_at) = 'text' AND length(weighed_at) = 19 AND weighed_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(weighed_at) = substr(weighed_at, 1, 10) AND time(weighed_at) = substr(weighed_at, 12, 8)) AND (typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
+-- @sqlite-only     , CONSTRAINT ck_lw_cts CHECK (client_occurred_at IS NULL OR (typeof(client_occurred_at) = 'text' AND length(client_occurred_at) = 19 AND datetime(client_occurred_at) IS client_occurred_at))
 );
 CREATE UNIQUE INDEX uq_lw_key ON live_weigh(task_kind, task_id, weigh_client_id) WHERE result = 'ACCEPTED';
 CREATE TRIGGER trg_lw_append_only BEFORE UPDATE OR DELETE ON live_weigh FOR EACH ROW EXECUTE FUNCTION trg_append_only();  -- @pg-only
@@ -296,8 +302,10 @@ CREATE TABLE live_death (
     scrap_order_id      BIGINT,                      -- 09 报损单（只记账）；FK 等 #4 合并
     reported_by         BIGINT       NOT NULL,
     reported_at         TIMESTAMP    NOT NULL,
-    created_at          TIMESTAMP    NOT NULL DEFAULT now(),
+    client_occurred_at  TIMESTAMP,   -- 00 §6.8 第 7 条：设备上报的原始时间（UTC），只用于展示，任何逻辑不得使用；reported_at 由库写
+    created_at          TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
     CONSTRAINT uq_ld_op UNIQUE (device_instance_id, client_op_id),
+-- @sqlite-only     CONSTRAINT ck_ld_date CHECK (typeof(work_date) = 'text' AND length(work_date) = 10 AND date(work_date) IS work_date),
     CONSTRAINT uq_ld_mv UNIQUE (movement_id),
     CONSTRAINT ck_ld_deduct CHECK (deducted_qty_milli >= 0 AND deducted_qty_milli <= death_qty_milli AND (
            (deduct_status = 'PENDING'   AND deducted_qty_milli = 0 AND movement_id IS NULL AND exception_key IS NULL)
@@ -310,8 +318,10 @@ CREATE TABLE live_death (
     CONSTRAINT fk_ld_tank FOREIGN KEY (location_id) REFERENCES live_tank(location_id),
     CONSTRAINT fk_ld_stock FOREIGN KEY (stock_id) REFERENCES live_stock_count(stock_id),
     CONSTRAINT fk_ld_lot FOREIGN KEY (lot_id) REFERENCES lot(id),
+    CONSTRAINT fk_ld_wh FOREIGN KEY (warehouse_id) REFERENCES warehouse(id),   -- 03 R3：补外键（小玛丽 r12）
     CONSTRAINT fk_ld_mv FOREIGN KEY (movement_id) REFERENCES stock_movement_key(movement_id)
 -- @sqlite-only     , CONSTRAINT ck_ld_ts CHECK ((typeof(reported_at) = 'text' AND length(reported_at) = 19 AND reported_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(reported_at) = substr(reported_at, 1, 10) AND time(reported_at) = substr(reported_at, 12, 8)) AND (typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
+-- @sqlite-only     , CONSTRAINT ck_ld_cts CHECK (client_occurred_at IS NULL OR (typeof(client_occurred_at) = 'text' AND length(client_occurred_at) = 19 AND datetime(client_occurred_at) IS client_occurred_at))
 );
 CREATE INDEX ix_ld_tank_day ON live_death(location_id, work_date);   -- 日死亡率
 CREATE INDEX ix_ld_pending ON live_death(deduct_status) WHERE deduct_status <> 'DEDUCTED';   -- 补扣作业 / 在途对账
@@ -352,7 +362,7 @@ CREATE TABLE live_shrink_settlement (
     movement_id         BIGINT,                      -- LOSS：本篇写的 SCRAP −1 流水
     scrap_order_id      BIGINT,                      -- 09（只记账），FK 等 #4
     count_order_id      BIGINT,                      -- 08，FK 等 08 新稿
-    created_at          TIMESTAMP    NOT NULL DEFAULT now(),
+    created_at          TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
     CONSTRAINT uq_lss_day UNIQUE (location_id, lot_id, work_date),
     CONSTRAINT uq_lss_mv UNIQUE (movement_id),
     CONSTRAINT ck_lss_qty CHECK (book_qty_milli >= 0 AND measured_qty_milli >= 0 AND shrink_qty_milli = book_qty_milli - measured_qty_milli AND shrink_bp >= 0 AND tolerance_bp BETWEEN 0 AND 10000),
@@ -362,6 +372,7 @@ CREATE TABLE live_shrink_settlement (
     CONSTRAINT fk_lss_tank FOREIGN KEY (location_id) REFERENCES live_tank(location_id),
     CONSTRAINT fk_lss_stock FOREIGN KEY (stock_id) REFERENCES stock(id),
     CONSTRAINT fk_lss_lot FOREIGN KEY (lot_id) REFERENCES lot(id),
+    CONSTRAINT fk_lss_wh FOREIGN KEY (warehouse_id) REFERENCES warehouse(id),   -- 03 R3：补外键（小玛丽 r12）
     CONSTRAINT fk_lss_mv FOREIGN KEY (movement_id) REFERENCES stock_movement_key(movement_id)
 -- @sqlite-only     , CONSTRAINT ck_lss_ts CHECK ((typeof(created_at) = 'text' AND length(created_at) = 19 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND date(created_at) = substr(created_at, 1, 10) AND time(created_at) = substr(created_at, 12, 8)))   -- 时间列格式（小赵 S1 口径）
 );
@@ -373,6 +384,34 @@ CREATE TRIGGER trg_lss_no_truncate BEFORE TRUNCATE ON live_shrink_settlement FOR
 -- @sqlite-only WHEN EXISTS (SELECT 1 FROM live_shrink_settlement x WHERE x.id = NEW.id OR (x.location_id = NEW.location_id AND x.lot_id = NEW.lot_id AND x.work_date = NEW.work_date) OR x.movement_id = NEW.movement_id)
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'lss_duplicate'); END;
 
+-- 时间约定（00 §6.8，小玛丽 time-scan 18-1）：巡检 / 称重 / 死亡上报 / 释放时间是服务端时间。PG 非属主写入一律改成库时钟 UTC 整秒（属主豁免：种子 / 迁移）；
+-- SQLite 不能改 NEW，只收 now ±300s（strftime 为 NULL 也算 live_clock_skew）。触发器名带 z：排在本篇业务守卫之后
+CREATE FUNCTION trg_live_zclock() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
+DECLARE t timestamp := date_trunc('second', now() AT TIME ZONE 'UTC');  -- @pg-only
+BEGIN  -- @pg-only
+    IF TG_OP = 'INSERT' AND TG_TABLE_NAME = 'live_inspection' THEN IF NEW.inspected_at IS NULL THEN RAISE EXCEPTION 'live_clock_skew: 40003 CLIENT_TIME_INVALID explicit NULL' USING ERRCODE = '23514'; END IF;  -- 显式 NULL 拒绝，不传列走 DEFAULT  -- @pg-only
+    ELSIF TG_OP = 'INSERT' AND TG_TABLE_NAME = 'live_weigh' THEN IF NEW.weighed_at IS NULL THEN RAISE EXCEPTION 'live_clock_skew: 40003 CLIENT_TIME_INVALID explicit NULL' USING ERRCODE = '23514'; END IF;  -- @pg-only
+    ELSIF TG_OP = 'INSERT' AND TG_TABLE_NAME = 'live_death' THEN IF NEW.reported_at IS NULL THEN RAISE EXCEPTION 'live_clock_skew: 40003 CLIENT_TIME_INVALID explicit NULL' USING ERRCODE = '23514'; END IF;  -- @pg-only
+    END IF;  -- @pg-only
+    IF current_user IS NOT DISTINCT FROM (SELECT r.rolname FROM pg_catalog.pg_roles r JOIN pg_catalog.pg_class c ON c.relowner = r.oid WHERE c.oid = TG_RELID) THEN  -- @pg-only
+        RETURN NEW;  -- @pg-only
+    END IF;  -- @pg-only
+    IF TG_TABLE_NAME = 'live_inspection' THEN NEW.inspected_at := t;  -- @pg-only
+    ELSIF TG_TABLE_NAME = 'live_weigh' THEN NEW.weighed_at := t;  -- @pg-only
+    ELSIF TG_TABLE_NAME = 'live_death' THEN NEW.reported_at := t;  -- @pg-only
+    ELSIF TG_TABLE_NAME = 'live_tank_hold' AND NEW.released_at IS NOT NULL AND (TG_OP = 'INSERT' OR OLD.released_at IS NULL) THEN NEW.released_at := t;  -- @pg-only
+    END IF;  -- @pg-only
+    RETURN NEW;  -- @pg-only
+END $$;  -- @pg-only
+CREATE TRIGGER trg_li_zclock BEFORE INSERT ON live_inspection FOR EACH ROW EXECUTE FUNCTION trg_live_zclock();  -- @pg-only
+CREATE TRIGGER trg_lw_zclock BEFORE INSERT ON live_weigh FOR EACH ROW EXECUTE FUNCTION trg_live_zclock();  -- @pg-only
+CREATE TRIGGER trg_ld_zclock BEFORE INSERT ON live_death FOR EACH ROW EXECUTE FUNCTION trg_live_zclock();  -- @pg-only
+CREATE TRIGGER trg_lth_zclock BEFORE INSERT OR UPDATE ON live_tank_hold FOR EACH ROW EXECUTE FUNCTION trg_live_zclock();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_li_zclock BEFORE INSERT ON live_inspection WHEN (strftime('%s', NEW.inspected_at) IS NULL OR substr(NEW.inspected_at, 12, 2) > '23' OR abs(CAST(strftime('%s', NEW.inspected_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300) BEGIN SELECT RAISE(ABORT, 'live_clock_skew: 40003 CLIENT_TIME_INVALID inspected_at'); END;
+-- @sqlite-only CREATE TRIGGER trg_lw_zclock BEFORE INSERT ON live_weigh WHEN (strftime('%s', NEW.weighed_at) IS NULL OR substr(NEW.weighed_at, 12, 2) > '23' OR abs(CAST(strftime('%s', NEW.weighed_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300) BEGIN SELECT RAISE(ABORT, 'live_clock_skew: 40003 CLIENT_TIME_INVALID weighed_at'); END;
+-- @sqlite-only CREATE TRIGGER trg_ld_zclock BEFORE INSERT ON live_death WHEN (strftime('%s', NEW.reported_at) IS NULL OR substr(NEW.reported_at, 12, 2) > '23' OR abs(CAST(strftime('%s', NEW.reported_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300) BEGIN SELECT RAISE(ABORT, 'live_clock_skew: 40003 CLIENT_TIME_INVALID reported_at'); END;
+-- @sqlite-only CREATE TRIGGER trg_lth_zclock BEFORE UPDATE ON live_tank_hold WHEN NEW.released_at IS NOT NULL AND OLD.released_at IS NULL AND (strftime('%s', NEW.released_at) IS NULL OR substr(NEW.released_at, 12, 2) > '23' OR abs(CAST(strftime('%s', NEW.released_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300) BEGIN SELECT RAISE(ABORT, 'live_clock_skew: 40003 CLIENT_TIME_INVALID released_at'); END;
+-- @sqlite-only CREATE TRIGGER trg_lth_zclock_ins BEFORE INSERT ON live_tank_hold WHEN NEW.released_at IS NOT NULL AND (strftime('%s', NEW.released_at) IS NULL OR substr(NEW.released_at, 12, 2) > '23' OR abs(CAST(strftime('%s', NEW.released_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300) BEGIN SELECT RAISE(ABORT, 'live_clock_skew: 40003 CLIENT_TIME_INVALID released_at'); END;
 GRANT SELECT, INSERT, UPDATE ON sku_live_param, live_tank, live_stock_count TO wms_app;             -- @pg-only
 GRANT SELECT, INSERT ON live_count_ledger, live_inspection, live_weigh, live_death, live_shrink_settlement TO wms_app;  -- 只追加 -- @pg-only
 GRANT UPDATE (deduct_status, movement_id, deducted_qty_milli, exception_key) ON live_death TO wms_app;   -- 只用于补扣，触发器再限转移 -- @pg-only
@@ -445,5 +484,20 @@ BEGIN  -- @pg-only
     RETURN 'WON:' || v_q || ':' || (v_death - v_q) || ':' || v_sku;  -- @pg-only
 END $$;  -- @pg-only
 
+-- X1/X2：no-replace 触发器（WHEN 覆盖本表全部 PK / UNIQUE，部分索引带谓词；由 genreplace 生成）
 
-
+-- 去重键不可改、计数器只增（由 genlock 生成；PG 触发器名 trg_0keylock_* 让它按字母序最先执行）
+CREATE TRIGGER trg_0keylock_sku_live_param BEFORE UPDATE ON sku_live_param FOR EACH ROW EXECUTE FUNCTION trg_keylock('sku_id', '', 'version');  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_sku_live_param_keylock BEFORE UPDATE ON sku_live_param WHEN NEW.sku_id IS NOT OLD.sku_id BEGIN SELECT RAISE(ABORT, 'sku_live_param_key_immutable: 40930 reason=DEDUPE_KEY_IMMUTABLE'); END;
+-- @sqlite-only CREATE TRIGGER trg_sku_live_param_monotonic BEFORE UPDATE ON sku_live_param WHEN NEW.version < OLD.version BEGIN SELECT RAISE(ABORT, 'sku_live_param_counter_not_monotonic: 40930 reason=COUNTER_NOT_MONOTONIC'); END;
+CREATE TRIGGER trg_0keylock_live_tank BEFORE UPDATE ON live_tank FOR EACH ROW EXECUTE FUNCTION trg_keylock('location_id', '', 'version');  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_live_tank_keylock BEFORE UPDATE ON live_tank WHEN NEW.location_id IS NOT OLD.location_id BEGIN SELECT RAISE(ABORT, 'live_tank_key_immutable: 40930 reason=DEDUPE_KEY_IMMUTABLE'); END;
+-- @sqlite-only CREATE TRIGGER trg_live_tank_monotonic BEFORE UPDATE ON live_tank WHEN NEW.version < OLD.version BEGIN SELECT RAISE(ABORT, 'live_tank_counter_not_monotonic: 40930 reason=COUNTER_NOT_MONOTONIC'); END;
+CREATE TRIGGER trg_0keylock_live_stock_count BEFORE UPDATE ON live_stock_count FOR EACH ROW EXECUTE FUNCTION trg_keylock('stock_id', '', 'version');  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_live_stock_count_keylock BEFORE UPDATE ON live_stock_count WHEN NEW.stock_id IS NOT OLD.stock_id BEGIN SELECT RAISE(ABORT, 'live_stock_count_key_immutable: 40930 reason=DEDUPE_KEY_IMMUTABLE'); END;
+-- @sqlite-only CREATE TRIGGER trg_live_stock_count_monotonic BEFORE UPDATE ON live_stock_count WHEN NEW.version < OLD.version BEGIN SELECT RAISE(ABORT, 'live_stock_count_counter_not_monotonic: 40930 reason=COUNTER_NOT_MONOTONIC'); END;
+CREATE TRIGGER trg_0keylock_live_tank_hold BEFORE UPDATE ON live_tank_hold FOR EACH ROW EXECUTE FUNCTION trg_keylock('id,location_id', '', '');  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_live_tank_hold_keylock BEFORE UPDATE ON live_tank_hold WHEN NEW.id IS NOT OLD.id OR NEW.location_id IS NOT OLD.location_id BEGIN SELECT RAISE(ABORT, 'live_tank_hold_key_immutable: 40930 reason=DEDUPE_KEY_IMMUTABLE'); END;
+CREATE TRIGGER trg_0keylock_live_death BEFORE UPDATE ON live_death FOR EACH ROW EXECUTE FUNCTION trg_keylock('id,movement_id,device_instance_id,client_op_id', 'movement_id', 'deducted_qty_milli');  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_live_death_keylock BEFORE UPDATE ON live_death WHEN NEW.id IS NOT OLD.id OR (OLD.movement_id IS NOT NULL AND NEW.movement_id IS NOT OLD.movement_id) OR NEW.device_instance_id IS NOT OLD.device_instance_id OR NEW.client_op_id IS NOT OLD.client_op_id BEGIN SELECT RAISE(ABORT, 'live_death_key_immutable: 40930 reason=DEDUPE_KEY_IMMUTABLE'); END;
+-- @sqlite-only CREATE TRIGGER trg_live_death_monotonic BEFORE UPDATE ON live_death WHEN NEW.deducted_qty_milli < OLD.deducted_qty_milli BEGIN SELECT RAISE(ABORT, 'live_death_counter_not_monotonic: 40930 reason=COUNTER_NOT_MONOTONIC'); END;
