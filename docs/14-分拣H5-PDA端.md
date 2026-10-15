@@ -46,7 +46,7 @@
 | Δ3 | `paused_actions` 写「三个」「八个值」 | **九个值**（含 `LIVE_WEIGH_OUT`） | 00 §6.6.2 已登记 9 个；11 篇、14 旧稿的「八个」是旧口径 |
 | Δ4 | `40312` 提示显示 `detail.rule` | 只认 **`detail.reason`** | 00 §6.4 `SOD_VIOLATION` 明确不再使用 `detail.rule` |
 | Δ5 | 上架权限点写 `inbound.putaway.execute` | `inbound.putaway` | 03 §7 / §10 |
-| Δ6 | 盲收 / 预约收货路径当成已定 | 保留流程，给出前端消费契约（§6.2），后端侧待登记 | main 的 03/10 均无 `/inbound/returns/blind`、`/returns/reservations/{id}/receive` |
+| Δ6 | 盲收 / 预约收货路径当成已定 | 保留流程，给出前端消费契约（§6.2）；两处接口均已合 main，按定稿路径接入 | 03 §7 盲收 `03:260`、10 §7.2 预约收货 `10:173-176` 均已落 `main`；原「后端侧待登记」已消 |
 | Δ7 | 旧稿示例的 `client_time` 用带 `T`/`Z` 的 ISO 写法 | 客户端时间统一 `YYYY-MM-DD HH:MM:SS` UTC 整秒 | 00 §6.8 第 4 条；带 `T`/`Z` 或小数秒在 SQLite 侧被拒 → 40003 |
 | Δ8 | 「PDA 心跳」被当成已知接口 | 路径待定（Q7） | 00 §6.6.2 只说「`/me` 和终端心跳响应」，未定路径 |
 | Δ9 | 离线令牌 `exp` 当 ISO 8601 带时区解析，`/me` 缺 00 §6.6.2 的四项 | `exp` 按 **UTC 整秒 `YYYY-MM-DD HH:MM:SS`** 解析，端上不得按时区换算；`/me` 六字段（`stale_policy` / `paused` / `offline_since` / `paused_actions[]` / `offline_deadline_at` / `backfill_deadline_at`）按 12 篇 §8 | 12 篇 Δ1（`12:10` / `12:91-94`）与 §8（`12:435-447`）；00 §6.6.2 是 400 级硬契约 |
@@ -72,7 +72,7 @@
 | P11 | 复核员 | 集货（扫箱码 + 集货位） | `/pack/:orderCode` | `POST /boxes/{code}/stage`；42215 温区不符 |
 | P12 | 复核员 | 封箱后丢箱/破损，发起箱作废申请 | 箱详情 | `POST /pack/boxes/{box_id}/void-request`；审批在后台（13 篇） |
 | P13 | 仓管员 | 收货登记、上架扫码 | `/receive`、`/putaway` | `POST /inbound/lines/{id}/receipts`、`POST /inbound/receipts/{id}/putaways`（03 §7，已合 main） |
-| P14 | 仓管员 | 盲收登记（无预约到货） | `/receive/blind` | 契约见 §6.2；后端侧待 10 篇补登记 |
+| P14 | 仓管员 | 盲收登记（无预约到货） | `/receive/blind` | **`POST /api/v1/inbound/returns/blind`**（03 §7 已合 main：`03:260`）；契约见 §6.2 |
 | P15 | 仓管员 | 设备不可用时用纸质单，恢复联网后纸单补录 | `/offline/paper` | `POST /offline/paper-records`（11 §7，已合 main）；24 h 窗口 |
 | P16 | 加工/活鲜作业员 | 领料、成品入库、损耗登记、巡池、死亡登记、出池称重 | `/processing/*`、`/live/*` | 17 / 18；是否可离线见 Q8 |
 
@@ -103,7 +103,7 @@ Hash 路由（WebView 兼容）。权限点为渲染依据，实际以服务端�
 | `/move` | 同仓移库；跨仓调拨 | `inventory.move.view` / `.confirm`（07 §10，已合 main；原 `inventory.move.execute` 作废） | 同仓可离线；跨仓调拨按 `paused_actions` 的 `TRANSFER` 置灰、不重试（11 §6.6） |
 | `/offline/paper` | 纸单补录（恢复联网后 24 h 内） | `offline.paper.backfill` | 必须在线 |
 | `/sync` | 补交队列（待上传 / 失败红条 / 已完成） | — | 离线可看 |
-| `/processing/issue`、`/processing/receipt`、`/processing/loss` | 加工领料 / 成品入库 / 损耗 | `process.order.issue` / `process.order.report` / `process.order.reverse`（17 §7.2 / §10，**已合 main**） | 损耗**无独立路径**（报工带 `LOSS` 行，17 §7.2）；离线可用性见 Q8 |
+| `/processing/issue`、`/processing/receipt`、`/processing/loss` | 加工领料 / 成品入库 / 损耗 | `POST /api/v1/processing/orders/{id}/issues`（`process.order.issue`）、`/reports`（`process.order.report`）、`/reversals`（`process.order.reverse`）（17 §7.2 / §10，**已合 main**） | 损耗**无独立路径**（报工带 `LOSS` 行，17 §7.2）；离线可用性见 Q8 |
 | `/live/patrol`、`/live/death`、`/live/weigh-out` | 巡池 / 死亡登记 / 出池称重 | `live.inspect.submit` / `live.death.report` / `live.weigh.submit`（18 §7） | 巡检、死亡登记可离线；出池称重看 `paused_actions` |
 | `/settings` | 声音/震动、扫码模式、设备信息、离线令牌剩余 | — | 离线可用 |
 
@@ -541,8 +541,8 @@ stateDiagram-v2
 
 | 流程 | 现场动作 | 接口 |
 |---|---|---|
-| `/processing/issue` | 加工领料：扫加工单 → 扫原料批次/库位 → 录数量（3 位小数） | **`POST /api/v1/processing/orders/{id}/issues`**（`issue_client_id`；活鲜池另带 `live_weigh_id` + `issue_count`，按件 SKU 带单件净重） |
-| `/processing/receipt` | 成品入库：扫加工单 → 录成品数量/重量 → 打印批次标签 → 上架 | **`POST /api/v1/processing/orders/{id}/reports`**（`report_client_id` + `lines[{output_role, sku_id, lot_id?, to_location_id?, gross_qty_milli, tare_qty_milli, loss_reason?}]`） |
+| `/processing/issue` | 加工领料：扫加工单 → 扫原料批次/库位 → 录数量（3 位小数） | **`POST /api/v1/processing/orders/{id}/issues`**，body `{issue_client_id, src_stock_id, issue_qty_milli, issue_pcs?, issue_count?, live_weigh_id?}`（17 §6.2；按件 SKU 必带单件净重与整件数，缺一 `40001`） |
+| `/processing/receipt` | 成品入库：扫加工单 → 录成品数量/重量 → 打印批次标签 → 上架 | **`POST /api/v1/processing/orders/{id}/reports`**，body `{report_client_id, is_final?, lines[{output_role, sku_id, lot_id?, to_location_id?, gross_qty_milli, tare_qty_milli, loss_reason?}]}`（17 §6.3） |
 | `/processing/loss` | 损耗登记（超得率容差提示） | **同一报工接口**，`lines[].output_role=LOSS`（17 §7.2：不另立路径） |
 | `/live/patrol` | 水质/水温巡检：扫池位 → 录指标 → 超限长鸣 | `POST /live/inspections` |
 | `/live/death` | 死亡登记：扫池位 → 录重量 + 尾数 → 拍照 → 生成报损 | `POST /live/deaths` |
