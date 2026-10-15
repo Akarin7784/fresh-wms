@@ -17,6 +17,7 @@
 | `06_pack_ship.sql` | 装箱、发运 |
 | `08_count.sql` | 盘点、调整 |
 | `10_returns.sql` | 退货与异常：异常码、异常单、退货预约、盲收；对 03 的 ALTER（见跨篇加列） |
+| `09_scrap.sql` | 报损单、报损行（含 SELL_EXPIRED / LIVE_* / PROCESS_LOSS 来源） |
 | `11_integration.sql` | 幂等、入站消息、outbox、审计、取号 |
 | `12_auth.sql` | 用户、角色、权限、API 凭证 |
 | `12b_auth_audit.sql` | 设备绑定、离线令牌、审批单；audit_log 节点列与只追加；sys_user.perm_version |
