@@ -5,12 +5,12 @@
 | 编号 | 14 |
 | 作者 | 界面（前端与端上） |
 | 评审 | 待定：1 名测试 + 1 名非作者开发（§12 攻击面逐条打） |
-| 基线 | `origin/main@fb7494d`（01 / 05 / 06 / 07 / 08 / 11 / 12 均已合入，含本三篇 #34）；总体设计 §6.4 错误码、§6.5 幂等、§6.6.1 审批类型、§6.6.2 离线/暂停下发、§6.6.5 缺口登记、§6.8 时间、§8 前端模板、§9.1 部署形态 |
+| 基线 | `origin/main@f85a95a`（01–12、17、18 均已合入）；总体设计 §6.4 错误码、§6.5 幂等、§6.6.1 审批类型、§6.6.2 离线/暂停下发、§6.6.5 缺口登记、§6.8 时间、§8 前端模板、§9.1 部署形态 |
 | 依赖 | 01 主数据（**已合 main**：条码解析 `GET /master/barcodes/{barcode}` 可用，端上不缓存条码表；主数据停用/软删一期未建）；02 库存核心（原语、系统冻结）；03 入库（收货、上架，**已合 main**）；04 出库与分配（待回库记录，**已合 main**）；05 波次与拣货（**已合 main**）；06 复核装箱发货（**已合 main**）；07 补货与移库（**已合 main**）；08 盘点（**已合 main**）；10 退货与异常（**已合 main**，退货预约收货待 #40）；11 集成（纸单补录、outbox，**已合 main**，含非计划切换 §7.3）；12 权限与审计（**已合 main**：`exp` 整秒、`/me` 六字段、`device.binding.*`）；17 加工中心（草稿）；18 活鲜暂存（**已合 main**） |
 | 技术栈 | Vue 3 + TypeScript + Vite + Vant，H5 打包；PDA 用 WebView 壳或自带浏览器，壳能力（扫码广播、蓝牙打印、电子秤）走 `bridge/` 适配层 |
 | 状态 | 新稿（界面，2026-10-15）。从 `docs/frontend-detail-design` 搬运后按当前 main 逐条重核；**对齐轮第一批（2026-10-15）**：按 00 已定口径、12 篇、01 已合 main 的现状改 §1.3 / §6 / §6.2 / §7 / §9.7 / §11（等 05/06/16/17 的第二批） |
 
-> **引用口径**：凡接口路径、权限点、错误码，以已合 main 的 01–12、18 与 00 为准；**只剩 16/17 是草稿**，正文引用处标「（草稿）」。旧稿里的业务码用法全部重核过，差异见 §1.3。**本篇引用 00 §6.4 / §6.5 的权威定义；12 篇与 00 冲突处以 00 为准。**
+> **引用口径**：凡接口路径、权限点、错误码，以已合 main 的 01–12、18 与 00 为准；**只剩 16 是草稿**（17 已合 main），正文引用处标「（草稿）」。旧稿里的业务码用法全部重核过，差异见 §1.3。**本篇引用 00 §6.4 / §6.5 的权威定义；12 篇与 00 冲突处以 00 为准。**
 
 ---
 
@@ -35,7 +35,7 @@
 | 复核通过条件、封箱人规则、箱作废审批 | 06（已合 main）+ 00 §6.6.1 |
 | 待回库记录的库存口径与并发 | 04 §7.3（已合 main） |
 | 司机装车/签收、商城下单 | 15（前端）、16（后端） |
-| 加工报工守恒校验、活鲜锁池判定 | 17（草稿）、18（已合 main） |
+| 加工报工守恒校验、活鲜锁池判定 | 17（**已合 main**）、18（已合 main） |
 
 ### 1.3 与旧稿（`docs/frontend-detail-design`）的差异
 
@@ -103,7 +103,7 @@ Hash 路由（WebView 兼容）。权限点为渲染依据，实际以服务端�
 | `/move` | 同仓移库；跨仓调拨 | `inventory.move.view` / `.confirm`（07 §10，已合 main；原 `inventory.move.execute` 作废） | 同仓可离线；跨仓调拨按 `paused_actions` 的 `TRANSFER` 置灰、不重试（11 §6.6） |
 | `/offline/paper` | 纸单补录（恢复联网后 24 h 内） | `offline.paper.backfill` | 必须在线 |
 | `/sync` | 补交队列（待上传 / 失败红条 / 已完成） | — | 离线可看 |
-| `/processing/issue`、`/processing/receipt`、`/processing/loss` | 加工领料 / 成品入库 / 损耗 | `process.order.issue` / `process.order.report` / `process.order.reverse`（17 §7.2 / §10，**草稿待合**） | 损耗**无独立路径**（报工带 `LOSS` 行，17 §7.2）；离线可用性见 Q8 |
+| `/processing/issue`、`/processing/receipt`、`/processing/loss` | 加工领料 / 成品入库 / 损耗 | `process.order.issue` / `process.order.report` / `process.order.reverse`（17 §7.2 / §10，**已合 main**） | 损耗**无独立路径**（报工带 `LOSS` 行，17 §7.2）；离线可用性见 Q8 |
 | `/live/patrol`、`/live/death`、`/live/weigh-out` | 巡池 / 死亡登记 / 出池称重 | `live.inspect.submit` / `live.death.report` / `live.weigh.submit`（18 §7） | 巡检、死亡登记可离线；出池称重看 `paused_actions` |
 | `/settings` | 声音/震动、扫码模式、设备信息、离线令牌剩余 | — | 离线可用 |
 
@@ -147,7 +147,7 @@ Hash 路由（WebView 兼容）。权限点为渲染依据，实际以服务端�
 
 ## 6. 页面 → 接口映射
 
-斜体标注的接口只剩草稿篇 **16 / 17**（05 / 06 / 08 / 12 已合 main），定稿后需复核。**01 已合 main**：条码解析 `GET /api/v1/master/barcodes/{barcode}` 是已定接口（端上仍不缓存条码表）；主数据的停用挂起、软删两段式、字典接口**一期未建**（01 §7「未建接口」/「显式延期」），端上不依赖。
+斜体标注的接口只剩草稿篇 **16**（01–12、17、18 均已合 main），定稿后需复核。**01 已合 main**：条码解析 `GET /api/v1/master/barcodes/{barcode}` 是已定接口（端上仍不缓存条码表）；主数据的停用挂起、软删两段式、字典接口**一期未建**（01 §7「未建接口」/「显式延期」），端上不依赖。
 
 | 页面 | 动作 | 接口 | 幂等键 |
 |---|---|---|---|
@@ -179,7 +179,7 @@ Hash 路由（WebView 兼容）。权限点为渲染依据，实际以服务端�
 | 收货 | 退货预约收货 | `POST /api/v1/returns/reservations/{id}/receive`（**10 §7.2 已合 main：`10:176`**；契约见 §6.2） | `Idempotency-Key` |
 | 上架 | 上架扫码 | `POST /api/v1/inbound/receipts/{id}/putaways`（03 §7，已合 main） | `op_key` / 四元组 |
 | 纸单补录 | 提交 | `POST /api/v1/offline/paper-records` `{action_type, occurred_at, operator_id, payload, photo_ids[]}`（11 §7，已合 main） | `Idempotency-Key` |
-| 加工 | 领料 / 报工 / 冲回 | *`POST /api/v1/processing/orders/{id}/issues`*、*`/reports`*、*`/reversals`*（17 §7.2，**草稿待合**；前缀按 17 Q6 = `processing`） | 业务键 `issue_client_id` / `report_client_id` / `reversal_client_id` + `Idempotency-Key` |
+| 加工 | 领料 / 报工 / 冲回 | **`POST /api/v1/processing/orders/{id}/issues`**、**`/reports`**、**`/reversals`**（17 §7.2，已合 main） | 业务键 `issue_client_id` / `report_client_id` / `reversal_client_id` + `Idempotency-Key` |
 | 活鲜 | 巡检 / 死亡登记 | `POST /api/v1/live/inspections`、`POST /api/v1/live/deaths`（18 §7） | `(device_instance_id, client_op_id)` |
 | 活鲜 | 出池称重 | `POST /api/v1/live/weighs`（18 §7） | `(task_kind, task_id, weigh_client_id)` |
 | 活鲜 | 阈值下发包 | `GET /api/v1/live/pda-package?warehouse_code=`（18 §7） | — |
@@ -230,7 +230,7 @@ Hash 路由（WebView 兼容）。权限点为渲染依据，实际以服务端�
   - 入库：`inbound.receive`、`inbound.putaway`（03 §10）、`inbound.return.blind`（盲收登记；**00 §6.6 第 3 篇清单第 10 个已登记**，12 篇 §4.2 收录）。
   - 离线：`offline.paper.backfill`（11 / 00 §6.6.1）。
   - 主数据：`master.sku.view`（条码解析，01 §7 已合 main）。**主数据停用挂起 / 软删两段式 / 字典接口一期未建**（01 §7），端上不出现对应入口；`40962` / `42221` / `42220` 保留文案但不做可达路径。
-  - 加工 / 活鲜：`process.order.issue`、`process.order.report`、`process.order.reverse`（`REWORK` 冲回另需 `process.rework.approve`，不能自批）、`process.trace.view`（17 §7.2，**草稿待合**）；`live.inspect.submit`、`live.death.report`、`live.weigh.submit`（18 §10）。
+  - 加工 / 活鲜：`process.order.issue`、`process.order.report`、`process.order.reverse`（`REWORK` 冲回另需 `process.rework.approve`，不能自批）、`process.trace.view`（17 §7.2，已合 main）；`live.inspect.submit`、`live.death.report`、`live.weigh.submit`（18 §10）。
   - 设备：`device.binding.view`、`device.binding.approve`、`device.binding.revoke`（**12 §4.2，已合 main**；PDA 侧只在绑定等待页查 `DEVICE_BIND` 审批状态与展示结果）。
 - **补交账号必须与产生操作的账号一致**：outbox 按 `user_id` 隔离（§9.3）；服务端以令牌里的 `device_instance_id` 为准，忽略请求体中的值。
 
@@ -535,14 +535,14 @@ stateDiagram-v2
   - **24 小时时限**：必须在恢复联网后 24 h 内提交，超时服务端转异常单（10 篇）。入口显示「补录剩余 HH:MM」倒计时，只读服务端下发的 `backfill_deadline_at`（`/me` 与心跳返回，= 恢复联网 + 24 h；**前端不用设备时间推算**）。为 `null`（窗口已过或设备从未断网）时隐藏入口与倒计时；窗口期内一直显示（服务端无从得知是否还有未录入的纸单）；< 1 小时标红。已提交的补录记录仍可查看。
   - **补录本身必须在线，不进 outbox**。
 
-### 9.12 加工中心与活鲜暂存（骨架）
+### 9.12 加工中心与活鲜暂存
 
-加工（17 草稿）与活鲜（18 已合 main）纳入范围，库存状态新增 `PROCESSING`、`LIVE_HOLD`。
+加工（17 已合 main）与活鲜（18 已合 main）纳入范围，库存状态新增 `PROCESSING`、`LIVE_HOLD`。
 
 | 流程 | 现场动作 | 接口 |
 |---|---|---|
-| `/processing/issue` | 加工领料：扫加工单 → 扫原料批次/库位 → 录数量（3 位小数） | *`POST /api/v1/processing/orders/{id}/issues`*（`issue_client_id`；活鲜池另带 `live_weigh_id` + `issue_count`，按件 SKU 带单件净重） |
-| `/processing/receipt` | 成品入库：扫加工单 → 录成品数量/重量 → 打印批次标签 → 上架 | *`POST /api/v1/processing/orders/{id}/reports`*（`report_client_id` + `lines[{output_role, sku_id, lot_id?, to_location_id?, gross_qty_milli, tare_qty_milli, loss_reason?}]`） |
+| `/processing/issue` | 加工领料：扫加工单 → 扫原料批次/库位 → 录数量（3 位小数） | **`POST /api/v1/processing/orders/{id}/issues`**（`issue_client_id`；活鲜池另带 `live_weigh_id` + `issue_count`，按件 SKU 带单件净重） |
+| `/processing/receipt` | 成品入库：扫加工单 → 录成品数量/重量 → 打印批次标签 → 上架 | **`POST /api/v1/processing/orders/{id}/reports`**（`report_client_id` + `lines[{output_role, sku_id, lot_id?, to_location_id?, gross_qty_milli, tare_qty_milli, loss_reason?}]`） |
 | `/processing/loss` | 损耗登记（超得率容差提示） | **同一报工接口**，`lines[].output_role=LOSS`（17 §7.2：不另立路径） |
 | `/live/patrol` | 水质/水温巡检：扫池位 → 录指标 → 超限长鸣 | `POST /live/inspections` |
 | `/live/death` | 死亡登记：扫池位 → 录重量 + 尾数 → 拍照 → 生成报损 | `POST /live/deaths` |
@@ -593,7 +593,7 @@ stateDiagram-v2
 | Q5 | PDA 壳选型及扫码事件 id、打印、电子秤接口 | 采购 / 05 | `bridge/` |
 | Q6 | 批量补交接口及其部分失败语义 | 05 / 11 | `/sync` 同步器 |
 | Q7 | 心跳接口路径与响应字段清单（00 §6.6.2 只说「终端心跳」；**12 篇 §8 只给了 `GET /api/v1/me`，没有心跳路径**） | 12 篇增量 / 00 登记 | §9.10；一期端上只轮询 `/me`，心跳作为可选优化，不阻塞 |
-| Q8 | 加工 / 活鲜在 PDA 的离线范围与成品标签打印接口 —— **17 已给**：报工可离线入 outbox 并按 `report_client_id` 回放（17 §6.3）；领料 / 冲回的离线可用性与标签打印接口待 17 定 | 17（草稿）/ 18（已合 main） | §9.12 |
+| Q8 | 加工 / 活鲜在 PDA 的离线范围与成品标签打印接口 —— **17 已给**：报工可离线入 outbox 并按 `report_client_id` 回放（17 §6.3）；领料 / 冲回的离线可用性与标签打印接口待定 | 17（已合 main）/ 18（已合 main） | §9.12 |
 | Q9 | 键盘楔入去抖阈值的配置来源 —— 原依赖 01 字典接口，**字典一期未建**（01 §7「显式延期」/ §12 Q9） | 01 增量 | §8.3；一期用编译期默认值（可由任务包下发），不依赖字典 |
 | Q10 | 「交给主管」的接管流程（主管在 PDA 登录确认 / 后台接管）与审计字段 | 12 篇 §8 + 13/14 篇 | §9.3；存储与审计字段以 12 篇 `system.audit.*` 为准 |
 | Q11 | ~~同仓移库 / 跨仓调拨的权限点定名~~ **已定**：07 §10 给 `inventory.move.view` / `.create` / `.confirm` / `.cancel`（无 `.execute`） | 已关闭 | `/move` |
