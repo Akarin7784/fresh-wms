@@ -5,7 +5,7 @@
 | 编号 | 14 |
 | 作者 | 界面（前端与端上） |
 | 评审 | 待定：1 名测试 + 1 名非作者开发（§12 攻击面逐条打） |
-| 基线 | `origin/main@5bfd335`（01 / 05 / 06 / 07 / 08 / 11 / 12 均已合入）；总体设计 §6.4 错误码、§6.5 幂等、§6.6.1 审批类型、§6.6.2 离线/暂停下发、§6.6.5 缺口登记、§6.8 时间、§8 前端模板、§9.1 部署形态 |
+| 基线 | `origin/main@fac0f98`（01 / 05 / 06 / 07 / 08 / 11 / 12 均已合入）；总体设计 §6.4 错误码、§6.5 幂等、§6.6.1 审批类型、§6.6.2 离线/暂停下发、§6.6.5 缺口登记、§6.8 时间、§8 前端模板、§9.1 部署形态 |
 | 依赖 | 01 主数据（**已合 main**：条码解析 `GET /master/barcodes/{barcode}` 可用，端上不缓存条码表；主数据停用/软删一期未建）；02 库存核心（原语、系统冻结）；03 入库（收货、上架，**已合 main**）；04 出库与分配（待回库记录，**已合 main**）；05 波次与拣货（**已合 main**）；06 复核装箱发货（**已合 main**）；07 补货与移库（**已合 main**）；08 盘点（**已合 main**）；10 退货与异常（**已合 main**，退货预约收货待 #40）；11 集成（纸单补录、outbox，**已合 main**，含非计划切换 §7.3）；12 权限与审计（**已合 main**：`exp` 整秒、`/me` 六字段、`device.binding.*`）；17 加工中心（草稿）；18 活鲜暂存（**已合 main**） |
 | 技术栈 | Vue 3 + TypeScript + Vite + Vant，H5 打包；PDA 用 WebView 壳或自带浏览器，壳能力（扫码广播、蓝牙打印、电子秤）走 `bridge/` 适配层 |
 | 状态 | 新稿（界面，2026-10-15）。从 `docs/frontend-detail-design` 搬运后按当前 main 逐条重核；**对齐轮第一批（2026-10-15）**：按 00 已定口径、12 篇、01 已合 main 的现状改 §1.3 / §6 / §6.2 / §7 / §9.7 / §11（等 05/06/16/17 的第二批） |
@@ -175,8 +175,8 @@ Hash 路由（WebView 兼容）。权限点为渲染依据，实际以服务端�
 | 集货 | 扫箱码 + 集货位 | *`POST /api/v1/boxes/{code}/stage`* | 四元键 |
 | 箱作废 | 申请作废 / 查箱详情 | `POST /api/v1/pack/boxes/{box_id}/void-request`、`GET /api/v1/pack/boxes/{box_id}`（00 §6.6.1 / 06 §7.3） | `Idempotency-Key` |
 | 收货 | 收货登记 | `POST /api/v1/inbound/lines/{id}/receipts`（03 §7，已合 main） | `op_key` / 四元组 |
-| 收货 | 盲收登记 | `POST /api/v1/inbound/returns/blind`（契约见 §6.2；**权限点 `inbound.return.blind` 已由 00 §6.6 第 3 篇清单第 10 个登记**，12 篇 §4.2 收录；路径待 03 篇 §7 补） | `Idempotency-Key` + 四元组 |
-| 收货 | 退货预约收货 | `POST /api/v1/returns/reservations/{id}/receive`（契约见 §6.2） | `Idempotency-Key` |
+| 收货 | 盲收登记 | `POST /api/v1/inbound/returns/blind`（契约见 §6.2；**权限点 `inbound.return.blind` 已由 00 §6.6 第 3 篇清单第 10 个登记**，12 §4.2 收录；**03 §7 已合 main：`03:260`**） | `Idempotency-Key` + 四元组 |
+| 收货 | 退货预约收货 | `POST /api/v1/returns/reservations/{id}/receive`（**10 §7.2 已合 main：`10:176`**；契约见 §6.2） | `Idempotency-Key` |
 | 上架 | 上架扫码 | `POST /api/v1/inbound/receipts/{id}/putaways`（03 §7，已合 main） | `op_key` / 四元组 |
 | 纸单补录 | 提交 | `POST /api/v1/offline/paper-records` `{action_type, occurred_at, operator_id, payload, photo_ids[]}`（11 §7，已合 main） | `Idempotency-Key` |
 | 加工 | 领料 / 报工 / 冲回 | *`POST /api/v1/process/orders/{id}/issues`*、*`/reports`*、*`/reversals`*（草稿 17） | `issue_client_id` / `report_client_id` |
@@ -190,7 +190,7 @@ Hash 路由（WebView 兼容）。权限点为渲染依据，实际以服务端�
 
 ### 6.2 盲收与退货预约收货的端上契约
 
-> 这两条接口在 main 的 03/10 篇里都没有**路径**定义（盲收的权限点 `inbound.return.blind` 已由 00 §6.6 第 3 篇清单登记，12 篇 §4.2 收录；退货预约的三个权限点也已在 12 篇 §4.2）。下面是**前端消费契约**：PDA 按此实现与 MSW mock，后端语义与落库由 03/10 篇定；字段名以后端定稿为准，形状有变本篇同步对齐。数量 3 位小数字符串，时间 UTC 整秒 `YYYY-MM-DD HH:MM:SS`。
+> 这两条接口在 main 上**已定义**（盲收 03 §7：`03:260`；退货预约 10 §7.2：`10:173-176`），权限点也已登记。下面是**端上消费要点与离线约定**：PDA 按此实现与 MSW mock，后端语义与落库由 03/10 篇定；字段名以后端定稿为准，形状有变本篇同步对齐。数量 3 位小数字符串，时间 UTC 整秒 `YYYY-MM-DD HH:MM:SS`。
 
 **盲收登记**（`POST /api/v1/inbound/returns/blind`，权限 `inbound.return.blind`）
 
@@ -587,7 +587,7 @@ stateDiagram-v2
 | # | 问题 | 依赖 | 影响 |
 |---|---|---|---|
 | Q1 | ~~12 篇 md 当前不在 main，`/me` 响应缺 00 §6.6.2 的四项~~ **已闭环**：12 篇§4.2 给出权限点矩阵，§8 的 `/me` 示例写全 `stale_policy` / `paused` / `offline_since` / `paused_actions[]` / `offline_deadline_at` / `backfill_deadline_at`；`exp` 为 UTC 整秒（Δ1） | 已关闭 | 登录、设备绑定、置灰与倒计时字段；12 与 00 冲突以 00 为准 |
-| Q2 | 盲收与退货预约收货的**前端契约见 §6.2**；后端语义、字段与 48 h 口径由后端定 | 03 / 10 篇 | **后端侧待 03 / 10 篇补登记**（盲收权限点已登记） |
+| Q2 | ~~盲收与退货预约收货的后端缺口~~ **已闭合**：盲收 03 §7（`03:260`）、退货预约 10 §7.2（`10:173-176`）已合 main；端上字段按 §6.2 对齐 | 已关闭 | §6 / §6.2 |
 | Q3 | 拣货任务接口（含 `preload` 任务包格式、任务版本号字段、`seq` 与四元组里 `line_no` 的对应）以 05 §7/§10 为依据（**已合 main**） | 已关闭 | §6 全部任务行 |
 | Q4 | 离线回收阈值（原文 2 h）是否配置下发 | 00 / 05 | 重连提示 |
 | Q5 | PDA 壳选型及扫码事件 id、打印、电子秤接口 | 采购 / 05 | `bridge/` |
