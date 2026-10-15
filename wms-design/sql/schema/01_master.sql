@@ -191,6 +191,8 @@ CREATE TABLE customer (
     created_at          TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
     updated_at          TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
     CONSTRAINT uq_customer_code UNIQUE (code),
+    -- 门店编码与供应商编码同口径：A-Z0-9、2–32 位（镜鉴 I1：原先 customer.code 一条格式 CHECK 都没有）
+    CONSTRAINT ck_customer_code CHECK (length(code) BETWEEN 2 AND 32 AND replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(code,'A',''),'B',''),'C',''),'D',''),'E',''),'F',''),'G',''),'H',''),'I',''),'J',''),'K',''),'L',''),'M',''),'N',''),'O',''),'P',''),'Q',''),'R',''),'S',''),'T',''),'U',''),'V',''),'W',''),'X',''),'Y',''),'Z',''),'0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9','') = ''),
     CONSTRAINT ck_customer_type CHECK (store_type IN ('STORE','MALL','OTHER')),
     CONSTRAINT ck_customer_status CHECK (status IN ('ACTIVE','DISABLED'))
 );
@@ -237,7 +239,7 @@ CREATE TABLE device (
     id                  BIGINT       PRIMARY KEY,
     device_instance_id  VARCHAR(64)  NOT NULL,
     device_type         VARCHAR(16)  NOT NULL DEFAULT 'PDA',
-    warehouse_id        BIGINT       NOT NULL REFERENCES warehouse(id),
+    warehouse_id        BIGINT       NOT NULL CONSTRAINT fk_device_warehouse REFERENCES warehouse(id),
     status              VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
     last_seen_at        TIMESTAMP,
     created_at          TIMESTAMP    NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),

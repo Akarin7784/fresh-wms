@@ -3939,6 +3939,27 @@ _tx_allow("01 变异：去掉 trg_device_no_replace_instance 后，同实例号�
            "INSERT INTO device (id,device_instance_id,warehouse_id) VALUES (8921,'D-REP',1)",
            "REPLACE INTO device (id,device_instance_id,warehouse_id) VALUES (8922,'D-REP',1)"])
 
+# 镜鉴 I2（覆盖补齐）：台账新约束的三件套补全——新增 CHECK（按名拒绝 + 变异）、5 个唯一键重复、device.warehouse_id 外键
+expect_block_tx("01 拒绝：ck_customer_code 小写门店编码", ["INSERT INTO customer (id,code,name) VALUES (8821,'store-x','x')"], "ck_customer_code")
+_ttl_mut("门店编码小写 store-x", "ck_customer_code", "INSERT INTO customer (id,code,name) VALUES (8821,'store-x','x')")
+expect_block_tx("01 拒绝：ck_customer_status 未知状态", ["INSERT INTO customer (id,code,name,status) VALUES (8822,'STORE003','x','PENDING')"], "ck_customer_status")
+expect_block_tx("01 拒绝：ck_vehicle_type 未知车型", ["INSERT INTO vehicle (id,plate_no,vehicle_type) VALUES (8823,'沪A88888','SHIP')"], "ck_vehicle_type")
+expect_block_tx("01 拒绝：ck_vehicle_status 未知状态", ["INSERT INTO vehicle (id,plate_no,vehicle_type,status) VALUES (8824,'沪A88889','VAN','PENDING')"], "ck_vehicle_status")
+expect_block_tx("01 拒绝：ck_vehicle_cap 载重为 0", ["INSERT INTO vehicle (id,plate_no,vehicle_type,capacity_kg) VALUES (8825,'沪A88890','VAN',0)"], "ck_vehicle_cap")
+_ttl_mut("载重为 0", "ck_vehicle_cap", "INSERT INTO vehicle (id,plate_no,vehicle_type,capacity_kg) VALUES (8825,'沪A88890','VAN',0)")
+expect_block_tx("01 拒绝：ck_driver_status 未知状态", ["INSERT INTO driver (id,name,phone,status) VALUES (8826,'王师傅','13900139000','PENDING')"], "ck_driver_status")
+expect_block_tx("01 拒绝：ck_device_type 未知设备类型", ["INSERT INTO device (id,device_instance_id,device_type,warehouse_id) VALUES (8827,'D-PDA-8827','ROBOT',1)"], "ck_device_type")
+_ttl_mut("设备类型 ROBOT", "ck_device_type", "INSERT INTO device (id,device_instance_id,device_type,warehouse_id) VALUES (8827,'D-PDA-8827','ROBOT',1)")
+expect_block_tx("01 拒绝：ck_device_status 未知状态", ["INSERT INTO device (id,device_instance_id,device_type,status,warehouse_id) VALUES (8828,'D-PDA-8828','PDA','PENDING',1)"], "ck_device_status")
+expect_block_tx("01 拒绝：ck_device_seen 心跳早于建档", ["INSERT INTO device (id,device_instance_id,device_type,warehouse_id,created_at,last_seen_at) VALUES (8829,'D-PDA-8829','PDA',1,'2026-10-15 10:00:00','2026-10-15 09:00:00')"], "ck_device_seen")
+_ttl_mut("心跳早于建档", "ck_device_seen", "INSERT INTO device (id,device_instance_id,device_type,warehouse_id,created_at,last_seen_at) VALUES (8829,'D-PDA-8829','PDA',1,'2026-10-15 10:00:00','2026-10-15 09:00:00')")
+expect_block_tx("01 拒绝：device.warehouse_id 挂不存在的仓", ["INSERT INTO device (id,device_instance_id,device_type,warehouse_id) VALUES (8830,'D-PDA-8830','PDA',999999)"], "FOREIGN KEY constraint failed")
+expect_block_tx("01 拒绝：uq_supplier_code 编码重复（守卫先命中）", ["INSERT INTO supplier (id,code,name) VALUES (8831,'SUP001','重复编码')"], "master_duplicate: supplier.code")
+expect_block_tx("01 拒绝：uq_customer_code 门店编码重复（守卫先命中）", ["INSERT INTO customer (id,code,name) VALUES (8832,'STORE001','重复门店')"], "master_duplicate: customer.code")
+expect_block_tx("01 拒绝：uq_vehicle_plate 车牌重复（守卫先命中）", ["INSERT INTO vehicle (id,plate_no,vehicle_type) VALUES (8833,'沪A12345','VAN')"], "master_duplicate: vehicle.plate_no")
+expect_block_tx("01 拒绝：uq_driver_phone 手机号重复（守卫先命中）", ["INSERT INTO driver (id,name,phone) VALUES (8834,'赵师傅','13800138000')"], "master_duplicate: driver.phone")
+expect_block_tx("01 拒绝：uq_device_instance 实例号重复（守卫先命中）", ["INSERT INTO device (id,device_instance_id,device_type,warehouse_id) VALUES (8835,'D-PDA-8805','PDA',1)"], "master_duplicate: device.device_instance_id")
+
 print("=== 2j. 第 7 篇补货与移库（任务 / 任务行 / 需求 / 移库 / 候选视图）===")
 # 种子已在最前面写入（replenish_task 701/702、replenish_task_line 7101、replenish_demand 7201、
 # move_order 7301/7302、move_order_line 7311）。下面每条都是「正向放行 + 反向按名拦截 + 变异」，
