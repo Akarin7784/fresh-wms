@@ -3316,6 +3316,9 @@ BEGIN SELECT RAISE(ABORT, 'api_credential_clock_skew'); END;
 --       `pod_line.pod_id = pod_correction.correct_op_id`（`correct_op_id` = 拥有这批签收行的 `pod_op.id`）。
 --       这样 `fk_podl_pod` 与 `uq_podl(pod_id, outbound_line_id, lot_id)` 同时成立，不需要 `correction_seq`。
 --       实测反例见 docs/16 §11.3（`pod_id = pod_correction.id` 撞 `fk_podl_pod`；`pod_id = corrected_pod_id` 撞 `uq_podl`）。
+--     · `pod_correction` 新增 `root_pod_op_id`（FK → `pod_op(id)`）：链根遍历与真实外键落点；
+--       `corrected_pod_id` 是"基于哪一版"的**信息列、无 FK**（首签时是 `pod_op.id`、链式更正时是 `pod_correction.id`，单列 FK 不可兼得）。
+--     · 就地覆盖后 `pod_line` 里只剩最新值 ⇒ 更正落库**必须同事务**把更正前值写进 12 篇 `audit_log`（验收项，见 docs/16 §6.3、docs/12 §8）。
 --     · `delivery_return_line.lot_id` 改 **NOT NULL**（`uq_dretl` 含 `lot_id`，可空会让 NULL 批次绕过去重）。
 --     · 两库「正向 / 按名拒绝 / 变异」断言 + 触发器冻结基线在 verify.sh / verify_sqlite.py 的 16 段（归镜鉴）。
 --   边界（Chief 已拍）：司机 / 车辆 / 发车 / 签收的权威与快照都在本文件；06 `shipment`
@@ -3465,8 +3468,9 @@ CREATE INDEX ix_podl_pod ON pod_line(pod_id, outbound_line_id);
 
 CREATE TABLE pod_correction (
     id                  BIGINT       PRIMARY KEY,                    -- 同时是更正后的签收 id
-    correct_op_id       BIGINT       NOT NULL,                       -- 拥有被更正签收行的 pod_op.id（更正就地 UPDATE 那批 pod_line）
-    corrected_pod_id    BIGINT       NOT NULL,                       -- 被更正的生效签收
+    correct_op_id       BIGINT       NOT NULL,                       -- 被更正的首签 pod_op.id（就地 UPDATE 它名下那批 pod_line 行）
+    corrected_pod_id    BIGINT       NOT NULL,                       -- 本次更正"基于哪一版"签收（信息列，**无 FK**：可能是 pod_op.id 或 pod_correction.id）
+    root_pod_op_id      BIGINT       NOT NULL,                       -- 链根：首次签收的 pod_op.id，链式更正不变（FK 落在它上面，用于链根遍历）
     outbound_id         BIGINT       NOT NULL,
     driver_id           BIGINT       NOT NULL,
     correction_client_id VARCHAR(36) NOT NULL,
@@ -3482,6 +3486,7 @@ CREATE TABLE pod_correction (
     created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT uq_podc_client   UNIQUE (driver_id, correction_client_id),
     CONSTRAINT fk_podc_op       FOREIGN KEY (correct_op_id)    REFERENCES pod_op(id),
+    CONSTRAINT fk_podc_root     FOREIGN KEY (root_pod_op_id)   REFERENCES pod_op(id),
     CONSTRAINT fk_podc_out      FOREIGN KEY (outbound_id)      REFERENCES outbound_order(id),
     CONSTRAINT fk_podc_apr      FOREIGN KEY (approval_id)      REFERENCES approval_request(id),
     CONSTRAINT ck_podc_client   CHECK (length(correction_client_id) = 36),
