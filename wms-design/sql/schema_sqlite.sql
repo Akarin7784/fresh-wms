@@ -1,7 +1,7 @@
 -- 本文件由 sql/verify_sqlite.py 从 sql/schema/*.sql 按加载顺序机械生成，请勿手改。
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
---   2. 32 处 DEFAULT now()、44 处 DEFAULT (now() AT TIME ZONE 'UTC') / (date_trunc('second', now() AT TIME ZONE 'UTC')) → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
+--   2. 22 处 DEFAULT now()、54 处 DEFAULT (now() AT TIME ZONE 'UTC') / (date_trunc('second', now() AT TIME ZONE 'UTC')) → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
 --   3. 方言专属行：删除 1405 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 857 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
@@ -17,7 +17,13 @@
 
 
 -- -----------------------------------------------------------------------------
--- 主数据
+-- 第 1 篇 主数据：仓库 / 库区（温区） / 库位 / SKU / 条码 / 单位换算 / 批次
+-- 全局约定见 00 篇：数量 BIGINT milli（R2）、雪花 ID（§6.1）、时间 UTC 整秒（§6.8）、
+-- 防 REPLACE（§6.10）、错误码 40960–40969 / 42220–42229（§6.4）。
+-- 本篇口径：
+--   温区温度一律 *_c10（0.1 ℃ 整数，第 18 篇同口径），不用 NUMERIC；
+--   可售天数 sku.sell_days 与保质期分开，批次 sell_deadline 建档后不可改。
+-- 不建的表、跨篇缺口见 docs/01-主数据.md §3.4 / §13。
 -- -----------------------------------------------------------------------------
 
 CREATE TABLE warehouse (
@@ -36,7 +42,10 @@ CREATE TABLE warehouse (
     created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     updated_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     deleted_at          TIMESTAMP,
-    CONSTRAINT uq_warehouse_code UNIQUE (code)
+    CONSTRAINT uq_warehouse_code UNIQUE (code),
+    -- 仓编码是单号前缀（00 §6.2），只允许 [A-Z0-9]、长度 2–16、不含 '-'（审批单号按 '-' 分段，见 02 ck_hold_approval_no）。
+    -- 两库同一条 CHECK：嵌套 replace 去掉 36 个合法字符后必须是空串（不用 ~ / GLOB，SQLite 没有正则）。
+    CONSTRAINT ck_wh_code CHECK (length(code) BETWEEN 2 AND 16 AND replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(code,'A',''),'B',''),'C',''),'D',''),'E',''),'F',''),'G',''),'H',''),'I',''),'J',''),'K',''),'L',''),'M',''),'N',''),'O',''),'P',''),'Q',''),'R',''),'S',''),'T',''),'U',''),'V',''),'W',''),'X',''),'Y',''),'Z',''),'0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9','') = '')
 );
 
 
@@ -47,14 +56,17 @@ CREATE TABLE zone (
     code            VARCHAR(32)  NOT NULL,
     name            VARCHAR(64)  NOT NULL,
     temp_zone       VARCHAR(16)  NOT NULL,   -- AMBIENT/CHILLED/FROZEN/FRESH
-    temp_min        NUMERIC(5,2),
-    temp_max        NUMERIC(5,2),
+    temp_min_c10    INTEGER,                 -- 温区下限，0.1 ℃（-180 = -18.0 ℃）；两列同时为空或同时有值
+    temp_max_c10    INTEGER,                 -- 温区上限，0.1 ℃
     zone_type       VARCHAR(16)  NOT NULL,   -- RECEIVE/STORAGE/PICK/STAGE/SHIP/RETURN/QUARANTINE
     pick_sequence   VARCHAR(32),
     created_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     updated_at      TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     deleted_at      TIMESTAMP,
-    CONSTRAINT uq_zone_code UNIQUE (warehouse_id, code)
+    CONSTRAINT uq_zone_code UNIQUE (warehouse_id, code),
+    -- 有温度要求的库区必须给出上下限，且下限严格小于上限（相等等于没有区间）
+    CONSTRAINT ck_zone_temp CHECK ((temp_min_c10 IS NULL AND temp_max_c10 IS NULL)
+        OR (temp_min_c10 IS NOT NULL AND temp_max_c10 IS NOT NULL AND temp_min_c10 < temp_max_c10))
 );
 CREATE INDEX ix_zone_wh_type ON zone(warehouse_id, zone_type, temp_zone);
 
@@ -64,7 +76,7 @@ CREATE TABLE location (
     warehouse_id        BIGINT        NOT NULL REFERENCES warehouse(id),
     zone_id             BIGINT        NOT NULL REFERENCES zone(id),
     code                VARCHAR(32)   NOT NULL,
-    location_type       VARCHAR(16)   NOT NULL,   -- PALLET/SHELF/FLOOR/BIN
+    location_type       VARCHAR(16)   NOT NULL,   -- PALLET/SHELF/FLOOR/BIN/LIVE_TANK（LIVE_TANK 见第 18 篇）
     capacity_weight     NUMERIC(12,3) NOT NULL DEFAULT 0,
     capacity_volume     NUMERIC(14,3) NOT NULL DEFAULT 0,
     used_weight         NUMERIC(12,3) NOT NULL DEFAULT 0,
@@ -73,17 +85,18 @@ CREATE TABLE location (
     mix_sku             BOOLEAN       NOT NULL DEFAULT false,
     pickable            BOOLEAN       NOT NULL DEFAULT true,
     abc_class           VARCHAR(2),
-    status              VARCHAR(16)   NOT NULL DEFAULT 'AVAILABLE', -- AVAILABLE/LOCKED/DISABLED
+    status              VARCHAR(16)   NOT NULL DEFAULT 'AVAILABLE', -- AVAILABLE/LOCKED/DISABLED；LOCKED＝盘点冻结（08，40906）
     lock_reason         VARCHAR(64),
-    min_level           NUMERIC(14,3) NOT NULL DEFAULT 0,  -- 拣货位补货水位
-    max_level           NUMERIC(14,3) NOT NULL DEFAULT 0,
+    min_level_milli     BIGINT        NOT NULL DEFAULT 0,  -- 拣货位补货水位下限（SKU 基本单位 milli）；低水位触发补货需求，见第 7 篇
+    max_level_milli     BIGINT        NOT NULL DEFAULT 0,  -- 补货水位上限；补到不超过它
     pick_sequence       VARCHAR(32),
     created_at          TIMESTAMP     NOT NULL DEFAULT (datetime('now')),
     updated_at          TIMESTAMP     NOT NULL DEFAULT (datetime('now')),
     deleted_at          TIMESTAMP,
-    CONSTRAINT uq_location_code UNIQUE (warehouse_id, code)
+    CONSTRAINT uq_location_code UNIQUE (warehouse_id, code),
+    CONSTRAINT ck_loc_level CHECK (min_level_milli >= 0 AND max_level_milli >= min_level_milli)
 );
--- 待补货扫描：available < min_level 且 pickable
+-- 待补货扫描（第 7 篇）：available < min_level_milli 且 pickable
 CREATE INDEX ix_loc_replen ON location(zone_id, pick_sequence) WHERE pickable = true AND status = 'AVAILABLE';
 -- [SQLite] 部分索引需 3.8+，语义一致；BOOLEAN 在 SQLite 存为 INTEGER 0/1
 
@@ -99,10 +112,11 @@ CREATE TABLE sku (
     shelf_life_days             SMALLINT     NOT NULL DEFAULT 0,
     receive_min_shelf_life      SMALLINT     NOT NULL DEFAULT 0,-- 收货允收期
     ship_min_shelf_life         SMALLINT     NOT NULL DEFAULT 0,-- 出库禁发期
+    sell_days                   SMALLINT,                       -- 可售天数：sell_deadline = COALESCE(生产日期, 收货日期) + sell_days；冷藏/冷冻必填
     is_weighing                 BOOLEAN      NOT NULL DEFAULT false,
     avg_weight_g                NUMERIC(10,2),
     weight_tolerance_pct        NUMERIC(5,2) NOT NULL DEFAULT 5,
-    natural_loss_pct            NUMERIC(5,2) NOT NULL DEFAULT 0, -- 自然损耗容差 RK7
+    natural_loss_tolerance_ppm  BIGINT       NOT NULL DEFAULT 0, -- 自然损耗容差，百万分比；0–50000（≤5%），09 用整数比较
     unit_gross_weight           NUMERIC(12,3) NOT NULL DEFAULT 0,
     unit_volume                 NUMERIC(14,6) NOT NULL DEFAULT 0,
     cross_dock                  BOOLEAN      NOT NULL DEFAULT false,
@@ -112,7 +126,14 @@ CREATE TABLE sku (
     created_at                  TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     updated_at                  TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     deleted_at                  TIMESTAMP,
-    CONSTRAINT uq_sku_code UNIQUE (code)
+    CONSTRAINT uq_sku_code UNIQUE (code),
+    CONSTRAINT ck_sku_shelf_life CHECK (shelf_life_days >= 0 AND receive_min_shelf_life >= 0 AND ship_min_shelf_life >= 0
+        AND (shelf_life_days = 0 OR (receive_min_shelf_life <= shelf_life_days AND ship_min_shelf_life <= shelf_life_days))),
+    -- 可售天数必须落在保质期内；保质期未登记（=0）的 SKU 不允许设 sell_days
+    CONSTRAINT ck_sku_sell_days CHECK (sell_days IS NULL OR (sell_days >= 1 AND sell_days <= shelf_life_days)),
+    -- 冷链生鲜必须给可售天数，否则批次永远没有 sell_deadline（09 SELL_EXPIRED 失效）
+    CONSTRAINT ck_sku_sell_days_req CHECK (temperature_required NOT IN ('CHILLED','FROZEN') OR sell_days IS NOT NULL),
+    CONSTRAINT ck_sku_loss_ppm CHECK (natural_loss_tolerance_ppm >= 0 AND natural_loss_tolerance_ppm <= 50000)
 );
 CREATE INDEX ix_sku_category ON sku(category_id, status);
 
@@ -133,12 +154,17 @@ CREATE TABLE sku_unit (
     id              BIGINT        PRIMARY KEY,
     sku_id          BIGINT        NOT NULL REFERENCES sku(id),
     uom             VARCHAR(16)   NOT NULL,
-    ratio_to_base   NUMERIC(14,6) NOT NULL,
+    base_qty_milli  BIGINT        NOT NULL,   -- 1 个该单位 = 多少 milli 基本单位（1 BOX = 12.500 KG → 12500）
     is_pick_uom     BOOLEAN       NOT NULL DEFAULT false,
     is_receive_uom  BOOLEAN       NOT NULL DEFAULT false,
     barcode_level   SMALLINT      NOT NULL DEFAULT 1,
-    CONSTRAINT uq_sku_uom UNIQUE (sku_id, uom)
+    CONSTRAINT uq_sku_uom UNIQUE (sku_id, uom),
+    CONSTRAINT ck_unit_ratio CHECK (base_qty_milli > 0)
 );
+-- 换算：milli = 数量(milli) × base_qty_milli / 1000，结果不是整数直接 400 40010，不取整（02 §换算）
+-- 基本单位自己那一行必须 base_qty_milli = 1000：**应用层断言**（00 R12）。库层暂不加触发器 ——
+-- 它会成为 sku_unit 上第一把 BEFORE UPDATE 锁，按 00 §6.10 第 5 条必须把 sku_unit 移出 REPLACE_OK、
+-- 补 no-REPLACE 守卫与 2z3b 样本，属独立治理改动，见 docs/01-主数据.md §12 Q8。
 
 CREATE TABLE lot (
     id                  BIGINT       PRIMARY KEY,
@@ -151,7 +177,7 @@ CREATE TABLE lot (
     origin_batch        VARCHAR(64),
     quality_status      VARCHAR(16)  NOT NULL DEFAULT 'QUALIFIED',
     remaining_life_days SMALLINT     NOT NULL DEFAULT 9999,  -- 冗余，定时刷新
-    sell_deadline       DATE,                           -- 可售截止日 = COALESCE(production_date, receive_date 的日期) + sku.sell_days；sku.sell_days 为空时为 NULL。建档写入后不可改（trg_lot_sell_deadline：含 NULL→日期、改早、改晚、清空）
+    sell_deadline       DATE,                           -- 可售截止日 = COALESCE(production_date, receive_date) + sku.sell_days；sku.sell_days 为空时为 NULL。建档写入后不可改（trg_lot_sell_deadline：含 NULL→日期、改早、改晚、清空）
     cert_no             VARCHAR(64),                    -- 检疫合格证等
     created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     updated_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),

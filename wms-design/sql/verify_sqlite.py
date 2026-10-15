@@ -298,7 +298,7 @@ def expect_allow_tx(desc: str, stmts: list[str]) -> None:
 _MASTER_MIN = ["INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (1,'WHSH01','x','20:00')",
                "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (1,1,'Z-C1','x','CHILLED','PICK'),(2,1,'Z-C2','x','CHILLED','STORAGE')",
                "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (1,1,1,'A01','BIN',2,'A010'),(2,1,1,'A02','BIN',2,'A020'),(3,1,2,'B01','PALLET',8,'B010')",
-               "INSERT INTO sku (id,code,name,base_uom,temperature_required) VALUES (1,'SKU-APPLE','x','KG','CHILLED')"]   # 第十三轮：01/02 补了外键，内存库变异也要有父行
+               "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,sell_days) VALUES (1,'SKU-APPLE','x','KG','CHILLED',30,14)"]   # 第十三轮：01/02 补了外键，内存库变异也要有父行；第 1 篇 sell_days 冷藏必填
 print("=== 2. 库层不变量断言（与 verify.sh 同一套）===")
 seed = [
     "INSERT INTO warehouse (id,code,name,cutoff_time,work_date_offset) VALUES (1,'WHSH01','上海青浦仓','20:00',-1)",
@@ -306,8 +306,8 @@ seed = [
     "WITH RECURSIVE n(i) AS (SELECT 102 UNION ALL SELECT i + 1 FROM n WHERE i < 299) INSERT INTO sys_user (id,username,password_hash) SELECT i, 'seed' || i, 'x' FROM n WHERE i <> 200",
     "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (1,1,'Z-C1','冷藏拣货区','CHILLED','PICK'),(2,1,'Z-C2','冷藏存储区','CHILLED','STORAGE')",
     "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (1,1,1,'A01-02-03','BIN',2,'A010'),(2,1,1,'A01-03-01','BIN',2,'A020'),(3,1,2,'B02-01-05','PALLET',8,'B010')",
-    "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life) VALUES (1,'SKU-APPLE','山东红富士 80#','KG','CHILLED',30,10)",
-    "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life) VALUES (2,'SKU-PEAR','砀山酥梨','KG','CHILLED',30,10)",   # 第十三轮：stock/lot 用例引用 sku 2，补外键父行
+    "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life,sell_days) VALUES (1,'SKU-APPLE','山东红富士 80#','KG','CHILLED',30,10,14)",
+    "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life,sell_days) VALUES (2,'SKU-PEAR','砀山酥梨','KG','CHILLED',30,10,14)",   # 第十三轮：stock/lot 用例引用 sku 2，补外键父行
     "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date,quality_status,remaining_life_days) VALUES (1,1,'LOT-1008','2026-10-25','2026-10-08','QUALIFIED',10),(2,1,'LOT-1012','2026-10-29','2026-10-12','QUALIFIED',14),(3,1,'LOT-1014','2026-10-31','2026-10-14','QUALIFIED',16)",
     "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,allocated_qty_milli) VALUES (11,1,1,1,2,'KG',50000,0),(12,1,2,1,1,'KG',30000,10000),(13,1,3,1,3,'KG',200000,0),(14,1,3,1,1,'KG',80000,0)",
     "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000)",
@@ -1344,7 +1344,7 @@ def b17(desc, sql, want):
     except sqlite3.IntegrityError as e:
         conn.rollback(); msg = str(e)
         ok(f"{desc} → 已拦截（{msg}）") if (msg == want or msg.endswith(": " + want)) else bad(f"{desc} → 被拦了但约束不对：期望 {want!r}，实际 {msg!r}")
-expect_allow_tx('17 种子：SKU 原料三文鱼/鱼柳/鱼骨/按件鸡腿、库位、批次', ["INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life) VALUES (1701,'SKU-SALMON','三文鱼整鱼','KG','CHILLED',6,1),(1702,'SKU-FILLET','三文鱼柳','KG','CHILLED',3,1),(1703,'SKU-BONE','三文鱼骨','KG','CHILLED',2,0),(1704,'SKU-LEG','鸡腿（定量装）','EA','CHILLED',5,1)", "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (1790,1,2,'PC-01','FLOOR',99,'P010'),(1791,1,2,'C-01-01','PALLET',8,'C010'),(1792,1,1,'A09-01-01','BIN',8,'A090')", "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (1701,1701,'L-RAW1','2026-10-20','2026-10-14'),(1760,1702,'L-FIL1','2026-10-18','2026-10-15'),(1761,1703,'L-BON1','2026-10-17','2026-10-15'),(1762,1702,'L-FIL2','2026-10-18','2026-10-15'),(1763,1702,'L-FIL3','2026-10-18','2026-10-15'),(1764,1704,'L-LEG1','2026-10-19','2026-10-14'),(1765,1703,'L-BON2','2026-10-17','2026-10-15')"])
+expect_allow_tx('17 种子：SKU 原料三文鱼/鱼柳/鱼骨/按件鸡腿、库位、批次', ["INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life,sell_days) VALUES (1701,'SKU-SALMON','三文鱼整鱼','KG','CHILLED',6,1,3),(1702,'SKU-FILLET','三文鱼柳','KG','CHILLED',3,1,2),(1703,'SKU-BONE','三文鱼骨','KG','CHILLED',2,0,1),(1704,'SKU-LEG','鸡腿（定量装）','EA','CHILLED',5,1,3)", "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (1790,1,2,'PC-01','FLOOR',99,'P010'),(1791,1,2,'C-01-01','PALLET',8,'C010'),(1792,1,1,'A09-01-01','BIN',8,'A090')", "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (1701,1701,'L-RAW1','2026-10-20','2026-10-14'),(1760,1702,'L-FIL1','2026-10-18','2026-10-15'),(1761,1703,'L-BON1','2026-10-17','2026-10-15'),(1762,1702,'L-FIL2','2026-10-18','2026-10-15'),(1763,1702,'L-FIL3','2026-10-18','2026-10-15'),(1764,1704,'L-LEG1','2026-10-19','2026-10-14'),(1765,1703,'L-BON2','2026-10-17','2026-10-15')"])
 expect_allow_tx('17 种子：库存行 + 期初（原料 20 KG、鸡腿 10 件）', ["INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (1781,1,1791,1701,1701,'KG',0)", "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (1782,1,1790,1701,1701,'KG',0)", "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (1783,1,1792,1702,1760,'KG',0)", "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (1784,1,1792,1703,1761,'KG',0)", "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (1785,1,1792,1702,1762,'KG',0)", "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (1786,1,1792,1702,1763,'KG',0)", "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (1787,1,1790,1704,1764,'KG',0)", "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (1788,1,1792,1703,1765,'KG',0)", "INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('OPEN-1781',1,'DOC',NULL)", 'UPDATE stock SET on_hand_qty_milli=20000, hold_qty_milli=0, ledger_seq=1, version=version+1 WHERE id=1781 AND ledger_seq=0', "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key,hold_id) VALUES (17001,'OPEN-1781',1,1,1,'DOC','OPENING',1,1781,1,1,1791,1701,1701,20000,0,20000,'2026-10-15','OPEN-1781:1:D1:1',NULL)", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,stock_id,stock_seq,direction,occurred_at) VALUES (17001,'OPEN-1781:1:D1:1','OPEN-1781',1,1,1,'DOC',1781,1,1,'2026-10-15')", "INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('OPEN-1787',1,'DOC',NULL)", 'UPDATE stock SET on_hand_qty_milli=10000, hold_qty_milli=0, ledger_seq=1, version=version+1 WHERE id=1787 AND ledger_seq=0', "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key,hold_id) VALUES (17002,'OPEN-1787',1,1,1,'DOC','OPENING',1,1787,1,1,1790,1704,1764,10000,0,10000,'2026-10-15','OPEN-1787:1:D1:1',NULL)", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,stock_id,stock_seq,direction,occurred_at) VALUES (17002,'OPEN-1787:1:D1:1','OPEN-1787',1,1,1,'DOC',1787,1,1,'2026-10-15')"])
 expect_allow_tx('17 BOM 草稿（出成率 45%–55%，损耗上限 30%，称重容差 0.5%）', ["INSERT INTO process_bom (id,warehouse_id,code,bom_version,name,yield_min_bp,yield_max_bp,loss_max_bp,balance_tol_bp,created_by) VALUES (1701,1,'BOM-SALMON',1,'三文鱼分切',4500,5500,3000,50,8)"])
 b17('17 BOM 损耗上限 > 100%', "INSERT INTO process_bom (id,warehouse_id,code,bom_version,name,yield_min_bp,yield_max_bp,loss_max_bp,created_by) VALUES (1709,1,'BOM-X',1,'x',4000,5000,10001,8)", 'ck_pbom_loss')
@@ -1468,7 +1468,7 @@ b17('17 过期转异常不带异常单号', "UPDATE process_output SET loss_stat
 b17('17 非 LOSS 行（SETTLED）不能改成待审', "UPDATE process_output SET loss_status='PENDING_APPROVAL' WHERE output_role='FINISHED' AND process_order_id=1711", 'process_loss_settle_once')
 
 print("=== 2h. docs/18 活鲜暂存：B2 死亡/失重单次扣减、P2 整池释放、B3 task_kind、B5 42217 不占键、B6 外键 ===")
-expect_allow_tx('18 种子：活鲜 SKU 3、池 61（LIVE_TANK）、普通位 62、批次 31/32、stock 6101/6102', ["INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (61,1,2,'LT-01','LIVE_TANK',4,'L010'),(62,1,2,'B09-01-01','BIN',2,'L020')", "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life) VALUES (3,'SKU-CRAB','阳澄湖大闸蟹','KG','CHILLED',7,1)", "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date,quality_status,remaining_life_days) VALUES (31,3,'LOT-C1','2026-10-22','2026-10-15','QUALIFIED',7),(32,3,'LOT-C2','2026-10-23','2026-10-16','QUALIFIED',7)", "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (6101,1,61,3,31,'KG',50000),(6102,1,61,3,32,'KG',20000)"])
+expect_allow_tx('18 种子：活鲜 SKU 3、池 61（LIVE_TANK）、普通位 62、批次 31/32、stock 6101/6102', ["INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (61,1,2,'LT-01','LIVE_TANK',4,'L010'),(62,1,2,'B09-01-01','BIN',2,'L020')", "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life,sell_days) VALUES (3,'SKU-CRAB','阳澄湖大闸蟹','KG','CHILLED',7,1,3)", "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date,quality_status,remaining_life_days) VALUES (31,3,'LOT-C1','2026-10-22','2026-10-15','QUALIFIED',7),(32,3,'LOT-C2','2026-10-23','2026-10-16','QUALIFIED',7)", "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (6101,1,61,3,31,'KG',50000),(6102,1,61,3,32,'KG',20000)"])
 expect_block_tx('18 B6 普通库位挂池扩展', ['INSERT INTO live_tank (location_id,warehouse_id,sku_id,water_volume_l,temp_min_c10,temp_max_c10,temp_severe_min_c10,temp_severe_max_c10,do_min_x100,do_severe_min_x100,ph_min_x100,ph_max_x100) VALUES (62,1,3,2000,140,200,100,240,500,300,700,850)'], 'lt_not_live_tank')
 expect_allow_tx('18 SKU 参数与池扩展（池 61）', ['INSERT INTO sku_live_param (sku_id) VALUES (3)', 'INSERT INTO live_tank (location_id,warehouse_id,sku_id,water_volume_l,temp_min_c10,temp_max_c10,temp_severe_min_c10,temp_severe_max_c10,do_min_x100,do_severe_min_x100,ph_min_x100,ph_max_x100) VALUES (61,1,3,2000,140,200,100,240,500,300,700,850)'])
 expect_block_tx('18 B6 SKU 参数指向不存在的 SKU', ['INSERT INTO sku_live_param (sku_id) VALUES (9999)'], 'FOREIGN KEY constraint failed')
@@ -2270,7 +2270,7 @@ SRTN_CLOCK_TRG = ("trg_srtn_ins_open", "trg_srtn_clock_ins", "trg_srtn_clock_upd
 SRTN_CLOCK_SQL = [one("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", t)[0] for t in SRTN_CLOCK_TRG]
 for _t in SRTN_CLOCK_TRG:
     conn.execute(f"DROP TRIGGER {_t}")
-SRTN_SKU = "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life,return_as_fresh) VALUES (97001,'SKU-SR-FRZ','冷冻虾仁','KG','FROZEN',180,30,false),(97002,'SKU-SR-AMB','常温大米','KG','AMBIENT',365,30,false),(97003,'SKU-SR-AMBF','常温香蕉（按生鲜退）','KG','AMBIENT',7,1,true),(97004,'SKU-SR-LIVE','活鲜（未定义映射）','KG','LIVE',3,1,false)"
+SRTN_SKU = "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life,sell_days,return_as_fresh) VALUES (97001,'SKU-SR-FRZ','冷冻虾仁','KG','FROZEN',180,30,90,false),(97002,'SKU-SR-AMB','常温大米','KG','AMBIENT',365,30,NULL,false),(97003,'SKU-SR-AMBF','常温香蕉（按生鲜退）','KG','AMBIENT',7,1,NULL,true),(97004,'SKU-SR-LIVE','活鲜（未定义映射）','KG','LIVE',3,1,NULL,false)"
 conn.execute(SRTN_SKU)
 SRTN_I = "INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES "
 T0 = "2026-10-15 08:00:00"
@@ -2900,7 +2900,7 @@ _T03 = {n: one("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", 
 def _p03(l): return [(_T03[x[10:]] if x.startswith('@RECREATE ') else ('DROP TRIGGER ' + x[6:] if x.startswith('@DROP ') else x)) for x in l]
 for _n in _TOL03: conn.execute('DROP TRIGGER ' + _n)
 conn.commit()
-expect_allow_tx('03 种子：冷藏收货区/暂存位/存储位、SKU 冷鲜猪里脊、批次、两条库存行、采购入库单 + 行（订 100 KG）', ["INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (31,1,'Z-RCV','冷藏收货区','CHILLED','RECEIVE')", "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (31,1,31,'RCV-01','FLOOR',99,'R010'),(32,1,2,'B31-01-01','PALLET',8,'B310')", "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life) VALUES (31,'SKU-PORK','冷鲜猪里脊','KG','CHILLED',5,2)", "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (303,31,'L-PORK1','2026-10-20','2026-10-15')", "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (3101,1,31,31,303,'KG',0),(3102,1,32,31,303,'KG',0)", "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,supplier_id,status,work_date,arrived_at,unload_start_at) VALUES (3100,'INB-SH01-0001-20261015-000001',1,'PURCHASE','ERP','PO-3100','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',501,'RECEIVING','2026-10-15','2026-10-15 01:00:00','2026-10-15 01:05:00')", "INSERT INTO inbound_line (id,inbound_id,line_no,sku_id,uom,temp_zone,ordered_qty_milli,lot_id,expiry_date) VALUES (3110,3100,1,31,'KG','CHILLED',100000,303,'2026-10-20')"])
+expect_allow_tx('03 种子：冷藏收货区/暂存位/存储位、SKU 冷鲜猪里脊、批次、两条库存行、采购入库单 + 行（订 100 KG）', ["INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (31,1,'Z-RCV','冷藏收货区','CHILLED','RECEIVE')", "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (31,1,31,'RCV-01','FLOOR',99,'R010'),(32,1,2,'B31-01-01','PALLET',8,'B310')", "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life,sell_days) VALUES (31,'SKU-PORK','冷鲜猪里脊','KG','CHILLED',5,2,3)", "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (303,31,'L-PORK1','2026-10-20','2026-10-15')", "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (3101,1,31,31,303,'KG',0),(3102,1,32,31,303,'KG',0)", "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,supplier_id,status,work_date,arrived_at,unload_start_at) VALUES (3100,'INB-SH01-0001-20261015-000001',1,'PURCHASE','ERP','PO-3100','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',501,'RECEIVING','2026-10-15','2026-10-15 01:00:00','2026-10-15 01:05:00')", "INSERT INTO inbound_line (id,inbound_id,line_no,sku_id,uom,temp_zone,ordered_qty_milli,lot_id,expiry_date) VALUES (3110,3100,1,31,'KG','CHILLED',100000,303,'2026-10-20')"])
 expect_block_tx('03 单头状态白名单', ["INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,status,work_date,closed_at) VALUES (3195,'INB-X1',1,'PURCHASE','ERP','PO-X1',NULL,'DONE','2026-10-15',NULL)"], 'ck_inb_status')
 expect_block_tx('03 source_hash 大写 hex', ["INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,status,work_date,closed_at) VALUES (3195,'INB-X1',1,'PURCHASE','ERP','PO-X1','AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA','CREATED','2026-10-15',NULL)"], 'ck_inb_hash')
 expect_block_tx('03 退货入库来源白名单（#5 的 ck_inb_rtn_src，10 ALTER，基线已有）', ["INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,status,work_date,closed_at) VALUES (3195,'RTN-X1',1,'RETURN','WHATEVER','X-1',NULL,'CREATED','2026-10-15',NULL)"], 'ck_inb_rtn_src')
@@ -3713,6 +3713,89 @@ for _p in (("sys_user", "actor_id", "id"), ("approval_request", "approval_id", "
     ok(f"audit_log 外键已声明：{_p[1]} → {_p[0]}") if _p in _fka else bad(f"audit_log 外键缺 {_p}：{_fka}")
 expect_block_tx("12 外键：audit_log.approval_id 指向不存在的审批单", ["INSERT INTO audit_log (id,approval_id,action,node_id,node_seq,occurred_at) VALUES (779802,999999,'t12.fk',7,779802,datetime('now'))"], "FOREIGN KEY constraint failed")
 expect_block_tx("12 外键：audit_log.actor_id 指向不存在的用户（12 侧复核）", ["INSERT INTO audit_log (id,actor_id,action,node_id,node_seq,occurred_at) VALUES (779801,999999,'t12.fk',7,779801,datetime('now'))"], "FOREIGN KEY constraint failed")
+print("=== 2i. 第 1 篇主数据不变量（sell_days / 温区 0.1 ℃ / 水位 milli / 换算 milli / 仓编码 / 时间默认值）===")
+# 每条库层不变量都是三件套：正向放行 + 反向按名拦截 + 变异（去掉约束后原被拒语句通过）。两库同一套断言。
+def _sku_ins(i, code, temp='CHILLED', shelf=30, sell=10, ppm=0, ship=0):
+    sell_s = 'NULL' if sell is None else str(sell)
+    return ("INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life,sell_days,natural_loss_tolerance_ppm) "
+            f"VALUES ({i},'{code}','x','KG','{temp}',{shelf},{ship},{sell_s},{ppm})")
+_sku_ok = _sku_ins(8011, 'SKU-T-SD')
+expect_allow_tx("01 sku.sell_days=10 且 ≤ 保质期 30 天（冷藏）", [_sku_ok])
+expect_block_tx("01 sku.sell_days 超保质期（31 > 30）", [_sku_ins(8012, 'SKU-T-SD2', sell=31)], "ck_sku_sell_days")
+expect_block_tx("01 sku.sell_days=0（可售天数是正数）", [_sku_ins(8013, 'SKU-T-SD3', sell=0)], "ck_sku_sell_days")
+expect_block_tx("01 冷藏 SKU 没有 sell_days（sell_deadline 会永远为空）", [_sku_ins(8014, 'SKU-T-SD4', sell=None)], "ck_sku_sell_days_req")
+expect_allow_tx("01 常温 SKU 允许不设 sell_days", [_sku_ins(8015, 'SKU-T-SD5', temp='AMBIENT', sell=None)])
+expect_allow_tx("01 损耗容差正好 50000 ppm（5%）", [_sku_ins(8016, 'SKU-T-PPM', ppm=50000)])
+expect_block_tx("01 损耗容差 50001 ppm（绕过 09 报损审批）", [_sku_ins(8017, 'SKU-T-PPM2', ppm=50001)], "ck_sku_loss_ppm")
+expect_block_tx("01 禁发期 6 天 > 保质期 5 天", [_sku_ins(8018, 'SKU-T-SL', shelf=5, sell=1, ship=6)], "ck_sku_shelf_life")
+expect_allow_tx("01 禁发期与收货允收期都等于保质期（放行）",
+                ["INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,receive_min_shelf_life,ship_min_shelf_life,sell_days) "
+                 "VALUES (8019,'SKU-T-SL2','x','KG','CHILLED',5,5,5,1)"])
+_ttl_mut("sell_days 超保质期被放行", "ck_sku_sell_days", _sku_ins(8091, 'SKU-M1', sell=31))
+_ttl_mut("冷藏 SKU 缺 sell_days 被放行", "ck_sku_sell_days_req", _sku_ins(8092, 'SKU-M2', sell=None))
+_ttl_mut("损耗容差 50001 被放行", "ck_sku_loss_ppm", _sku_ins(8093, 'SKU-M3', ppm=50001))
+_ttl_mut("禁发期超保质期被放行", "ck_sku_shelf_life", _sku_ins(8094, 'SKU-M4', shelf=5, sell=1, ship=6))
+
+_zone_ins = ("INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type,temp_min_c10,temp_max_c10) "
+             "VALUES ({i},1,'{c}','x','FROZEN','STORAGE',{lo},{hi})")
+expect_allow_tx("01 冷冻区 -18.0 ℃ ~ -15.0 ℃（c10 整数）", [_zone_ins.format(i=8101, c='Z-T1', lo=-180, hi=-150)])
+expect_block_tx("01 温区上下限相等（等于没有区间）", [_zone_ins.format(i=8102, c='Z-T2', lo=-150, hi=-150)], "ck_zone_temp")
+expect_block_tx("01 温区只给下限不给上限", [_zone_ins.format(i=8103, c='Z-T3', lo=-180, hi='NULL')], "ck_zone_temp")
+expect_block_tx("01 温区下限大于上限", [_zone_ins.format(i=8104, c='Z-T4', lo=-150, hi=-180)], "ck_zone_temp")
+expect_allow_tx("01 温区两列都为空（不控温库区）", ["INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (8105,1,'Z-T5','x','AMBIENT','STAGE')"])
+_ttl_mut("温区上下限相等被放行", "ck_zone_temp", _zone_ins.format(i=8096, c='Z-M1', lo=-150, hi=-150))
+
+_loc_ins = ("INSERT INTO location (id,warehouse_id,zone_id,code,location_type,min_level_milli,max_level_milli) "
+            "VALUES ({i},1,1,'{c}','BIN',{lo},{hi})")
+expect_allow_tx("01 补货水位 0 ≤ 下限 ≤ 上限（milli）", [_loc_ins.format(i=8111, c='L-T1', lo=0, hi=100000)])
+expect_block_tx("01 补货水位下限 > 上限", [_loc_ins.format(i=8112, c='L-T2', lo=100000, hi=50000)], "ck_loc_level")
+expect_block_tx("01 补货水位下限为负", [_loc_ins.format(i=8113, c='L-T3', lo=-1, hi=0)], "ck_loc_level")
+_ttl_mut("补货水位下限 > 上限被放行", "ck_loc_level", _loc_ins.format(i=8097, c='L-M1', lo=100000, hi=50000))
+
+_wh_ins = "INSERT INTO warehouse (id,code,name,cutoff_time) VALUES ({i},'{c}','x','20:00')"
+expect_allow_tx("01 仓编码 WHSH02（[A-Z0-9]、2–16 位）", [_wh_ins.format(i=8121, c='WHSH02')])
+expect_block_tx("01 仓编码含小写字母", [_wh_ins.format(i=8122, c='wh02')], "ck_wh_code")
+expect_block_tx("01 仓编码含 '-'（会与审批单号分段冲突）", [_wh_ins.format(i=8123, c='AB-C1')], "ck_wh_code")
+expect_block_tx("01 仓编码只有 1 位", [_wh_ins.format(i=8124, c='A')], "ck_wh_code")
+expect_block_tx("01 仓编码 17 位", [_wh_ins.format(i=8125, c='ABCDEFGH123456789')], "ck_wh_code")
+_ttl_mut("仓编码含小写被放行", "ck_wh_code", _wh_ins.format(i=8098, c='wh02'))
+
+_su_ins = "INSERT INTO sku_unit (id,sku_id,uom,base_qty_milli) VALUES ({i},1,'{u}',{q})"
+expect_allow_tx("01 换算系数 1 BOX = 12.500 KG（12500 milli）", [_su_ins.format(i=8131, u='BOX12', q=12500)])
+expect_block_tx("01 换算系数为 0", [_su_ins.format(i=8132, u='BOX0', q=0)], "ck_unit_ratio")
+expect_block_tx("01 换算系数为负", [_su_ins.format(i=8133, u='BOXN', q=-1)], "ck_unit_ratio")
+_ttl_mut("换算系数为 0 被放行", "ck_unit_ratio", _su_ins.format(i=8099, u='BOXM', q=0))
+
+# 旧口径列必须消失、新口径列必须在且是整数列（R2；第 18 篇同 *_c10 口径）
+_cols01 = lambda t: [r[1] for r in conn.execute(f"PRAGMA table_info({t})")]
+_typed01 = lambda t: {r[1]: (r[2] or '').upper() for r in conn.execute(f"PRAGMA table_info({t})")}
+_gone01 = {"zone": ("temp_min", "temp_max"), "sku": ("natural_loss_pct",), "location": ("min_level", "max_level"), "sku_unit": ("ratio_to_base",)}
+_stale01 = [f"{t}.{c}" for t, cs in _gone01.items() for c in cs if c in _cols01(t)]
+ok("01 旧口径列已全部改名（无 " + ", ".join(f"{t}.{c}" for t, cs in _gone01.items() for c in cs) + "）") if not _stale01 else bad(f"01 旧口径列还在：{_stale01}")
+_new01 = {"zone": ("temp_min_c10", "temp_max_c10"), "sku": ("sell_days", "natural_loss_tolerance_ppm"),
+          "location": ("min_level_milli", "max_level_milli"), "sku_unit": ("base_qty_milli",)}
+_miss01 = [f"{t}.{c}" for t, cs in _new01.items() for c in cs if c not in _cols01(t)]
+ok("01 新口径列齐全（" + ", ".join(f"{t}.{c}" for t, cs in _new01.items() for c in cs) + "）") if not _miss01 else bad(f"01 缺新口径列：{_miss01}")
+_nonint01 = [f"{t}.{c}" for t, cs in _new01.items() for c in cs
+             if 'INT' not in _typed01(t).get(c, '')]
+ok("01 新口径列都是整数列（SQLite 不会退化成 REAL）") if not _nonint01 else bad(f"01 新口径列不是整数：{_nonint01}")
+# 变异：把温区上下限改回 NUMERIC，上面那条整数列扫描必须变红
+_mddl01 = sqlite_ddl.replace("temp_min_c10    INTEGER", "temp_min_c10    NUMERIC")
+if _mddl01 == sqlite_ddl:
+    bad("变异没生效：没找到 temp_min_c10 INTEGER 声明")
+else:
+    _mc01 = sqlite3.connect(":memory:")
+    _mc01.executescript(_mddl01)
+    _mtype01 = (dict((r[1], (r[2] or '').upper()) for r in _mc01.execute("PRAGMA table_info(zone)")))['temp_min_c10']
+    _mc01.close()
+    ok(f"变异：temp_min_c10 改回 NUMERIC 后上面那条整数列扫描会变红（实测类型 {_mtype01}）") if 'INT' not in _mtype01 else bad("变异没变红：temp_min_c10 仍是整数列")
+
+# 00 §6.8 第 3 条：服务端时间由库写 UTC 整秒（SQLite datetime('now') 本身就是整秒 UTC）
+_t01 = ("warehouse", "zone", "location", "sku", "lot")
+_bad_ts01 = [f"{t}.{c}" for t in _t01 for c in ("created_at", "updated_at")
+             if (dict((r[1], r[4]) for r in conn.execute(f"PRAGMA table_info({t})")).get(c) or "") != "datetime('now')"]
+ok("01 的 10 个 created_at / updated_at 默认值都是 datetime('now')（UTC 整秒，00 §6.8）") if not _bad_ts01 else bad(f"01 时间默认值不合规：{_bad_ts01}")
+
 print("=== FK 自检 ===")
 _fk_guard("收尾")
 ok(f"全程无用例在 foreign_keys=OFF 下运行（守卫命中 {_fk_guard_hits} 次）") if _fk_guard_hits == 0 else bad(f"FK 守卫命中 {_fk_guard_hits} 次")
