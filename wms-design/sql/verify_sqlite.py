@@ -13,6 +13,7 @@ sql/verify_sqlite.py —— 双库对等验证（设计文档 §3.1 / D5 的可�
 """
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
 import sys
@@ -78,11 +79,12 @@ def translate(pg: str) -> tuple[str, list[str]]:
     # delta 2: now() —— SQLite 无 now() 函数，且表达式默认值必须加括号
     #   九轮 P1：UTC 默认值 DEFAULT (now() AT TIME ZONE 'UTC') 同属这一类，SQLite 的 datetime('now') 恒为 UTC
     n_now = len(re.findall(r"DEFAULT now\(\)", s))
-    n_utc = s.count("DEFAULT (now() AT TIME ZONE 'UTC')")
+    n_utc = s.count("DEFAULT (now() AT TIME ZONE 'UTC')") + s.count("DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC'))")
     if n_now or n_utc:
+        s = s.replace("DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC'))", "DEFAULT (datetime('now'))")   # #2 第九轮：UTC 整秒，SQLite datetime('now') 本来就是整秒 UTC
         s = s.replace("DEFAULT (now() AT TIME ZONE 'UTC')", "DEFAULT (datetime('now'))")
         s = s.replace("DEFAULT now()", "DEFAULT (datetime('now'))")
-        deltas.append(f"{n_now} 处 DEFAULT now()、{n_utc} 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）")
+        deltas.append(f"{n_now} 处 DEFAULT now()、{n_utc} 处 DEFAULT (now() AT TIME ZONE 'UTC') / (date_trunc('second', now() AT TIME ZONE 'UTC')) → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）")
 
     # delta 4: 方言专属行 —— 行尾 "-- @pg-only" 的行删除；"-- @sqlite-only " 开头的行取消注释。
     #   只用于交集之外、两库语义相同但语法不同的东西：分区子句、触发器、角色权限（docs/02 §4.4、§4.8）
@@ -109,7 +111,8 @@ src = "".join((SCHEMA_DIR / name).read_text(encoding="utf-8") for name in SCHEMA
 if not src.endswith("\n"):
     src += "\n"
 sqlite_ddl, deltas = translate(src)
-OUT_SQL.write_text(
+if os.environ.get("VERIFY_SQLITE_NO_WRITE") != "1":  # 变异子进程不覆盖生成文件
+  OUT_SQL.write_text(
     "-- 本文件由 sql/verify_sqlite.py 从 sql/schema/*.sql 按加载顺序机械生成，请勿手改。\n"
     f"-- 翻译产生的改动共 {len(deltas)} 类：\n"
     + "".join(f"--   {i}. {d}\n" for i, d in enumerate(deltas, 1))
@@ -128,8 +131,28 @@ else:
     bad(f"改动 {len(deltas)} 类，交集原则守得不够，见上方清单")
 
 dbf = tempfile.mktemp(suffix=".db")
-conn = sqlite3.connect(dbf, isolation_level=None)   # 自动提交；需要事务时显式 BEGIN/COMMIT
-conn.execute("PRAGMA foreign_keys = ON")
+# 变异开关（仅供自检用）：=1 时 connect_main() 重连后不再打开外键，用来证明下面的守卫会让 verify 变红
+_MUTANT_NO_FK = os.environ.get("VERIFY_SQLITE_MUTANT_NO_FK") == "1"
+_n_connects = 0
+_fk_off_allowed = False   # 只有刻意测"连接漏开外键"的用例才会临时置 True
+
+
+def connect_main(**kw):
+    """主连接唯一入口：每次（重）连接都必须打开外键，并确认真的生效。
+    SQLite 的 foreign_keys 是连接级设置，重连后默认是 OFF。"""
+    global _n_connects
+    c = sqlite3.connect(dbf, **kw)
+    _n_connects += 1
+    if not (_MUTANT_NO_FK and _n_connects > 1):   # 变异：只去掉"重连"后的外键开启
+        c.execute("PRAGMA foreign_keys = ON")
+        fk = c.execute("PRAGMA foreign_keys").fetchone()[0]
+        if fk != 1:
+            print(f"  ✗ PRAGMA foreign_keys=ON 未生效（读回 {fk}），立即退出")
+            sys.exit(3)
+    return c
+
+
+conn = connect_main(isolation_level=None)   # 自动提交；需要事务时显式 BEGIN/COMMIT
 try:
     conn.executescript(sqlite_ddl)
     conn.commit()
@@ -149,6 +172,27 @@ ok(f"表数 = {NT}（期望 {EXPECT_TABLES}）") if NT == EXPECT_TABLES else bad
 ok(f"视图数 = {NV}") if NV == EXPECT_VIEWS else bad(f"视图数 = {NV}，期望 {EXPECT_VIEWS}")
 
 
+_fk_guard_hits = 0
+
+
+def _fk_guard(desc: str) -> None:
+    """自检：用例运行时外键必须是开的（刻意测漏开的用例除外），否则直接记失败。"""
+    global _fk_guard_hits
+    if _fk_off_allowed:
+        return
+    if conn.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+        _fk_guard_hits += 1
+        bad(f"[FK 守卫] 运行用例时 foreign_keys=OFF：{desc}")
+
+
+# #2 第十一轮 种子模式（同 2s 退供 SRTN_CLOCK_TRG 口径）：流水 / key 的 occurred_at 时钟触发器对所有写入生效（SQLite 没有表属主），
+# 而前面几百条用例用固定日期（'2026-10-15' 等）写流水验证业务规则。先摘掉，文件末尾 "2z2-mv" 节装回来专测时钟。
+MV_CLOCK_TRG = ("trg_mv_clock", "trg_mvk_clock")
+MV_CLOCK_SQL = [conn.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (t,)).fetchone()[0] for t in MV_CLOCK_TRG]
+for _t in MV_CLOCK_TRG:
+    conn.execute(f"DROP TRIGGER {_t}")
+
+
 def one(sql, *a):
     return conn.execute(sql, a).fetchone()
 
@@ -156,6 +200,7 @@ def one(sql, *a):
 def expect_block(desc: str, sql: str, want: str) -> None:
     """want = 期望的约束名（CHECK）或列清单（UNIQUE，SQLite 报错只给列不给约束名）。
     只有错误信息精确命中 want 才算通过：被别的约束拦下 = 断言没测到它声称测的东西。"""
+    _fk_guard(desc)
     try:
         conn.execute(sql)
         conn.commit()
@@ -170,6 +215,7 @@ def expect_block(desc: str, sql: str, want: str) -> None:
 
 
 def expect_allow(desc: str, sql: str) -> None:
+    _fk_guard(desc)
     try:
         conn.execute(sql)
         conn.commit()
@@ -192,6 +238,7 @@ def _run_tx(stmts):
 
 def expect_block_tx(desc: str, stmts: list[str], want: str) -> None:
     """一个事务里执行一组语句（如：归属行 + 流水 + 去重键），期望被 want 指定的约束/触发器拦下并整体回滚。"""
+    _fk_guard(desc)
     try:
         _run_tx(stmts)
         bad(f"{desc} → 未拦截（SQLite 侧有洞）")
@@ -204,6 +251,7 @@ def expect_block_tx(desc: str, stmts: list[str], want: str) -> None:
 
 
 def expect_allow_tx(desc: str, stmts: list[str]) -> None:
+    _fk_guard(desc)
     try:
         _run_tx(stmts)
         ok(f"{desc} → 通过")
@@ -214,12 +262,17 @@ def expect_allow_tx(desc: str, stmts: list[str]) -> None:
 # ---------------------------------------------------------------------------
 # 2. 同一套断言
 # ---------------------------------------------------------------------------
+_MASTER_MIN = ["INSERT INTO warehouse (id,code,name,cutoff_time) VALUES (1,'WHSH01','x','20:00')",
+               "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (1,1,'Z-C1','x','CHILLED','PICK'),(2,1,'Z-C2','x','CHILLED','STORAGE')",
+               "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (1,1,1,'A01','BIN',2,'A010'),(2,1,1,'A02','BIN',2,'A020'),(3,1,2,'B01','PALLET',8,'B010')",
+               "INSERT INTO sku (id,code,name,base_uom,temperature_required) VALUES (1,'SKU-APPLE','x','KG','CHILLED')"]   # 第十三轮：01/02 补了外键，内存库变异也要有父行
 print("=== 2. 库层不变量断言（与 verify.sh 同一套）===")
 seed = [
     "INSERT INTO warehouse (id,code,name,cutoff_time,work_date_offset) VALUES (1,'WHSH01','上海青浦仓','20:00',-1)",
     "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (1,1,'Z-C1','冷藏拣货区','CHILLED','PICK'),(2,1,'Z-C2','冷藏存储区','CHILLED','STORAGE')",
     "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (1,1,1,'A01-02-03','BIN',2,'A010'),(2,1,1,'A01-03-01','BIN',2,'A020'),(3,1,2,'B02-01-05','PALLET',8,'B010')",
     "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life) VALUES (1,'SKU-APPLE','山东红富士 80#','KG','CHILLED',30,10)",
+    "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life) VALUES (2,'SKU-PEAR','砀山酥梨','KG','CHILLED',30,10)",   # 第十三轮：stock/lot 用例引用 sku 2，补外键父行
     "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date,quality_status,remaining_life_days) VALUES (1,1,'LOT-1008','2026-10-25','2026-10-08','QUALIFIED',10),(2,1,'LOT-1012','2026-10-29','2026-10-12','QUALIFIED',14),(3,1,'LOT-1014','2026-10-31','2026-10-14','QUALIFIED',16)",
     "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,allocated_qty_milli) VALUES (11,1,1,1,2,'KG',50000,0),(12,1,2,1,1,'KG',30000,10000),(13,1,3,1,3,'KG',200000,0),(14,1,3,1,1,'KG',80000,0)",
     "INSERT INTO count_line (id,count_id,location_id,sku_id,lot_id,book_qty_milli,movement_qty_milli,actual_qty_milli) VALUES (1,1,1,1,1,100000,-30000,68000)",
@@ -236,6 +289,7 @@ ok("种子数据写入（含 TIME/DATE/TIMESTAMP/BOOLEAN/NUMERIC 列，未做任
 
 
 def assert_n(desc: str, sql: str, n: int) -> None:
+    _fk_guard(desc)
     got = one(sql)[0]
     ok(f"{desc} = {got}") if got == n else bad(f"{desc} = {got}，期望 {n}")
 
@@ -243,7 +297,7 @@ def assert_n(desc: str, sql: str, n: int) -> None:
 assert_n("主数据种子 warehouse", "SELECT count(*) FROM warehouse", 1)
 assert_n("主数据种子 zone", "SELECT count(*) FROM zone", 2)
 assert_n("主数据种子 location", "SELECT count(*) FROM location", 3)
-assert_n("主数据种子 sku", "SELECT count(*) FROM sku", 1)
+assert_n("主数据种子 sku", "SELECT count(*) FROM sku", 2)
 assert_n("主数据种子 lot", "SELECT count(*) FROM lot", 3)
 assert_n("主数据种子 stock", "SELECT count(*) FROM stock", 4)
 assert_n("种子 outbound_order", "SELECT count(*) FROM outbound_order", 1)
@@ -326,31 +380,79 @@ conn.commit()
 
 # ---- 以下由用例表生成（verify_sqlite.py 与 verify.sh 同一份用例）----
 print("=== 2b. docs/02 库存核心：记账去重、只追加、期初、互斥、占用/冻结状态、对账去重 ===")
-expect_block_tx('I5 流水平衡（after<>before+qty*dir）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('ADJ0',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (1,'ADJ0',1,1,1,'DOC','ADJUST',-1,11,1,1,1,1,2,NULL,NULL,NULL,NULL,3000,100000,98000,'2026-10-15','ADJ0:1:D1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (1,'ADJ0:1:D1:1','ADJ0',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,1,-1,'2026-10-15')"], 'ck_mv_balance')
-expect_allow_tx('期初流水 OPENING（迁移行 seq=1，before=0）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('OPEN-MIG1',11,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (2,'OPEN-MIG1',11,1,1,'DOC','OPENING',1,11,1,1,1,1,2,NULL,NULL,NULL,NULL,50000,0,50000,'2026-10-15','OPEN-MIG1:11:D1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (2,'OPEN-MIG1:11:D1:1','OPEN-MIG1',11,1,1,'DOC',NULL,NULL,NULL,NULL,11,1,1,'2026-10-15')"])
-expect_block_tx('期初流水只能是该行第 1 条', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('OPEN-MIG1',111,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (3,'OPEN-MIG1',111,1,1,'DOC','OPENING',1,11,2,1,1,1,2,NULL,NULL,NULL,NULL,50000,0,50000,'2026-10-15','OPEN-MIG1:111:D1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (3,'OPEN-MIG1:111:D1:1','OPEN-MIG1',111,1,1,'DOC',NULL,NULL,NULL,NULL,11,2,1,'2026-10-15')"], 'ck_mv_opening')
-expect_allow_tx('DOC 过账（调整出 3000）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('ADJ1',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (4,'ADJ1',1,1,1,'DOC','ADJUST',-1,11,2,1,1,1,2,NULL,NULL,NULL,NULL,3000,50000,47000,'2026-10-15','ADJ1:1:D1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (4,'ADJ1:1:D1:1','ADJ1',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,2,-1,'2026-10-15')"])
-expect_block_tx('重复过账：同 biz_no+line_no+op_no+leg，换 idempotency_key', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('ADJ1',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (5,'ADJ1',1,1,1,'DOC','ADJUST',-1,11,9,1,1,1,2,NULL,NULL,NULL,NULL,3000,50000,47000,'2026-10-15','X:other')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (5,'X:other','ADJ1',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,9,-1,'2026-10-15')"], 'stock_movement_key.biz_no, stock_movement_key.line_no, stock_movement_key.op_no, stock_movement_key.leg')
-expect_allow_tx('同一 DOC 行第二次合法操作（op_no=2，不被吞）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('ADJ1',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (6,'ADJ1',1,2,1,'DOC','ADJUST',-1,11,3,1,1,1,2,NULL,NULL,NULL,NULL,1000,47000,46000,'2026-10-15','ADJ1:1:D2:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (6,'ADJ1:1:D2:1','ADJ1',1,2,1,'DOC',NULL,NULL,NULL,NULL,11,3,-1,'2026-10-15')"])
-expect_block_tx('idempotency_key 重复（唯一格式）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('ADJ9',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (7,'ADJ9',1,1,1,'DOC','ADJUST',-1,11,4,1,1,1,2,NULL,NULL,NULL,NULL,1000,46000,45000,'2026-10-15','ADJ1:1:D1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (7,'ADJ1:1:D1:1','ADJ9',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,4,-1,'2026-10-15')"], 'stock_movement_key.idempotency_key')
-expect_block_tx('记账链分叉（同 stock_id+stock_seq）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('ADJ8',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (8,'ADJ8',1,1,1,'DOC','ADJUST',-1,11,3,1,1,1,2,NULL,NULL,NULL,NULL,1000,46000,45000,'2026-10-15','ADJ8:1:D1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (8,'ADJ8:1:D1:1','ADJ8',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,3,-1,'2026-10-15')"], 'stock_movement_key.stock_id, stock_movement_key.stock_seq')
-expect_allow_tx('direction=0 纯事件流水不入链（SHIP）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('SHP1',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (9,'SHP1',1,1,1,'DOC','SHIP',0,11,3,1,1,1,2,NULL,NULL,NULL,NULL,3000,46000,46000,'2026-10-15','SHP1:1:D1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (9,'SHP1:1:D1:1','SHP1',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,3,0,'2026-10-15')"])
-expect_allow_tx('期初：stock 12', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('OPEN-MIG1',12,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (10,'OPEN-MIG1',12,1,1,'DOC','OPENING',1,12,1,1,2,1,1,NULL,NULL,NULL,NULL,30000,0,30000,'2026-10-15','OPEN-MIG1:12:D1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (10,'OPEN-MIG1:12:D1:1','OPEN-MIG1',12,1,1,'DOC',NULL,NULL,NULL,NULL,12,1,1,'2026-10-15')"])
-expect_allow_tx('PDA 拣货（四元组 77/3/DEV-A/1）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('PK2',3,'PDA','DEV-A') ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (11,'PK2',3,0,1,'PDA','PICK',-1,12,2,1,2,1,1,77,3,'DEV-A',1,1000,30000,29000,'2026-10-15','PK2:3:PDEV-A.1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (11,'PK2:3:PDEV-A.1:1','PK2',3,0,1,'PDA',77,3,'DEV-A',1,12,2,-1,'2026-10-15')"])
-expect_block_tx('Idempotency-Key 过期后 PDA 重放同一四元组（换 idempotency_key）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('PK2',3,'PDA','DEV-A') ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (12,'PK2',3,0,1,'PDA','PICK',-1,12,3,1,2,1,1,77,3,'DEV-A',1,1000,29000,28000,'2026-10-15','X:replay')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (12,'X:replay','PK2',3,0,1,'PDA',77,3,'DEV-A',1,12,3,-1,'2026-10-15')"], 'stock_movement_key.src_task_id, stock_movement_key.src_line_no, stock_movement_key.device_instance_id, stock_movement_key.src_op_seq, stock_movement_key.leg')
-expect_allow_tx('同一 PDA 行第二次合法操作（op_seq=2，不被吞）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('PK2',3,'PDA','DEV-A') ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (13,'PK2',3,0,1,'PDA','PICK',-1,12,3,1,2,1,1,77,3,'DEV-A',2,1000,29000,28000,'2026-10-15','PK2:3:PDEV-A.2:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (13,'PK2:3:PDEV-A.2:1','PK2',3,0,1,'PDA',77,3,'DEV-A',2,12,3,-1,'2026-10-15')"])
-expect_block_tx('同一单据行 DOC 与 PDA 互斥（PDA 行上来一条 DOC 过账）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('PK2',3,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (14,'PK2',3,1,1,'DOC','PICK',-1,12,4,1,2,1,1,NULL,NULL,NULL,NULL,1000,28000,27000,'2026-10-15','PK2:3:D1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (14,'PK2:3:D1:1','PK2',3,1,1,'DOC',NULL,NULL,NULL,NULL,12,4,-1,'2026-10-15')"], 'ledger_line_owner_mismatch')
-expect_block_tx('换设备实例不能直接记账（DEV-B 不是当前持有设备）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('PK2',3,'PDA','DEV-B') ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (15,'PK2',3,0,1,'PDA','PICK',-1,12,4,1,2,1,1,77,3,'DEV-B',1,1000,28000,27000,'2026-10-15','PK2:3:PDEV-B.1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (15,'PK2:3:PDEV-B.1:1','PK2',3,0,1,'PDA',77,3,'DEV-B',1,12,4,-1,'2026-10-15')"], 'ledger_line_owner_mismatch')
+expect_block_tx('I5 流水平衡（after<>before+qty*dir）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'ADJ0',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'ADJ0' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (1,'ADJ0',1,1,1,'DOC','ADJUST',-1,11,1,1,1,1,2,NULL,NULL,NULL,NULL,3000,100000,98000,'2026-10-15','ADJ0:1:D1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (1,'ADJ0:1:D1:1','ADJ0',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,1,-1,'2026-10-15')"], 'ck_mv_balance')
+expect_allow_tx('期初流水 OPENING（迁移行 seq=1，before=0）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'OPEN-MIG1',11,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'OPEN-MIG1' AND l.line_no = 11) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (2,'OPEN-MIG1',11,1,1,'DOC','OPENING',1,11,1,1,1,1,2,NULL,NULL,NULL,NULL,50000,0,50000,'2026-10-15','OPEN-MIG1:11:D1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (2,'OPEN-MIG1:11:D1:1','OPEN-MIG1',11,1,1,'DOC',NULL,NULL,NULL,NULL,11,1,1,'2026-10-15')"])
+expect_block_tx('期初流水只能是该行第 1 条', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'OPEN-MIG1',111,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'OPEN-MIG1' AND l.line_no = 111) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (3,'OPEN-MIG1',111,1,1,'DOC','OPENING',1,11,2,1,1,1,2,NULL,NULL,NULL,NULL,50000,0,50000,'2026-10-15','OPEN-MIG1:111:D1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (3,'OPEN-MIG1:111:D1:1','OPEN-MIG1',111,1,1,'DOC',NULL,NULL,NULL,NULL,11,2,1,'2026-10-15')"], 'ck_mv_opening')
+expect_allow_tx('DOC 过账（调整出 3000）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'ADJ1',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'ADJ1' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (4,'ADJ1',1,1,1,'DOC','ADJUST',-1,11,2,1,1,1,2,NULL,NULL,NULL,NULL,3000,50000,47000,'2026-10-15','ADJ1:1:D1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (4,'ADJ1:1:D1:1','ADJ1',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,2,-1,'2026-10-15')"])
+expect_block_tx('重复过账：同 biz_no+line_no+op_no+leg，换 idempotency_key', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'ADJ1',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'ADJ1' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (5,'ADJ1',1,1,1,'DOC','ADJUST',-1,11,9,1,1,1,2,NULL,NULL,NULL,NULL,3000,50000,47000,'2026-10-15','X:other')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (5,'X:other','ADJ1',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,9,-1,'2026-10-15')"], 'stock_movement_key.biz_no, stock_movement_key.line_no, stock_movement_key.op_no, stock_movement_key.leg')
+expect_allow_tx('同一 DOC 行第二次合法操作（op_no=2，不被吞）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'ADJ1',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'ADJ1' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (6,'ADJ1',1,2,1,'DOC','ADJUST',-1,11,3,1,1,1,2,NULL,NULL,NULL,NULL,1000,47000,46000,'2026-10-15','ADJ1:1:D2:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (6,'ADJ1:1:D2:1','ADJ1',1,2,1,'DOC',NULL,NULL,NULL,NULL,11,3,-1,'2026-10-15')"])
+expect_block_tx('idempotency_key 重复（唯一格式）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'ADJ9',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'ADJ9' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (7,'ADJ9',1,1,1,'DOC','ADJUST',-1,11,4,1,1,1,2,NULL,NULL,NULL,NULL,1000,46000,45000,'2026-10-15','ADJ1:1:D1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (7,'ADJ1:1:D1:1','ADJ9',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,4,-1,'2026-10-15')"], 'stock_movement_key.idempotency_key')
+expect_block_tx('记账链分叉（同 stock_id+stock_seq）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'ADJ8',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'ADJ8' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (8,'ADJ8',1,1,1,'DOC','ADJUST',-1,11,3,1,1,1,2,NULL,NULL,NULL,NULL,1000,46000,45000,'2026-10-15','ADJ8:1:D1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (8,'ADJ8:1:D1:1','ADJ8',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,3,-1,'2026-10-15')"], 'stock_movement_key.stock_id, stock_movement_key.stock_seq')
+expect_allow_tx('direction=0 纯事件流水不入链（SHIP）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'SHP1',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'SHP1' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (9,'SHP1',1,1,1,'DOC','SHIP',0,11,3,1,1,1,2,NULL,NULL,NULL,NULL,3000,46000,46000,'2026-10-15','SHP1:1:D1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (9,'SHP1:1:D1:1','SHP1',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,3,0,'2026-10-15')"])
+expect_allow_tx('期初：stock 12', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'OPEN-MIG1',12,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'OPEN-MIG1' AND l.line_no = 12) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (10,'OPEN-MIG1',12,1,1,'DOC','OPENING',1,12,1,1,2,1,1,NULL,NULL,NULL,NULL,30000,0,30000,'2026-10-15','OPEN-MIG1:12:D1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (10,'OPEN-MIG1:12:D1:1','OPEN-MIG1',12,1,1,'DOC',NULL,NULL,NULL,NULL,12,1,1,'2026-10-15')"])
+expect_allow_tx('PDA 拣货（四元组 77/3/DEV-A/1）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'PK2',3,'PDA','DEV-A' WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'PK2' AND l.line_no = 3) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (11,'PK2',3,0,1,'PDA','PICK',-1,12,2,1,2,1,1,77,3,'DEV-A',1,1000,30000,29000,'2026-10-15','PK2:3:PDEV-A.1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (11,'PK2:3:PDEV-A.1:1','PK2',3,0,1,'PDA',77,3,'DEV-A',1,12,2,-1,'2026-10-15')"])
+expect_block_tx('Idempotency-Key 过期后 PDA 重放同一四元组（换 idempotency_key）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'PK2',3,'PDA','DEV-A' WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'PK2' AND l.line_no = 3) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (12,'PK2',3,0,1,'PDA','PICK',-1,12,3,1,2,1,1,77,3,'DEV-A',1,1000,29000,28000,'2026-10-15','X:replay')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (12,'X:replay','PK2',3,0,1,'PDA',77,3,'DEV-A',1,12,3,-1,'2026-10-15')"], 'stock_movement_key.src_task_id, stock_movement_key.src_line_no, stock_movement_key.device_instance_id, stock_movement_key.src_op_seq, stock_movement_key.leg')
+expect_allow_tx('同一 PDA 行第二次合法操作（op_seq=2，不被吞）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'PK2',3,'PDA','DEV-A' WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'PK2' AND l.line_no = 3) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (13,'PK2',3,0,1,'PDA','PICK',-1,12,3,1,2,1,1,77,3,'DEV-A',2,1000,29000,28000,'2026-10-15','PK2:3:PDEV-A.2:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (13,'PK2:3:PDEV-A.2:1','PK2',3,0,1,'PDA',77,3,'DEV-A',2,12,3,-1,'2026-10-15')"])
+expect_block_tx('同一单据行 DOC 与 PDA 互斥（PDA 行上来一条 DOC 过账）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'PK2',3,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'PK2' AND l.line_no = 3) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (14,'PK2',3,1,1,'DOC','PICK',-1,12,4,1,2,1,1,NULL,NULL,NULL,NULL,1000,28000,27000,'2026-10-15','PK2:3:D1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (14,'PK2:3:D1:1','PK2',3,1,1,'DOC',NULL,NULL,NULL,NULL,12,4,-1,'2026-10-15')"], 'ledger_line_owner_mismatch')
+expect_block_tx('换设备实例不能直接记账（DEV-B 不是当前持有设备）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'PK2',3,'PDA','DEV-B' WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'PK2' AND l.line_no = 3) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (15,'PK2',3,0,1,'PDA','PICK',-1,12,4,1,2,1,1,77,3,'DEV-B',1,1000,28000,27000,'2026-10-15','PK2:3:PDEV-B.1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (15,'PK2:3:PDEV-B.1:1','PK2',3,0,1,'PDA',77,3,'DEV-B',1,12,4,-1,'2026-10-15')"], 'ledger_line_owner_mismatch')
 expect_block_tx('PDA 业务键半截（device_instance_id 为 NULL）', ["INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (16,'PK3',1,0,1,'PDA','PICK',-1,12,4,1,2,1,1,78,1,NULL,1,1000,28000,27000,'2026-10-15','PK3:1:PDEV-A.1:1')"], 'ck_mv_kind')
 expect_block_tx('只追加：UPDATE 流水', ["UPDATE stock_movement SET remark='x' WHERE id=4"], 'append_only_violation: stock_movement')
 expect_block_tx('只追加：DELETE 去重键', ["DELETE FROM stock_movement_key WHERE movement_id=4"], 'append_only_violation: stock_movement_key')
-expect_allow_tx('跨分区去重：10-31 记一条', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('XP1',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (17,'XP1',1,1,1,'DOC','SHIP',0,13,0,1,3,1,3,NULL,NULL,NULL,NULL,1000,200000,200000,'2026-10-31','XP1:1:D1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (17,'XP1:1:D1:1','XP1',1,1,1,'DOC',NULL,NULL,NULL,NULL,13,0,0,'2026-10-31')"])
-expect_block_tx('跨分区去重：同一键 11-01 再记（PG 落在另一个分区）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('XP1',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (18,'XP1',1,1,1,'DOC','SHIP',0,13,0,1,3,1,3,NULL,NULL,NULL,NULL,1000,200000,200000,'2026-11-01','X:xp')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (18,'X:xp','XP1',1,1,1,'DOC',NULL,NULL,NULL,NULL,13,0,0,'2026-11-01')"], 'stock_movement_key.biz_no, stock_movement_key.line_no, stock_movement_key.op_no, stock_movement_key.leg')
+expect_allow_tx('跨分区去重：10-31 记一条', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'XP1',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'XP1' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (17,'XP1',1,1,1,'DOC','SHIP',0,13,0,1,3,1,3,NULL,NULL,NULL,NULL,1000,200000,200000,'2026-10-31','XP1:1:D1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (17,'XP1:1:D1:1','XP1',1,1,1,'DOC',NULL,NULL,NULL,NULL,13,0,0,'2026-10-31')"])
+expect_block_tx('跨分区去重：同一键 11-01 再记（PG 落在另一个分区）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'XP1',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'XP1' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (18,'XP1',1,1,1,'DOC','SHIP',0,13,0,1,3,1,3,NULL,NULL,NULL,NULL,1000,200000,200000,'2026-11-01','X:xp')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (18,'X:xp','XP1',1,1,1,'DOC',NULL,NULL,NULL,NULL,13,0,0,'2026-11-01')"], 'stock_movement_key.biz_no, stock_movement_key.line_no, stock_movement_key.op_no, stock_movement_key.leg')
 expect_allow_tx('占用写入（RESERVE 10000）', ["INSERT INTO stock_reservation (id,stock_id,stage,source_type,source_id,source_line_id,op_key,reserve_qty_milli,consumed_qty_milli,released_qty_milli,status) VALUES (1,11,'RESERVE','OUTBOUND_LINE',1,1,'RES:OBT1:1:1:11',10000,0,0,'RESERVED')"])
-expect_block_tx('占用幂等（同 op_key）', ["INSERT INTO stock_reservation (id,stock_id,stage,source_type,source_id,source_line_id,op_key,reserve_qty_milli,consumed_qty_milli,released_qty_milli,status) VALUES (2,11,'RESERVE','OUTBOUND_LINE',1,1,'RES:OBT1:1:1:11',10000,0,0,'RESERVED')"], 'stock_reservation.op_key')
+expect_block_tx('占用幂等（同 op_key）', ["INSERT INTO stock_reservation (id,stock_id,stage,source_type,source_id,source_line_id,op_key,reserve_qty_milli,consumed_qty_milli,released_qty_milli,status) VALUES (2,11,'RESERVE','OUTBOUND_LINE',1,1,'RES:OBT1:1:1:11',10000,0,0,'RESERVED')"], 'reservation_duplicate')   # 第十一轮：trg_res_no_replace 先拦，uq_res_op 兜底
 expect_block_tx('超消耗（consumed+released > reserve）', ["UPDATE stock_reservation SET consumed_qty_milli=6000, released_qty_milli=5000, status='CONSUMED' WHERE id=1"], 'ck_res')
 expect_block_tx('状态与余量不符：全部释放但仍是 RESERVED（过期任务会漏/重复扫）', ["UPDATE stock_reservation SET released_qty_milli=10000 WHERE id=1"], 'ck_res_status')
 expect_block_tx('状态与余量不符：余量>0 却标 RELEASED', ["UPDATE stock_reservation SET released_qty_milli=4000, status='RELEASED' WHERE id=1"], 'ck_res_status')
+# #2 第九轮：预占过期时间由库计算（created_at + 最长 24h），调用方不能填永不过期；批次日期严格 YYYY-MM-DD
+_R = "INSERT INTO stock_reservation (id,stock_id,stage,source_type,source_id,source_line_id,op_key,reserve_qty_milli,status{c}) VALUES ({i},11,'RESERVE','OUTBOUND_LINE',1,{i},'RES:TTL:{i}',1000,'RESERVED'{v})"
+expect_allow_tx('预占不带 expires_at：库补算 created_at + 24h', [_R.format(i=9101, c='', v='')])
+r = one("SELECT CAST(strftime('%s', expires_at) AS INTEGER) - CAST(strftime('%s', created_at) AS INTEGER) FROM stock_reservation WHERE id=9101")
+ok(f"预占 expires_at 由库算出 = created_at + 86400s（{r[0]}）") if r and r[0] == 86400 else bad(f"预占 expires_at 补算 = {r}")
+expect_block_tx('预占 expires_at 填 2999 年（永不过期）', [_R.format(i=9102, c=',expires_at', v=",'2999-01-01 00:00:00'")], 'ck_res_ttl')
+expect_block_tx('预占 expires_at 填 created_at + 24h + 1s', [_R.format(i=9103, c=',expires_at', v=",datetime('now','+86401 seconds')")], 'ck_res_ttl')
+expect_block_tx('预占 expires_at 非 ISO（strftime 取不到）', [_R.format(i=9104, c=',expires_at', v=",'2999/01/01'")], 'ck_res_ttl')
+expect_block_tx('预占 created_at 倒签/预签（与 now 差 > 300s）', [_R.format(i=9105, c=',created_at', v=",'2999-01-01 00:00:00'")], 'reservation_clock_skew')
+expect_block_tx('预占 事后把 expires_at 改成 2999 年', ["UPDATE stock_reservation SET expires_at='2999-01-01 00:00:00' WHERE id=9101"], 'ck_res_ttl')
+expect_block_tx('预占 事后改 created_at（借此抬高上界）', ["UPDATE stock_reservation SET created_at='2999-01-01 00:00:00' WHERE id=9101"], 'reservation_created_at_immutable')
+expect_block_tx('预占 B1：事后把 expires_at 改成 NULL（永不过期）', ["UPDATE stock_reservation SET expires_at=NULL WHERE id=9101"], 'reservation_expires_null')
+try:
+    conn.execute("BEGIN"); conn.execute("DROP TRIGGER trg_res_expires_lock"); conn.execute("UPDATE stock_reservation SET expires_at=NULL WHERE id=9101")
+    ok("变异：去掉 trg_res_expires_lock 后，expires_at 改成 NULL 通过（断言能抓到）") if one("SELECT expires_at FROM stock_reservation WHERE id=9101")[0] is None else bad("变异：去掉 trg_res_expires_lock 后 expires_at 不是 NULL")
+except sqlite3.Error as e:
+    bad(f"变异：去掉 trg_res_expires_lock 后改 NULL 仍被拒：{e}")
+finally:
+    conn.execute("ROLLBACK")
+expect_allow_tx('预占 N1：缩短 TTL（expires_at = created_at + 1s）允许，更早释放更安全', ["UPDATE stock_reservation SET expires_at=datetime(created_at,'+1 seconds') WHERE id=9101"])
+expect_block_tx('预占 N1：再延长到 created_at + 24h + 1s 仍拒', ["UPDATE stock_reservation SET expires_at=datetime(created_at,'+86401 seconds') WHERE id=9101"], 'ck_res_ttl')
+expect_block_tx('批次 expiry_date 非 YYYY-MM-DD', ["INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (9101,1,'LOT-D1','2026/10/25','2026-10-08')"], 'ck_lot_date')
+expect_block_tx('批次 expiry_date 非真实日历日', ["INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (9102,1,'LOT-D2','2026-02-30','2026-10-08')"], 'ck_lot_date')
+expect_block_tx('批次 sell_deadline 带时间', ["INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date,sell_deadline) VALUES (9103,1,'LOT-D3','2026-10-25','2026-10-08','2026-10-20 00:00:00')"], 'ck_lot_date')
+expect_block_tx('批次 production_date 乱填', ["INSERT INTO lot (id,sku_id,lot_code,production_date,expiry_date,receive_date) VALUES (9104,1,'LOT-D4','zzzz','2026-10-25','2026-10-08')"], 'ck_lot_date')
+for _bad in ('2026/10/15', ' 2026-10-15', '2026-02-30', '20261015', '2026-10-15T00:00:00Z', '2026-10-15 00:00:00.5', '2026-10-15 08:00:00', '2026-10-15 00:00:00', '2026-10-15 24:00:00', '2026-10-15+08:00', '2026-10-15Z', '2026-1-5'):
+    expect_block_tx(f'批次 receive_date 非法：{_bad!r}', [f"INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (9110,1,'LOT-R','2026-10-25','{_bad}')"], 'ck_lot_recv_ts')
+expect_allow_tx('批次 receive_date 纯日期 YYYY-MM-DD（第十一轮：DATE only，带时间一律拒）', ["INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (9111,1,'LOT-R2','2026-10-25','2026-10-15')"])
+expect_block_tx('日快照 work_date 非 YYYY-MM-DD', ["INSERT INTO stock_snapshot_daily (work_date,stock_id,warehouse_id,location_id,sku_id,lot_id,on_hand_qty_milli,allocated_qty_milli,reserved_qty_milli,quality_hold_qty_milli,hold_qty_milli,ledger_seq) VALUES ('2026/10/15',11,1,1,1,2,0,0,0,0,0,0)"], 'ck_ssd_date')
+def _ttl_mut(desc, drop_name, stmt):
+    """变异：去掉约束（只改内存库 DDL）后，原被拒语句应当通过。"""
+    ddl = sqlite_ddl.replace(f"CONSTRAINT {drop_name} CHECK (", f"CONSTRAINT {drop_name} CHECK (1 OR ", 1)   # 约束恒真 = 去掉
+    if ddl == sqlite_ddl:
+        bad(f"变异：没找到 {drop_name}，变异未生效"); return
+    mc = sqlite3.connect(":memory:", isolation_level=None)   # 内存库：只装 DDL 做变异 / 扫描，不跑业务用例，不经 connect_main（外键在本行之后按需显式打开），不计入 FK 守卫（r12 非阻塞 3）
+    try:
+        mc.executescript(ddl)
+        [mc.execute(_q) for _q in _MASTER_MIN]
+        mc.execute(stmt)
+        ok(f"变异：去掉 {drop_name} 后，{desc} 通过（断言能抓到）")
+    except sqlite3.Error as e:
+        bad(f"变异：去掉 {drop_name} 后 {desc} 仍被拒：{e}")
+    finally:
+        mc.close()
+_ttl_mut("预占 expires_at 填 2999 年", "ck_res_ttl", "INSERT INTO stock_reservation (id,stock_id,stage,source_type,source_id,source_line_id,op_key,reserve_qty_milli,status,expires_at) VALUES (9102,11,'RESERVE','OUTBOUND_LINE',1,9102,'RES:TTL:9102',1000,'RESERVED','2999-01-01 00:00:00')")
+_ttl_mut("批次 receive_date 带时间 2026-10-15 08:00:00", "ck_lot_recv_ts", "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (9112,1,'LOT-R3','2026-10-25','2026-10-15 08:00:00')")
+_ttl_mut("批次 receive_date 2026/10/15", "ck_lot_recv_ts", "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (9110,1,'LOT-R','2026-10-25','2026/10/15')")
+_ttl_mut("批次 expiry_date 2026/10/25", "ck_lot_date", "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (9101,1,'LOT-D1','2026/10/25','2026-10-08')")
 expect_block_tx('冻结超释放', ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (1,11,'MANUAL','DAMAGE','MANUAL',0,'HOLD:1',1000,2000,'RELEASED',7)"], 'ck_hold')
 expect_block_tx('冻结状态与余量不符（已全释放仍 HELD）', ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (2,11,'MANUAL','DAMAGE','MANUAL',0,'HOLD:2',1000,1000,'HELD',7)"], 'ck_hold_status')
 expect_block_tx('冻结类型不在码表', ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (3,11,'FROZEN','DAMAGE','MANUAL',0,'HOLD:3',1000,0,'HELD',7)"], 'ck_hold_type')
@@ -362,9 +464,14 @@ expect_allow_tx('对账告警（I4, stock 13）', ["INSERT INTO stock_recon_aler
 expect_block_tx('同一未闭环差异不重复建告警', ["INSERT INTO stock_recon_alert (id,check_code,warehouse_id,stock_id,expected_qty_milli,actual_qty_milli) VALUES (2,'I4',1,13,200000,198000)"], 'stock_recon_alert.check_code, stock_recon_alert.warehouse_id, stock_recon_alert.stock_id')
 expect_allow_tx('重复检出走 upsert 累加 hit_count', ["INSERT INTO stock_recon_alert (id,check_code,warehouse_id,stock_id,expected_qty_milli,actual_qty_milli) VALUES (3,'I4',1,13,200000,198000) ON CONFLICT (check_code,warehouse_id,stock_id) WHERE status <> 'RESOLVED' DO UPDATE SET hit_count = stock_recon_alert.hit_count + 1, actual_qty_milli = excluded.actual_qty_milli"])
 expect_allow_tx('闭环后同一差异可再开', ["UPDATE stock_recon_alert SET status='RESOLVED', resolved_by=7, resolution='调整单 ADJ-x' WHERE id=1", "INSERT INTO stock_recon_alert (id,check_code,warehouse_id,stock_id,expected_qty_milli,actual_qty_milli) VALUES (4,'I4',1,13,200000,199000)"])
+# 第十三轮（r12 非阻塞 1）：RESOLVED 终态锁；未闭环告警的 UPSERT 不受影响（上面两条）
+expect_block_tx('RESOLVED 告警不可再改（resolution 抹空）', ["UPDATE stock_recon_alert SET resolution = NULL, resolved_by = NULL WHERE id = 1"], 'recon_resolved_immutable')
+expect_block_tx('RESOLVED 告警不可同 id REPLACE（重置 detected_at / 改 stock_id）', ["REPLACE INTO stock_recon_alert (id,check_code,warehouse_id,stock_id,expected_qty_milli,actual_qty_milli) VALUES (1,'I4',1,14,1,1)"], 'stock_recon_alert.id')
+expect_allow_tx('变异：去掉 trg_recon_resolved_lock 后可改 RESOLVED 告警', ["DROP TRIGGER trg_recon_resolved_lock", "UPDATE stock_recon_alert SET resolution = NULL WHERE id = 1"])
+expect_allow_tx('未闭环告警仍可 UPDATE（认领 ACKED）', ["UPDATE stock_recon_alert SET status = 'ACKED' WHERE id = 4"])
 print("=== 2b2. 小赵复评 C2–C4 + convert_hold ===")
-expect_block_tx('C2 只写流水、不写 key 行（库层外键，提交时拦）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('ADJ7',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (30,'ADJ7',1,1,1,'DOC','ADJUST',-1,13,1,1,3,1,3,NULL,NULL,NULL,NULL,1000,200000,199000,'2026-10-15','ADJ7:1:D1:1')"], 'FOREIGN KEY constraint failed')
-expect_block_tx('C2 key 行与流水内容不一致（key=ADJ7，流水=ADJ6）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('ADJ7',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (31,'ADJ6',1,1,1,'DOC','ADJUST',-1,13,1,1,3,1,3,NULL,NULL,NULL,NULL,1000,200000,199000,'2026-10-15','ADJ7:1:D1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (31,'ADJ7:1:D1:1','ADJ7',1,1,1,'DOC',NULL,NULL,NULL,NULL,13,1,-1,'2026-10-15')"], 'FOREIGN KEY constraint failed')
+expect_block_tx('C2 只写流水、不写 key 行（库层外键，提交时拦）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'ADJ7',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'ADJ7' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (30,'ADJ7',1,1,1,'DOC','ADJUST',-1,13,1,1,3,1,3,NULL,NULL,NULL,NULL,1000,200000,199000,'2026-10-15','ADJ7:1:D1:1')"], 'FOREIGN KEY constraint failed')
+expect_block_tx('C2 key 行与流水内容不一致（key=ADJ7，流水=ADJ6）', ["INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'ADJ7',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'ADJ7' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING", "INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (31,'ADJ6',1,1,1,'DOC','ADJUST',-1,13,1,1,3,1,3,NULL,NULL,NULL,NULL,1000,200000,199000,'2026-10-15','ADJ7:1:D1:1')", "INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (31,'ADJ7:1:D1:1','ADJ7',1,1,1,'DOC',NULL,NULL,NULL,NULL,13,1,-1,'2026-10-15')"], 'FOREIGN KEY constraint failed')
 expect_block_tx('C3 归属行 src_kind 从 PDA 改成 DOC', ["UPDATE stock_ledger_line SET src_kind='DOC', owner_device_instance_id=NULL WHERE biz_no='PK2' AND line_no=3"], 'ledger_line_immutable')
 expect_block_tx('C3 归属行 biz_no 不可改', ["UPDATE stock_ledger_line SET biz_no='PK9' WHERE biz_no='PK2' AND line_no=3"], 'ledger_line_immutable')
 expect_allow_tx('C3 换主（只改 owner_device_instance_id）仍允许', ["UPDATE stock_ledger_line SET owner_device_instance_id='DEV-B', post_count=post_count+1 WHERE biz_no='PK2' AND line_no=3"])
@@ -948,9 +1055,9 @@ expect_allow('10 异常单来源 SCRAP_MISREPORT', "INSERT INTO exception_case (
 expect_block('10 L3 SQLite INSERT OR REPLACE 把已关闭异常单重置为 OPEN', "INSERT OR REPLACE INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (100,'EXC-100',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','POD:1610:0','0000000000000000000000000000000000000000000000000000000000000001',1,1,5000,5000,0,'2026-10-15 12:00:00',7)", 'exc_duplicate')
 expect_block('10 L3 SQLite REPLACE 换 id 复用旧键 POD:1610:0', "REPLACE INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (199,'EXC-199',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','POD:1610:0','0000000000000000000000000000000000000000000000000000000000000001',1,1,5000,5000,0,'2026-10-15 12:00:00',7)", 'exc_duplicate')
 expect_block('10 L3 SQLite INSERT OR IGNORE 也不能静默吞掉（触发器 ABORT）', "INSERT OR IGNORE INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (100,'EXC-100',1,'RETURN_COUNT_DIFF','DELIVERY_RETURN','POD:1610:0','0000000000000000000000000000000000000000000000000000000000000001',1,1,5000,5000,0,'2026-10-15 12:00:00',7)", 'exc_duplicate')
-_c = conn.execute("PRAGMA foreign_keys=OFF").fetchall()
+_c = conn.execute("PRAGMA foreign_keys=OFF").fetchall(); _fk_off_allowed = True
 expect_block('10 建议 2 SQLite 连接漏开 foreign_keys 仍拦未知异常码', "INSERT INTO exception_case (id,code,warehouse_id,exception_code,source_type,source_key,source_hash,sku_id,lot_id,claimed_qty_milli,counted_qty_milli,diff_qty_milli,due_at,reporter_id) VALUES (198,'EXC-198',1,'NO_SUCH','MANUAL','M:198','00000000000000000000000000000000000000000000000000000000000000c6',1,1,0,0,0,'2026-10-15 12:00:00',7)", 'exc_code_unknown')
-_c = conn.execute("PRAGMA foreign_keys=ON").fetchall()
+_c = conn.execute("PRAGMA foreign_keys=ON").fetchall(); _fk_off_allowed = False
 expect_allow('10 STORE_RETURN 门店退货回仓 RTN', "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8002,'RTN-2',1,'RETURN','STORE_RETURN','ST01:R-001','CREATED','2026-10-15')")
 expect_block('10 STORE_RETURN 之外的未登记退货来源', "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8003,'RTN-3',1,'RETURN','WHATEVER','X-1','CREATED','2026-10-15')", 'ck_inb_rtn_src')
 expect_allow('10 非退货入库单不受退货来源 CHECK 约束', "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,status,work_date) VALUES (8004,'PO-1',1,'PURCHASE','ERP_X','PO-001','CREATED','2026-10-15')")
@@ -1533,7 +1640,7 @@ ok(f"available_qty_milli = 30000 − 10000 = {AV}") if AV == 20000 else bad(f"�
 print("=== 4. §4.3 并发防超卖：50 线程同时扣 3 KG，起始 100 KG ===")
 conn.close()
 
-c1 = sqlite3.connect(dbf, timeout=30)
+c1 = connect_main(timeout=30)   # N5：种子写连接也开外键
 c1.execute("PRAGMA journal_mode = WAL")
 c1.execute("PRAGMA busy_timeout = 30000")
 c1.execute("INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (999,1,1,1,1,'KG',100000)")
@@ -1547,7 +1654,7 @@ lock = threading.Lock()
 
 
 def worker() -> None:
-    wc = sqlite3.connect(dbf, timeout=30, isolation_level=None)
+    wc = connect_main(timeout=30, isolation_level=None)   # N5：并发写连接也开外键
     wc.execute("PRAGMA busy_timeout = 30000")
     try:
         cur = wc.execute(
@@ -1573,7 +1680,7 @@ for t in threads:
 succ = sum(1 for r in results if r == 1)
 rej = sum(1 for r in results if r == 0)
 err = sum(1 for r in results if r == -1)
-conn = sqlite3.connect(dbf, isolation_level=None)  # 与开头一致：并发段重连后仍自动提交，后面的 expect_*_tx 才能自己 BEGIN
+conn = connect_main(isolation_level=None)  # 与开头一致：并发段重连后仍自动提交，后面的 expect_*_tx 才能自己 BEGIN
 final = one("SELECT on_hand_qty_milli FROM stock WHERE id=999")[0]
 ver = one("SELECT version FROM stock WHERE id=999")[0]
 print(f"  → 成功 {succ} / 拒绝 {rej} / 异常 {err} / 剩余 {final} / version {ver}")
@@ -1639,7 +1746,11 @@ expect_block_tx('12 同一设备实例两条 PENDING/ACTIVE 绑定', ["INSERT IN
 expect_block_tx('12 I3 REPLACE 覆盖绑定', ["INSERT OR REPLACE INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id) VALUES (1,'DEV-Z','PDA',99,1)"], 'binding_duplicate')
 expect_block_tx('12 I3 直接插成 ACTIVE', ["INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id,status,activated_at,approval_id) VALUES (3,'DEV-C','PDA',101,1,'ACTIVE','2026-10-15 08:00',1)"], 'binding_insert_not_pending')
 expect_block_tx('12 REVOKED 没有吊销时间', ["UPDATE user_device_binding SET status='REVOKED' WHERE id=1"], 'ck_udb_status')
-expect_block_tx('12 I3 用不存在的审批激活', ["UPDATE user_device_binding SET status='ACTIVE', approval_id=999, activated_at='2026-10-15 09:00' WHERE id=1"], 'binding_approval_invalid')
+expect_block_tx('12 I3 用不存在的审批激活（触发器 trg_udb_activate 的 NOT EXISTS 拦；approval_id 两库都没有外键，本条不证明外键开着）', ["UPDATE user_device_binding SET status='ACTIVE', approval_id=999, activated_at='2026-10-15 09:00' WHERE id=1"], 'binding_approval_invalid')
+# 外键判别用例（小玛丽 time-scan/fk-case.py）：sku_live_param.sku_id REFERENCES sku(id)，表上其余 CHECK 取默认值都满足、触发器只管 UPDATE/DELETE/重复，
+# 插不存在的 sku 只有外键能拦。放在重连之后，外键没重开就会红（小玛丽实测 FK OFF → 未拦截，FK ON → 拦截）。
+assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1 or _MUTANT_NO_FK, "foreign_keys 未开"
+expect_block_tx('18 FK 判别：sku_live_param 指向不存在的 sku（只有外键能拦，重连后外键必须已重开）', ["INSERT INTO sku_live_param (sku_id) VALUES (987654321)"], 'FOREIGN KEY constraint failed')
 conn.execute("INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (7,'APR-WHSH01-20261015-000007','DEVICE_BIND',1,'DEVICE_BINDING','1','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','r',202,'2099-01-01')")
 conn.execute("UPDATE approval_request SET status='APPROVED', first_approver_id=101, first_approver_role='WH_SUPERVISOR', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00' WHERE id=7")
 expect_block_tx('12 S1 审批人 = 绑定使用人', ["UPDATE user_device_binding SET status='ACTIVE', approval_id=7, activated_at='2026-10-15 09:00' WHERE id=1"], 'binding_approval_invalid')
@@ -1820,7 +1931,7 @@ conn.commit()  # 前面第 5 节在主连接上留有隐式事务，先提交释
 RELAY8 = 'UPDATE outbox_event SET seq = m.b + r.rn FROM (SELECT id, row_number() OVER (ORDER BY id) AS rn FROM outbox_event WHERE node_id = 8 AND seq = 0) r, (SELECT COALESCE(MAX(seq), 0) AS b FROM outbox_event WHERE node_id = 8) m WHERE outbox_event.id = r.id'
 cc_err = []
 def cc_ins(i):
-    wc = sqlite3.connect(dbf, timeout=30, isolation_level=None)
+    wc = connect_main(timeout=30, isolation_level=None)   # N5：并发写连接也开外键
     wc.execute("PRAGMA busy_timeout = 30000")
     try:
         wc.execute("BEGIN IMMEDIATE")
@@ -1831,7 +1942,7 @@ def cc_ins(i):
     finally:
         wc.close()
 def cc_relay():
-    wc = sqlite3.connect(dbf, timeout=30, isolation_level=None)
+    wc = connect_main(timeout=30, isolation_level=None)   # N5：并发写连接也开外键
     wc.execute("PRAGMA busy_timeout = 30000")
     try:
         wc.execute("BEGIN IMMEDIATE"); wc.execute(RELAY8); wc.execute("COMMIT")
@@ -1843,7 +1954,7 @@ ths = [threading.Thread(target=cc_ins, args=(i,)) for i in range(1, 41)] + [thre
 for t in ths: t.start()
 for t in ths: t.join()
 cc_relay()
-conn = sqlite3.connect(dbf)
+conn = connect_main()
 r = one("SELECT count(*) || '/' || count(DISTINCT seq) || '/' || min(seq) || '/' || max(seq) || '/' || sum(CASE WHEN seq = 0 THEN 1 ELSE 0 END) FROM outbox_event WHERE node_id = 8")[0]
 ok(f"C3 40 并发事务 + 5 个并发 relay：seq 连续 1..40、无重复、无漏补、无报错（{r}）") if r == "40/40/1/40/0" and not cc_err else bad(f"C3 并发补号：{r} {cc_err[:3]}")
 r = one("SELECT count(*) FROM numbering_segment WHERE biz_prefix LIKE 'OUTBOX%'")[0]
@@ -1861,8 +1972,7 @@ except sqlite3.IntegrityError as e:
 # ---------------------------------------------------------------------------
 print("=== 2s. 退供应商：原因白名单、处置必填、食安只退或报废、提货时限、超期转 09 报损 + hold(SCRAP_PENDING) ===")
 conn.close()
-conn = sqlite3.connect(dbf, isolation_level=None)
-conn.execute("PRAGMA foreign_keys = ON")
+conn = connect_main(isolation_level=None)
 # 种子模式：SQLite 没有「表属主」，时钟窗口 / 只能以 OPEN 建单的触发器对所有写入生效。2s–2s3 用固定日期验证业务规则，
 # 先摘掉这三个触发器（同第 11 篇 outbox_seed_begin 口径），2s4 再装回来专测时钟。
 SRTN_CLOCK_TRG = ("trg_srtn_ins_open", "trg_srtn_clock_ins", "trg_srtn_clock_upd")
@@ -1909,14 +2019,14 @@ def _mut_ddl(drop):
 
 
 def srtn_mut(desc, drop, setup, stmt):
-    mc = sqlite3.connect(":memory:", isolation_level=None)
+    mc = sqlite3.connect(":memory:", isolation_level=None)   # 内存库：只装 DDL 做变异 / 扫描，不跑业务用例，不经 connect_main（外键在本行之后按需显式打开），不计入 FK 守卫（r12 非阻塞 3）
     try:
         mc.executescript(_mut_ddl(drop))
         if drop[0] == "trg":
             mc.execute(f"DROP TRIGGER {drop[1]}")
         for _t in SRTN_CLOCK_TRG:
             mc.execute(f"DROP TRIGGER IF EXISTS {_t}")
-        mc.execute("INSERT INTO sku (id,code,name,base_uom,temperature_required) VALUES (1,'SKU-APPLE','x','KG','CHILLED')")
+        [mc.execute(_q) for _q in _MASTER_MIN]
         mc.execute(SRTN_SKU)
         for st in setup:
             mc.execute(st)
@@ -1983,6 +2093,7 @@ _r = one("SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name='trg_
 ok("退供 外键兜底测试回滚后 trg_srtn_overdue 仍在") if _r == 1 else bad(f"trg_srtn_overdue 丢失：{_r}")
 print("=== 2s2. 退供 食安/滞销、超期绕过、op_key 与重放、唯一与并发 ===")
 def _tx_allow(desc, stmts):
+    _fk_guard(desc)
     conn.execute("BEGIN")
     try:
         for st in stmts: conn.execute(st)
@@ -1992,6 +2103,7 @@ def _tx_allow(desc, stmts):
     finally:
         conn.execute("ROLLBACK")
 def _tx_block(desc, stmts, want):
+    _fk_guard(desc)
     conn.execute("BEGIN")
     try:
         for st in stmts: conn.execute(st)
@@ -2037,18 +2149,18 @@ expect_block_tx("退供 绕过 拒绝：转超期后退回待提货（去掉状�
 expect_block_tx("退供 绕过 拒绝：转超期后改数量", ["UPDATE supplier_return SET qty_milli=1 WHERE id=97101"], "srtn_overdue_immutable")
 _tx_allow("变异：去掉 trg_srtn_overdue（转超期后换挂报损单） 后，原被拒语句通过", ["DROP TRIGGER trg_srtn_overdue", "DROP TRIGGER trg_srtn_overdue_lock"] + ["UPDATE supplier_return SET scrap_order_id=97130 WHERE id=97101"])
 expect_block_tx("退供 重放 拒绝：同一退供单再 hold(SCRAP_PENDING)（op_key SRTO:97101 已用；SQLite 先由 trg_hold_no_replace 拦，uq_hold_op 兜底）", ["INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (97139,14,'SCRAP_PENDING','SCRAP','SCRAP',97101,'SRTO:97101',5000,0,'HELD',0)"], "hold_duplicate")
-_mc = sqlite3.connect(":memory:", isolation_level=None)
+_mc = sqlite3.connect(":memory:", isolation_level=None)   # 内存库：只装 DDL 做变异 / 扫描，不跑业务用例，不经 connect_main（外键在本行之后按需显式打开），不计入 FK 守卫（r12 非阻塞 3）
 try:
-    _mc.executescript(_mut_ddl(("ck", "uq_hold_op"))); _mc.execute("INSERT INTO sku (id,code,name,base_uom,temperature_required) VALUES (1,'SKU-APPLE','x','KG','CHILLED')"); _mc.execute("DROP TRIGGER trg_hold_no_replace")
+    _mc.executescript(_mut_ddl(("ck", "uq_hold_op"))); [_mc.execute(_q) for _q in _MASTER_MIN]; _mc.execute("DROP TRIGGER trg_hold_no_replace")
     _mc.execute(HOLD_INS); _mc.execute("INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (97139,14,'SCRAP_PENDING','SCRAP','SCRAP',97101,'SRTO:97101',5000,0,'HELD',0)")
     ok("变异：去掉 uq_hold_op 与 trg_hold_no_replace 后，重放 hold(SCRAP_PENDING) 通过")
 except sqlite3.Error as e:
     bad(f"变异：去掉 uq_hold_op 后重放仍被拒：{e}")
 finally:
     _mc.close()
-_mc = sqlite3.connect(":memory:", isolation_level=None)
+_mc = sqlite3.connect(":memory:", isolation_level=None)   # 内存库：只装 DDL 做变异 / 扫描，不跑业务用例，不经 connect_main（外键在本行之后按需显式打开），不计入 FK 守卫（r12 非阻塞 3）
 try:
-    _mc.executescript(_mut_ddl(("ck", "uq_hold_op"))); _mc.execute("INSERT INTO sku (id,code,name,base_uom,temperature_required) VALUES (1,'SKU-APPLE','x','KG','CHILLED')"); _mc.execute(HOLD_INS); _mc.execute("INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (97139,14,'SCRAP_PENDING','SCRAP','SCRAP',97101,'SRTO:97101',5000,0,'HELD',0)")
+    _mc.executescript(_mut_ddl(("ck", "uq_hold_op"))); [_mc.execute(_q) for _q in _MASTER_MIN]; _mc.execute(HOLD_INS); _mc.execute("INSERT INTO stock_hold (id,stock_id,hold_type,reason_code,source_type,source_id,op_key,hold_qty_milli,released_qty_milli,status,operator_id) VALUES (97139,14,'SCRAP_PENDING','SCRAP','SCRAP',97101,'SRTO:97101',5000,0,'HELD',0)")
     bad("变异：只去掉 uq_hold_op，trg_hold_no_replace 没拦住重放")
 except sqlite3.IntegrityError as e:
     ok(f"只去掉 uq_hold_op 时 trg_hold_no_replace 仍拦重放（{e}）") if str(e) == "hold_duplicate" else bad(f"重放拦错：{e}")
@@ -2065,7 +2177,7 @@ import time as _time
 conn.execute("INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,status,created_by) VALUES (97135,'SRN-97135',1,501,14,1,1,5000,'QUALITY',NULL,false,'RETURN','FRESH','2026-10-15 08:00:00','2026-10-16 08:00:00','AWAITING_PICKUP',31)")
 _cc_res = []
 def _cc_scr(sid, hold_s):
-    wc = sqlite3.connect(dbf, timeout=30, isolation_level=None)
+    wc = connect_main(timeout=30, isolation_level=None)   # N5：并发写连接也开外键
     try:
         wc.execute("BEGIN IMMEDIATE")
         wc.execute(f"INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES ({sid},'SCR-{sid}',1,'SUPPLIER_RETURN',97135,'PICKUP_OVERDUE','2026-10-16',0)")
@@ -2179,13 +2291,13 @@ _tx_allow("退供 边界 正向：picked_up_at = 截止（同一秒）", [f"DROP
 _PK_LE = "CAST(strftime('%s', picked_up_at) AS INTEGER) <= CAST(strftime('%s', pickup_deadline_at) AS INTEGER)"
 _OD_GT = "CAST(strftime('%s', overdue_at) AS INTEGER) > CAST(strftime('%s', pickup_deadline_at) AS INTEGER)"
 def srtn_mut_red(desc, old, new, setup, stmt, want):
-    mc = sqlite3.connect(":memory:", isolation_level=None)
+    mc = sqlite3.connect(":memory:", isolation_level=None)   # 内存库：只装 DDL 做变异 / 扫描，不跑业务用例，不经 connect_main（外键在本行之后按需显式打开），不计入 FK 守卫（r12 非阻塞 3）
     try:
         txt = sqlite_ddl
         assert txt.count(old) == 1, old
         mc.executescript(txt.replace(old, new))
         for _t in SRTN_CLOCK_TRG: mc.execute(f"DROP TRIGGER IF EXISTS {_t}")
-        mc.execute("INSERT INTO sku (id,code,name,base_uom,temperature_required) VALUES (1,'SKU-APPLE','x','KG','CHILLED')")
+        [mc.execute(_q) for _q in _MASTER_MIN]
         mc.execute(SRTN_SKU)
         for st in setup: mc.execute(st)
         mc.execute(stmt)
@@ -2215,6 +2327,383 @@ _tx_allow("退供 0 行 正向：孤儿报损单可以取消", _orph + ["UPDATE 
 _tx_allow("退供 0 行 正向：97101（已转超期且指回本单）报损单提交审批", ["UPDATE scrap_order SET status='PENDING_APPROVAL' WHERE id=97101"])
 _tx_block("退供 0 行 拒绝：给未进待提货（OPEN）的退供单开报损单", ["INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (97184,'SCR-97184',1,'SUPPLIER_RETURN',97104,'PICKUP_OVERDUE','2026-10-16',0)"], "srtn_scrap_not_awaiting")
 _tx_allow("变异：去掉 trg_scr_srtn_ins 后，给 OPEN 退供单开报损单通过", ["DROP TRIGGER trg_scr_srtn_ins", "INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (97184,'SCR-97184',1,'SUPPLIER_RETURN',97104,'PICKUP_OVERDUE','2026-10-16',0)"])
+print("=== 2z3 SQLite 全库 no-REPLACE 扫描（00 §6.10 第 3/4 条；第十二轮：逐唯一键）===")
+import re as _re
+_GUARD_RE = lambda tb: (_re.compile(r"\bBEFORE\s+INSERT\s+ON\s+" + _re.escape(tb) + r"\b", _re.I), _re.compile(r"RAISE\s*\(\s*ABORT", _re.I),
+                        _re.compile(r"EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+" + _re.escape(tb) + r"\b", _re.I))
+def _is_guard(tb, s):
+    return all(r.search(s) for r in _GUARD_RE(tb))
+def _eqref(s, c):
+    c = _re.escape(c)
+    return bool(_re.search(rf"\b\w+\.{c}\s*=\s*NEW\.{c}\b", s, _re.I) or _re.search(rf"\bNEW\.{c}\s*=\s*\w+\.{c}\b", s, _re.I))
+def table_keys(mc, tb):
+    """表上全部唯一键：(名, 列元组；表达式列为 None, 部分索引谓词或 None)。主键用 table_info（INTEGER PRIMARY KEY 没有索引行）。"""
+    ks = []
+    pk = tuple(r[1] for r in sorted(mc.execute(f"PRAGMA table_info({tb})"), key=lambda r: r[5]) if r[5])
+    if pk: ks.append(("PK", pk, None))
+    for _, iname, uniq, origin, partial in mc.execute(f"PRAGMA index_list({tb})").fetchall():
+        if not uniq or origin == 'pk': continue
+        cols = tuple(r[2] for r in mc.execute(f"PRAGMA index_xinfo({iname})") if r[5])   # 只取键列；表达式列 name 为 None
+        where = None
+        if partial:
+            sql = mc.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (iname,)).fetchone()[0]
+            where = _re.search(r"\bWHERE\b(.*)$", sql, _re.I | _re.S).group(1).strip()
+        ks.append((iname, cols, where))
+    return ks
+def replace_scan(ddl):
+    mc = sqlite3.connect(":memory:"); mc.executescript(ddl)   # 内存库：只装 DDL 做变异 / 扫描，不跑业务用例，不经 connect_main（外键在本行之后按需显式打开），不计入 FK 守卫（r12 非阻塞 3）
+    rows = mc.execute("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE sql IS NOT NULL").fetchall()
+    tables = {n: s for t, n, tb, s in rows if t == 'table'}
+    a = sorted(n for n, s in tables.items() if _re.search(r"ON\s+CONFLICT\s+REPLACE", s, _re.I))
+    trg = [(n, tb, s) for t, n, tb, s in rows if t == 'trigger']
+    # 非阻塞 1（已知限制）：只认 BEFORE UPDATE/DELETE 的锁；AFTER UPDATE … RAISE 写的锁不计（当前 0 处）
+    locked = sorted({tb for n, tb, s in trg if _re.search(r"\bBEFORE\s+(UPDATE|DELETE)\b", s, _re.I) and _re.search(r"RAISE\s*\(", s, _re.I)})
+    guards = {t: [s for n, t2, s in trg if t2 == t and _is_guard(t, s)] for t in tables}
+    keys = {t: table_keys(mc, t) for t in tables}
+    mc.close()
+    return a, locked, guards, keys
+def key_cover(keys, guards):
+    """静态：某个守卫触发器对键的每一列都写了 x.col = NEW.col 才算覆盖；子集键被覆盖时超集键随之覆盖。"""
+    direct = [set(c) for _, c, _ in keys if None not in c and any(all(_eqref(s, x) for x in c) for s in guards)]
+    return {c: any(d <= set(c) for d in direct) for _, c, _ in keys if None not in c}
+# 表级豁免：整张表还没有 no-REPLACE 触发器。只能缩小；修好一张删一行（已有触发器还在名单 = 红）
+REPLACE_ALLOW = {
+    "inbound_order": "03", "supplier_return": "10", "upstream_push_log": "11", "process_bom": "17", "process_bom_line": "17",
+}
+REPLACE_BASELINE = frozenset({"lot", "stock_ledger_line", "inbound_order", "supplier_return", "upstream_push_log", "process_bom", "process_bom_line"})
+# 第十二轮扩面：没有锁定字段的表也要逐唯一键拦 REPLACE。下面两张名单都冻结基线、只能缩小；表已全部覆盖还在名单 = 红
+# REPLACE_OK：REPLACE 可以接受（主数据整行改写 ≈ UPDATE，无去重/序号语义；被引用的行由外键兜底，REPLACE 删父行会报 FOREIGN KEY）
+REPLACE_OK = {
+    "sku_unit": "01 换算系数：没有任何表引用 sku_unit（无子行，不会产生孤儿）；按 (sku_id,uom) 换 id REPLACE 等价于整行改写换算系数，与 UPDATE 能做的一样，不涉及去重 / 序号",
+}
+REPLACE_OK_BASELINE = frozenset({"sku_unit"})   # 第十三轮冻结（r12 的 warehouse/zone/location/sku/stock_recon_alert 已移出：理由不成立，改为加守卫）
+# REPLACE_TODO：别篇的表，由属主判定"加守卫"还是"挪进 REPLACE_OK 并写理由"（第十二轮冻结，只能缩小）
+REPLACE_TODO = {t: o for o, ts in {
+    "03 小肥鱼": ("inbound_line",), "04": ("outbound_order", "outbound_line"), "05 小肥鱼": ("wave", "pick_task", "pick_task_line"),
+    "06 小肥鱼": ("pack_box", "pack_box_line", "shipment", "shipment_order"), "08": ("count_order", "count_line", "adjust_order", "adjust_line"),
+    "10 米雪儿": ("exception_code",), "11 米雪儿（offline_paper_record 在 11 时间 diff 里加守卫；numbering_segment 是取号计数器、inbound_message 是去重表，应加守卫）": ("offline_paper_record", "inbound_message", "numbering_segment"),
+    "12 爱弥斯": ("sys_role", "sys_permission", "sys_user_role", "sys_role_perm", "sys_user_warehouse", "api_credential"),
+}.items() for t in ts}
+REPLACE_TODO_BASELINE = frozenset(REPLACE_TODO)
+# 键级豁免（第十二轮）：表已有守卫，但这几个唯一键还没拦。按条文属主，只能缩小；键已被覆盖还在名单 = 红；基线外 = 红
+REPLACE_KEY_ALLOW = {
+    ("outbox_event", ("biz_key",)): "11 米雪儿（uq_outbox_dead_bizkey，部分索引）",
+    ("outbox_event", ("node_id", "seq")): "11 米雪儿（uq_outbox_seq；小玛丽 r11 实打可删未投递事件）",
+    ("exception_case", ("code",)): "10 米雪儿",
+    ("process_order", ("approval_no",)): "17 米雪儿（uq_prc_apr）",
+    ("scrap_line", ("scrap_id", "line_no")): "09 米雪儿",
+    ("scrap_order", ("source_id",)): "09 米雪儿（uq_scr_srtn）",
+    ("scrap_order", ("source_type", "source_id", "source_date")): "09 米雪儿（uq_scr_source）",
+    ("scrap_order", ("code",)): "09 米雪儿",
+    ("stock_recon_alert", ("check_code", "warehouse_id", "stock_id")): "02 Doro：未闭环告警靠 ON CONFLICT (uq_recon_open) DO UPDATE 累加 hit_count，守卫会拦掉 UPSERT；索引谓词只含未闭环行，REPLACE 碰不到 RESOLVED（终态锁 trg_recon_resolved_lock），会整行重写未闭环告警，与 UPDATE 能做的一样",
+}
+REPLACE_KEY_BASELINE = frozenset(REPLACE_KEY_ALLOW)   # 第十三轮：stock_recon_alert 由表级 REPLACE_OK 收窄为这一个键
+def replace_check(ddl, allow, key_allow=None):
+    key_allow = REPLACE_KEY_ALLOW if key_allow is None else key_allow
+    errs = []
+    a, locked, guards, keys = replace_scan(ddl)
+    errs += [f"{t}: 表 DDL 含 ON CONFLICT REPLACE" for t in a]
+    errs += [f"{t}: 有 BEFORE UPDATE/DELETE 拦截却没有 no-REPLACE 触发器（不在豁免名单）" for t in locked if not guards[t] and t not in allow]
+    errs += [f"{t}: 豁免名单过期（已有 no-REPLACE 触发器，删掉这行）" for t in allow if guards.get(t)]
+    errs += [f"{t}: 豁免名单含冻结基线外的表（新表不能豁免）" for t in allow if t not in REPLACE_BASELINE]
+    for t in sorted(keys):
+        if not keys[t]: continue
+        cov = key_cover(keys[t], guards[t])
+        full = all(cov.get(c, False) or (t, c) in key_allow for _, c, _ in keys[t])
+        if t in REPLACE_OK or t in REPLACE_TODO:
+            tag = "REPLACE_OK" if t in REPLACE_OK else "REPLACE_TODO"
+            if t in locked: errs.append(f"{t}: 受锁表不能进 {tag}")
+            if full and guards[t]: errs.append(f"{t}: {tag} 过期（唯一键已全部覆盖，删掉这行）")
+            continue
+        if t in allow: continue
+        for n, c, w in keys[t]:
+            if None in c:
+                if (t, c) not in key_allow: errs.append(f"{t}({n}): 表达式唯一索引，扫描无法判定覆盖 → 红（改成列索引或逐键豁免）")
+                continue
+            if not cov[c] and (t, c) not in key_allow:
+                errs.append(f"{t}({','.join(c)}): 唯一键没有被 no-REPLACE 触发器覆盖（WHEN 里要有每列的 x.col = NEW.col）")
+    errs += [f"{t}: REPLACE_OK 含冻结基线外的表" for t in REPLACE_OK if t not in REPLACE_OK_BASELINE]
+    errs += [f"{t}: REPLACE_TODO 含冻结基线外的表" for t in REPLACE_TODO if t not in REPLACE_TODO_BASELINE]
+    for (t, c), _ in key_allow.items():
+        if t in keys and c in key_cover(keys[t], guards[t]) and key_cover(keys[t], guards[t])[c]:
+            errs.append(f"{t}({','.join(c)}): 键级豁免过期（已覆盖，删掉这行）")
+        if (t, c) not in REPLACE_KEY_BASELINE:
+            errs.append(f"{t}({','.join(c)}): 键级豁免含冻结基线外的键")
+    return errs, locked, guards, keys
+_e, _lk, _gd, _ks = replace_check(sqlite_ddl, REPLACE_ALLOW)
+_nkeys = sum(len(_ks[t]) for t in _ks if t not in REPLACE_ALLOW and t not in REPLACE_OK and t not in REPLACE_TODO)
+ok(f"no-REPLACE 扫描通过：受锁表 {len(_lk)}，已防护 {len([t for t in _lk if _gd[t]])}，表级豁免 {len(REPLACE_ALLOW)}，REPLACE_OK {len(REPLACE_OK)}，REPLACE_TODO {len(REPLACE_TODO)}，逐键检查 {_nkeys} 个唯一键，键级豁免 {len(REPLACE_KEY_ALLOW)}") if not _e else bad("no-REPLACE 扫描：" + "；".join(_e))
+def _scan_mut(desc, ddl, allow, want, key_allow=None):
+    e = replace_check(ddl, allow, key_allow)[0]
+    ok(f"变异：{desc} → 扫描变红（{[x for x in e if want in x][0]}）") if any(want in x for x in e) else bad(f"变异：{desc} 后扫描仍绿：{e}")
+_ddl_nr = sqlite_ddl + "\nDROP TRIGGER trg_res_no_replace;"
+assert _ddl_nr != sqlite_ddl
+_scan_mut("去掉 trg_res_no_replace", _ddl_nr, REPLACE_ALLOW, "stock_reservation: 有 BEFORE")
+_scan_mut("豁免名单加入已防护的 stock_reservation", sqlite_ddl, {**REPLACE_ALLOW, "stock_reservation": "02"}, "stock_reservation: 豁免名单过期")
+_scan_mut("去掉 trg_res_no_replace 并把 stock_reservation 塞进豁免名单", _ddl_nr, {**REPLACE_ALLOW, "stock_reservation": "02"}, "stock_reservation: 豁免名单含冻结基线外")
+_scan_mut("把已修好的 lot 塞回豁免名单", sqlite_ddl, {**REPLACE_ALLOW, "lot": "01"}, "lot: 豁免名单过期")
+_scan_mut("表 DDL 加 ON CONFLICT REPLACE", sqlite_ddl + "\nCREATE TABLE zz_rep (id INTEGER PRIMARY KEY ON CONFLICT REPLACE);", REPLACE_ALLOW, "zz_rep: 表 DDL 含 ON CONFLICT REPLACE")
+# X2：假守卫（WHEN 只查 status='never'）必须红
+_scan_mut("假守卫：trg_res_no_replace 换成 WHEN r.status = 'never'", _ddl_nr + "\nCREATE TRIGGER trg_res_fake BEFORE INSERT ON stock_reservation WHEN EXISTS (SELECT 1 FROM stock_reservation r WHERE r.status = 'never') BEGIN SELECT RAISE(ABORT, 'reservation_duplicate'); END;", REPLACE_ALLOW, "stock_reservation(id)")
+_scan_mut("假守卫：只写 NEW.id IS NULL（引用了列但不比较）", _ddl_nr + "\nCREATE TRIGGER trg_res_fake BEFORE INSERT ON stock_reservation WHEN NEW.id IS NULL AND NEW.op_key IS NULL AND EXISTS (SELECT 1 FROM stock_reservation r) BEGIN SELECT RAISE(ABORT, 'reservation_duplicate'); END;", REPLACE_ALLOW, "stock_reservation(id)")
+_scan_mut("WHEN 少一个键：trg_res_no_replace 只查 id，不查 op_key", _ddl_nr + "\nCREATE TRIGGER trg_res_no_replace BEFORE INSERT ON stock_reservation WHEN EXISTS (SELECT 1 FROM stock_reservation r WHERE r.id = NEW.id) BEGIN SELECT RAISE(ABORT, 'reservation_duplicate'); END;", REPLACE_ALLOW, "stock_reservation(op_key)")
+_scan_mut("去掉 trg_mvk_no_replace_idem（X1 回退）", sqlite_ddl + "\nDROP TRIGGER trg_mvk_no_replace_idem;", REPLACE_ALLOW, "stock_movement_key(idempotency_key)")
+_scan_mut("去掉 trg_mvk_no_replace_seq（X1 回退）", sqlite_ddl + "\nDROP TRIGGER trg_mvk_no_replace_seq;", REPLACE_ALLOW, "stock_movement_key(stock_id,stock_seq)")
+_scan_mut("键级豁免去掉 outbox_event(node_id,seq)", sqlite_ddl, REPLACE_ALLOW, "outbox_event(node_id,seq)", {k: v for k, v in REPLACE_KEY_ALLOW.items() if k != ("outbox_event", ("node_id", "seq"))})
+_scan_mut("键级豁免加入已覆盖的 stock_movement_key(idempotency_key)", sqlite_ddl, REPLACE_ALLOW, "键级豁免过期", {**REPLACE_KEY_ALLOW, ("stock_movement_key", ("idempotency_key",)): "x"})
+_scan_mut("键级豁免加入基线外的键", sqlite_ddl + "\nDROP TRIGGER trg_hold_no_replace_ret;", REPLACE_ALLOW, "键级豁免含冻结基线外", {**REPLACE_KEY_ALLOW, ("stock_hold", ("source_id",)): "x"})
+_scan_mut("表达式唯一索引", sqlite_ddl + "\nCREATE UNIQUE INDEX zz_res_expr ON stock_reservation(lower(op_key));", REPLACE_ALLOW, "stock_reservation(zz_res_expr): 表达式唯一索引")
+
+print("=== 2z4 第 1/2 篇触发器 / 索引名冻结基线（#2 第十三轮；少一个 = 红）===")
+T0102 = ('warehouse', 'zone', 'location', 'sku', 'sku_barcode', 'sku_unit', 'lot', 'stock', 'stock_reservation', 'stock_hold', 'stock_hold_release', 'stock_ledger_line', 'stock_movement', 'stock_movement_key', 'stock_snapshot_daily', 'stock_recon_alert')
+SQ_BASE_0102 = {"trigger": frozenset(['trg_bc_no_replace', 'trg_bc_no_replace_code', 'trg_hold_approval_fk', 'trg_hold_approval_fk_upd', 'trg_hold_immutable', 'trg_hold_no_delete', 'trg_hold_no_replace', 'trg_hold_no_replace_ret', 'trg_hr_no_delete', 'trg_hr_no_replace', 'trg_hr_no_update', 'trg_location_no_replace', 'trg_location_no_replace_code', 'trg_lot_no_replace', 'trg_lot_sell_deadline', 'trg_mv_clock', 'trg_mv_no_delete', 'trg_mv_no_replace', 'trg_mv_no_update', 'trg_mvk_clock', 'trg_mvk_line_kind', 'trg_mvk_no_delete', 'trg_mvk_no_replace', 'trg_mvk_no_replace_biz', 'trg_mvk_no_replace_idem', 'trg_mvk_no_replace_pda', 'trg_mvk_no_replace_seq', 'trg_mvk_no_update', 'trg_recon_no_delete', 'trg_recon_no_replace', 'trg_recon_resolved_lock', 'trg_res_clock', 'trg_res_created_lock', 'trg_res_expires_lock', 'trg_res_no_replace', 'trg_res_ttl_fill', 'trg_sku_no_replace', 'trg_sku_no_replace_code', 'trg_sll_immutable', 'trg_sll_no_replace', 'trg_snap_no_replace', 'trg_stock_no_replace', 'trg_stock_no_replace_dim', 'trg_warehouse_no_replace', 'trg_warehouse_no_replace_code', 'trg_zone_no_replace', 'trg_zone_no_replace_code']),
+                "index": frozenset(['ix_hold_from', 'ix_hold_stock', 'ix_hr_hold', 'ix_loc_replen', 'ix_lot_aging', 'ix_lot_expiry', 'ix_mv_biz', 'ix_mv_hold', 'ix_mv_sku_time', 'ix_mv_stock', 'ix_mv_time', 'ix_recon_open', 'ix_res_exp', 'ix_res_source', 'ix_res_stock', 'ix_sku_category', 'ix_snap_sku', 'ix_stock_loc', 'ix_stock_sku_avail', 'ix_stock_wh', 'ix_zone_wh_type', 'sqlite_autoindex_location_1', 'sqlite_autoindex_location_2', 'sqlite_autoindex_lot_1', 'sqlite_autoindex_lot_2', 'sqlite_autoindex_sku_1', 'sqlite_autoindex_sku_2', 'sqlite_autoindex_sku_barcode_1', 'sqlite_autoindex_sku_barcode_2', 'sqlite_autoindex_sku_unit_1', 'sqlite_autoindex_sku_unit_2', 'sqlite_autoindex_stock_1', 'sqlite_autoindex_stock_2', 'sqlite_autoindex_stock_hold_1', 'sqlite_autoindex_stock_hold_2', 'sqlite_autoindex_stock_hold_release_1', 'sqlite_autoindex_stock_hold_release_2', 'sqlite_autoindex_stock_ledger_line_1', 'sqlite_autoindex_stock_movement_1', 'sqlite_autoindex_stock_movement_key_1', 'sqlite_autoindex_stock_movement_key_2', 'sqlite_autoindex_stock_movement_key_3', 'sqlite_autoindex_stock_recon_alert_1', 'sqlite_autoindex_stock_reservation_1', 'sqlite_autoindex_stock_reservation_2', 'sqlite_autoindex_stock_snapshot_daily_1', 'sqlite_autoindex_warehouse_1', 'sqlite_autoindex_warehouse_2', 'sqlite_autoindex_zone_1', 'sqlite_autoindex_zone_2', 'uq_hold_return', 'uq_mvk_biz_line', 'uq_mvk_pda_op', 'uq_mvk_stock_seq', 'uq_recon_open'])}
+def _names_0102(ddl):
+    mc = sqlite3.connect(":memory:"); mc.executescript(ddl)   # 内存库：只装 DDL 做扫描，不跑业务用例
+    out = {ty: {n for (n,) in mc.execute(f"SELECT name FROM sqlite_master WHERE type = ? AND tbl_name IN ({','.join('?' * len(T0102))})", (ty,) + T0102)} for ty in ("trigger", "index")}
+    mc.close(); return out
+def _base_check(ddl):
+    now = _names_0102(ddl)
+    return {ty: (sorted(SQ_BASE_0102[ty] - now[ty]), sorted(now[ty] - SQ_BASE_0102[ty])) for ty in now}
+for _ty, (_miss, _extra) in _base_check(sqlite_ddl).items():
+    ok(f"01/02 {_ty} 名单与冻结基线一致（{len(SQ_BASE_0102[_ty])} 个）") if not _miss else bad(f"01/02 {_ty} 少了：{_miss}")
+    if _extra: print(f"  · 01/02 {_ty} 基线外新增（请补进基线）：{_extra}")
+_m = _base_check(sqlite_ddl + "\nDROP TRIGGER trg_mvk_no_replace_seq;\nDROP INDEX uq_mvk_stock_seq;")
+ok(f"变异：去掉 trg_mvk_no_replace_seq + uq_mvk_stock_seq → 基线变红（{_m['trigger'][0]} / {_m['index'][0]}）") if _m["trigger"][0] and _m["index"][0] else bad("变异：去掉触发器 / 索引后基线仍绿")
+
+print("=== 2z2 预占 / 流水 防 REPLACE ===")
+_RES = "INTO stock_reservation (id,stock_id,stage,source_type,source_id,source_line_id,op_key,reserve_qty_milli,status) VALUES ({i},11,'RESERVE','OUTBOUND_LINE',1,{i},'{k}',1000,'RESERVED')"
+_tx_block("预占 INSERT OR REPLACE 同 id", ["INSERT " + _RES.format(i=99801, k='RES:RP:1'), "INSERT OR REPLACE " + _RES.format(i=99801, k='RES:RP:2')], "reservation_duplicate")
+_tx_block("预占 REPLACE INTO 同 op_key 换 id（续命）", ["INSERT " + _RES.format(i=99802, k='RES:RP:3'), "REPLACE " + _RES.format(i=99803, k='RES:RP:3')], "reservation_duplicate")
+_tx_allow("变异：去掉 trg_res_no_replace 后，REPLACE 同 op_key 换 id 通过（旧行被删）", ["DROP TRIGGER trg_res_no_replace", "INSERT " + _RES.format(i=99802, k='RES:RP:3'), "REPLACE " + _RES.format(i=99803, k='RES:RP:3')])
+
+print("=== 2z2-mv 流水 occurred_at 服务端时钟（00 §6.8 第 7 条）===")
+for _s in MV_CLOCK_SQL: conn.execute(_s)
+conn.commit()
+def _mv(t, mid=99901, seq=1, stock=99901):
+    return ["INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (99901,1,'LOT-MV','2027-01-01','2026-10-15')",
+            f"INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES ({stock},1,1,1,99901,'KG',0)",
+            "INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'MVCLK',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'MVCLK' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING",
+            f"INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES ({mid},'MVCLK',1,1,1,'DOC','OPENING',1,{stock},{seq},1,1,1,99901,NULL,NULL,NULL,NULL,50000,0,50000,{t},'MVCLK:1')",
+            f"INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES ({mid},'MVCLK:1','MVCLK',1,1,1,'DOC',NULL,NULL,NULL,NULL,{stock},{seq},1,{t})"]
+_NOW = "datetime('now')"
+_tx_allow("流水 occurred_at = 服务端当前整秒 UTC", _mv(_NOW))
+_tx_block("流水 occurred_at 远离 now（2 个月后）", _mv("datetime('now','+2 months')"), "movement_clock_skew")
+_tx_block("流水 occurred_at 只有日期", _mv("date('now')"), "movement_clock_skew")
+_tx_block("流水 occurred_at 带 Z 偏移", _mv("strftime('%Y-%m-%dT%H:%M:%SZ','now')"), "movement_clock_skew")
+_tx_block("流水 key occurred_at 远离 now（流水本身合法）", ["DROP TRIGGER trg_mv_clock"] + _mv("datetime('now','-1 day')")[:3] + [_mv(_NOW)[3].replace(_NOW, "datetime('now','-1 day')")] + _mv("datetime('now','-1 day')")[4:], "movement_clock_skew")
+_tx_allow("变异：去掉 trg_mv_clock / trg_mvk_clock 后，2 个月后的 occurred_at 通过", ["DROP TRIGGER trg_mv_clock", "DROP TRIGGER trg_mvk_clock"] + _mv("datetime('now','+2 months')"))
+_tx_block("流水 REPLACE 同主键", _mv(_NOW) + [_mv(_NOW)[3].replace("INSERT INTO", "INSERT OR REPLACE INTO").replace("{_NOW}", _NOW)], "append_only_violation: stock_movement")
+_tx_block("流水 key REPLACE 同 movement_id", _mv(_NOW) + [_mv(_NOW)[4].replace("INSERT INTO", "REPLACE INTO")], "append_only_violation: stock_movement_key")
+_MVK_GUARDS = ("trg_mvk_no_replace", "trg_mvk_no_replace_idem", "trg_mvk_no_replace_biz", "trg_mvk_no_replace_pda", "trg_mvk_no_replace_seq")
+_tx_allow("变异：去掉全部 trg_mvk_no_replace* 后，key REPLACE 同 movement_id 通过", [f"DROP TRIGGER {t}" for t in _MVK_GUARDS] + _mv(_NOW) + [_mv(_NOW)[4].replace("INSERT INTO", "REPLACE INTO")])
+# 第十二轮 X1：换 movement_id，只撞其他唯一键（小玛丽 mvk_replace.py 的三种打法）
+def _mvk_rep(mid, idem, op_no, seq):
+    return (f"REPLACE INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) "
+            f"VALUES ({mid},'{idem}','MVCLK',1,{op_no},1,'DOC',NULL,NULL,NULL,NULL,99901,{seq},1,{_NOW})")
+_K = "stock_movement_key"
+_X1 = [("同 idempotency_key", _mvk_rep(99902, 'MVCLK:1', 2, 2), f"{_K}.idempotency_key", "trg_mvk_no_replace_idem"),
+       ("同 (stock_id,stock_seq)", _mvk_rep(99902, 'MVCLK:2', 2, 1), f"{_K}.stock_id, {_K}.stock_seq", "trg_mvk_no_replace_seq"),
+       ("同 (biz_no,line_no,op_no,leg)", _mvk_rep(99902, 'MVCLK:2', 1, 2), f"{_K}.biz_no, {_K}.line_no, {_K}.op_no, {_K}.leg", "trg_mvk_no_replace_biz")]
+for _d, _sql, _want, _trg in _X1:
+    _tx_block(f"X1 流水 key 换 movement_id，REPLACE {_d}", _mv(_NOW) + [_sql], _want)
+    _tx_allow(f"变异：去掉 {_trg} 后，REPLACE {_d} 通过（旧 key 行被删）", [f"DROP TRIGGER {_trg}"] + _mv(_NOW) + [_sql])
+_tx_block("流水 occurred_at 小时 = 24（strftime 能解析，GLOB 也过）", ["DROP TRIGGER trg_mvk_clock"] + _mv("strftime('%Y-%m-%d', 'now') || ' 24:00:00'"), "movement_clock_skew")
+_tx_block("流水 key occurred_at 小时 = 24", ["DROP TRIGGER trg_mv_clock"] + _mv(_NOW)[:4] + [_mv("strftime('%Y-%m-%d', 'now') || ' 24:00:00'")[4]], "movement_clock_skew")
+_tx_block("预占 created_at 小时 = 24", ["INSERT " + _RES.format(i=99804, k='RES:RP:24').replace("op_key,reserve_qty_milli,status)", "op_key,reserve_qty_milli,status,created_at)").replace("'RESERVED')", "'RESERVED', strftime('%Y-%m-%d', 'now') || ' 24:00:00')")], "reservation_clock_skew")
+print("=== 2z2-01/02 第十二轮新守卫（lot / stock_ledger_line / stock / sku_barcode / stock_snapshot_daily / stock_hold RETURN_PENDING）===")
+_tx_block("lot REPLACE 同 (sku_id,lot_code,expiry_date) 换 id", ["INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (99951,1,'LOT-RP','2027-01-01','2026-10-15')", "REPLACE INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (99952,1,'LOT-RP','2027-01-01','2026-10-15')"], "lot_duplicate")
+_tx_block("lot INSERT OR REPLACE 同 id（绕 sell_deadline 锁）", ["INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (99951,1,'LOT-RP','2027-01-01','2026-10-15')", "INSERT OR REPLACE INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (99951,1,'LOT-RP2','2027-02-01','2026-10-15')"], "lot_duplicate")
+_tx_allow("变异：去掉 trg_lot_no_replace 后，lot REPLACE 换 id 通过", ["DROP TRIGGER trg_lot_no_replace", "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (99951,1,'LOT-RP','2027-01-01','2026-10-15')", "REPLACE INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (99952,1,'LOT-RP','2027-01-01','2026-10-15')"])
+_SLL = "INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'SLLRP',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'SLLRP' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING"
+_tx_allow("02 原语先查再插：同一单据行建两次归属行，第二次 0 行（不被守卫误拦）", [_SLL, _SLL])
+_tx_block("stock_ledger_line REPLACE 同 (biz_no,line_no) 改 src_kind（抢归属）", [_SLL, "REPLACE INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('SLLRP',1,'PDA','DEV-X')"], "ledger_line_duplicate")
+_tx_block("旧写法 ON CONFLICT DO NOTHING 重放被守卫拦（证明原语必须先查再插）", [_SLL, "INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('SLLRP',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING"], "ledger_line_duplicate")
+_tx_allow("变异：去掉 trg_sll_no_replace 后，REPLACE 抢归属通过", ["DROP TRIGGER trg_sll_no_replace", _SLL, "REPLACE INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('SLLRP',1,'PDA','DEV-X')"])
+_tx_block("stock REPLACE 同维度换 id（余额 / version 重置）", ["INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (99953,1,'LOT-SRP','2027-01-01','2026-10-15')", "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (99953,1,1,1,99953,'KG',5000)", "REPLACE INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (99954,1,1,1,99953,'KG',0)"], "stock.warehouse_id, stock.location_id, stock.sku_id, stock.lot_id, stock.container_id")
+_tx_allow("变异：去掉 trg_stock_no_replace_dim 后，stock REPLACE 同维度通过", ["DROP TRIGGER trg_stock_no_replace_dim", "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date) VALUES (99953,1,'LOT-SRP','2027-01-01','2026-10-15')", "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (99953,1,1,1,99953,'KG',5000)", "REPLACE INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli) VALUES (99954,1,1,1,99953,'KG',0)"])
+_tx_block("sku_barcode REPLACE 同条码换 id（抢条码）", ["INSERT INTO sku_barcode (id,sku_id,barcode,uom) VALUES (99955,1,'BC-RP','EA')", "REPLACE INTO sku_barcode (id,sku_id,barcode,uom) VALUES (99956,1,'BC-RP','KG')"], "sku_barcode.barcode")
+# 种子（提交）：给逐键实打留样本行
+for _s in ["INSERT INTO sku_barcode (id,sku_id,barcode,uom) VALUES (99990,1,'BC-PROBE','EA')",
+           "INSERT INTO stock_snapshot_daily (work_date,stock_id,warehouse_id,location_id,sku_id,lot_id,container_id,on_hand_qty_milli,allocated_qty_milli,reserved_qty_milli,quality_hold_qty_milli,hold_qty_milli,ledger_seq) "
+           "SELECT '2026-10-14',id,warehouse_id,location_id,sku_id,lot_id,container_id,on_hand_qty_milli,allocated_qty_milli,reserved_qty_milli,quality_hold_qty_milli,hold_qty_milli,0 FROM stock ORDER BY id LIMIT 1"]:
+    conn.execute(_s)
+conn.commit()
+_tx_block("stock_snapshot_daily REPLACE 同 (work_date,stock_id)（改写历史快照）", ["REPLACE INTO stock_snapshot_daily (work_date,stock_id,warehouse_id,location_id,sku_id,lot_id,container_id,on_hand_qty_milli,allocated_qty_milli,reserved_qty_milli,quality_hold_qty_milli,hold_qty_milli,ledger_seq) SELECT work_date,stock_id,warehouse_id,location_id,sku_id,lot_id,container_id,0,0,0,0,0,0 FROM stock_snapshot_daily WHERE work_date = '2026-10-14'"], "stock_snapshot_daily.work_date, stock_snapshot_daily.stock_id")
+# 第十三轮（小玛丽 r12 B1）：删掉"实打缺口"名单。给 r12 那 12 个键补无子行的合法种子（提交），2z3b 的生成器按 rowid 倒序先取到它们
+def _copy_row(t, where, **chg):
+    cs = [r[1] for r in conn.execute(f"PRAGMA table_info({t})")]
+    r = dict(zip(cs, conn.execute(f"SELECT {', '.join(cs)} FROM {t} WHERE {where}").fetchone())); r.update(chg)
+    conn.execute(f"INSERT INTO {t} ({', '.join(cs)}) VALUES ({', '.join('?' for _ in cs)})", [r[c] for c in cs])
+_free_hold = lambda k: conn.execute("SELECT id FROM stock_hold WHERE id NOT IN (SELECT hold_id FROM process_issue WHERE hold_id IS NOT NULL) ORDER BY id LIMIT 1 OFFSET ?", (k,)).fetchone()[0]
+_loc_lt = conn.execute("SELECT location_id FROM live_tank WHERE location_id NOT IN (SELECT location_id FROM live_tank_hold WHERE status = 'ACTIVE') ORDER BY location_id LIMIT 1").fetchone()[0]
+_ins_lt = conn.execute("SELECT id FROM live_inspection ORDER BY id LIMIT 1").fetchone()[0]
+_mv_free = conn.execute("SELECT movement_id FROM stock_movement_key WHERE movement_id NOT IN (SELECT movement_id FROM live_shrink_settlement WHERE movement_id IS NOT NULL) ORDER BY movement_id LIMIT 1").fetchone()[0]
+for _s in ["INSERT INTO return_reservation (id,code,warehouse_id,store_code,outbound_order_id,status,created_by) VALUES (90001,'RSV-20261015-990001',1,'ST001',1,'CREATED',21)",
+           "INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id,status) VALUES (90001,'DEV-RP','PDA',101,1,'PENDING')",
+           f"INSERT INTO live_tank_hold (id,warehouse_id,location_id,reason,trigger_inspection_id,status) VALUES (90001,1,{_loc_lt},'SEVERE',{_ins_lt},'ACTIVE')",
+           f"INSERT INTO live_shrink_settlement (id,warehouse_id,location_id,lot_id,stock_id,work_date,book_qty_milli,measured_qty_milli,shrink_qty_milli,shrink_bp,tolerance_bp,outcome,movement_id,scrap_order_id) VALUES (90001,1,61,31,6101,'2026-09-01',10000,9950,50,50,100,'LOSS',{_mv_free},1)"]:
+    conn.execute(_s)
+_copy_row("process_issue", "id = 1722", id=1798, line_no=98, op_key="PRCI:1711:00000000-0000-4000-8000-000000009998", hold_id=_free_hold(0))
+_copy_row("process_report", "id = 1744", id=1798, report_seq=8, report_client_id="00000000-0000-4000-8000-000000009998")
+_li = conn.execute("SELECT id FROM live_inspection ORDER BY id DESC LIMIT 1").fetchone()[0]
+_copy_row("live_inspection", f"id = {_li}", id=90001, client_op_id="00000000-0000-4000-8000-000000090001")   # 无子行（不被 live_tank_hold 引用）
+conn.execute("INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (90001,1,'Z-RP','无库位','CHILLED','STORAGE')")   # 无子库位
+conn.commit()
+# 生成器的"只撞目标键"造不出时的手写实打（不是豁免：同样两段——带守卫必须被拒且原行在，去掉全部触发器后必须通过且原行被删；任一不满足 = 红）。
+# 两条都是"同主键、其余唯一键也落在同一行"：REPLACE 只会删这一行，原值被覆盖（小玛丽 r12 gap_probe2 的打法）
+def _hand_rep(t, where, **chg):
+    cs = [r[1] for r in conn.execute(f"PRAGMA table_info({t})")]
+    r = dict(zip(cs, conn.execute(f"SELECT {', '.join(cs)} FROM {t} WHERE {where}").fetchone())); r.update(chg)
+    return f"REPLACE INTO {t} ({', '.join(cs)}) VALUES ({', '.join('?' for _ in cs)})", [r[c] for c in cs]
+_HAND = {
+    ("live_tank_hold", ("id",)): (lambda: _hand_rep("live_tank_hold", "id = 90001", reason="CONSECUTIVE_BREACH"), "SELECT count(*) FROM live_tank_hold WHERE id = 90001 AND reason = 'SEVERE'"),
+    ("process_issue", ("id",)): (lambda: _hand_rep("process_issue", "id = 1798", issue_qty_milli=conn.execute("SELECT issue_qty_milli + 1 FROM process_issue WHERE id = 1798").fetchone()[0]), "SELECT count(*) FROM process_issue WHERE id = 1798 AND issue_qty_milli = (SELECT issue_qty_milli FROM process_issue WHERE id = 1722)"),
+}
+print("=== 2z3b 逐唯一键实打 REPLACE（第十二轮：每张受锁表、每个唯一键造一条冲突行，必须被拒且原行还在）===")
+def _replace_probe(only=None, sink=None):
+    ok_, bad_ = (ok, bad) if sink is None else ((lambda m: sink.append(('ok', m))), (lambda m: sink.append(('bad', m))))
+    _, locked, guards, keys = replace_scan(sqlite_ddl)
+    tried = 0
+    for t in sorted(keys):
+        if only and t != only: continue
+        if not keys[t]: continue
+        if t in REPLACE_ALLOW or t in REPLACE_OK or t in REPLACE_TODO:
+            print(f"  · {t}: 表级豁免（{REPLACE_ALLOW.get(t) or REPLACE_OK.get(t) or 'TODO ' + REPLACE_TODO[t]}），不实打"); continue
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({t})")]
+        ctype = {r[1]: (r[2] or "").upper() for r in conn.execute(f"PRAGMA table_info({t})")}
+        fkcols = {r[3] for r in conn.execute(f"PRAGMA foreign_key_list({t})")}
+        trgs = conn.execute("SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name=?", (t,)).fetchall()
+        gnames = [n for n, s in trgs if _is_guard(t, s)]
+        others = [n for n, s in trgs if n not in gnames]
+        for kname, kc, where in keys[t]:
+            if (t, kc) in REPLACE_KEY_ALLOW:
+                print(f"  · {t}({','.join(kc)}): 键级豁免（{REPLACE_KEY_ALLOW[(t, kc)]}），不实打"); continue
+            if None in kc:
+                bad_(f"{t}({kname}): 表达式唯一索引，实打无法造冲突行 → 红"); continue
+            if (t, kc) in _HAND:
+                (_hs, _ha), _chk = _HAND[(t, kc)][0](), _HAND[(t, kc)][1]
+                conn.execute("SAVEPOINT rh")
+                try:
+                    for n, _s in trgs:
+                        if n not in gnames: conn.execute(f"DROP TRIGGER {n}")
+                    try: conn.execute(_hs, _ha); _e1 = None
+                    except sqlite3.Error as e: _e1 = str(e)
+                    _a1 = conn.execute(_chk).fetchone()[0]
+                    conn.execute("ROLLBACK TO rh")
+                    for n, _s in trgs: conn.execute(f"DROP TRIGGER {n}")
+                    try: conn.execute(_hs, _ha); _e2 = None
+                    except sqlite3.Error as e: _e2 = str(e)
+                    _a2 = conn.execute(_chk).fetchone()[0]
+                finally:
+                    conn.execute("ROLLBACK TO rh"); conn.execute("RELEASE rh")
+                tried += 1
+                ok_(f"手写实打 REPLACE {t}({','.join(kc)}) → 被拒（{_e1}），原行还在") if _e1 and _a1 == 1 else bad_(f"手写实打 REPLACE {t}({','.join(kc)}) → {_e1 or '通过'}，原行 {_a1}")
+                ok_(f"变异：去掉 {t} 的触发器后手写 REPLACE 通过且原值被覆盖") if not _e2 and _a2 == 0 else bad_(f"变异：{t}({','.join(kc)}) 手写 REPLACE 去触发器后 {_e2 or '通过但原行还在'}（样本无效）")
+                continue
+            cond = " AND ".join(f"{c} IS NOT NULL" for c in kc) + (f" AND ({where})" if where else "")
+            samples = conn.execute(f"SELECT rowid, {', '.join(cols)} FROM {t} WHERE {cond} ORDER BY rowid DESC LIMIT 12").fetchall()
+            row = samples[0] if samples else None
+            if row is None:
+                bad_(f"{t}({','.join(kc)}): verify 跑完库里没有满足{'谓词 ' + where if where else '该键'}的样本行，实打不了 → 补一条种子"); continue
+            rid, vals = row[0], dict(zip(cols, row[1:]))
+            sub = [oc for _, oc, _w in keys[t] if None not in oc and set(oc) < set(kc)]
+            if sub:   # 目标键是别的键的超集：撞它必然先撞子集键，子集键单独实打，这里显式记一笔，不静默跳过
+                ok_(f"{t}({','.join(kc)}): 是 ({','.join(sub[0])}) 的超集，由子集键的实打覆盖"); continue
+            sql = f"REPLACE INTO {t} ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})"
+            still = f"SELECT count(*) FROM {t} WHERE rowid = ? AND " + " AND ".join(f"{c} IS ?" for c in cols)   # 原行 = 每一列都等于原值
+            desc = f"{t}({','.join(kc)}{' WHERE ' + where if where else ''})"
+            args = None; tries = 0; last = None; anomaly = None
+            for row in samples:
+                rid, vals = row[0], dict(zip(cols, row[1:]))
+                def _cands(c, i):
+                    v = vals[c]; out = []
+                    if isinstance(v, int): out += [v + 7000000 + i, v + 1, v - 1]
+                    elif isinstance(v, str):
+                        out += [v[:-1] + ('1' if v[-1:] != '1' else '2'), v[:-1] + ('Z' if v[-1:] != 'Z' else 'Y'), f"{v}#R{i}"]
+                        if v[-1:].isdigit(): out.append(v + "9")
+                        if c not in kc and _re.fullmatch(r"\d{4}-\d\d-\d\d", v or ""): out.append(conn.execute("SELECT date(?, '-1 day')", (v,)).fetchone()[0])
+                    for _id, _sq, ptab, fc, pc, *_r in conn.execute(f"PRAGMA foreign_key_list({t})").fetchall():
+                        if fc == c and pc:   # 外键列：取父表里本表还没用过的值
+                            out += [r[0] for r in conn.execute(f"SELECT {pc} FROM {ptab} WHERE {pc} IS NOT NULL AND {pc} NOT IN (SELECT {c} FROM {t} WHERE {c} IS NOT NULL) LIMIT 3")]
+                    out.append(None)
+                    return out
+                comp = [(i, [c for c in oc if c not in kc]) for i, (_, oc, _w) in enumerate(keys[t]) if None not in oc and not set(oc) >= set(kc)]
+                opts = [[(c, v) for c in free for v in _cands(c, i)] for i, free in comp]
+                import itertools as _it
+                # 先在"去掉守卫"的保存点里试出一条能真删掉原行的冲突行（证明打到了目标键），再用它实打带守卫的库
+                conn.execute("SAVEPOINT rpf")
+                for n, _s in trgs: conn.execute(f"DROP TRIGGER {n}")
+                for _k, combo in enumerate(_it.product(*opts)):
+                    tries += 1
+                    if _k >= 120: break
+                    new = dict(vals)
+                    for c, v in combo: new[c] = v
+                    a_ = [new[c] for c in cols]
+                    conn.execute("SAVEPOINT rpt")
+                    try:
+                        conn.execute(sql, a_)
+                        gone = conn.execute(still, [rid] + [vals[c] for c in cols]).fetchone()[0] == 0
+                        hit = conn.execute(f"SELECT count(*) FROM {t} WHERE " + " AND ".join(f"{c} IS ?" for c in kc) + (f" AND ({where})" if where else ""), [vals[c] for c in kc]).fetchone()[0] == 1
+                        if gone and hit: args = a_
+                        else: anomaly = f"REPLACE 执行了但原行{'还在' if not gone else '被删、目标键却没留下新行'}"   # 去全部触发器后仍不删原行 = 造样本失败，绝不当通过
+                    except sqlite3.Error as e:
+                        last = str(e)
+                    conn.execute("ROLLBACK TO rpt"); conn.execute("RELEASE rpt")
+                    if args or anomaly: break
+                conn.execute("ROLLBACK TO rpf"); conn.execute("RELEASE rpf")
+                if args or anomaly: break
+            tried += 1
+            if anomaly:
+                bad_(f"{desc}: 造样本失败（{anomaly}）→ 红"); continue
+            if args is None:
+                bad_(f"{desc}: 造不出能撞到这个键的冲突行（试了 {tries} 种，最后错误 {last}）→ 红"); continue
+            conn.execute("SAVEPOINT rp")
+            try:
+                for n in others: conn.execute(f"DROP TRIGGER {n}")   # 只留守卫：拒绝必须来自 no-REPLACE 触发器
+                try:
+                    conn.execute(sql, args); err = None
+                except sqlite3.Error as e:
+                    err = str(e)
+                alive = conn.execute(still, [rid] + [vals[c] for c in cols]).fetchone()[0]
+                ok_(f"实打 REPLACE {desc} → 被拒（{err}），原行还在") if err and alive == 1 else bad_(f"实打 REPLACE {desc} → {'通过' if not err else '被拒'}，原行{'还在' if alive else '被删'}")
+                conn.execute("ROLLBACK TO rp")
+                for n in others + gnames: conn.execute(f"DROP TRIGGER {n}")
+                try:
+                    conn.execute(sql, args); merr = None
+                except sqlite3.Error as e:
+                    merr = str(e)
+                malive = conn.execute(still, [rid] + [vals[c] for c in cols]).fetchone()[0]
+                ok_(f"变异：去掉 {t} 的守卫后同一 REPLACE 通过且原行被删（证明冲突行打到了这个键）") if not merr and malive == 0 else bad_(f"变异：{desc} 去掉守卫后 REPLACE {'被拒：' + merr if merr else '通过但原行还在'}（样本没打到这个键）")
+            finally:
+                conn.execute("ROLLBACK TO rp"); conn.execute("RELEASE rp")
+    return tried
+_np = _replace_probe()
+ok(f"逐唯一键实打共 {_np} 个键（无缺口名单）") if _np else bad("逐唯一键实打 0 个键")
+# 第十三轮变异（小玛丽 r12 mut_lw）：trg_lw_dup 业务键分支加 AND NEW.result='NEVER'，静态 x.col=NEW.col 仍全在，实打必须变红
+_lw_sql = conn.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_lw_dup'").fetchone()[0]
+assert "(NEW.result = 'ACCEPTED' AND" in _lw_sql
+conn.execute("SAVEPOINT lwm")
+try:
+    conn.execute("DROP TRIGGER trg_lw_dup"); conn.execute(_lw_sql.replace("(NEW.result = 'ACCEPTED' AND", "(NEW.result = 'ACCEPTED' AND NEW.result = 'NEVER' AND"))
+    _st = replace_check(conn.execute("SELECT group_concat(sql, ';' || char(10)) || ';' FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'").fetchone()[0], REPLACE_ALLOW)[0]
+    _sink = []; _replace_probe(only="live_weigh", sink=_sink)
+    _red = [m for k, m in _sink if k == 'bad' and 'task_kind' in m]
+    ok(f"变异：trg_lw_dup 加 NEW.result='NEVER' → 实打变红（{_red[0][:80]}）；静态扫描{'仍绿（说明只靠静态不够）' if not any('live_weigh' in e for e in _st) else '也红'}") if _red else bad(f"变异：trg_lw_dup 加 NEW.result='NEVER' 后实打仍绿：{_sink}")
+finally:
+    conn.execute("ROLLBACK TO lwm"); conn.execute("RELEASE lwm")
+print("=== FK 自检 ===")
+_fk_guard("收尾")
+ok(f"全程无用例在 foreign_keys=OFF 下运行（守卫命中 {_fk_guard_hits} 次）") if _fk_guard_hits == 0 else bad(f"FK 守卫命中 {_fk_guard_hits} 次")
+if not _MUTANT_NO_FK and os.environ.get("VERIFY_SQLITE_SKIP_MUTANT") != "1":
+    import subprocess
+    _mr = subprocess.run([sys.executable, __file__], env={**os.environ, "VERIFY_SQLITE_MUTANT_NO_FK": "1", "VERIFY_SQLITE_NO_WRITE": "1"},
+                         capture_output=True, text=True)
+    _mout = _mr.stdout + _mr.stderr
+    if _mr.returncode != 0 and "[FK 守卫]" in _mout:
+        ok(f"变异：去掉重连后的外键开启 → verify 变红（exit {_mr.returncode}，守卫命中 {_mout.count('[FK 守卫]')} 次）")
+    else:
+        bad(f"变异：去掉重连后的外键开启后 verify 仍绿或未被守卫发现（exit {_mr.returncode}）")
 print("=== 汇总 ===")
 print(f"  通过 {passed} 项 / 失败 {failed} 项")
 conn.close()

@@ -9,9 +9,9 @@
 
 CREATE TABLE stock (
     id                      BIGINT          PRIMARY KEY,
-    warehouse_id            BIGINT          NOT NULL,
-    location_id             BIGINT          NOT NULL,
-    sku_id                  BIGINT          NOT NULL,
+    warehouse_id            BIGINT          NOT NULL REFERENCES warehouse(id),
+    location_id             BIGINT          NOT NULL REFERENCES location(id),
+    sku_id                  BIGINT          NOT NULL REFERENCES sku(id),
     lot_id                  BIGINT          NOT NULL,
     container_id            BIGINT          NOT NULL DEFAULT 0,   -- 0 = 散货无容器（哨兵值，见下）
     uom                     VARCHAR(16)     NOT NULL,             -- 恒为 sku.base_uom
@@ -24,8 +24,8 @@ CREATE TABLE stock (
 
     ledger_seq              BIGINT          NOT NULL DEFAULT 0,   -- 本行 on_hand 变更计数，与流水 stock_seq 一一对应（快照水位线）；期初/迁移行的第 1 条流水是 OPENING
     version                 BIGINT          NOT NULL DEFAULT 0,
-    created_at              TIMESTAMP       NOT NULL DEFAULT now(),
-    updated_at              TIMESTAMP       NOT NULL DEFAULT now(),
+    created_at              TIMESTAMP       NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
+    updated_at              TIMESTAMP       NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
 
     CONSTRAINT uq_stock_dim UNIQUE (warehouse_id, location_id, sku_id, lot_id, container_id),
     -- ⚠ container_id 必须是 NOT NULL DEFAULT 0 而不是可空：
@@ -47,6 +47,10 @@ CREATE TABLE stock (
         AND (allocated_qty_milli + reserved_qty_milli + quality_hold_qty_milli + hold_qty_milli) <= on_hand_qty_milli
     )
 );
+-- #2 第十二轮（00 §6.10 扩到全部表）：stock 行带 version / 各数量，REPLACE 撞 id 或 uq_stock_dim 会把余额和版本整行重置 → 先拦
+-- @sqlite-only CREATE TRIGGER trg_stock_no_replace BEFORE INSERT ON stock WHEN EXISTS (SELECT 1 FROM stock s WHERE s.id = NEW.id) BEGIN SELECT RAISE(ABORT, 'stock_duplicate: stock.id'); END;
+-- @sqlite-only CREATE TRIGGER trg_stock_no_replace_dim BEFORE INSERT ON stock WHEN EXISTS (SELECT 1 FROM stock s WHERE s.warehouse_id = NEW.warehouse_id AND s.location_id = NEW.location_id AND s.sku_id = NEW.sku_id AND s.lot_id = NEW.lot_id AND s.container_id = NEW.container_id)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'stock_duplicate: stock.warehouse_id, stock.location_id, stock.sku_id, stock.lot_id, stock.container_id'); END;
 CREATE INDEX ix_stock_sku_avail ON stock(sku_id, warehouse_id, lot_id) WHERE on_hand_qty_milli > 0;
 CREATE INDEX ix_stock_loc       ON stock(location_id, sku_id);
 CREATE INDEX ix_stock_wh        ON stock(warehouse_id, sku_id);
@@ -65,12 +69,18 @@ CREATE TABLE stock_reservation (
     consumed_qty_milli  BIGINT          NOT NULL DEFAULT 0,
     released_qty_milli  BIGINT          NOT NULL DEFAULT 0,
     status              VARCHAR(16)     NOT NULL DEFAULT 'RESERVED',  -- RESERVED/CONSUMED/RELEASED，由余量决定
-    expires_at          TIMESTAMP,                  -- 超时自动释放，防死锁
+    expires_at          TIMESTAMP,                  -- 超时自动释放，防死锁。#2 第九轮：由库计算（created_at + 最长 TTL 24h），调用方不能填永不过期
     version             BIGINT          NOT NULL DEFAULT 0,
-    created_at          TIMESTAMP       NOT NULL DEFAULT now(),
-    updated_at          TIMESTAMP       NOT NULL DEFAULT now(),
+    created_at          TIMESTAMP       NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
+    updated_at          TIMESTAMP       NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
     CONSTRAINT uq_res_op  UNIQUE (op_key),
     CONSTRAINT ck_res_stage CHECK (stage IN ('RESERVE','ALLOCATE')),
+    -- #2 第九轮 TTL 上界：expires_at 只能落在 (created_at, created_at + 24h]；允许缩短（更早释放更安全），不许超过 24h。
+    -- 不能为 NULL（NULL = 永不过期）：PG 列 NOT NULL（BEFORE INSERT 触发器先补算）；SQLite 由 AFTER INSERT 补算，trg_res_expires_lock 拒 UPDATE 成 NULL
+    CONSTRAINT ck_res_ttl CHECK (expires_at IS NULL OR (expires_at > created_at AND expires_at <= created_at + interval '24 hours')),  -- @pg-only
+-- @sqlite-only     CONSTRAINT ck_res_ttl CHECK (expires_at IS NULL OR (strftime('%s', created_at) IS NOT NULL AND strftime('%s', expires_at) IS NOT NULL
+-- @sqlite-only         AND expires_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND substr(expires_at, 12, 2) <= '23'
+-- @sqlite-only         AND CAST(strftime('%s', expires_at) AS INTEGER) - CAST(strftime('%s', created_at) AS INTEGER) BETWEEN 1 AND 86400)),
     CONSTRAINT ck_res_int CHECK (
         reserve_qty_milli = CAST(reserve_qty_milli AS BIGINT)
         AND consumed_qty_milli = CAST(consumed_qty_milli AS BIGINT)
@@ -91,6 +101,36 @@ CREATE TABLE stock_reservation (
 CREATE INDEX ix_res_stock  ON stock_reservation(stock_id, stage, status);
 CREATE INDEX ix_res_source ON stock_reservation(source_type, source_id, source_line_id);
 CREATE INDEX ix_res_exp    ON stock_reservation(expires_at) WHERE status = 'RESERVED';
+-- #2 第九轮：预占过期时间由库计算。PG：INSERT 时 created_at 强制为库时钟（UTC 整秒），expires_at 为空则补 created_at + 24h；
+-- 调用方显式给的值由 ck_res_ttl 校验上界（不能超过 24h，不能早于建单）；UPDATE 不许改 created_at。
+-- SQLite：created_at 只收与 now 相差 ≤ 300s 的整秒 UTC；AFTER INSERT 补 expires_at；上界同样由 ck_res_ttl 拦。
+CREATE FUNCTION trg_res_ttl() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
+BEGIN                                                                                                         -- @pg-only
+    IF TG_OP = 'INSERT' THEN                                                                                  -- @pg-only
+        NEW.created_at := date_trunc('second', now() AT TIME ZONE 'UTC');                                    -- @pg-only
+        IF NEW.expires_at IS NULL THEN NEW.expires_at := NEW.created_at + interval '24 hours'; END IF;        -- @pg-only
+    ELSIF NEW.created_at IS DISTINCT FROM OLD.created_at THEN                                                 -- @pg-only
+        RAISE EXCEPTION 'reservation_created_at_immutable' USING ERRCODE = '23514';                          -- @pg-only
+    END IF;                                                                                                   -- @pg-only
+    RETURN NEW;                                                                                               -- @pg-only
+END $$;                                                                                                       -- @pg-only
+CREATE TRIGGER trg_res_ttl BEFORE INSERT OR UPDATE ON stock_reservation FOR EACH ROW EXECUTE FUNCTION trg_res_ttl();  -- @pg-only
+-- B1：PG 补算在 BEFORE 触发器里，NOT NULL 检查在其后，调用方 / 属主都不能把它改成 NULL
+ALTER TABLE stock_reservation ALTER COLUMN expires_at SET NOT NULL;  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_res_clock BEFORE INSERT ON stock_reservation
+-- @sqlite-only WHEN NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' OR substr(NEW.created_at, 12, 2) > '23' OR strftime('%s', NEW.created_at) IS NULL
+-- @sqlite-only   OR abs(CAST(strftime('%s', NEW.created_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'reservation_clock_skew'); END;
+-- @sqlite-only CREATE TRIGGER trg_res_ttl_fill AFTER INSERT ON stock_reservation WHEN NEW.expires_at IS NULL
+-- @sqlite-only BEGIN UPDATE stock_reservation SET expires_at = datetime(NEW.created_at, '+24 hours') WHERE id = NEW.id; END;
+-- SQLite REPLACE 冲突是删旧行再插新行，不经过 UPDATE 触发器（小玛丽 r10 R1：可借此无限续期）→ 同 trg_idem_no_replace，主键已存在就中止
+--   主键和 op_key 都查：REPLACE 撞 op_key（换 id）同样会删旧行重建。同 op_key 的普通重复插入也由本触发器先拦（reservation_duplicate），uq_res_op 兜底
+-- @sqlite-only CREATE TRIGGER trg_res_no_replace BEFORE INSERT ON stock_reservation WHEN EXISTS (SELECT 1 FROM stock_reservation r WHERE r.id = NEW.id OR r.op_key = NEW.op_key)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'reservation_duplicate'); END;
+-- @sqlite-only CREATE TRIGGER trg_res_expires_lock BEFORE UPDATE OF expires_at ON stock_reservation WHEN NEW.expires_at IS NULL
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'reservation_expires_null'); END;
+-- @sqlite-only CREATE TRIGGER trg_res_created_lock BEFORE UPDATE OF created_at ON stock_reservation WHEN NEW.created_at IS NOT OLD.created_at
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'reservation_created_at_immutable'); END;
 
 CREATE TABLE stock_hold (
     id                  BIGINT          PRIMARY KEY,
@@ -109,8 +149,8 @@ CREATE TABLE stock_hold (
     is_reversal         BOOLEAN         NOT NULL DEFAULT false,  -- 误报回转明细（SCRAP_PENDING → RETURN_QC）显式标记，替代 op_key LIKE 'CVT:%' 识别（小赵 N1）
     from_hold_id        BIGINT,                 -- convert_hold 子明细指向被转出的父冻结；一条父冻结可多次部分转出。I3e 按此汇总，不再用 op_key = 'CVT:' || id
     version             BIGINT          NOT NULL DEFAULT 0,
-    created_at          TIMESTAMP       NOT NULL DEFAULT now(),
-    updated_at          TIMESTAMP       NOT NULL DEFAULT now(),
+    created_at          TIMESTAMP       NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
+    updated_at          TIMESTAMP       NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
     CONSTRAINT uq_hold_op UNIQUE (op_key),
     CONSTRAINT ck_hold_type CHECK (hold_type IN ('QUALITY','RETURN_QC','MANUAL','RETURN_PENDING','SCRAP_PENDING','PROCESSING','LIVE_HOLD')),
     -- 一套方案：hold_type 是大类（决定计入哪一列），reason_code 是细分原因，二者成对约束。
@@ -204,7 +244,7 @@ CREATE TABLE stock_hold_release (
     hold_id             BIGINT          NOT NULL,
     op_key              VARCHAR(80)     NOT NULL,
     qty_milli           BIGINT          NOT NULL,
-    created_at          TIMESTAMP       NOT NULL DEFAULT now(),
+    created_at          TIMESTAMP       NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
     CONSTRAINT uq_hr_op UNIQUE (op_key),
     CONSTRAINT fk_hr_hold FOREIGN KEY (hold_id) REFERENCES stock_hold(id),   -- 小赵 S6：释放记录必须挂在真实冻结上
     CONSTRAINT ck_hr_qty CHECK (qty_milli > 0 AND qty_milli = CAST(qty_milli AS BIGINT))
@@ -236,7 +276,7 @@ CREATE TABLE stock_movement_key (
     stock_id            BIGINT          NOT NULL,
     stock_seq           BIGINT          NOT NULL,
     direction           SMALLINT        NOT NULL,
-    occurred_at         TIMESTAMP       NOT NULL,       -- 冗余，便于按 key 找到所在分区
+    occurred_at         TIMESTAMP       NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),  -- 冗余，便于按 key 找到所在分区；#2 第十一轮：服务端时间（trg_mvk_zclock）
     CONSTRAINT uq_mvk_idem UNIQUE (idempotency_key),
     CONSTRAINT ck_mvk_kind CHECK (
         (src_kind = 'DOC' AND src_task_id IS NULL AND src_line_no IS NULL AND device_instance_id IS NULL AND src_op_seq IS NULL AND op_no >= 1)
@@ -259,10 +299,10 @@ CREATE TABLE stock_movement (
     stock_id                    BIGINT          NOT NULL,   -- 记账到哪一行库存，按行回放的依据
     hold_id                     BIGINT,                     -- 冻结类流水指向单条 stock_hold；非冻结流水 NULL。I3f/I3g 按此对账，不按 stock 汇总
     stock_seq                   BIGINT          NOT NULL,   -- = 该次条件 UPDATE 后的 stock.ledger_seq；direction=0 时填当前 ledger_seq（不入链）
-    warehouse_id                BIGINT          NOT NULL,
-    location_id                 BIGINT          NOT NULL,
-    from_location_id            BIGINT,
-    sku_id                      BIGINT          NOT NULL,
+    warehouse_id                BIGINT          NOT NULL REFERENCES warehouse(id),
+    location_id                 BIGINT          NOT NULL REFERENCES location(id),
+    from_location_id            BIGINT REFERENCES location(id),
+    sku_id                      BIGINT          NOT NULL REFERENCES sku(id),
     lot_id                      BIGINT          NOT NULL,
     container_id                BIGINT          NOT NULL DEFAULT 0,
     -- PDA 作业来源 = 00 总体设计 §6.5 四元组 (task_id, line_no, device_instance_id, op_seq)；DOC 行四列全 NULL
@@ -275,8 +315,8 @@ CREATE TABLE stock_movement (
     on_hand_after_qty_milli     BIGINT          NOT NULL,
     operator_id                 BIGINT,
     device                      VARCHAR(32),
-    occurred_at                 TIMESTAMP       NOT NULL,
-    recorded_at                 TIMESTAMP       NOT NULL DEFAULT now(),
+    occurred_at                 TIMESTAMP       NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),  -- #2 第十一轮：服务端时间（trg_mv_zclock），00 §6.8 第 7 条
+    recorded_at                 TIMESTAMP       NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
     cost_amount                 BIGINT,                     -- 分
     idempotency_key             VARCHAR(160)    NOT NULL,   -- 唯一格式见 stock_movement_key
     remark                      VARCHAR(256),
@@ -327,8 +367,8 @@ CREATE TABLE stock_ledger_line (
     src_kind        VARCHAR(8)      NOT NULL,
     owner_device_instance_id VARCHAR(64),           -- PDA 行：当前唯一允许记账的设备实例；改派/重新领取时由第 5 篇条件更新换主
     post_count      INT             NOT NULL DEFAULT 0,
-    created_at      TIMESTAMP       NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMP       NOT NULL DEFAULT now(),
+    created_at      TIMESTAMP       NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
+    updated_at      TIMESTAMP       NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
     PRIMARY KEY (biz_no, line_no),
     CONSTRAINT ck_sll_kind CHECK (
         (src_kind = 'DOC' AND owner_device_instance_id IS NULL)
@@ -338,7 +378,7 @@ CREATE TABLE stock_ledger_line (
 
 -- 去重表与归属表绑定：写入 key 时，该单据行的归属必须已存在、来源一致，PDA 行还必须是当前持有设备（两库各一份触发器，语义相同）
 -- search_path 固定为 pg_catalog, public。函数体里的 stock_ledger_line 不写 schema，在这条路径下只解析到 public；调用方把自己的 schema 放在前面也看不见。
-CREATE FUNCTION trg_mvk_line_kind() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_mvk_line_kind() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF NOT EXISTS (SELECT 1 FROM stock_ledger_line l                                                         -- @pg-only
                     WHERE l.biz_no = NEW.biz_no AND l.line_no = NEW.line_no AND l.src_kind = NEW.src_kind  -- @pg-only
@@ -355,7 +395,7 @@ CREATE TRIGGER trg_mvk_line_kind BEFORE INSERT ON stock_movement_key FOR EACH RO
 
 -- 归属行的来源不可改（小赵 C3）：src_kind / biz_no / line_no 写入后禁止 UPDATE，否则把 PDA 行改成 DOC 就能绕过互斥
 -- search_path 固定为 pg_catalog, public。函数体只比较 NEW/OLD，没有名字查找。
-CREATE FUNCTION trg_sll_immutable() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_sll_immutable() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF NEW.src_kind IS DISTINCT FROM OLD.src_kind OR NEW.biz_no IS DISTINCT FROM OLD.biz_no                   -- @pg-only
        OR NEW.line_no IS DISTINCT FROM OLD.line_no THEN                                                       -- @pg-only
@@ -376,7 +416,7 @@ CREATE TRIGGER trg_sll_immutable BEFORE UPDATE ON stock_ledger_line FOR EACH ROW
 --   同列转换不改 stock 数量和 version，也要先锁 stock，避免和 release/consume 交叉等锁。
 --   PG 在这两条 SELECT 上加 FOR UPDATE；SQLite 没有行锁，语句顺序相同，写事务用 BEGIN IMMEDIATE。
 -- search_path 固定为 pg_catalog, public。函数体只比较 NEW/OLD，没有名字查找。
-CREATE FUNCTION trg_hold_immutable() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_hold_immutable() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     IF NEW.id IS DISTINCT FROM OLD.id OR NEW.stock_id IS DISTINCT FROM OLD.stock_id                           -- @pg-only
        OR NEW.hold_type IS DISTINCT FROM OLD.hold_type OR NEW.reason_code IS DISTINCT FROM OLD.reason_code    -- @pg-only
@@ -395,7 +435,7 @@ END $$;                                                                         
 CREATE TRIGGER trg_hold_immutable BEFORE UPDATE ON stock_hold FOR EACH ROW EXECUTE FUNCTION trg_hold_immutable();  -- @pg-only
 -- R2：冻结明细不可删除（wms_app 本就没有 DELETE/TRUNCATE 权限；这里兜底超级用户/迁移脚本，与流水表写法一致）
 -- search_path 固定为 pg_catalog, public。函数体只 RAISE，没有名字查找。
-CREATE FUNCTION trg_hold_no_delete() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_hold_no_delete() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     RAISE EXCEPTION 'hold_immutable' USING ERRCODE = '23514';                                                -- @pg-only
 END $$;                                                                                                       -- @pg-only
@@ -418,14 +458,49 @@ CREATE TRIGGER trg_hr_append_only BEFORE UPDATE OR DELETE ON stock_hold_release 
 -- @sqlite-only CREATE TRIGGER trg_hold_no_replace BEFORE INSERT ON stock_hold
 -- @sqlite-only WHEN EXISTS (SELECT 1 FROM stock_hold h WHERE h.id = NEW.id OR h.op_key = NEW.op_key)
 -- @sqlite-only BEGIN SELECT RAISE(ABORT, 'hold_duplicate'); END;
+-- 第十二轮（r11 X1/X2）：uq_hold_return（部分索引，同谓词）
+-- @sqlite-only CREATE TRIGGER trg_hold_no_replace_ret BEFORE INSERT ON stock_hold WHEN EXISTS (SELECT 1 FROM stock_hold h WHERE NEW.hold_type = 'RETURN_PENDING' AND h.hold_type = 'RETURN_PENDING' AND h.source_id = NEW.source_id)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'hold_duplicate: stock_hold.source_id'); END;
 
 -- 只追加：流水表与去重表禁止 UPDATE / DELETE。PG 侧收回应用角色权限 + 触发器（防超级用户/运维脚本误操作）；SQLite 侧触发器
 -- search_path 固定为 pg_catalog, public。函数体只用 TG_TABLE_NAME。
-CREATE FUNCTION trg_append_only() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$  -- @pg-only
+CREATE FUNCTION trg_append_only() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
 BEGIN                                                                                                         -- @pg-only
     RAISE EXCEPTION 'append_only_violation: %', TG_TABLE_NAME USING ERRCODE = '42501';                       -- @pg-only
 END $$;                                                                                                       -- @pg-only
 CREATE TRIGGER trg_mv_append_only  BEFORE UPDATE OR DELETE ON stock_movement     FOR EACH ROW EXECUTE FUNCTION trg_append_only();  -- @pg-only
+-- #2 第十一轮（小玛丽 r10 R2）：流水与 key 的 occurred_at 由 02 原语写，是服务端时间（00 §6.8 第 7 条）。
+-- PG：非表属主写入一律改成 date_trunc('second', now() AT TIME ZONE 'UTC')（同一事务内 now() 不变，key 与流水取到同一值，fk_mv_key 对得上）。
+--     stock_movement 按月分区，BEFORE 行触发器建在父表上（PG13+ 自动克隆到各分区），在路由之后执行，不能把行改到别的分区：
+--     调用方的值与库时钟不在同一个月时直接拒 movement_clock_skew（→ 40003），同月则覆盖。原语不传 occurred_at（走 DEFAULT）就不会撞上。
+--     表属主（迁移 / 期初导入 / verify 种子）不受约束，同 10 trg_srtn_zclock、11 trg_outbox_insert_pending 的属主口径。
+-- SQLite（不能改 NEW）：trg_mv_clock / trg_mvk_clock 拒非整秒 UTC 或与 now 相差 > 300 s（movement_clock_skew → 40003）。
+CREATE FUNCTION trg_mv_zclock() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
+DECLARE   -- @pg-only
+    owner_name name;   -- @pg-only
+    t timestamp := date_trunc('second', now() AT TIME ZONE 'UTC');   -- @pg-only
+BEGIN   -- @pg-only
+    SELECT r.rolname INTO owner_name FROM pg_catalog.pg_roles r JOIN pg_catalog.pg_class c ON c.relowner = r.oid   -- @pg-only
+     WHERE c.oid = TG_RELID;   -- @pg-only
+    IF current_user IS NOT DISTINCT FROM owner_name THEN RETURN NEW; END IF;   -- @pg-only
+    IF NEW.occurred_at IS DISTINCT FROM t THEN   -- @pg-only
+        IF TG_TABLE_NAME <> 'stock_movement_key' AND date_trunc('month', NEW.occurred_at) IS DISTINCT FROM date_trunc('month', t) THEN   -- @pg-only
+            RAISE EXCEPTION 'movement_clock_skew' USING ERRCODE = '23514';   -- @pg-only
+        END IF;   -- @pg-only
+        NEW.occurred_at := t;   -- @pg-only
+    END IF;   -- @pg-only
+    RETURN NEW;   -- @pg-only
+END $$;   -- @pg-only
+CREATE TRIGGER trg_mv_zclock  BEFORE INSERT ON stock_movement     FOR EACH ROW EXECUTE FUNCTION trg_mv_zclock();  -- @pg-only
+CREATE TRIGGER trg_mvk_zclock BEFORE INSERT ON stock_movement_key FOR EACH ROW EXECUTE FUNCTION trg_mv_zclock();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_mv_clock BEFORE INSERT ON stock_movement
+-- @sqlite-only WHEN NEW.occurred_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' OR substr(NEW.occurred_at, 12, 2) > '23' OR strftime('%s', NEW.occurred_at) IS NULL
+-- @sqlite-only   OR abs(CAST(strftime('%s', NEW.occurred_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'movement_clock_skew'); END;
+-- @sqlite-only CREATE TRIGGER trg_mvk_clock BEFORE INSERT ON stock_movement_key
+-- @sqlite-only WHEN NEW.occurred_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' OR substr(NEW.occurred_at, 12, 2) > '23' OR strftime('%s', NEW.occurred_at) IS NULL
+-- @sqlite-only   OR abs(CAST(strftime('%s', NEW.occurred_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'movement_clock_skew'); END;
 CREATE TRIGGER trg_mvk_append_only BEFORE UPDATE OR DELETE ON stock_movement_key FOR EACH ROW EXECUTE FUNCTION trg_append_only();  -- @pg-only
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'wms_app') THEN CREATE ROLE wms_app NOLOGIN; END IF; END $$;  -- @pg-only
 GRANT SELECT, INSERT ON stock_movement, stock_movement_key TO wms_app;                                       -- @pg-only
@@ -443,6 +518,19 @@ GRANT UPDATE (released_qty_milli, status, version, updated_at) ON stock_hold TO 
 GRANT SELECT, INSERT ON stock_ledger_line TO wms_app;                                                         -- @pg-only
 GRANT UPDATE (owner_device_instance_id, post_count, updated_at) ON stock_ledger_line TO wms_app;             -- @pg-only
 -- @sqlite-only CREATE TRIGGER trg_mv_no_update  BEFORE UPDATE ON stock_movement     BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement'); END;
+-- #2 第十一轮：只追加表也要防 REPLACE（REPLACE 删旧行不触发 DELETE 触发器）。
+-- #2 第十二轮（小玛丽 r11 X1）：表上**每个**唯一键都要拦，不只主键——REPLACE 撞任意唯一键都会删掉那一行，且 SQLite 的隐式删除不做外键检查。
+-- 部分唯一索引按索引谓词收窄（与索引同条件），否则会误拦合法行。
+-- @sqlite-only CREATE TRIGGER trg_mv_no_replace  BEFORE INSERT ON stock_movement     WHEN EXISTS (SELECT 1 FROM stock_movement m WHERE m.id = NEW.id AND m.occurred_at = NEW.occurred_at) BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement'); END;
+-- 每个唯一键一个触发器，报错尾部与 UNIQUE 冲突同名（便于两库用例按同一键断言）。SQLite 后建的触发器先触发：seq 放最后，多键同撞时先报账序分叉，与 UNIQUE 判定顺序一致
+-- @sqlite-only CREATE TRIGGER trg_mvk_no_replace BEFORE INSERT ON stock_movement_key WHEN EXISTS (SELECT 1 FROM stock_movement_key k WHERE k.movement_id = NEW.movement_id) BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement_key'); END;
+-- @sqlite-only CREATE TRIGGER trg_mvk_no_replace_idem BEFORE INSERT ON stock_movement_key WHEN EXISTS (SELECT 1 FROM stock_movement_key k WHERE k.idempotency_key = NEW.idempotency_key) BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement_key.idempotency_key'); END;
+-- @sqlite-only CREATE TRIGGER trg_mvk_no_replace_biz BEFORE INSERT ON stock_movement_key WHEN EXISTS (SELECT 1 FROM stock_movement_key k WHERE NEW.src_kind = 'DOC' AND k.src_kind = 'DOC' AND k.biz_no = NEW.biz_no AND k.line_no = NEW.line_no AND k.op_no = NEW.op_no AND k.leg = NEW.leg) BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement_key.biz_no, stock_movement_key.line_no, stock_movement_key.op_no, stock_movement_key.leg'); END;
+-- @sqlite-only CREATE TRIGGER trg_mvk_no_replace_pda BEFORE INSERT ON stock_movement_key WHEN EXISTS (SELECT 1 FROM stock_movement_key k WHERE NEW.src_kind = 'PDA' AND k.src_kind = 'PDA' AND k.src_task_id = NEW.src_task_id AND k.src_line_no = NEW.src_line_no AND k.device_instance_id = NEW.device_instance_id AND k.src_op_seq = NEW.src_op_seq AND k.leg = NEW.leg) BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement_key.src_task_id, stock_movement_key.src_line_no, stock_movement_key.device_instance_id, stock_movement_key.src_op_seq, stock_movement_key.leg'); END;
+-- @sqlite-only CREATE TRIGGER trg_mvk_no_replace_seq BEFORE INSERT ON stock_movement_key WHEN EXISTS (SELECT 1 FROM stock_movement_key k WHERE NEW.direction <> 0 AND k.direction <> 0 AND k.stock_id = NEW.stock_id AND k.stock_seq = NEW.stock_seq) BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement_key.stock_id, stock_movement_key.stock_seq'); END;
+-- stock_ledger_line：第十二轮起 02 原语改成"先查再插"（INSERT … SELECT … WHERE NOT EXISTS），重放不再产生插入，所以可以加防 REPLACE
+-- @sqlite-only CREATE TRIGGER trg_sll_no_replace BEFORE INSERT ON stock_ledger_line WHEN EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = NEW.biz_no AND l.line_no = NEW.line_no)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'ledger_line_duplicate'); END;
 -- @sqlite-only CREATE TRIGGER trg_mv_no_delete  BEFORE DELETE ON stock_movement     BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement'); END;
 -- @sqlite-only CREATE TRIGGER trg_mvk_no_update BEFORE UPDATE ON stock_movement_key BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement_key'); END;
 -- @sqlite-only CREATE TRIGGER trg_mvk_no_delete BEFORE DELETE ON stock_movement_key BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement_key'); END;
@@ -451,9 +539,9 @@ GRANT UPDATE (owner_device_instance_id, post_count, updated_at) ON stock_ledger_
 CREATE TABLE stock_snapshot_daily (
     work_date               DATE            NOT NULL,
     stock_id                BIGINT          NOT NULL,
-    warehouse_id            BIGINT          NOT NULL,
-    location_id             BIGINT          NOT NULL,
-    sku_id                  BIGINT          NOT NULL,
+    warehouse_id            BIGINT          NOT NULL REFERENCES warehouse(id),
+    location_id             BIGINT          NOT NULL REFERENCES location(id),
+    sku_id                  BIGINT          NOT NULL REFERENCES sku(id),
     lot_id                  BIGINT          NOT NULL,
     container_id            BIGINT          NOT NULL DEFAULT 0,
     on_hand_qty_milli       BIGINT          NOT NULL,
@@ -463,15 +551,19 @@ CREATE TABLE stock_snapshot_daily (
     hold_qty_milli        BIGINT          NOT NULL,
     ledger_seq              BIGINT          NOT NULL,   -- 快照水位线：回放该行 stock_seq <= ledger_seq 的流水应等于 on_hand
     cost_amount             BIGINT          NOT NULL DEFAULT 0,
-    created_at              TIMESTAMP       NOT NULL DEFAULT now(),
+    created_at              TIMESTAMP       NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
+-- @sqlite-only     CONSTRAINT ck_ssd_date CHECK (work_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' AND date(work_date) IS work_date),
     PRIMARY KEY (work_date, stock_id)
 );
+-- #2 第十二轮：日快照一天一行，REPLACE 会改写历史快照 → 先拦（重跑快照任务按主键先查）
+-- @sqlite-only CREATE TRIGGER trg_snap_no_replace BEFORE INSERT ON stock_snapshot_daily WHEN EXISTS (SELECT 1 FROM stock_snapshot_daily d WHERE d.work_date = NEW.work_date AND d.stock_id = NEW.stock_id)
+-- @sqlite-only BEGIN SELECT RAISE(ABORT, 'snapshot_duplicate: stock_snapshot_daily.work_date, stock_snapshot_daily.stock_id'); END;
 CREATE INDEX ix_snap_sku ON stock_snapshot_daily(work_date, warehouse_id, sku_id, lot_id);
 
 CREATE TABLE stock_recon_alert (
     id                      BIGINT          PRIMARY KEY,
     check_code              VARCHAR(24)     NOT NULL,   -- 码表见 ck_recon_code；CHECK_BOX_MISMATCH 18 位，16 放不下
-    warehouse_id            BIGINT          NOT NULL,
+    warehouse_id            BIGINT          NOT NULL REFERENCES warehouse(id),
     stock_id                BIGINT          NOT NULL DEFAULT 0,   -- 0 = 仓级汇总差异（R11）
     expected_qty_milli      BIGINT          NOT NULL,
     actual_qty_milli        BIGINT          NOT NULL,
@@ -480,14 +572,25 @@ CREATE TABLE stock_recon_alert (
     status                  VARCHAR(16)     NOT NULL DEFAULT 'OPEN',   -- OPEN/ACKED/RESOLVED
     resolved_by             BIGINT,
     resolution              VARCHAR(256),
-    detected_at             TIMESTAMP       NOT NULL DEFAULT now(),
-    last_seen_at            TIMESTAMP       NOT NULL DEFAULT now(),
+    detected_at             TIMESTAMP       NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
+    last_seen_at            TIMESTAMP       NOT NULL DEFAULT (date_trunc('second', now() AT TIME ZONE 'UTC')),
     CONSTRAINT ck_recon_status CHECK (status IN ('OPEN','ACKED','RESOLVED')),
     CONSTRAINT ck_recon_code CHECK (check_code IN ('I3a','I3b','I3c','I3d','I3e','I4','I5','SNAP','RR_HOLD_FAILED','RR_HOLD_MISMATCH','CHECK_BOX_MISMATCH','SHIP_EVENT_MISSING','LIVE_COUNT_WEIGHT','LIVE_COUNT_LEDGER','LIVE_HOLD_MISMATCH','LIVE_INSPECT_OVERDUE'))   -- 码表见 docs/02 §4.6；活鲜四码见第 18 篇 §9 / Q6
 );
 CREATE INDEX ix_recon_open ON stock_recon_alert(warehouse_id, status, detected_at DESC);
 CREATE UNIQUE INDEX uq_recon_open ON stock_recon_alert(check_code, warehouse_id, stock_id) WHERE status <> 'RESOLVED';
 GRANT SELECT, INSERT, UPDATE ON stock_recon_alert TO wms_app;   -- @pg-only
+-- #2 第十二轮（r12 非阻塞 1）：RESOLVED 是终态，闭环后的 resolved_by / resolution / stock_id / detected_at 不能再改（UPDATE 拒，REPLACE 撞 id 拒）。
+-- 未闭环告警仍走 INSERT … ON CONFLICT (uq_recon_open) DO UPDATE 累加 hit_count，所以 uq_recon_open 不加 BEFORE INSERT 守卫（键级豁免，见 00 §6.10）；
+-- 经 uq_recon_open 的 REPLACE 只能碰到未闭环行（索引谓词 status <> 'RESOLVED'），会把未闭环告警整行重写（hit_count、detected_at 重置）——与 UPDATE 本来就能做的一样，不涉及库存数量。
+CREATE FUNCTION trg_recon_resolved_lock() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$  -- @pg-only
+BEGIN                                                                                                     -- @pg-only
+    RAISE EXCEPTION 'recon_resolved_immutable' USING ERRCODE = '23514';                                  -- @pg-only
+END $$;                                                                                                   -- @pg-only
+CREATE TRIGGER trg_recon_resolved_lock BEFORE UPDATE ON stock_recon_alert FOR EACH ROW WHEN (OLD.status = 'RESOLVED') EXECUTE FUNCTION trg_recon_resolved_lock();  -- @pg-only
+-- @sqlite-only CREATE TRIGGER trg_recon_resolved_lock BEFORE UPDATE ON stock_recon_alert WHEN OLD.status = 'RESOLVED' BEGIN SELECT RAISE(ABORT, 'recon_resolved_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_recon_no_delete BEFORE DELETE ON stock_recon_alert WHEN OLD.status = 'RESOLVED' BEGIN SELECT RAISE(ABORT, 'recon_resolved_immutable'); END;
+-- @sqlite-only CREATE TRIGGER trg_recon_no_replace BEFORE INSERT ON stock_recon_alert WHEN EXISTS (SELECT 1 FROM stock_recon_alert a WHERE a.id = NEW.id) BEGIN SELECT RAISE(ABORT, 'recon_duplicate: stock_recon_alert.id'); END;
 -- ↑ 未闭环的同一差异只有一条；对账任务用 INSERT … ON CONFLICT DO UPDATE SET hit_count = hit_count + 1, last_seen_at = …
 --   （PG 与 SQLite ≥ 3.24 写法相同；部分唯一索引作冲突目标时两库都要求带同样的 WHERE）
 

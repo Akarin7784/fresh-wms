@@ -157,12 +157,13 @@ seed "INSERT INTO warehouse (id,code,name,cutoff_time,work_date_offset) VALUES (
 seed "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type) VALUES (1,1,'Z-C1','冷藏拣货区','CHILLED','PICK'),(2,1,'Z-C2','冷藏存储区','CHILLED','STORAGE');"
 seed "INSERT INTO location (id,warehouse_id,zone_id,code,location_type,max_lots,pick_sequence) VALUES (1,1,1,'A01-02-03','BIN',2,'A010'),(2,1,1,'A01-03-01','BIN',2,'A020'),(3,1,2,'B02-01-05','PALLET',8,'B010');"
 seed "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life) VALUES (1,'SKU-APPLE','山东红富士 80#','KG','CHILLED',30,10);"
+seed "INSERT INTO sku (id,code,name,base_uom,temperature_required,shelf_life_days,ship_min_shelf_life) VALUES (2,'SKU-PEAR','砀山酥梨','KG','CHILLED',30,10);"   # 第十三轮：补外键父行
 seed "INSERT INTO lot (id,sku_id,lot_code,expiry_date,receive_date,quality_status,remaining_life_days) VALUES (1,1,'LOT-1008','2026-10-25','2026-10-08','QUALIFIED',10),(2,1,'LOT-1012','2026-10-29','2026-10-12','QUALIFIED',14),(3,1,'LOT-1014','2026-10-31','2026-10-14','QUALIFIED',16);"
 seed "INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,uom,on_hand_qty_milli,allocated_qty_milli) VALUES (11,1,1,1,2,'KG',50000,0),(12,1,2,1,1,'KG',30000,10000),(13,1,3,1,3,'KG',200000,0),(14,1,3,1,1,'KG',80000,0);"
 assert_n "主数据种子 warehouse" "SELECT count(*) FROM warehouse" 1
 assert_n "主数据种子 zone" "SELECT count(*) FROM zone" 2
 assert_n "主数据种子 location" "SELECT count(*) FROM location" 3
-assert_n "主数据种子 sku" "SELECT count(*) FROM sku" 1
+assert_n "主数据种子 sku" "SELECT count(*) FROM sku" 2
 assert_n "主数据种子 lot" "SELECT count(*) FROM lot" 3
 assert_n "主数据种子 stock" "SELECT count(*) FROM stock" 4
 
@@ -248,43 +249,45 @@ expect_block "02 文本小数写入 BIGINT（'12.500'）" \
 
 
 echo "=== 2b. docs/02 库存核心：记账去重、只追加、期初、互斥、占用/冻结状态、对账去重 ==="
+expect_allow "#2 第十二轮 02 原语先查再插：同一单据行建两次归属行（第二次 0 行，与 SQLite 同文）" \
+  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'SLLRP',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'SLLRP' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'SLLRP',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'SLLRP' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING; ROLLBACK;"
 expect_block "I5 流水平衡（after<>before+qty*dir）" \
-  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('ADJ0',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (1,'ADJ0',1,1,1,'DOC','ADJUST',-1,11,1,1,1,1,2,NULL,NULL,NULL,NULL,3000,100000,98000,'2026-10-15','ADJ0:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (1,'ADJ0:1:D1:1','ADJ0',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,1,-1,'2026-10-15'); COMMIT;" \
+  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'ADJ0',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'ADJ0' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (1,'ADJ0',1,1,1,'DOC','ADJUST',-1,11,1,1,1,1,2,NULL,NULL,NULL,NULL,3000,100000,98000,'2026-10-15','ADJ0:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (1,'ADJ0:1:D1:1','ADJ0',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,1,-1,'2026-10-15'); COMMIT;" \
   "ck_mv_balance"
 expect_allow "期初流水 OPENING（迁移行 seq=1，before=0）" \
-  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('OPEN-MIG1',11,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (2,'OPEN-MIG1',11,1,1,'DOC','OPENING',1,11,1,1,1,1,2,NULL,NULL,NULL,NULL,50000,0,50000,'2026-10-15','OPEN-MIG1:11:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (2,'OPEN-MIG1:11:D1:1','OPEN-MIG1',11,1,1,'DOC',NULL,NULL,NULL,NULL,11,1,1,'2026-10-15'); COMMIT;"
+  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'OPEN-MIG1',11,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'OPEN-MIG1' AND l.line_no = 11) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (2,'OPEN-MIG1',11,1,1,'DOC','OPENING',1,11,1,1,1,1,2,NULL,NULL,NULL,NULL,50000,0,50000,'2026-10-15','OPEN-MIG1:11:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (2,'OPEN-MIG1:11:D1:1','OPEN-MIG1',11,1,1,'DOC',NULL,NULL,NULL,NULL,11,1,1,'2026-10-15'); COMMIT;"
 expect_block "期初流水只能是该行第 1 条" \
-  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('OPEN-MIG1',111,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (3,'OPEN-MIG1',111,1,1,'DOC','OPENING',1,11,2,1,1,1,2,NULL,NULL,NULL,NULL,50000,0,50000,'2026-10-15','OPEN-MIG1:111:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (3,'OPEN-MIG1:111:D1:1','OPEN-MIG1',111,1,1,'DOC',NULL,NULL,NULL,NULL,11,2,1,'2026-10-15'); COMMIT;" \
+  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'OPEN-MIG1',111,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'OPEN-MIG1' AND l.line_no = 111) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (3,'OPEN-MIG1',111,1,1,'DOC','OPENING',1,11,2,1,1,1,2,NULL,NULL,NULL,NULL,50000,0,50000,'2026-10-15','OPEN-MIG1:111:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (3,'OPEN-MIG1:111:D1:1','OPEN-MIG1',111,1,1,'DOC',NULL,NULL,NULL,NULL,11,2,1,'2026-10-15'); COMMIT;" \
   "ck_mv_opening"
 expect_allow "DOC 过账（调整出 3000）" \
-  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('ADJ1',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (4,'ADJ1',1,1,1,'DOC','ADJUST',-1,11,2,1,1,1,2,NULL,NULL,NULL,NULL,3000,50000,47000,'2026-10-15','ADJ1:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (4,'ADJ1:1:D1:1','ADJ1',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,2,-1,'2026-10-15'); COMMIT;"
+  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'ADJ1',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'ADJ1' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (4,'ADJ1',1,1,1,'DOC','ADJUST',-1,11,2,1,1,1,2,NULL,NULL,NULL,NULL,3000,50000,47000,'2026-10-15','ADJ1:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (4,'ADJ1:1:D1:1','ADJ1',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,2,-1,'2026-10-15'); COMMIT;"
 expect_block "重复过账：同 biz_no+line_no+op_no+leg，换 idempotency_key" \
-  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('ADJ1',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (5,'ADJ1',1,1,1,'DOC','ADJUST',-1,11,9,1,1,1,2,NULL,NULL,NULL,NULL,3000,50000,47000,'2026-10-15','X:other'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (5,'X:other','ADJ1',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,9,-1,'2026-10-15'); COMMIT;" \
+  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'ADJ1',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'ADJ1' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (5,'ADJ1',1,1,1,'DOC','ADJUST',-1,11,9,1,1,1,2,NULL,NULL,NULL,NULL,3000,50000,47000,'2026-10-15','X:other'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (5,'X:other','ADJ1',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,9,-1,'2026-10-15'); COMMIT;" \
   "uq_mvk_biz_line"
 expect_allow "同一 DOC 行第二次合法操作（op_no=2，不被吞）" \
-  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('ADJ1',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (6,'ADJ1',1,2,1,'DOC','ADJUST',-1,11,3,1,1,1,2,NULL,NULL,NULL,NULL,1000,47000,46000,'2026-10-15','ADJ1:1:D2:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (6,'ADJ1:1:D2:1','ADJ1',1,2,1,'DOC',NULL,NULL,NULL,NULL,11,3,-1,'2026-10-15'); COMMIT;"
+  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'ADJ1',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'ADJ1' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (6,'ADJ1',1,2,1,'DOC','ADJUST',-1,11,3,1,1,1,2,NULL,NULL,NULL,NULL,1000,47000,46000,'2026-10-15','ADJ1:1:D2:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (6,'ADJ1:1:D2:1','ADJ1',1,2,1,'DOC',NULL,NULL,NULL,NULL,11,3,-1,'2026-10-15'); COMMIT;"
 expect_block "idempotency_key 重复（唯一格式）" \
-  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('ADJ9',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (7,'ADJ9',1,1,1,'DOC','ADJUST',-1,11,4,1,1,1,2,NULL,NULL,NULL,NULL,1000,46000,45000,'2026-10-15','ADJ1:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (7,'ADJ1:1:D1:1','ADJ9',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,4,-1,'2026-10-15'); COMMIT;" \
+  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'ADJ9',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'ADJ9' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (7,'ADJ9',1,1,1,'DOC','ADJUST',-1,11,4,1,1,1,2,NULL,NULL,NULL,NULL,1000,46000,45000,'2026-10-15','ADJ1:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (7,'ADJ1:1:D1:1','ADJ9',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,4,-1,'2026-10-15'); COMMIT;" \
   "uq_mvk_idem"
 expect_block "记账链分叉（同 stock_id+stock_seq）" \
-  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('ADJ8',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (8,'ADJ8',1,1,1,'DOC','ADJUST',-1,11,3,1,1,1,2,NULL,NULL,NULL,NULL,1000,46000,45000,'2026-10-15','ADJ8:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (8,'ADJ8:1:D1:1','ADJ8',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,3,-1,'2026-10-15'); COMMIT;" \
+  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'ADJ8',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'ADJ8' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (8,'ADJ8',1,1,1,'DOC','ADJUST',-1,11,3,1,1,1,2,NULL,NULL,NULL,NULL,1000,46000,45000,'2026-10-15','ADJ8:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (8,'ADJ8:1:D1:1','ADJ8',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,3,-1,'2026-10-15'); COMMIT;" \
   "uq_mvk_stock_seq"
 expect_allow "direction=0 纯事件流水不入链（SHIP）" \
-  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('SHP1',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (9,'SHP1',1,1,1,'DOC','SHIP',0,11,3,1,1,1,2,NULL,NULL,NULL,NULL,3000,46000,46000,'2026-10-15','SHP1:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (9,'SHP1:1:D1:1','SHP1',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,3,0,'2026-10-15'); COMMIT;"
+  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'SHP1',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'SHP1' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (9,'SHP1',1,1,1,'DOC','SHIP',0,11,3,1,1,1,2,NULL,NULL,NULL,NULL,3000,46000,46000,'2026-10-15','SHP1:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (9,'SHP1:1:D1:1','SHP1',1,1,1,'DOC',NULL,NULL,NULL,NULL,11,3,0,'2026-10-15'); COMMIT;"
 expect_allow "期初：stock 12" \
-  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('OPEN-MIG1',12,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (10,'OPEN-MIG1',12,1,1,'DOC','OPENING',1,12,1,1,2,1,1,NULL,NULL,NULL,NULL,30000,0,30000,'2026-10-15','OPEN-MIG1:12:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (10,'OPEN-MIG1:12:D1:1','OPEN-MIG1',12,1,1,'DOC',NULL,NULL,NULL,NULL,12,1,1,'2026-10-15'); COMMIT;"
+  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'OPEN-MIG1',12,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'OPEN-MIG1' AND l.line_no = 12) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (10,'OPEN-MIG1',12,1,1,'DOC','OPENING',1,12,1,1,2,1,1,NULL,NULL,NULL,NULL,30000,0,30000,'2026-10-15','OPEN-MIG1:12:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (10,'OPEN-MIG1:12:D1:1','OPEN-MIG1',12,1,1,'DOC',NULL,NULL,NULL,NULL,12,1,1,'2026-10-15'); COMMIT;"
 expect_allow "PDA 拣货（四元组 77/3/DEV-A/1）" \
-  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('PK2',3,'PDA','DEV-A') ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (11,'PK2',3,0,1,'PDA','PICK',-1,12,2,1,2,1,1,77,3,'DEV-A',1,1000,30000,29000,'2026-10-15','PK2:3:PDEV-A.1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (11,'PK2:3:PDEV-A.1:1','PK2',3,0,1,'PDA',77,3,'DEV-A',1,12,2,-1,'2026-10-15'); COMMIT;"
+  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'PK2',3,'PDA','DEV-A' WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'PK2' AND l.line_no = 3) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (11,'PK2',3,0,1,'PDA','PICK',-1,12,2,1,2,1,1,77,3,'DEV-A',1,1000,30000,29000,'2026-10-15','PK2:3:PDEV-A.1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (11,'PK2:3:PDEV-A.1:1','PK2',3,0,1,'PDA',77,3,'DEV-A',1,12,2,-1,'2026-10-15'); COMMIT;"
 expect_block "Idempotency-Key 过期后 PDA 重放同一四元组（换 idempotency_key）" \
-  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('PK2',3,'PDA','DEV-A') ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (12,'PK2',3,0,1,'PDA','PICK',-1,12,3,1,2,1,1,77,3,'DEV-A',1,1000,29000,28000,'2026-10-15','X:replay'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (12,'X:replay','PK2',3,0,1,'PDA',77,3,'DEV-A',1,12,3,-1,'2026-10-15'); COMMIT;" \
+  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'PK2',3,'PDA','DEV-A' WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'PK2' AND l.line_no = 3) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (12,'PK2',3,0,1,'PDA','PICK',-1,12,3,1,2,1,1,77,3,'DEV-A',1,1000,29000,28000,'2026-10-15','X:replay'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (12,'X:replay','PK2',3,0,1,'PDA',77,3,'DEV-A',1,12,3,-1,'2026-10-15'); COMMIT;" \
   "uq_mvk_pda_op"
 expect_allow "同一 PDA 行第二次合法操作（op_seq=2，不被吞）" \
-  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('PK2',3,'PDA','DEV-A') ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (13,'PK2',3,0,1,'PDA','PICK',-1,12,3,1,2,1,1,77,3,'DEV-A',2,1000,29000,28000,'2026-10-15','PK2:3:PDEV-A.2:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (13,'PK2:3:PDEV-A.2:1','PK2',3,0,1,'PDA',77,3,'DEV-A',2,12,3,-1,'2026-10-15'); COMMIT;"
+  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'PK2',3,'PDA','DEV-A' WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'PK2' AND l.line_no = 3) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (13,'PK2',3,0,1,'PDA','PICK',-1,12,3,1,2,1,1,77,3,'DEV-A',2,1000,29000,28000,'2026-10-15','PK2:3:PDEV-A.2:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (13,'PK2:3:PDEV-A.2:1','PK2',3,0,1,'PDA',77,3,'DEV-A',2,12,3,-1,'2026-10-15'); COMMIT;"
 expect_block "同一单据行 DOC 与 PDA 互斥（PDA 行上来一条 DOC 过账）" \
-  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('PK2',3,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (14,'PK2',3,1,1,'DOC','PICK',-1,12,4,1,2,1,1,NULL,NULL,NULL,NULL,1000,28000,27000,'2026-10-15','PK2:3:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (14,'PK2:3:D1:1','PK2',3,1,1,'DOC',NULL,NULL,NULL,NULL,12,4,-1,'2026-10-15'); COMMIT;" \
+  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'PK2',3,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'PK2' AND l.line_no = 3) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (14,'PK2',3,1,1,'DOC','PICK',-1,12,4,1,2,1,1,NULL,NULL,NULL,NULL,1000,28000,27000,'2026-10-15','PK2:3:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (14,'PK2:3:D1:1','PK2',3,1,1,'DOC',NULL,NULL,NULL,NULL,12,4,-1,'2026-10-15'); COMMIT;" \
   "ledger_line_owner_mismatch"
 expect_block "换设备实例不能直接记账（DEV-B 不是当前持有设备）" \
-  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('PK2',3,'PDA','DEV-B') ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (15,'PK2',3,0,1,'PDA','PICK',-1,12,4,1,2,1,1,77,3,'DEV-B',1,1000,28000,27000,'2026-10-15','PK2:3:PDEV-B.1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (15,'PK2:3:PDEV-B.1:1','PK2',3,0,1,'PDA',77,3,'DEV-B',1,12,4,-1,'2026-10-15'); COMMIT;" \
+  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'PK2',3,'PDA','DEV-B' WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'PK2' AND l.line_no = 3) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (15,'PK2',3,0,1,'PDA','PICK',-1,12,4,1,2,1,1,77,3,'DEV-B',1,1000,28000,27000,'2026-10-15','PK2:3:PDEV-B.1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (15,'PK2:3:PDEV-B.1:1','PK2',3,0,1,'PDA',77,3,'DEV-B',1,12,4,-1,'2026-10-15'); COMMIT;" \
   "ledger_line_owner_mismatch"
 expect_block "PDA 业务键半截（device_instance_id 为 NULL）" \
   "BEGIN; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (16,'PK3',1,0,1,'PDA','PICK',-1,12,4,1,2,1,1,78,1,NULL,1,1000,28000,27000,'2026-10-15','PK3:1:PDEV-A.1:1'); COMMIT;" \
@@ -296,9 +299,9 @@ expect_block "只追加：DELETE 去重键" \
   "BEGIN; DELETE FROM stock_movement_key WHERE movement_id=4; COMMIT;" \
   "append_only_violation: stock_movement_key"
 expect_allow "跨分区去重：10-31 记一条" \
-  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('XP1',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (17,'XP1',1,1,1,'DOC','SHIP',0,13,0,1,3,1,3,NULL,NULL,NULL,NULL,1000,200000,200000,'2026-10-31','XP1:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (17,'XP1:1:D1:1','XP1',1,1,1,'DOC',NULL,NULL,NULL,NULL,13,0,0,'2026-10-31'); COMMIT;"
+  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'XP1',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'XP1' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (17,'XP1',1,1,1,'DOC','SHIP',0,13,0,1,3,1,3,NULL,NULL,NULL,NULL,1000,200000,200000,'2026-10-31','XP1:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (17,'XP1:1:D1:1','XP1',1,1,1,'DOC',NULL,NULL,NULL,NULL,13,0,0,'2026-10-31'); COMMIT;"
 expect_block "跨分区去重：同一键 11-01 再记（PG 落在另一个分区）" \
-  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('XP1',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (18,'XP1',1,1,1,'DOC','SHIP',0,13,0,1,3,1,3,NULL,NULL,NULL,NULL,1000,200000,200000,'2026-11-01','X:xp'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (18,'X:xp','XP1',1,1,1,'DOC',NULL,NULL,NULL,NULL,13,0,0,'2026-11-01'); COMMIT;" \
+  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'XP1',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'XP1' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (18,'XP1',1,1,1,'DOC','SHIP',0,13,0,1,3,1,3,NULL,NULL,NULL,NULL,1000,200000,200000,'2026-11-01','X:xp'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (18,'X:xp','XP1',1,1,1,'DOC',NULL,NULL,NULL,NULL,13,0,0,'2026-11-01'); COMMIT;" \
   "uq_mvk_biz_line"
 expect_allow "占用写入（RESERVE 10000）" \
   "BEGIN; INSERT INTO stock_reservation (id,stock_id,stage,source_type,source_id,source_line_id,op_key,reserve_qty_milli,consumed_qty_milli,released_qty_milli,status) VALUES (1,11,'RESERVE','OUTBOUND_LINE',1,1,'RES:OBT1:1:1:11',10000,0,0,'RESERVED'); COMMIT;"
@@ -343,12 +346,18 @@ expect_allow "重复检出走 upsert 累加 hit_count" \
   "BEGIN; INSERT INTO stock_recon_alert (id,check_code,warehouse_id,stock_id,expected_qty_milli,actual_qty_milli) VALUES (3,'I4',1,13,200000,198000) ON CONFLICT (check_code,warehouse_id,stock_id) WHERE status <> 'RESOLVED' DO UPDATE SET hit_count = stock_recon_alert.hit_count + 1, actual_qty_milli = excluded.actual_qty_milli; COMMIT;"
 expect_allow "闭环后同一差异可再开" \
   "BEGIN; UPDATE stock_recon_alert SET status='RESOLVED', resolved_by=7, resolution='调整单 ADJ-x' WHERE id=1; INSERT INTO stock_recon_alert (id,check_code,warehouse_id,stock_id,expected_qty_milli,actual_qty_milli) VALUES (4,'I4',1,13,200000,199000); COMMIT;"
+expect_block "第十三轮：RESOLVED 告警不可再改（resolution 抹空）" \
+  "BEGIN; UPDATE stock_recon_alert SET resolution = NULL, resolved_by = NULL WHERE id = 1; COMMIT;" "recon_resolved_immutable"
+expect_allow "第十三轮：未闭环告警仍可 UPDATE（认领 ACKED）" \
+  "BEGIN; UPDATE stock_recon_alert SET status = 'ACKED' WHERE id = 4; ROLLBACK;"
+expect_allow "变异：去掉 trg_recon_resolved_lock 后可改 RESOLVED 告警" \
+  "BEGIN; DROP TRIGGER trg_recon_resolved_lock ON stock_recon_alert; UPDATE stock_recon_alert SET resolution = NULL WHERE id = 1; ROLLBACK;"
 echo "=== 2b2. 小赵复评 C2–C5 + convert_hold ==="
 expect_block "C2 只写流水、不写 key 行（库层外键，提交时拦）" \
-  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('ADJ7',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (30,'ADJ7',1,1,1,'DOC','ADJUST',-1,13,1,1,3,1,3,NULL,NULL,NULL,NULL,1000,200000,199000,'2026-10-15','ADJ7:1:D1:1'); COMMIT;" \
+  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'ADJ7',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'ADJ7' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (30,'ADJ7',1,1,1,'DOC','ADJUST',-1,13,1,1,3,1,3,NULL,NULL,NULL,NULL,1000,200000,199000,'2026-10-15','ADJ7:1:D1:1'); COMMIT;" \
   "fk_mv_key"
 expect_block "C2 key 行与流水内容不一致（key=ADJ7，流水=ADJ6）" \
-  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('ADJ7',1,'DOC',NULL) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (31,'ADJ6',1,1,1,'DOC','ADJUST',-1,13,1,1,3,1,3,NULL,NULL,NULL,NULL,1000,200000,199000,'2026-10-15','ADJ7:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (31,'ADJ7:1:D1:1','ADJ7',1,1,1,'DOC',NULL,NULL,NULL,NULL,13,1,-1,'2026-10-15'); COMMIT;" \
+  "BEGIN; INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) SELECT 'ADJ7',1,'DOC',NULL WHERE NOT EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = 'ADJ7' AND l.line_no = 1) ON CONFLICT (biz_no,line_no) DO NOTHING; INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,src_task_id,src_line_no,device_instance_id,src_op_seq,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key) VALUES (31,'ADJ6',1,1,1,'DOC','ADJUST',-1,13,1,1,3,1,3,NULL,NULL,NULL,NULL,1000,200000,199000,'2026-10-15','ADJ7:1:D1:1'); INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,src_task_id,src_line_no,device_instance_id,src_op_seq,stock_id,stock_seq,direction,occurred_at) VALUES (31,'ADJ7:1:D1:1','ADJ7',1,1,1,'DOC',NULL,NULL,NULL,NULL,13,1,-1,'2026-10-15'); COMMIT;" \
   "fk_mv_key"
 expect_block "C3 归属行 src_kind 从 PDA 改成 DOC" \
   "BEGIN; UPDATE stock_ledger_line SET src_kind='DOC', owner_device_instance_id=NULL WHERE biz_no='PK2' AND line_no=3; COMMIT;" \
@@ -471,7 +480,7 @@ expect_block "Q2 超级用户删刚投递（未过保留期）事件" "BEGIN; DE
 OUT=$(psql_capture "TRUNCATE idempotency_record;")
 case "$OUT" in *"purge_not_allowed"*) ok "Q2 超级用户 TRUNCATE idempotency_record 被拦";; *) bad "TRUNCATE idem 未被拦：$OUT";; esac
 R=$(psql -t -A -c "SELECT p.prosecdef::text || '/' || array_to_string(p.proconfig, ',') || '/' || r.rolsuper::text || '/' || r.rolname || '/' || has_function_privilege('public', p.oid, 'EXECUTE')::text FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner WHERE p.proname = 'purge_expired'")
-[ "$R" = "true/search_path=pg_catalog, public/false/wms_purge_owner/false" ] && ok "Q2 purge_expired：SECURITY DEFINER、固定 search_path、属主非超级用户、PUBLIC 无 EXECUTE（$R）" || bad "purge_expired 属性：$R"
+[ "$R" = "true/search_path=pg_catalog, public, pg_temp/false/wms_purge_owner/false" ] && ok "Q2 purge_expired：SECURITY DEFINER、固定 search_path、属主非超级用户、PUBLIC 无 EXECUTE（$R）" || bad "purge_expired 属性：$R"
 # 小赵 S2：wms_cleaner / wms_purge_owner / PUBLIC 的逐表权限矩阵（七种表权限全查），以及 purge_expired 的 proacl 逐条核对
 role_matrix() {  # $1 角色名（public 用小写）：列出有任一权限的对象，无则输出 NONE
   psql -t -A -c "SELECT COALESCE(string_agg(x, ' ' ORDER BY x), 'NONE') FROM (SELECT c.relname || ':' || concat_ws(',', CASE WHEN has_table_privilege('$1', c.oid, 'SELECT') THEN 'SELECT' END, CASE WHEN has_table_privilege('$1', c.oid, 'INSERT') THEN 'INSERT' END, CASE WHEN has_table_privilege('$1', c.oid, 'UPDATE') THEN 'UPDATE' END, CASE WHEN has_table_privilege('$1', c.oid, 'DELETE') THEN 'DELETE' END, CASE WHEN has_table_privilege('$1', c.oid, 'TRUNCATE') THEN 'TRUNCATE' END, CASE WHEN has_table_privilege('$1', c.oid, 'REFERENCES') THEN 'REFERENCES' END, CASE WHEN has_table_privilege('$1', c.oid, 'TRIGGER') THEN 'TRIGGER' END) AS x FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m') AND NOT c.relispartition) t WHERE x NOT LIKE '%:'"
@@ -507,9 +516,9 @@ expect_block "R1 PENDING → SENT 时 sent_at 写成 1 小时前" "BEGIN; SET LO
 expect_block "R1 PENDING → SENT 时 sent_at 写成 1 小时后" "BEGIN; SET LOCAL ROLE wms_app; UPDATE outbox_event SET status='SENT', sent_at=(now() AT TIME ZONE 'UTC') + interval '1 hour' WHERE id=8801; ROLLBACK;" "sent_at_not_now"
 expect_allow "R1 正向：PENDING → SENT 写当前 UTC（容差内 +3 秒）" "BEGIN; SET LOCAL ROLE wms_app; UPDATE outbox_event SET status='SENT', ack_kind='2XX', sent_at=(now() AT TIME ZONE 'UTC') + interval '3 seconds' WHERE id=8801; ROLLBACK;"
 echo "=== 2f2c. search_path 钉死；登录角色劫持同名对象；非属主插入 FAILED ==="
-# #2 定义的 10 个函数。proconfig 要正好是 search_path=pg_catalog, public（与 purge_expired 已有断言同一写法）。
-R=$(psql -t -A -c "SELECT count(*)::text || '/' || (count(*) FILTER (WHERE p.proconfig = ARRAY['search_path=pg_catalog, public']::text[]))::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname IN ('purge_expired','trg_append_only','trg_expiry_forward','trg_hold_immutable','trg_hold_no_delete','trg_lot_sell_deadline','trg_mvk_line_kind','trg_outbox_insert_pending','trg_purge_guard','trg_sll_immutable')")
-[ "$R" = "10/10" ] && ok "#2 的 10 个函数 proconfig 都是 search_path=pg_catalog, public（$R）" || bad "search_path 目录：$R（期望 10/10）"
+# #2 定义的 10 个函数。proconfig 要正好是 search_path=pg_catalog, public, pg_temp（与 purge_expired 已有断言同一写法）。
+R=$(psql -t -A -c "SELECT count(*)::text || '/' || (count(*) FILTER (WHERE p.proconfig = ARRAY['search_path=pg_catalog, public, pg_temp']::text[]))::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname IN ('purge_expired','trg_append_only','trg_expiry_forward','trg_hold_immutable','trg_hold_no_delete','trg_lot_sell_deadline','trg_mvk_line_kind','trg_outbox_insert_pending','trg_purge_guard','trg_sll_immutable')")
+[ "$R" = "10/10" ] && ok "#2 的 10 个函数 proconfig 都是 search_path=pg_catalog, public, pg_temp（$R）" || bad "search_path 目录：$R（期望 10/10）"
 # 角色是集群级的。CREATE ROLE 不能放进事务。已有就改属性，避免第二次跑 verify 撞“角色已存在”。
 if [ "$(psql -t -A -c "SELECT count(*) FROM pg_roles WHERE rolname = 'wms_login_test'" | tr -d '[:space:]')" != "1" ]; then
   seed "CREATE ROLE wms_login_test LOGIN INHERIT"
@@ -797,9 +806,9 @@ SET LOCAL search_path = hj_evil, public;
 DO $hj$ BEGIN INSERT INTO public.return_reservation_line (id,reservation_id,line_no,sku_id,qty_milli,container_code) VALUES (19902,999999,1,1,2000,'CTN-HJ'); RAISE EXCEPTION 'HJ_OK'; EXCEPTION WHEN OTHERS THEN PERFORM set_config('hj.fixed', SQLERRM, true); END $hj$;
 RESET ROLE;
 SET LOCAL search_path = public;
-SELECT set_config('hj.cat0', (SELECT count(*) FILTER (WHERE NOT COALESCE(proconfig,'{}'::text[]) @> ARRAY['search_path=pg_catalog, public']) || '/' || count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('trg_exc_forward','trg_exc_no_delete','trg_exc_blind_ins','trg_rrsv_guard','trg_rrsl_guard','trg_rtn10_no_delete','trg_rbr_immutable')), true);
+SELECT set_config('hj.cat0', (SELECT count(*) FILTER (WHERE NOT COALESCE(proconfig,'{}'::text[]) @> ARRAY['search_path=pg_catalog, public, pg_temp']) || '/' || count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('trg_exc_forward','trg_exc_no_delete','trg_exc_blind_ins','trg_rrsv_guard','trg_rrsl_guard','trg_rtn10_no_delete','trg_rbr_immutable')), true);
 ALTER FUNCTION public.trg_rrsl_guard() RESET search_path;
-SELECT set_config('hj.cat1', (SELECT count(*) FILTER (WHERE NOT COALESCE(proconfig,'{}'::text[]) @> ARRAY['search_path=pg_catalog, public']) || '/' || count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('trg_exc_forward','trg_exc_no_delete','trg_exc_blind_ins','trg_rrsv_guard','trg_rrsl_guard','trg_rtn10_no_delete','trg_rbr_immutable')), true);
+SELECT set_config('hj.cat1', (SELECT count(*) FILTER (WHERE NOT COALESCE(proconfig,'{}'::text[]) @> ARRAY['search_path=pg_catalog, public, pg_temp']) || '/' || count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('trg_exc_forward','trg_exc_no_delete','trg_exc_blind_ins','trg_rrsv_guard','trg_rrsl_guard','trg_rtn10_no_delete','trg_rbr_immutable')), true);
 SET LOCAL ROLE wms_app;
 SET LOCAL search_path = hj_evil, public;
 DO $hj$ BEGIN INSERT INTO public.return_reservation_line (id,reservation_id,line_no,sku_id,qty_milli,container_code) VALUES (19902,999999,1,1,2000,'CTN-HJ'); RAISE EXCEPTION 'HJ_OK'; EXCEPTION WHEN OTHERS THEN PERFORM set_config('hj.mut', SQLERRM, true); END $hj$;
@@ -809,7 +818,7 @@ ROLLBACK;
 HJSQL
 )
 IFS='#' read -r _ HB HF HM HC0 HC1 <<< "$R"
-[ "$HC0" = "0/7" ] && ok "本 PR 新增/重定义的 7 个 PL/pgSQL 函数 proconfig 都含 search_path=pg_catalog, public（缺失/总数 = $HC0）" || bad "search_path 目录断言：缺失/总数 = $HC0（期望 0/7）"
+[ "$HC0" = "0/7" ] && ok "本 PR 新增/重定义的 7 个 PL/pgSQL 函数 proconfig 都含 search_path=pg_catalog, public, pg_temp（缺失/总数 = $HC0）" || bad "search_path 目录断言：缺失/总数 = $HC0（期望 0/7）"
 [ -n "$HB" ] && [ "$HF" = "$HB" ] && ok "劫持：wms_app 在自建 schema hj_evil 建同名表 return_reservation 并置于 search_path 首位，trg_rrsl_guard() 仍读 public（结果与无劫持一致：$HB）" || bad "劫持后行为改变：无劫持=$HB / 劫持=$HF"
 [ "$HC1" = "1/7" ] && [ "$HM" != "$HB" ] && ok "变异检查：RESET trg_rrsl_guard() 的 search_path 后，目录断言变红（$HC1）且劫持生效（$HM），两条断言都能抓到" || bad "变异检查没变红：目录=$HC1 劫持后=$HM 基准=$HB"
 echo "=== 2f. docs/09 效期与损耗：报损单状态前进、交接单不可撤回、来源/原因 CHECK、外键 ==="
@@ -947,9 +956,9 @@ SET LOCAL search_path = hj_evil, public;
 DO $hj$ BEGIN INSERT INTO public.scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (19901,999999,1,14,1,1,5000,0,'POST_OUT'); RAISE EXCEPTION 'HJ_OK'; EXCEPTION WHEN OTHERS THEN PERFORM set_config('hj.fixed', SQLERRM, true); END $hj$;
 RESET ROLE;
 SET LOCAL search_path = public;
-SELECT set_config('hj.cat0', (SELECT count(*) FILTER (WHERE NOT COALESCE(proconfig,'{}'::text[]) @> ARRAY['search_path=pg_catalog, public']) || '/' || count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('trg_scr_forward','trg_scr_ins_draft','trg_scrl_draft_only','trg_scr_no_delete')), true);
+SELECT set_config('hj.cat0', (SELECT count(*) FILTER (WHERE NOT COALESCE(proconfig,'{}'::text[]) @> ARRAY['search_path=pg_catalog, public, pg_temp']) || '/' || count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('trg_scr_forward','trg_scr_ins_draft','trg_scrl_draft_only','trg_scr_no_delete')), true);
 ALTER FUNCTION public.trg_scrl_draft_only() RESET search_path;
-SELECT set_config('hj.cat1', (SELECT count(*) FILTER (WHERE NOT COALESCE(proconfig,'{}'::text[]) @> ARRAY['search_path=pg_catalog, public']) || '/' || count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('trg_scr_forward','trg_scr_ins_draft','trg_scrl_draft_only','trg_scr_no_delete')), true);
+SELECT set_config('hj.cat1', (SELECT count(*) FILTER (WHERE NOT COALESCE(proconfig,'{}'::text[]) @> ARRAY['search_path=pg_catalog, public, pg_temp']) || '/' || count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('trg_scr_forward','trg_scr_ins_draft','trg_scrl_draft_only','trg_scr_no_delete')), true);
 SET LOCAL ROLE wms_app;
 SET LOCAL search_path = hj_evil, public;
 DO $hj$ BEGIN INSERT INTO public.scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (19901,999999,1,14,1,1,5000,0,'POST_OUT'); RAISE EXCEPTION 'HJ_OK'; EXCEPTION WHEN OTHERS THEN PERFORM set_config('hj.mut', SQLERRM, true); END $hj$;
@@ -959,7 +968,7 @@ ROLLBACK;
 HJSQL
 )
 IFS='#' read -r _ HB HF HM HC0 HC1 <<< "$R"
-[ "$HC0" = "0/4" ] && ok "本 PR 新增/重定义的 4 个 PL/pgSQL 函数 proconfig 都含 search_path=pg_catalog, public（缺失/总数 = $HC0）" || bad "search_path 目录断言：缺失/总数 = $HC0（期望 0/4）"
+[ "$HC0" = "0/4" ] && ok "本 PR 新增/重定义的 4 个 PL/pgSQL 函数 proconfig 都含 search_path=pg_catalog, public, pg_temp（缺失/总数 = $HC0）" || bad "search_path 目录断言：缺失/总数 = $HC0（期望 0/4）"
 [ -n "$HB" ] && [ "$HF" = "$HB" ] && ok "劫持：wms_app 在自建 schema hj_evil 建同名表 scrap_order 并置于 search_path 首位，trg_scrl_draft_only() 仍读 public（结果与无劫持一致：$HB）" || bad "劫持后行为改变：无劫持=$HB / 劫持=$HF"
 [ "$HC1" = "1/4" ] && [ "$HM" != "$HB" ] && ok "变异检查：RESET trg_scrl_draft_only() 的 search_path 后，目录断言变红（$HC1）且劫持生效（$HM），两条断言都能抓到" || bad "变异检查没变红：目录=$HC1 劫持后=$HM 基准=$HB"
 echo "=== 2h. docs/17 加工中心（#13 改稿，基于 #2 1d907031）：02 原语、守恒 C1–C5、外键、状态白名单、REPLACE 防护 ==="
@@ -1101,9 +1110,9 @@ SET LOCAL search_path = hj_evil, public;
 DO $hj$ BEGIN INSERT INTO public.process_bom_line (id,bom_id,line_no,line_role,sku_id,std_qty_milli) VALUES (17099,999999,1,'INPUT',1701,1000); RAISE EXCEPTION 'HJ_OK'; EXCEPTION WHEN OTHERS THEN PERFORM set_config('hj.fixed', SQLERRM, true); END $hj$;
 RESET ROLE;
 SET LOCAL search_path = public;
-SELECT set_config('hj.cat0', (SELECT count(*) FILTER (WHERE NOT COALESCE(proconfig,'{}'::text[]) @> ARRAY['search_path=pg_catalog, public']) || '/' || count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('trg_pbom_forward','trg_pboml_frozen','trg_prc_snapshot','trg_prc_insert','trg_prci_immutable','trg_prco_immutable')), true);
+SELECT set_config('hj.cat0', (SELECT count(*) FILTER (WHERE NOT COALESCE(proconfig,'{}'::text[]) @> ARRAY['search_path=pg_catalog, public, pg_temp']) || '/' || count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('trg_pbom_forward','trg_pboml_frozen','trg_prc_snapshot','trg_prc_insert','trg_prci_immutable','trg_prco_immutable')), true);
 ALTER FUNCTION public.trg_pboml_frozen() RESET search_path;
-SELECT set_config('hj.cat1', (SELECT count(*) FILTER (WHERE NOT COALESCE(proconfig,'{}'::text[]) @> ARRAY['search_path=pg_catalog, public']) || '/' || count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('trg_pbom_forward','trg_pboml_frozen','trg_prc_snapshot','trg_prc_insert','trg_prci_immutable','trg_prco_immutable')), true);
+SELECT set_config('hj.cat1', (SELECT count(*) FILTER (WHERE NOT COALESCE(proconfig,'{}'::text[]) @> ARRAY['search_path=pg_catalog, public, pg_temp']) || '/' || count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('trg_pbom_forward','trg_pboml_frozen','trg_prc_snapshot','trg_prc_insert','trg_prci_immutable','trg_prco_immutable')), true);
 SET LOCAL ROLE wms_app;
 SET LOCAL search_path = hj_evil, public;
 DO $hj$ BEGIN INSERT INTO public.process_bom_line (id,bom_id,line_no,line_role,sku_id,std_qty_milli) VALUES (17099,999999,1,'INPUT',1701,1000); RAISE EXCEPTION 'HJ_OK'; EXCEPTION WHEN OTHERS THEN PERFORM set_config('hj.mut', SQLERRM, true); END $hj$;
@@ -1113,7 +1122,7 @@ ROLLBACK;
 HJSQL
 )
 IFS='#' read -r _ HB HF HM HC0 HC1 <<< "$R"
-[ "$HC0" = "0/6" ] && ok "本 PR 新增/重定义的 6 个 PL/pgSQL 函数 proconfig 都含 search_path=pg_catalog, public（缺失/总数 = $HC0）" || bad "search_path 目录断言：缺失/总数 = $HC0（期望 0/6）"
+[ "$HC0" = "0/6" ] && ok "本 PR 新增/重定义的 6 个 PL/pgSQL 函数 proconfig 都含 search_path=pg_catalog, public, pg_temp（缺失/总数 = $HC0）" || bad "search_path 目录断言：缺失/总数 = $HC0（期望 0/6）"
 [ -n "$HB" ] && [ "$HF" = "$HB" ] && ok "劫持：wms_app 在自建 schema hj_evil 建同名表 process_bom 并置于 search_path 首位，trg_pboml_frozen() 仍读 public（结果与无劫持一致：$HB）" || bad "劫持后行为改变：无劫持=$HB / 劫持=$HF"
 [ "$HC1" = "1/6" ] && [ "$HM" != "$HB" ] && ok "变异检查：RESET trg_pboml_frozen() 的 search_path 后，目录断言变红（$HC1）且劫持生效（$HM），两条断言都能抓到" || bad "变异检查没变红：目录=$HC1 劫持后=$HM 基准=$HB"
 echo "=== 2i. docs/11 集成：outbox 节点序号、入站报文 ==="
@@ -1201,7 +1210,7 @@ case "$OUT" in *"append_only_violation: upstream_push_log"*|*"permission denied 
 OUT=$(psql_capture "SET ROLE wms_app; SELECT * FROM purge_push_log();")
 case "$OUT" in *"permission denied for function purge_push_log"*) ok "B1 wms_app 调 purge_push_log() → permission denied";; *) bad "wms_app 调函数未被拒：$OUT";; esac
 R=$(psql -t -A -c "SELECT p.prosecdef::text || '/' || array_to_string(p.proconfig, ',') || '/' || r.rolname || '/' || has_function_privilege('public', p.oid, 'EXECUTE')::text FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner WHERE p.proname = 'purge_push_log'")
-[ "${R%%/*}/$(echo "$R" | cut -d/ -f2)/${R##*/}" = "true/search_path=pg_catalog, public/false" ] && ok "B1 purge_push_log：SECURITY DEFINER、固定 search_path、PUBLIC 无 EXECUTE（属主 $(echo "$R" | cut -d/ -f3)；属主改 wms_purge_owner 由 #2 99 授予）" || bad "purge_push_log 属性：$R"
+[ "${R%%/*}/$(echo "$R" | cut -d/ -f2)/${R##*/}" = "true/search_path=pg_catalog, public, pg_temp/false" ] && ok "B1 purge_push_log：SECURITY DEFINER、固定 search_path、PUBLIC 无 EXECUTE（属主 $(echo "$R" | cut -d/ -f3)；属主改 wms_purge_owner 由 #2 99 授予）" || bad "purge_push_log 属性：$R"
 OUT=$(psql -q -t -A -c "SET ROLE wms_cleaner; SELECT push_log_deleted FROM purge_push_log();" 2>&1)
 R2=$(psql -t -A -c "SELECT count(*) FROM upstream_push_log WHERE retain_until < (now() AT TIME ZONE 'UTC')")
 [ "$OUT/$R2" = "1/0" ] && ok "B1 wms_cleaner 调 purge_push_log() 只删 1 条已过 retain_until 的日志，未过期行都在（$OUT/$R2）" || bad "purge_push_log 结果：$OUT / 剩余过期 $R2（期望 1/0）"
@@ -1272,9 +1281,9 @@ SET LOCAL search_path = hj_evil, public;
 DO $hj$ BEGIN UPDATE public.outbox_event SET status='SENDING' WHERE id=19950; RAISE EXCEPTION 'HJ_OK'; EXCEPTION WHEN OTHERS THEN PERFORM set_config('hj.fixed', SQLERRM, true); END $hj$;
 RESET ROLE;
 SET LOCAL search_path = public;
-SELECT set_config('hj.cat0', (SELECT count(*) FILTER (WHERE NOT COALESCE(proconfig,'{}'::text[]) @> ARRAY['search_path=pg_catalog, public']) || '/' || count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('trg_upl_append_only','purge_push_log','trg_outbox_order_guard','trg_purge_guard','trg_expiry_forward','trg_outbox_insert_pending')), true);
+SELECT set_config('hj.cat0', (SELECT count(*) FILTER (WHERE NOT COALESCE(proconfig,'{}'::text[]) @> ARRAY['search_path=pg_catalog, public, pg_temp']) || '/' || count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('trg_upl_append_only','purge_push_log','trg_outbox_order_guard','trg_purge_guard','trg_expiry_forward','trg_outbox_insert_pending')), true);
 ALTER FUNCTION public.trg_outbox_order_guard() RESET search_path;
-SELECT set_config('hj.cat1', (SELECT count(*) FILTER (WHERE NOT COALESCE(proconfig,'{}'::text[]) @> ARRAY['search_path=pg_catalog, public']) || '/' || count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('trg_upl_append_only','purge_push_log','trg_outbox_order_guard','trg_purge_guard','trg_expiry_forward','trg_outbox_insert_pending')), true);
+SELECT set_config('hj.cat1', (SELECT count(*) FILTER (WHERE NOT COALESCE(proconfig,'{}'::text[]) @> ARRAY['search_path=pg_catalog, public, pg_temp']) || '/' || count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('trg_upl_append_only','purge_push_log','trg_outbox_order_guard','trg_purge_guard','trg_expiry_forward','trg_outbox_insert_pending')), true);
 SET LOCAL ROLE wms_app;
 SET LOCAL search_path = hj_evil, public;
 DO $hj$ BEGIN UPDATE public.outbox_event SET status='SENDING' WHERE id=19950; RAISE EXCEPTION 'HJ_OK'; EXCEPTION WHEN OTHERS THEN PERFORM set_config('hj.mut', SQLERRM, true); END $hj$;
@@ -1284,7 +1293,7 @@ ROLLBACK;
 HJSQL
 )
 IFS='#' read -r _ HB HF HM HC0 HC1 <<< "$R"
-[ "$HC0" = "0/6" ] && ok "本 PR 新增/重定义的 6 个 PL/pgSQL 函数 proconfig 都含 search_path=pg_catalog, public（缺失/总数 = $HC0）" || bad "search_path 目录断言：缺失/总数 = $HC0（期望 0/6）"
+[ "$HC0" = "0/6" ] && ok "本 PR 新增/重定义的 6 个 PL/pgSQL 函数 proconfig 都含 search_path=pg_catalog, public, pg_temp（缺失/总数 = $HC0）" || bad "search_path 目录断言：缺失/总数 = $HC0（期望 0/6）"
 [ -n "$HB" ] && [ "$HF" = "$HB" ] && ok "劫持：wms_app 在自建 schema hj_evil 建同名表 outbox_event 并置于 search_path 首位，trg_outbox_order_guard() 仍读 public（结果与无劫持一致：$HB）" || bad "劫持后行为改变：无劫持=$HB / 劫持=$HF"
 [ "$HC1" = "1/6" ] && [ "$HM" != "$HB" ] && ok "变异检查：RESET trg_outbox_order_guard() 的 search_path 后，目录断言变红（$HC1）且劫持生效（$HM），两条断言都能抓到" || bad "变异检查没变红：目录=$HC1 劫持后=$HM 基准=$HB"
 echo "=== 3. §5.6 盘点差异生成列（实盘 − 基准账面 − 期间流水）==="
@@ -2112,8 +2121,8 @@ for T in PAPER_BACKFILL BOX_VOID PROCESS_YIELD_DEVIATION LIVE_DEATH_OVER PROCESS
   i=$((i+1))
 done
 # 12 search_path 固定：8 个函数都带 SET search_path = pg_catalog, public（防同名表劫持）
-R=$(psql -t -A -c "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public' AND p.proname IN ('trg_audit_node_required','trg_audit_append_only','trg_apr_insert','trg_apr_final','trg_udb_guard','trg_no_delete_12','trg_offline_guard','trg_user_perm_ver') AND 'search_path=pg_catalog, public' = ANY(p.proconfig)")
-[ "$R" = "8" ] && ok "12 search_path：8 个触发器函数 proconfig 均为 search_path=pg_catalog, public（$R）" || bad "12 search_path：只有 $R/8 个函数固定了 search_path"
+R=$(psql -t -A -c "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public' AND p.proname IN ('trg_audit_node_required','trg_audit_append_only','trg_apr_insert','trg_apr_final','trg_udb_guard','trg_no_delete_12','trg_offline_guard','trg_user_perm_ver') AND 'search_path=pg_catalog, public, pg_temp' = ANY(p.proconfig)")
+[ "$R" = "8" ] && ok "12 search_path：8 个触发器函数 proconfig 均为 search_path=pg_catalog, public, pg_temp（$R）" || bad "12 search_path：只有 $R/8 个函数固定了 search_path"
 seed "INSERT INTO approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (95,'APR-WHSH01-20261015-000095','PAPER_BACKFILL',1,'PAPER_BACKFILL','95','{}','$H','r',201,'2099-01-01');"
 # 劫持：会话把自建 schema 放在 search_path 最前，建同名的 sys_user_role/sys_role/sys_role_perm/sys_permission/sys_user_warehouse 影子表，给质检主管 205 伪造 offline.paper.approve。函数固定了 search_path，仍查 public 的真表 → 必须照样 approval_perm_not_held
 OUT=$(psql_capture "CREATE SCHEMA hijack12; CREATE TABLE hijack12.sys_user_role (user_id BIGINT, role_id BIGINT); CREATE TABLE hijack12.sys_role (id BIGINT, code VARCHAR(32)); CREATE TABLE hijack12.sys_role_perm (role_id BIGINT, perm_id BIGINT); CREATE TABLE hijack12.sys_permission (id BIGINT, code VARCHAR(64)); CREATE TABLE hijack12.sys_user_warehouse (user_id BIGINT, warehouse_id BIGINT); INSERT INTO hijack12.sys_user_role VALUES (205,3); INSERT INTO hijack12.sys_role VALUES (3,'QC_SUPERVISOR'); INSERT INTO hijack12.sys_role_perm VALUES (3,11); INSERT INTO hijack12.sys_permission VALUES (11,'offline.paper.approve'); INSERT INTO hijack12.sys_user_warehouse VALUES (205,1); SET search_path = hijack12, public; UPDATE approval_request SET status='APPROVED', first_approved_at='2026-10-15 09:00', decided_at='2026-10-15 09:00', first_approver_id=205, first_approver_role='QC_SUPERVISOR' WHERE id=95;")
@@ -2153,8 +2162,8 @@ expect_allow "17×12 返工：加工主管 1733 批 PROCESS_REWORK" "UPDATE appr
 fi
 echo "=== 2h3. 18 函数固定 search_path（目录断言 + 同名表劫持）==="
 R=$(psql -t -A -c "SELECT string_agg(p.proname || '=' || COALESCE(array_to_string(p.proconfig, ','), 'NONE'), ' ' ORDER BY p.proname) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname IN ('trg_slp_guard','trg_lt_guard','trg_lt_type','trg_lsc_guard','trg_lth_guard','trg_ld_guard','live_death_makeup')")
-EXP18="live_death_makeup=search_path=pg_catalog, public trg_ld_guard=search_path=pg_catalog, public trg_lsc_guard=search_path=pg_catalog, public trg_lt_guard=search_path=pg_catalog, public trg_lt_type=search_path=pg_catalog, public trg_lth_guard=search_path=pg_catalog, public trg_slp_guard=search_path=pg_catalog, public"
-[ "$R" = "$EXP18" ] && ok "18 的 7 个 PG 函数 proconfig 均为 search_path=pg_catalog, public" || bad "18 函数 proconfig 不符：$R"
+EXP18="live_death_makeup=search_path=pg_catalog, public, pg_temp trg_ld_guard=search_path=pg_catalog, public, pg_temp trg_lsc_guard=search_path=pg_catalog, public, pg_temp trg_lt_guard=search_path=pg_catalog, public, pg_temp trg_lt_type=search_path=pg_catalog, public, pg_temp trg_lth_guard=search_path=pg_catalog, public, pg_temp trg_slp_guard=search_path=pg_catalog, public, pg_temp"
+[ "$R" = "$EXP18" ] && ok "18 的 7 个 PG 函数 proconfig 均为 search_path=pg_catalog, public, pg_temp" || bad "18 函数 proconfig 不符：$R"
 # 劫持：调用方 search_path 前置 rogue schema，放一张同名 live_death，id 999999 标 HIJACK。
 # 固定后函数只看 public，public 里没有 999999 → live_death_not_found；被劫持则返回 EXISTING:HIJACK。整段 ROLLBACK。
 OUT=$(psql_capture "BEGIN; CREATE SCHEMA t18_rogue; CREATE TABLE t18_rogue.live_death (id BIGINT, deduct_status TEXT); INSERT INTO t18_rogue.live_death VALUES (999999, 'HIJACK'); SET LOCAL search_path = t18_rogue, public; SELECT live_death_makeup(999999, 999999); ROLLBACK;")
@@ -2483,6 +2492,163 @@ srtn_mut "ck_srtn_ts（created_at 整秒）" "ALTER TABLE supplier_return DROP C
 expect_block "N1 拒绝：属主事后改 created_at" "UPDATE supplier_return SET created_at = created_at - INTERVAL '1 day' WHERE id=97420;" "srtn_time_immutable"
 srtn_mut "trg_srtn_zclock（created_at 只写一次）" "DROP TRIGGER trg_srtn_zclock ON supplier_return;" "UPDATE supplier_return SET created_at = created_at - INTERVAL '1 day' WHERE id=97420;"
 expect_block "N1 拒绝：wms_app 改 created_at（无列级授权）" "SET ROLE wms_app; UPDATE supplier_return SET created_at = now() WHERE id=97420;" "permission denied for table supplier_return"
+echo "=== 2z. pg_temp 劫持（#2 第九轮）：search_path 必须显式写 pg_temp 且放最后；目录断言 + 临时表劫持 + 去掉 pg_temp 的变异（PG）==="
+# PG 规则：search_path 里没写 pg_temp 时，会话临时 schema 被隐式放在最前面查表。wms_app 默认有库级 TEMP 权限，
+# 能建同名临时表盖住 public 的真表。所以 'pg_catalog, public' 不够，必须 'pg_catalog, public, pg_temp'（pg_temp 显式且最后）。
+# SQLite 没有对应攻击面：没有 schema 搜索路径，TEMP 表只对本连接可见，触发器体里的表名在建触发器时就绑到 main（不跟会话走），verify_sqlite.py 不加对应用例。
+# 目录断言：public 里所有带 search_path 设置的函数（含退供增量自带的 5 个，米雪儿已按本规则写）都必须正好是 pg_catalog, public, pg_temp。
+R=$(psql -t -A -c "SELECT count(*) FILTER (WHERE c <> 'search_path=pg_catalog, public, pg_temp') || '/' || count(*) FROM (SELECT unnest(p.proconfig) c FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace) s WHERE c LIKE 'search_path=%'")
+[ "$R" = "0/53" ] && ok "pg_temp 目录断言：53 个固定 search_path 的函数都显式以 pg_temp 结尾（不合规/总数 = $R）" || bad "pg_temp 目录断言：不合规/总数 = $R（期望 0/53）"
+# 通用断言（不限函数个数）：public 下任何函数只要设了 search_path，pg_temp 必须是最后一项
+R=$(psql -t -A -c "SELECT count(*) FILTER (WHERE c !~ ',\s*pg_temp\s*$') || '/' || count(*) || '#' || COALESCE(string_agg(proname, ',') FILTER (WHERE c !~ ',\s*pg_temp\s*$'), '') FROM (SELECT p.proname, c FROM pg_proc p, unnest(p.proconfig) c WHERE p.pronamespace = 'public'::regnamespace AND c LIKE 'search_path=%') s")
+[ "${R%%/*}" = "0" ] && ok "pg_temp 末位断言：public 下设了 search_path 的函数 pg_temp 都在最后（缺/总 = ${R%%#*}）" || bad "pg_temp 末位断言：缺/总 = ${R%%#*}，函数：${R#*#}"
+R=$(psql -t -A -c "SELECT has_database_privilege('wms_app', current_database(), 'TEMP')")
+[ "$R" = "t" ] && ok "前提：wms_app 有库级 TEMP 权限（攻击面真实存在，下面的劫持用例有意义）" || bad "wms_app TEMP 权限 = $R，劫持用例前提不成立"
+# 四个目标：02 trg_mvk_line_kind（读 stock_ledger_line）、09 trg_scrl_draft_only（读 scrap_order）、
+# 11 trg_outbox_order_guard（读 outbox_event）、12 trg_apr_insert（读 warehouse）。每个都由 wms_app 建同名临时表并塞伪造行。
+# fixed = 现行函数下的结果（必须是真表给出的原拒绝），mut = 把该函数改成 'pg_catalog, public'（去掉 pg_temp）后的结果（必须变）。
+R=$(psql -q -t -A <<'PTSQL' | grep '^PT#'
+BEGIN;
+INSERT INTO outbox_event (id,topic,biz_key,payload,warehouse_id,node_id,seq) VALUES (19960,'t','PT-1','{}',1,3,0);
+INSERT INTO scrap_order (id,code,warehouse_id,source_type,source_id,reason_code,work_date,applicant_id) VALUES (19960,'SCR-PT-19960',1,'MANUAL',19960,'DAMAGED','2026-10-16',0);
+UPDATE scrap_order SET status='CANCELLED' WHERE id=19960;
+SET LOCAL ROLE wms_app;
+CREATE TEMP TABLE stock_ledger_line (biz_no varchar(64), line_no int, src_kind varchar(8), owner_device_instance_id varchar(64)) ON COMMIT DROP;
+INSERT INTO pg_temp.stock_ledger_line VALUES ('PT-HIJACK', 1, 'DOC', NULL);
+CREATE TEMP TABLE scrap_order (id BIGINT, status TEXT, record_only BOOLEAN, source_type TEXT) ON COMMIT DROP;
+INSERT INTO pg_temp.scrap_order VALUES (19960,'DRAFT',false,'MANUAL');
+CREATE TEMP TABLE outbox_event (id BIGINT, biz_key TEXT, status TEXT, node_id BIGINT, seq BIGINT) ON COMMIT DROP;
+INSERT INTO pg_temp.outbox_event VALUES (1,'PT-1','PENDING',3,0);
+CREATE TEMP TABLE warehouse (id BIGINT, code TEXT) ON COMMIT DROP;
+INSERT INTO pg_temp.warehouse VALUES (1,'PTFAKE');
+SET LOCAL search_path = public;
+CREATE FUNCTION pg_temp.pt_try(q text, k text) RETURNS void LANGUAGE plpgsql AS $f$ BEGIN BEGIN EXECUTE q; RAISE EXCEPTION 'PT_PASSED'; EXCEPTION WHEN OTHERS THEN PERFORM set_config(k, SQLERRM, true); END; END $f$;
+SELECT pg_temp.pt_try($q$INSERT INTO public.stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,stock_id,stock_seq,direction,occurred_at) VALUES (99061,'PT:1:D1:1','PT-HIJACK',1,1,1,'DOC',11,99061,0,'2026-10-15 00:00:00')$q$, 'pt.a0');
+SELECT pg_temp.pt_try($q$INSERT INTO public.scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (19961,19960,1,14,1,1,5000,0,'POST_OUT')$q$, 'pt.b0');
+SELECT pg_temp.pt_try($q$UPDATE public.outbox_event SET status='SENDING' WHERE id=19960$q$, 'pt.c0');
+SELECT pg_temp.pt_try($q$INSERT INTO public.approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (19960,'APR-PTFAKE-20261015-019960','PAPER_BACKFILL',1,'PAPER_BACKFILL','19960','{}','0000000000000000000000000000000000000000000000000000000000000000','r',201,'2099-01-01')$q$, 'pt.d0');
+RESET ROLE;
+ALTER FUNCTION public.trg_mvk_line_kind() SET search_path = pg_catalog, public;
+ALTER FUNCTION public.trg_scrl_draft_only() SET search_path = pg_catalog, public;
+ALTER FUNCTION public.trg_outbox_order_guard() SET search_path = pg_catalog, public;
+ALTER FUNCTION public.trg_apr_insert() SET search_path = pg_catalog, public;
+SELECT set_config('pt.cat1', (SELECT count(*) FILTER (WHERE c <> 'search_path=pg_catalog, public, pg_temp') || '/' || count(*) FROM (SELECT unnest(p.proconfig) c FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace) s WHERE c LIKE 'search_path=%'), true);
+SET LOCAL ROLE wms_app;
+SET LOCAL search_path = public;
+SELECT pg_temp.pt_try($q$INSERT INTO public.stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,stock_id,stock_seq,direction,occurred_at) VALUES (99061,'PT:1:D1:1','PT-HIJACK',1,1,1,'DOC',11,99061,0,'2026-10-15 00:00:00')$q$, 'pt.a1');
+SELECT pg_temp.pt_try($q$INSERT INTO public.scrap_line (id,scrap_id,line_no,stock_id,sku_id,lot_id,scrap_qty_milli,hold_id,ledger_mode) VALUES (19961,19960,1,14,1,1,5000,0,'POST_OUT')$q$, 'pt.b1');
+SELECT pg_temp.pt_try($q$UPDATE public.outbox_event SET status='SENDING' WHERE id=19960$q$, 'pt.c1');
+SELECT pg_temp.pt_try($q$INSERT INTO public.approval_request (id,code,approval_type,warehouse_id,target_type,target_id,payload_json,payload_hash,reason,requested_by,expires_at) VALUES (19960,'APR-PTFAKE-20261015-019960','PAPER_BACKFILL',1,'PAPER_BACKFILL','19960','{}','0000000000000000000000000000000000000000000000000000000000000000','r',201,'2099-01-01')$q$, 'pt.d1');
+RESET ROLE;
+SELECT 'PT#' || current_setting('pt.a0') || '#' || current_setting('pt.a1') || '#' || current_setting('pt.b0') || '#' || current_setting('pt.b1') || '#' || current_setting('pt.c0') || '#' || current_setting('pt.c1') || '#' || current_setting('pt.d0') || '#' || current_setting('pt.d1') || '#' || current_setting('pt.cat1');
+ROLLBACK;
+PTSQL
+)
+IFS='#' read -r _ A0 A1 B0 B1 C0 C1 D0 D1 PC1 <<< "$R"
+echo "  → fixed/mut：02[$A0 | $A1] 09[$B0 | $B1] 11[$C0 | $C1] 12[$D0 | $D1]"
+[ "$A0" = "ledger_line_owner_mismatch" ] && ok "pg_temp 劫持 02 trg_mvk_line_kind：wms_app 建临时表 stock_ledger_line 伪造归属行，函数仍读 public → $A0" || bad "02 pg_temp 劫持：$A0（期望 ledger_line_owner_mismatch）"
+[ "$B0" = "scrap_line_locked" ] && ok "pg_temp 劫持 09 trg_scrl_draft_only：临时表 scrap_order 把已取消单伪造成 DRAFT，函数仍读 public → $B0" || bad "09 pg_temp 劫持：$B0（期望 scrap_line_locked）"
+[ "$C0" = "PT_PASSED" ] && ok "pg_temp 劫持 11 trg_outbox_order_guard：临时表 outbox_event 伪造同 biz_key 更早的 PENDING 行想卡住投递，函数仍读 public，真实事件照常进 SENDING（$C0）" || bad "11 pg_temp 劫持：$C0（期望正常放行 PT_PASSED）"
+[ "$D0" = "approval_code_warehouse_mismatch" ] && ok "pg_temp 劫持 12 trg_apr_insert：临时表 warehouse 把仓 1 编码伪造成 PTFAKE，函数仍读 public → $D0" || bad "12 pg_temp 劫持：$D0（期望 approval_code_warehouse_mismatch）"
+[ "$PC1" = "4/53" ] && ok "变异：四个函数去掉 pg_temp 后目录断言变红（$PC1）" || bad "变异目录断言没变红：$PC1（期望 4/53）"
+[ "$A1" != "$A0" ] && ok "变异：trg_mvk_line_kind 去掉 pg_temp 后临时表劫持生效（$A1）" || bad "变异没变红：trg_mvk_line_kind 去掉 pg_temp 后仍是 $A1"
+[ "$B1" != "$B0" ] && ok "变异：trg_scrl_draft_only 去掉 pg_temp 后临时表劫持生效（$B1）" || bad "变异没变红：trg_scrl_draft_only 去掉 pg_temp 后仍是 $B1"
+[ "$C1" != "$C0" ] && ok "变异：trg_outbox_order_guard 去掉 pg_temp 后临时表劫持生效（$C1）" || bad "变异没变红：trg_outbox_order_guard 去掉 pg_temp 后仍是 $C1"
+[ "$D1" != "$D0" ] && ok "变异：trg_apr_insert 去掉 pg_temp 后临时表劫持生效（$D1）" || bad "变异没变红：trg_apr_insert 去掉 pg_temp 后仍是 $D1"
+echo "=== 2z2. #2 第九轮 时间约定：UTC 整秒、TIMESTAMP（不带时区）；预占 expires_at 由库计算（PG）==="
+# 会话时区设成 Asia/Shanghai，经 02 路径写入：stock.created_at（DEFAULT）与 stock_reservation.created_at/expires_at（BEFORE 触发器）都必须是 UTC 整秒
+R=$(psql -t -A <<'TZSQL' | grep '^TZ#'
+SET TIME ZONE 'Asia/Shanghai';
+INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,container_id,uom,on_hand_qty_milli) VALUES (9201,1,2,1,3,9201,'KG',1000);
+INSERT INTO stock_reservation (id,stock_id,stage,source_type,source_id,source_line_id,op_key,reserve_qty_milli,status,created_at) VALUES (9201,11,'RESERVE','OUTBOUND_LINE',1,9201,'RES:TZ:9201',1000,'RESERVED','2000-01-01 00:00:00');
+SELECT 'TZ#' || (SELECT abs(extract(epoch FROM created_at - (now() AT TIME ZONE 'UTC'))) <= 5 AND created_at = date_trunc('second', created_at) FROM stock WHERE id=9201)::text
+  || '#' || (SELECT abs(extract(epoch FROM created_at - (now() AT TIME ZONE 'UTC'))) <= 5 AND created_at = date_trunc('second', created_at) FROM stock_reservation WHERE id=9201)::text
+  || '#' || (SELECT extract(epoch FROM expires_at - created_at)::bigint FROM stock_reservation WHERE id=9201)::text;
+TZSQL
+)
+IFS='#' read -r _ TZ1 TZ2 TZ3 <<< "$R"
+[ "$TZ1" = "true" ] && ok "会话 TIME ZONE=Asia/Shanghai 下经 02 写 stock：created_at 是 UTC 整秒（与 now() AT TIME ZONE 'UTC' 差 ≤ 5s）" || bad "stock.created_at 不是 UTC 整秒：$TZ1"
+[ "$TZ2" = "true" ] && ok "会话 Asia/Shanghai 下写预占，调用方填 created_at=2000-01-01 被库改写成 UTC 整秒的当前时间" || bad "stock_reservation.created_at 不是库时钟 UTC 整秒：$TZ2"
+[ "$TZ3" = "86400" ] && ok "预占不带 expires_at：库补算 created_at + 24h（$TZ3 s）" || bad "预占 expires_at 补算 = $TZ3（期望 86400）"
+R=$(psql -t -A -c "SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND data_type = 'timestamp with time zone'")
+[ "$R" = "0" ] && ok "public 下没有 timestamptz 列（时间列一律 TIMESTAMP 不带时区，语义 UTC）" || bad "public 下有 $R 个 timestamptz 列"
+expect_block "预占 expires_at 填 2999 年（永不过期）" \
+  "INSERT INTO stock_reservation (id,stock_id,stage,source_type,source_id,source_line_id,op_key,reserve_qty_milli,status,expires_at) VALUES (9202,11,'RESERVE','OUTBOUND_LINE',1,9202,'RES:TTL:9202',1000,'RESERVED','2999-01-01 00:00:00');" "ck_res_ttl"
+expect_block "预占 expires_at = 当前 UTC + 24h + 1min" \
+  "INSERT INTO stock_reservation (id,stock_id,stage,source_type,source_id,source_line_id,op_key,reserve_qty_milli,status,expires_at) VALUES (9203,11,'RESERVE','OUTBOUND_LINE',1,9203,'RES:TTL:9203',1000,'RESERVED',(now() AT TIME ZONE 'UTC') + interval '24 hours 1 minute');" "ck_res_ttl"
+expect_block "预占 事后把 expires_at 改成 2999 年" "UPDATE stock_reservation SET expires_at='2999-01-01 00:00:00' WHERE id=9201;" "ck_res_ttl"
+expect_block "预占 事后改 created_at（借此抬高上界）" "UPDATE stock_reservation SET created_at='2999-01-01 00:00:00', expires_at='2999-01-01 12:00:00' WHERE id=9201;" "reservation_created_at_immutable"
+expect_block "预占 B1：属主把 expires_at 改成 NULL（永不过期）" "UPDATE stock_reservation SET expires_at=NULL WHERE id=9201;" "expires_at"
+expect_block "预占 B1：wms_app 把 expires_at 改成 NULL（永不过期）" "SET ROLE wms_app; UPDATE stock_reservation SET expires_at=NULL WHERE id=9201;" "expires_at"
+R=$(psql -t -A <<'MUTSQL' | grep '^MUT#'
+BEGIN;
+ALTER TABLE stock_reservation ALTER COLUMN expires_at DROP NOT NULL;
+DO $m$ BEGIN UPDATE stock_reservation SET expires_at=NULL WHERE id=9201; PERFORM set_config('m.r','PASSED',true); EXCEPTION WHEN OTHERS THEN PERFORM set_config('m.r',SQLERRM,true); END $m$;
+SELECT 'MUT#' || current_setting('m.r');
+ROLLBACK;
+MUTSQL
+)
+[ "$R" = "MUT#PASSED" ] && ok "变异：去掉 expires_at NOT NULL 后，改成 NULL 成功（B1 断言能抓到）" || bad "变异没变红：去掉 NOT NULL 后仍是 $R"
+expect_allow "预占 N1：缩短 TTL（expires_at = created_at + 1s）允许" "UPDATE stock_reservation SET expires_at = created_at + interval '1 second' WHERE id=9201;"
+expect_block "预占 N1：再延长到 created_at + 24h + 1s 仍拒" "UPDATE stock_reservation SET expires_at = created_at + interval '24 hours 1 second' WHERE id=9201;" "ck_res_ttl"
+R=$(psql -t -A <<'MUTSQL' | grep '^MUT#'
+BEGIN;
+ALTER TABLE stock_reservation DROP CONSTRAINT ck_res_ttl;
+DO $m$ BEGIN INSERT INTO stock_reservation (id,stock_id,stage,source_type,source_id,source_line_id,op_key,reserve_qty_milli,status,expires_at) VALUES (9204,11,'RESERVE','OUTBOUND_LINE',1,9204,'RES:TTL:9204',1000,'RESERVED','2999-01-01 00:00:00'); PERFORM set_config('m.r','PASSED',true); EXCEPTION WHEN OTHERS THEN PERFORM set_config('m.r',SQLERRM,true); END $m$;
+SELECT 'MUT#' || current_setting('m.r');
+ROLLBACK;
+MUTSQL
+)
+[ "$R" = "MUT#PASSED" ] && ok "变异：去掉 ck_res_ttl 后，expires_at=2999 的预占写入成功（断言能抓到）" || bad "变异没变红：去掉 ck_res_ttl 后仍是 $R"
+echo "=== 2z4. #2 第十一轮 流水 occurred_at 由库定（PG）==="
+MVI="INSERT INTO stock_movement (id,biz_no,line_no,op_no,leg,src_kind,biz_type,direction,stock_id,stock_seq,warehouse_id,location_id,sku_id,lot_id,move_qty_milli,on_hand_before_qty_milli,on_hand_after_qty_milli,occurred_at,idempotency_key)"
+MKI="INSERT INTO stock_movement_key (movement_id,idempotency_key,biz_no,line_no,op_no,leg,src_kind,stock_id,stock_seq,direction,occurred_at)"
+mv_try() {  # $1 = 前置语句（属主），$2 = 客户端 occurred_at 表达式；输出 MV#<结果>#<库里的值是否 = 事务 now 整秒>
+psql -q -t -A <<MVSQL | grep '^MV#'
+BEGIN;
+INSERT INTO stock (id,warehouse_id,location_id,sku_id,lot_id,container_id,uom,on_hand_qty_milli) VALUES (9301,1,2,1,3,9301,'KG',0);
+INSERT INTO stock_ledger_line (biz_no,line_no,src_kind,owner_device_instance_id) VALUES ('MVCLK',1,'DOC',NULL);
+$1
+SET LOCAL ROLE wms_app;
+DO \$m\$ BEGIN
+  $MVI VALUES (99301,'MVCLK',1,1,1,'DOC','OPENING',1,9301,1,1,2,1,3,50000,0,50000,$2,'MVCLK:1');
+  $MKI VALUES (99301,'MVCLK:1','MVCLK',1,1,1,'DOC',9301,1,1,$2);
+  PERFORM set_config('m.r','PASSED',true);
+EXCEPTION WHEN OTHERS THEN PERFORM set_config('m.r',SQLERRM,true); END \$m\$;
+RESET ROLE;
+SELECT 'MV#' || current_setting('m.r') || '#' || COALESCE((SELECT (m.occurred_at = date_trunc('second', now() AT TIME ZONE 'UTC') AND k.occurred_at = m.occurred_at)::text FROM stock_movement m JOIN stock_movement_key k ON k.movement_id = m.id WHERE m.id = 99301), 'none');
+ROLLBACK;
+MVSQL
+}
+R=$(mv_try "" "date_trunc('month', now() AT TIME ZONE 'UTC')")
+[ "$R" = "MV#PASSED#true" ] && ok "wms_app 写流水 occurred_at=本月 1 日 0 点：库改写成事务 now 的 UTC 整秒（流水与 key 一致）" || bad "流水 occurred_at 同月改写：$R（期望 MV#PASSED#true）"
+R=$(mv_try "" "date_trunc('second', now() AT TIME ZONE 'UTC') + interval '2 months'")
+[ "${R#MV#}" != "${R#MV#movement_clock_skew}" ] && ok "wms_app 写流水 occurred_at=2 个月后（跨分区）→ movement_clock_skew（40003）" || bad "流水 occurred_at 跨月：$R（期望 movement_clock_skew）"
+R=$(mv_try "SET LOCAL TIME ZONE 'Asia/Shanghai';" "'2000-01-01 00:00:00'::timestamp + (date_trunc('month', now() AT TIME ZONE 'UTC') - '2000-01-01'::timestamp)")
+[ "$R" = "MV#PASSED#true" ] && ok "会话时区 Asia/Shanghai 下 wms_app 写流水：仍落 UTC 整秒" || bad "时区下流水 occurred_at：$R"
+R=$(mv_try "DROP TRIGGER trg_mv_zclock ON stock_movement; DROP TRIGGER trg_mvk_zclock ON stock_movement_key;" "date_trunc('month', now() AT TIME ZONE 'UTC')")
+[ "$R" = "MV#PASSED#false" ] && ok "变异：去掉 trg_mv_zclock / trg_mvk_zclock 后，客户端填的本月 1 日原样落库（断言能抓到）" || bad "变异没变红：去掉流水时钟触发器后 $R（期望 MV#PASSED#false）"
+R=$(mv_try "DROP TRIGGER trg_mv_zclock ON stock_movement; DROP TRIGGER trg_mvk_zclock ON stock_movement_key;" "date_trunc('second', now() AT TIME ZONE 'UTC') + interval '2 months'")
+[ "$R" = "MV#PASSED#false" ] && ok "变异：去掉流水时钟触发器后，2 个月后的 occurred_at 写入成功（断言能抓到）" || bad "变异没变红：$R"
+R=$(psql -t -A -c "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid WHERE t.tgname='trg_mv_zclock' AND c.relispartition")
+[ "$R" -ge 1 ] && ok "trg_mv_zclock 挂在分区父表，已克隆到 $R 个分区" || bad "trg_mv_zclock 没克隆到分区：$R"
+echo "=== 2z5. N4 收尾：清掉 verify 自建的劫持辅助对象，库里不留未固定 search_path 的自定义函数（PG）==="
+psql -q -c "DROP SCHEMA IF EXISTS hijack, hijack12, hj_evil, t18_rogue CASCADE;" >/dev/null 2>&1
+R=$(psql -t -A -c "SELECT count(*) || '#' || COALESCE(string_agg(n.nspname || '.' || p.proname, ','), '') FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%' AND p.prolang IN (SELECT oid FROM pg_language WHERE lanname IN ('plpgsql','sql')) AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e') AND NOT EXISTS (SELECT 1 FROM unnest(p.proconfig) c WHERE c = 'search_path=pg_catalog, public, pg_temp')")
+[ "${R%%#*}" = "0" ] && ok "收尾后库内自定义函数全部固定 search_path=pg_catalog, public, pg_temp（不合规 0）" || bad "收尾后仍有未固定 search_path 的函数：${R#*#}"
+echo "=== 2z4 第 1/2 篇触发器 / 索引名冻结基线（#2 第十三轮；少一个 = 红）==="
+T0102="'warehouse','zone','location','sku','sku_barcode','sku_unit','lot','stock','stock_reservation','stock_hold','stock_hold_release','stock_ledger_line','stock_movement','stock_movement_key','stock_snapshot_daily','stock_recon_alert'"
+PG_TRG_NOW=$(psql -t -A -c "SELECT string_agg(DISTINCT t.tgname, ' ' ORDER BY t.tgname) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal AND c.relnamespace = 'public'::regnamespace AND NOT c.relispartition AND c.relname IN ($T0102)")
+PG_IDX_NOW=$(psql -t -A -c "SELECT string_agg(i.relname, ' ' ORDER BY i.relname) FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_class c ON c.oid = x.indrelid WHERE c.relnamespace = 'public'::regnamespace AND NOT c.relispartition AND c.relname IN ($T0102)")
+PG_TRG_BASE="trg_hold_immutable trg_hold_no_delete trg_hold_no_truncate trg_hr_append_only trg_hr_no_truncate trg_lot_sell_deadline trg_mv_append_only trg_mv_no_truncate trg_mv_zclock trg_mvk_append_only trg_mvk_line_kind trg_mvk_no_truncate trg_mvk_zclock trg_recon_resolved_lock trg_res_ttl trg_sll_immutable"
+PG_IDX_BASE="ix_hold_from ix_hold_stock ix_hr_hold ix_loc_replen ix_lot_aging ix_lot_expiry ix_mv_biz ix_mv_hold ix_mv_sku_time ix_mv_stock ix_mv_time ix_recon_open ix_res_exp ix_res_source ix_res_stock ix_sku_category ix_snap_sku ix_stock_loc ix_stock_sku_avail ix_stock_wh ix_zone_wh_type location_pkey lot_pkey sku_barcode_pkey sku_pkey sku_unit_pkey stock_hold_pkey stock_hold_release_pkey stock_ledger_line_pkey stock_movement_key_pkey stock_movement_pkey stock_pkey stock_recon_alert_pkey stock_reservation_pkey stock_snapshot_daily_pkey uq_barcode uq_hold_op uq_hold_return uq_hr_op uq_location_code uq_lot uq_mvk_biz_line uq_mvk_idem uq_mvk_mv uq_mvk_pda_op uq_mvk_stock_seq uq_recon_open uq_res_op uq_sku_code uq_sku_uom uq_stock_dim uq_warehouse_code uq_zone_code warehouse_pkey zone_pkey"
+for KIND in TRG IDX; do
+  eval "NOW=\$PG_${KIND}_NOW; BASE=\$PG_${KIND}_BASE"
+  MISS=$(comm -23 <(tr ' ' '\n' <<<"$BASE" | sort) <(tr ' ' '\n' <<<"$NOW" | sort) | tr '\n' ' ')
+  EXTRA=$(comm -13 <(tr ' ' '\n' <<<"$BASE" | sort) <(tr ' ' '\n' <<<"$NOW" | sort) | tr '\n' ' ')
+  [ -z "${MISS// /}" ] && ok "01/02 $KIND 名单与冻结基线一致（$(wc -w <<<"$BASE") 个）" || bad "01/02 $KIND 少了：$MISS"
+  [ -z "${EXTRA// /}" ] || echo "  · 01/02 $KIND 基线外新增（请补进基线）：$EXTRA"
+done
 echo "=== 汇总 ==="
 echo "  通过 $pass 项 / 失败 $fail 项"
 cleanup

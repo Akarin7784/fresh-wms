@@ -1,8 +1,8 @@
 -- 本文件由 sql/verify_sqlite.py 从 sql/schema/*.sql 按加载顺序机械生成，请勿手改。
 -- 翻译产生的改动共 4 类：
 --   1. 删除 1 条 COMMENT ON（SQLite 无该语法，注释降级到行内）
---   2. 60 处 DEFAULT now()、7 处 DEFAULT (now() AT TIME ZONE 'UTC') → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
---   3. 方言专属行：删除 865 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 552 行 @sqlite-only（等价触发器）
+--   2. 47 处 DEFAULT now()、22 处 DEFAULT (now() AT TIME ZONE 'UTC') / (date_trunc('second', now() AT TIME ZONE 'UTC')) → DEFAULT (datetime('now'))（表达式默认值需括号；SQLite 恒为 UTC）
+--   3. 方言专属行：删除 901 行 @pg-only（分区、plpgsql 触发器、角色权限），启用 612 行 @sqlite-only（等价触发器）
 --   4. 去掉显式 BEGIN/COMMIT（由 executescript 管理）
 
 -- =============================================================================
@@ -43,7 +43,7 @@ CREATE TABLE warehouse (
 
 CREATE TABLE zone (
     id              BIGINT       PRIMARY KEY,
-    warehouse_id    BIGINT       NOT NULL,
+    warehouse_id    BIGINT       NOT NULL REFERENCES warehouse(id),
     code            VARCHAR(32)  NOT NULL,
     name            VARCHAR(64)  NOT NULL,
     temp_zone       VARCHAR(16)  NOT NULL,   -- AMBIENT/CHILLED/FROZEN/FRESH
@@ -61,8 +61,8 @@ CREATE INDEX ix_zone_wh_type ON zone(warehouse_id, zone_type, temp_zone);
 
 CREATE TABLE location (
     id                  BIGINT        PRIMARY KEY,
-    warehouse_id        BIGINT        NOT NULL,
-    zone_id             BIGINT        NOT NULL,
+    warehouse_id        BIGINT        NOT NULL REFERENCES warehouse(id),
+    zone_id             BIGINT        NOT NULL REFERENCES zone(id),
     code                VARCHAR(32)   NOT NULL,
     location_type       VARCHAR(16)   NOT NULL,   -- PALLET/SHELF/FLOOR/BIN
     capacity_weight     NUMERIC(12,3) NOT NULL DEFAULT 0,
@@ -118,17 +118,20 @@ CREATE INDEX ix_sku_category ON sku(category_id, status);
 
 CREATE TABLE sku_barcode (
     id          BIGINT      PRIMARY KEY,
-    sku_id      BIGINT      NOT NULL,
+    sku_id      BIGINT      NOT NULL REFERENCES sku(id),
     barcode     VARCHAR(64) NOT NULL,
     uom         VARCHAR(16) NOT NULL DEFAULT 'EA',   -- 该条码对应的包装层级
     is_primary  BOOLEAN     NOT NULL DEFAULT false,
     CONSTRAINT uq_barcode UNIQUE (barcode)
 );
 -- PDA 扫码解析：条码 → SKU，必须走唯一索引，一次命中
+-- #2 第十二轮（00 §6.10 扩到全部带唯一键的表）：REPLACE 同条码会静默删掉别的 SKU 的条码行（条码被"抢"走）→ 两个唯一键都先拦
+CREATE TRIGGER trg_bc_no_replace BEFORE INSERT ON sku_barcode WHEN EXISTS (SELECT 1 FROM sku_barcode b WHERE b.id = NEW.id) BEGIN SELECT RAISE(ABORT, 'barcode_duplicate: sku_barcode.id'); END;
+CREATE TRIGGER trg_bc_no_replace_code BEFORE INSERT ON sku_barcode WHEN EXISTS (SELECT 1 FROM sku_barcode b WHERE b.barcode = NEW.barcode) BEGIN SELECT RAISE(ABORT, 'barcode_duplicate: sku_barcode.barcode'); END;
 
 CREATE TABLE sku_unit (
     id              BIGINT        PRIMARY KEY,
-    sku_id          BIGINT        NOT NULL,
+    sku_id          BIGINT        NOT NULL REFERENCES sku(id),
     uom             VARCHAR(16)   NOT NULL,
     ratio_to_base   NUMERIC(14,6) NOT NULL,
     is_pick_uom     BOOLEAN       NOT NULL DEFAULT false,
@@ -139,11 +142,11 @@ CREATE TABLE sku_unit (
 
 CREATE TABLE lot (
     id                  BIGINT       PRIMARY KEY,
-    sku_id              BIGINT       NOT NULL,
+    sku_id              BIGINT       NOT NULL REFERENCES sku(id),
     lot_code            VARCHAR(64)  NOT NULL,
     production_date     DATE,                           -- 日历日（04 I5）
     expiry_date         DATE         NOT NULL,          -- FEFO 排序键；日历日，禁发期按仓库时区自然日计算（04 I5）
-    receive_date        TIMESTAMP    NOT NULL,
+    receive_date        DATE         NOT NULL,          -- #2 第十一轮：纯日期（收货自然日），不带时间；00 §6.8
     supplier_id         BIGINT,
     origin_batch        VARCHAR(64),
     quality_status      VARCHAR(16)  NOT NULL DEFAULT 'QUALIFIED',
@@ -152,6 +155,11 @@ CREATE TABLE lot (
     cert_no             VARCHAR(64),                    -- 检疫合格证等
     created_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
     updated_at          TIMESTAMP    NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT ck_lot_date CHECK (
+        (production_date IS NULL OR (production_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' AND date(production_date) IS production_date))
+        AND expiry_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' AND date(expiry_date) IS expiry_date
+        AND (sell_deadline IS NULL OR (sell_deadline GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' AND date(sell_deadline) IS sell_deadline))),
+    CONSTRAINT ck_lot_recv_ts CHECK (receive_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' AND date(receive_date) IS receive_date),   -- #2 第十一轮：只收 YYYY-MM-DD，拒时间/24:00/偏移/斜杠/紧凑写法/非法日期
     CONSTRAINT uq_lot UNIQUE (sku_id, lot_code, expiry_date)
 );
 CREATE INDEX ix_lot_expiry ON lot(sku_id, expiry_date) WHERE quality_status = 'QUALIFIED';
@@ -162,6 +170,19 @@ CREATE INDEX ix_lot_aging  ON lot(remaining_life_days, sku_id);
 CREATE TRIGGER trg_lot_sell_deadline BEFORE UPDATE ON lot
 WHEN NEW.sell_deadline IS NOT OLD.sell_deadline
 BEGIN SELECT RAISE(ABORT, 'sell_deadline_immutable'); END;
+-- #2 第十二轮：REPLACE 撞 id 或 uq_lot 会删旧批次再插新行，绕过 trg_lot_sell_deadline（00 §6.10）→ 两个唯一键都先拦
+CREATE TRIGGER trg_lot_no_replace BEFORE INSERT ON lot WHEN EXISTS (SELECT 1 FROM lot l WHERE l.id = NEW.id
+  OR (l.sku_id = NEW.sku_id AND l.lot_code = NEW.lot_code AND l.expiry_date = NEW.expiry_date))
+BEGIN SELECT RAISE(ABORT, 'lot_duplicate'); END;
+-- #2 第十二轮（小玛丽 r12 B2）：主数据按业务键换 id REPLACE 会静默删掉父行；子表 sku_id / location_id / zone_id 很多没声明外键（见 #14），删掉就是孤儿 → 每个唯一键都拦
+CREATE TRIGGER trg_warehouse_no_replace BEFORE INSERT ON warehouse WHEN EXISTS (SELECT 1 FROM warehouse x WHERE x.id = NEW.id) BEGIN SELECT RAISE(ABORT, 'master_duplicate: warehouse.id'); END;
+CREATE TRIGGER trg_warehouse_no_replace_code BEFORE INSERT ON warehouse WHEN EXISTS (SELECT 1 FROM warehouse x WHERE x.code = NEW.code) BEGIN SELECT RAISE(ABORT, 'master_duplicate: warehouse.code'); END;
+CREATE TRIGGER trg_zone_no_replace BEFORE INSERT ON zone WHEN EXISTS (SELECT 1 FROM zone x WHERE x.id = NEW.id) BEGIN SELECT RAISE(ABORT, 'master_duplicate: zone.id'); END;
+CREATE TRIGGER trg_zone_no_replace_code BEFORE INSERT ON zone WHEN EXISTS (SELECT 1 FROM zone x WHERE x.warehouse_id = NEW.warehouse_id AND x.code = NEW.code) BEGIN SELECT RAISE(ABORT, 'master_duplicate: zone.warehouse_id, zone.code'); END;
+CREATE TRIGGER trg_location_no_replace BEFORE INSERT ON location WHEN EXISTS (SELECT 1 FROM location x WHERE x.id = NEW.id) BEGIN SELECT RAISE(ABORT, 'master_duplicate: location.id'); END;
+CREATE TRIGGER trg_location_no_replace_code BEFORE INSERT ON location WHEN EXISTS (SELECT 1 FROM location x WHERE x.warehouse_id = NEW.warehouse_id AND x.code = NEW.code) BEGIN SELECT RAISE(ABORT, 'master_duplicate: location.warehouse_id, location.code'); END;
+CREATE TRIGGER trg_sku_no_replace BEFORE INSERT ON sku WHEN EXISTS (SELECT 1 FROM sku x WHERE x.id = NEW.id) BEGIN SELECT RAISE(ABORT, 'master_duplicate: sku.id'); END;
+CREATE TRIGGER trg_sku_no_replace_code BEFORE INSERT ON sku WHEN EXISTS (SELECT 1 FROM sku x WHERE x.code = NEW.code) BEGIN SELECT RAISE(ABORT, 'master_duplicate: sku.code'); END;
 -- -----------------------------------------------------------------------------
 -- 库存（核心）
 -- -----------------------------------------------------------------------------
@@ -173,9 +194,9 @@ BEGIN SELECT RAISE(ABORT, 'sell_deadline_immutable'); END;
 
 CREATE TABLE stock (
     id                      BIGINT          PRIMARY KEY,
-    warehouse_id            BIGINT          NOT NULL,
-    location_id             BIGINT          NOT NULL,
-    sku_id                  BIGINT          NOT NULL,
+    warehouse_id            BIGINT          NOT NULL REFERENCES warehouse(id),
+    location_id             BIGINT          NOT NULL REFERENCES location(id),
+    sku_id                  BIGINT          NOT NULL REFERENCES sku(id),
     lot_id                  BIGINT          NOT NULL,
     container_id            BIGINT          NOT NULL DEFAULT 0,   -- 0 = 散货无容器（哨兵值，见下）
     uom                     VARCHAR(16)     NOT NULL,             -- 恒为 sku.base_uom
@@ -211,6 +232,10 @@ CREATE TABLE stock (
         AND (allocated_qty_milli + reserved_qty_milli + quality_hold_qty_milli + hold_qty_milli) <= on_hand_qty_milli
     )
 );
+-- #2 第十二轮（00 §6.10 扩到全部表）：stock 行带 version / 各数量，REPLACE 撞 id 或 uq_stock_dim 会把余额和版本整行重置 → 先拦
+CREATE TRIGGER trg_stock_no_replace BEFORE INSERT ON stock WHEN EXISTS (SELECT 1 FROM stock s WHERE s.id = NEW.id) BEGIN SELECT RAISE(ABORT, 'stock_duplicate: stock.id'); END;
+CREATE TRIGGER trg_stock_no_replace_dim BEFORE INSERT ON stock WHEN EXISTS (SELECT 1 FROM stock s WHERE s.warehouse_id = NEW.warehouse_id AND s.location_id = NEW.location_id AND s.sku_id = NEW.sku_id AND s.lot_id = NEW.lot_id AND s.container_id = NEW.container_id)
+BEGIN SELECT RAISE(ABORT, 'stock_duplicate: stock.warehouse_id, stock.location_id, stock.sku_id, stock.lot_id, stock.container_id'); END;
 CREATE INDEX ix_stock_sku_avail ON stock(sku_id, warehouse_id, lot_id) WHERE on_hand_qty_milli > 0;
 CREATE INDEX ix_stock_loc       ON stock(location_id, sku_id);
 CREATE INDEX ix_stock_wh        ON stock(warehouse_id, sku_id);
@@ -229,12 +254,17 @@ CREATE TABLE stock_reservation (
     consumed_qty_milli  BIGINT          NOT NULL DEFAULT 0,
     released_qty_milli  BIGINT          NOT NULL DEFAULT 0,
     status              VARCHAR(16)     NOT NULL DEFAULT 'RESERVED',  -- RESERVED/CONSUMED/RELEASED，由余量决定
-    expires_at          TIMESTAMP,                  -- 超时自动释放，防死锁
+    expires_at          TIMESTAMP,                  -- 超时自动释放，防死锁。#2 第九轮：由库计算（created_at + 最长 TTL 24h），调用方不能填永不过期
     version             BIGINT          NOT NULL DEFAULT 0,
     created_at          TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     updated_at          TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     CONSTRAINT uq_res_op  UNIQUE (op_key),
     CONSTRAINT ck_res_stage CHECK (stage IN ('RESERVE','ALLOCATE')),
+    -- #2 第九轮 TTL 上界：expires_at 只能落在 (created_at, created_at + 24h]；允许缩短（更早释放更安全），不许超过 24h。
+    -- 不能为 NULL（NULL = 永不过期）：PG 列 NOT NULL（BEFORE INSERT 触发器先补算）；SQLite 由 AFTER INSERT 补算，trg_res_expires_lock 拒 UPDATE 成 NULL
+    CONSTRAINT ck_res_ttl CHECK (expires_at IS NULL OR (strftime('%s', created_at) IS NOT NULL AND strftime('%s', expires_at) IS NOT NULL
+        AND expires_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND substr(expires_at, 12, 2) <= '23'
+        AND CAST(strftime('%s', expires_at) AS INTEGER) - CAST(strftime('%s', created_at) AS INTEGER) BETWEEN 1 AND 86400)),
     CONSTRAINT ck_res_int CHECK (
         reserve_qty_milli = CAST(reserve_qty_milli AS BIGINT)
         AND consumed_qty_milli = CAST(consumed_qty_milli AS BIGINT)
@@ -255,6 +285,24 @@ CREATE TABLE stock_reservation (
 CREATE INDEX ix_res_stock  ON stock_reservation(stock_id, stage, status);
 CREATE INDEX ix_res_source ON stock_reservation(source_type, source_id, source_line_id);
 CREATE INDEX ix_res_exp    ON stock_reservation(expires_at) WHERE status = 'RESERVED';
+-- #2 第九轮：预占过期时间由库计算。PG：INSERT 时 created_at 强制为库时钟（UTC 整秒），expires_at 为空则补 created_at + 24h；
+-- 调用方显式给的值由 ck_res_ttl 校验上界（不能超过 24h，不能早于建单）；UPDATE 不许改 created_at。
+-- SQLite：created_at 只收与 now 相差 ≤ 300s 的整秒 UTC；AFTER INSERT 补 expires_at；上界同样由 ck_res_ttl 拦。
+-- B1：PG 补算在 BEFORE 触发器里，NOT NULL 检查在其后，调用方 / 属主都不能把它改成 NULL
+CREATE TRIGGER trg_res_clock BEFORE INSERT ON stock_reservation
+WHEN NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' OR substr(NEW.created_at, 12, 2) > '23' OR strftime('%s', NEW.created_at) IS NULL
+  OR abs(CAST(strftime('%s', NEW.created_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300
+BEGIN SELECT RAISE(ABORT, 'reservation_clock_skew'); END;
+CREATE TRIGGER trg_res_ttl_fill AFTER INSERT ON stock_reservation WHEN NEW.expires_at IS NULL
+BEGIN UPDATE stock_reservation SET expires_at = datetime(NEW.created_at, '+24 hours') WHERE id = NEW.id; END;
+-- SQLite REPLACE 冲突是删旧行再插新行，不经过 UPDATE 触发器（小玛丽 r10 R1：可借此无限续期）→ 同 trg_idem_no_replace，主键已存在就中止
+--   主键和 op_key 都查：REPLACE 撞 op_key（换 id）同样会删旧行重建。同 op_key 的普通重复插入也由本触发器先拦（reservation_duplicate），uq_res_op 兜底
+CREATE TRIGGER trg_res_no_replace BEFORE INSERT ON stock_reservation WHEN EXISTS (SELECT 1 FROM stock_reservation r WHERE r.id = NEW.id OR r.op_key = NEW.op_key)
+BEGIN SELECT RAISE(ABORT, 'reservation_duplicate'); END;
+CREATE TRIGGER trg_res_expires_lock BEFORE UPDATE OF expires_at ON stock_reservation WHEN NEW.expires_at IS NULL
+BEGIN SELECT RAISE(ABORT, 'reservation_expires_null'); END;
+CREATE TRIGGER trg_res_created_lock BEFORE UPDATE OF created_at ON stock_reservation WHEN NEW.created_at IS NOT OLD.created_at
+BEGIN SELECT RAISE(ABORT, 'reservation_created_at_immutable'); END;
 
 CREATE TABLE stock_hold (
     id                  BIGINT          PRIMARY KEY,
@@ -389,7 +437,7 @@ CREATE TABLE stock_movement_key (
     stock_id            BIGINT          NOT NULL,
     stock_seq           BIGINT          NOT NULL,
     direction           SMALLINT        NOT NULL,
-    occurred_at         TIMESTAMP       NOT NULL,       -- 冗余，便于按 key 找到所在分区
+    occurred_at         TIMESTAMP       NOT NULL DEFAULT (datetime('now')),  -- 冗余，便于按 key 找到所在分区；#2 第十一轮：服务端时间（trg_mvk_zclock）
     CONSTRAINT uq_mvk_idem UNIQUE (idempotency_key),
     CONSTRAINT ck_mvk_kind CHECK (
         (src_kind = 'DOC' AND src_task_id IS NULL AND src_line_no IS NULL AND device_instance_id IS NULL AND src_op_seq IS NULL AND op_no >= 1)
@@ -412,10 +460,10 @@ CREATE TABLE stock_movement (
     stock_id                    BIGINT          NOT NULL,   -- 记账到哪一行库存，按行回放的依据
     hold_id                     BIGINT,                     -- 冻结类流水指向单条 stock_hold；非冻结流水 NULL。I3f/I3g 按此对账，不按 stock 汇总
     stock_seq                   BIGINT          NOT NULL,   -- = 该次条件 UPDATE 后的 stock.ledger_seq；direction=0 时填当前 ledger_seq（不入链）
-    warehouse_id                BIGINT          NOT NULL,
-    location_id                 BIGINT          NOT NULL,
-    from_location_id            BIGINT,
-    sku_id                      BIGINT          NOT NULL,
+    warehouse_id                BIGINT          NOT NULL REFERENCES warehouse(id),
+    location_id                 BIGINT          NOT NULL REFERENCES location(id),
+    from_location_id            BIGINT REFERENCES location(id),
+    sku_id                      BIGINT          NOT NULL REFERENCES sku(id),
     lot_id                      BIGINT          NOT NULL,
     container_id                BIGINT          NOT NULL DEFAULT 0,
     -- PDA 作业来源 = 00 总体设计 §6.5 四元组 (task_id, line_no, device_instance_id, op_seq)；DOC 行四列全 NULL
@@ -428,7 +476,7 @@ CREATE TABLE stock_movement (
     on_hand_after_qty_milli     BIGINT          NOT NULL,
     operator_id                 BIGINT,
     device                      VARCHAR(32),
-    occurred_at                 TIMESTAMP       NOT NULL,
+    occurred_at                 TIMESTAMP       NOT NULL DEFAULT (datetime('now')),  -- #2 第十一轮：服务端时间（trg_mv_zclock），00 §6.8 第 7 条
     recorded_at                 TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
     cost_amount                 BIGINT,                     -- 分
     idempotency_key             VARCHAR(160)    NOT NULL,   -- 唯一格式见 stock_movement_key
@@ -523,14 +571,44 @@ CREATE TRIGGER trg_hold_no_delete BEFORE DELETE ON stock_hold BEGIN SELECT RAISE
 CREATE TRIGGER trg_hold_no_replace BEFORE INSERT ON stock_hold
 WHEN EXISTS (SELECT 1 FROM stock_hold h WHERE h.id = NEW.id OR h.op_key = NEW.op_key)
 BEGIN SELECT RAISE(ABORT, 'hold_duplicate'); END;
+-- 第十二轮（r11 X1/X2）：uq_hold_return（部分索引，同谓词）
+CREATE TRIGGER trg_hold_no_replace_ret BEFORE INSERT ON stock_hold WHEN EXISTS (SELECT 1 FROM stock_hold h WHERE NEW.hold_type = 'RETURN_PENDING' AND h.hold_type = 'RETURN_PENDING' AND h.source_id = NEW.source_id)
+BEGIN SELECT RAISE(ABORT, 'hold_duplicate: stock_hold.source_id'); END;
 
 -- 只追加：流水表与去重表禁止 UPDATE / DELETE。PG 侧收回应用角色权限 + 触发器（防超级用户/运维脚本误操作）；SQLite 侧触发器
 -- search_path 固定为 pg_catalog, public。函数体只用 TG_TABLE_NAME。
+-- #2 第十一轮（小玛丽 r10 R2）：流水与 key 的 occurred_at 由 02 原语写，是服务端时间（00 §6.8 第 7 条）。
+-- PG：非表属主写入一律改成 date_trunc('second', now() AT TIME ZONE 'UTC')（同一事务内 now() 不变，key 与流水取到同一值，fk_mv_key 对得上）。
+--     stock_movement 按月分区，BEFORE 行触发器建在父表上（PG13+ 自动克隆到各分区），在路由之后执行，不能把行改到别的分区：
+--     调用方的值与库时钟不在同一个月时直接拒 movement_clock_skew（→ 40003），同月则覆盖。原语不传 occurred_at（走 DEFAULT）就不会撞上。
+--     表属主（迁移 / 期初导入 / verify 种子）不受约束，同 10 trg_srtn_zclock、11 trg_outbox_insert_pending 的属主口径。
+-- SQLite（不能改 NEW）：trg_mv_clock / trg_mvk_clock 拒非整秒 UTC 或与 now 相差 > 300 s（movement_clock_skew → 40003）。
+CREATE TRIGGER trg_mv_clock BEFORE INSERT ON stock_movement
+WHEN NEW.occurred_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' OR substr(NEW.occurred_at, 12, 2) > '23' OR strftime('%s', NEW.occurred_at) IS NULL
+  OR abs(CAST(strftime('%s', NEW.occurred_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300
+BEGIN SELECT RAISE(ABORT, 'movement_clock_skew'); END;
+CREATE TRIGGER trg_mvk_clock BEFORE INSERT ON stock_movement_key
+WHEN NEW.occurred_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' OR substr(NEW.occurred_at, 12, 2) > '23' OR strftime('%s', NEW.occurred_at) IS NULL
+  OR abs(CAST(strftime('%s', NEW.occurred_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)) > 300
+BEGIN SELECT RAISE(ABORT, 'movement_clock_skew'); END;
 -- TRUNCATE 不触发行级触发器，单独加语句级触发器拦（小赵 C5）；归档走 DETACH PARTITION，不用 TRUNCATE
 -- 应用角色授权清单（小赵 C3，docs/02 §4.9）：库存类表只给 SELECT/INSERT/UPDATE，不给 DELETE/TRUNCATE；
 -- stock_ledger_line 只能改换主相关列（第 5 篇改派/重新领取），来源与单据行由 trg_sll_immutable 再拦一道（防超级用户/迁移脚本）
 -- stock_hold 只授释放相关列（小赵 N1）；其余列由 trg_hold_immutable 再拦一道（防超级用户/迁移脚本）
 CREATE TRIGGER trg_mv_no_update  BEFORE UPDATE ON stock_movement     BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement'); END;
+-- #2 第十一轮：只追加表也要防 REPLACE（REPLACE 删旧行不触发 DELETE 触发器）。
+-- #2 第十二轮（小玛丽 r11 X1）：表上**每个**唯一键都要拦，不只主键——REPLACE 撞任意唯一键都会删掉那一行，且 SQLite 的隐式删除不做外键检查。
+-- 部分唯一索引按索引谓词收窄（与索引同条件），否则会误拦合法行。
+CREATE TRIGGER trg_mv_no_replace  BEFORE INSERT ON stock_movement     WHEN EXISTS (SELECT 1 FROM stock_movement m WHERE m.id = NEW.id AND m.occurred_at = NEW.occurred_at) BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement'); END;
+-- 每个唯一键一个触发器，报错尾部与 UNIQUE 冲突同名（便于两库用例按同一键断言）。SQLite 后建的触发器先触发：seq 放最后，多键同撞时先报账序分叉，与 UNIQUE 判定顺序一致
+CREATE TRIGGER trg_mvk_no_replace BEFORE INSERT ON stock_movement_key WHEN EXISTS (SELECT 1 FROM stock_movement_key k WHERE k.movement_id = NEW.movement_id) BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement_key'); END;
+CREATE TRIGGER trg_mvk_no_replace_idem BEFORE INSERT ON stock_movement_key WHEN EXISTS (SELECT 1 FROM stock_movement_key k WHERE k.idempotency_key = NEW.idempotency_key) BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement_key.idempotency_key'); END;
+CREATE TRIGGER trg_mvk_no_replace_biz BEFORE INSERT ON stock_movement_key WHEN EXISTS (SELECT 1 FROM stock_movement_key k WHERE NEW.src_kind = 'DOC' AND k.src_kind = 'DOC' AND k.biz_no = NEW.biz_no AND k.line_no = NEW.line_no AND k.op_no = NEW.op_no AND k.leg = NEW.leg) BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement_key.biz_no, stock_movement_key.line_no, stock_movement_key.op_no, stock_movement_key.leg'); END;
+CREATE TRIGGER trg_mvk_no_replace_pda BEFORE INSERT ON stock_movement_key WHEN EXISTS (SELECT 1 FROM stock_movement_key k WHERE NEW.src_kind = 'PDA' AND k.src_kind = 'PDA' AND k.src_task_id = NEW.src_task_id AND k.src_line_no = NEW.src_line_no AND k.device_instance_id = NEW.device_instance_id AND k.src_op_seq = NEW.src_op_seq AND k.leg = NEW.leg) BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement_key.src_task_id, stock_movement_key.src_line_no, stock_movement_key.device_instance_id, stock_movement_key.src_op_seq, stock_movement_key.leg'); END;
+CREATE TRIGGER trg_mvk_no_replace_seq BEFORE INSERT ON stock_movement_key WHEN EXISTS (SELECT 1 FROM stock_movement_key k WHERE NEW.direction <> 0 AND k.direction <> 0 AND k.stock_id = NEW.stock_id AND k.stock_seq = NEW.stock_seq) BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement_key.stock_id, stock_movement_key.stock_seq'); END;
+-- stock_ledger_line：第十二轮起 02 原语改成"先查再插"（INSERT … SELECT … WHERE NOT EXISTS），重放不再产生插入，所以可以加防 REPLACE
+CREATE TRIGGER trg_sll_no_replace BEFORE INSERT ON stock_ledger_line WHEN EXISTS (SELECT 1 FROM stock_ledger_line l WHERE l.biz_no = NEW.biz_no AND l.line_no = NEW.line_no)
+BEGIN SELECT RAISE(ABORT, 'ledger_line_duplicate'); END;
 CREATE TRIGGER trg_mv_no_delete  BEFORE DELETE ON stock_movement     BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement'); END;
 CREATE TRIGGER trg_mvk_no_update BEFORE UPDATE ON stock_movement_key BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement_key'); END;
 CREATE TRIGGER trg_mvk_no_delete BEFORE DELETE ON stock_movement_key BEGIN SELECT RAISE(ABORT, 'append_only_violation: stock_movement_key'); END;
@@ -539,9 +617,9 @@ CREATE TRIGGER trg_mvk_no_delete BEFORE DELETE ON stock_movement_key BEGIN SELEC
 CREATE TABLE stock_snapshot_daily (
     work_date               DATE            NOT NULL,
     stock_id                BIGINT          NOT NULL,
-    warehouse_id            BIGINT          NOT NULL,
-    location_id             BIGINT          NOT NULL,
-    sku_id                  BIGINT          NOT NULL,
+    warehouse_id            BIGINT          NOT NULL REFERENCES warehouse(id),
+    location_id             BIGINT          NOT NULL REFERENCES location(id),
+    sku_id                  BIGINT          NOT NULL REFERENCES sku(id),
     lot_id                  BIGINT          NOT NULL,
     container_id            BIGINT          NOT NULL DEFAULT 0,
     on_hand_qty_milli       BIGINT          NOT NULL,
@@ -552,14 +630,18 @@ CREATE TABLE stock_snapshot_daily (
     ledger_seq              BIGINT          NOT NULL,   -- 快照水位线：回放该行 stock_seq <= ledger_seq 的流水应等于 on_hand
     cost_amount             BIGINT          NOT NULL DEFAULT 0,
     created_at              TIMESTAMP       NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT ck_ssd_date CHECK (work_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' AND date(work_date) IS work_date),
     PRIMARY KEY (work_date, stock_id)
 );
+-- #2 第十二轮：日快照一天一行，REPLACE 会改写历史快照 → 先拦（重跑快照任务按主键先查）
+CREATE TRIGGER trg_snap_no_replace BEFORE INSERT ON stock_snapshot_daily WHEN EXISTS (SELECT 1 FROM stock_snapshot_daily d WHERE d.work_date = NEW.work_date AND d.stock_id = NEW.stock_id)
+BEGIN SELECT RAISE(ABORT, 'snapshot_duplicate: stock_snapshot_daily.work_date, stock_snapshot_daily.stock_id'); END;
 CREATE INDEX ix_snap_sku ON stock_snapshot_daily(work_date, warehouse_id, sku_id, lot_id);
 
 CREATE TABLE stock_recon_alert (
     id                      BIGINT          PRIMARY KEY,
     check_code              VARCHAR(24)     NOT NULL,   -- 码表见 ck_recon_code；CHECK_BOX_MISMATCH 18 位，16 放不下
-    warehouse_id            BIGINT          NOT NULL,
+    warehouse_id            BIGINT          NOT NULL REFERENCES warehouse(id),
     stock_id                BIGINT          NOT NULL DEFAULT 0,   -- 0 = 仓级汇总差异（R11）
     expected_qty_milli      BIGINT          NOT NULL,
     actual_qty_milli        BIGINT          NOT NULL,
@@ -575,6 +657,12 @@ CREATE TABLE stock_recon_alert (
 );
 CREATE INDEX ix_recon_open ON stock_recon_alert(warehouse_id, status, detected_at DESC);
 CREATE UNIQUE INDEX uq_recon_open ON stock_recon_alert(check_code, warehouse_id, stock_id) WHERE status <> 'RESOLVED';
+-- #2 第十二轮（r12 非阻塞 1）：RESOLVED 是终态，闭环后的 resolved_by / resolution / stock_id / detected_at 不能再改（UPDATE 拒，REPLACE 撞 id 拒）。
+-- 未闭环告警仍走 INSERT … ON CONFLICT (uq_recon_open) DO UPDATE 累加 hit_count，所以 uq_recon_open 不加 BEFORE INSERT 守卫（键级豁免，见 00 §6.10）；
+-- 经 uq_recon_open 的 REPLACE 只能碰到未闭环行（索引谓词 status <> 'RESOLVED'），会把未闭环告警整行重写（hit_count、detected_at 重置）——与 UPDATE 本来就能做的一样，不涉及库存数量。
+CREATE TRIGGER trg_recon_resolved_lock BEFORE UPDATE ON stock_recon_alert WHEN OLD.status = 'RESOLVED' BEGIN SELECT RAISE(ABORT, 'recon_resolved_immutable'); END;
+CREATE TRIGGER trg_recon_no_delete BEFORE DELETE ON stock_recon_alert WHEN OLD.status = 'RESOLVED' BEGIN SELECT RAISE(ABORT, 'recon_resolved_immutable'); END;
+CREATE TRIGGER trg_recon_no_replace BEFORE INSERT ON stock_recon_alert WHEN EXISTS (SELECT 1 FROM stock_recon_alert a WHERE a.id = NEW.id) BEGIN SELECT RAISE(ABORT, 'recon_duplicate: stock_recon_alert.id'); END;
 -- ↑ 未闭环的同一差异只有一条；对账任务用 INSERT … ON CONFLICT DO UPDATE SET hit_count = hit_count + 1, last_seen_at = …
 --   （PG 与 SQLite ≥ 3.24 写法相同；部分唯一索引作冲突目标时两库都要求带同样的 WHERE）
 
