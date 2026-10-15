@@ -165,6 +165,9 @@ assert_n() {  # $1 描述  $2 SQL  $3 期望行数。计数语句本身失败也
   [ "$n" = "$3" ] && ok "$1 = $n" || bad "$1 = $n，期望 $3"
 }
 seed "INSERT INTO warehouse (id,code,name,cutoff_time,work_date_offset) VALUES (1,'WHSH01','上海青浦仓','20:00',-1);"
+# 跨篇 FK 收口（Chief 2026-10-16）：03/10 supplier_id 与 04 customer_id 的既有种子用 501 / 1，**父行必须最先建**
+seed "INSERT INTO supplier (id,code,name) VALUES (501,'SUP501','跨篇 FK 收口父行');"
+seed "INSERT INTO customer (id,code,name) VALUES (1,'STORE0001','跨篇 FK 收口父行');"
 # 第 12 篇 FK 底数：102–199、201–299 号测试用户（审批人 / 申请人 / 映射引用）
 seed "INSERT INTO sys_user (id,username,password_hash) SELECT i, 'seed' || i, 'x' FROM generate_series(102,299) i WHERE i <> 200;"
 seed "INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type,temp_min_c10,temp_max_c10) VALUES (1,1,'Z-C1','冷藏拣货区','CHILLED','PICK',20,80),(2,1,'Z-C2','冷藏存储区','CHILLED','STORAGE',20,80);"
@@ -229,6 +232,8 @@ assert_n "种子 replenish_task_line" "SELECT count(*) FROM replenish_task_line"
 assert_n "种子 replenish_demand" "SELECT count(*) FROM replenish_demand" 1
 assert_n "种子 move_order" "SELECT count(*) FROM move_order" 2
 assert_n "种子 move_order_line" "SELECT count(*) FROM move_order_line" 1
+assert_n "种子 supplier(501)" "SELECT count(*) FROM supplier WHERE id = 501" 1
+assert_n "种子 customer(1)" "SELECT count(*) FROM customer WHERE id = 1" 1
 # 第 7 篇候选视图 v_location_sku_candidate：每个用例一个事务现造夹具（BEGIN … ROLLBACK），不依赖基础种子；
 # 与 verify_sqlite.py 的 _view_case 同名同口径（两库对称）。号段避开其他篇用例。
 _vseed="INSERT INTO zone (id,warehouse_id,code,name,temp_zone,zone_type,temp_min_c10,temp_max_c10) VALUES (7711,1,'Z7V-C','7篇视图冷藏','CHILLED','STORAGE',0,40),(7712,1,'Z7V-A','7篇视图常温','AMBIENT','STORAGE',100,300); \
@@ -3688,6 +3693,50 @@ expect_block "01 拒绝：uq_driver_phone 手机号重复" "INSERT INTO driver (
 expect_block "01 拒绝：uq_device_instance 实例号重复" "INSERT INTO device (id,device_instance_id,device_type,warehouse_id) VALUES (8835,'D-PDA-8805','PDA',1);" "uq_device_instance"
 R=$(psql -t -A -c "SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexname='ix_lot_supplier'")
 [ "$R" = "1" ] && ok "01 目录断言：ix_lot_supplier（lot.supplier_id 外键列索引）存在（$R）" || bad "01 ix_lot_supplier 缺：$R（期望 1）"
+echo "=== 2a-FK. 跨篇 FK 收口（03 supplier / 10 supplier / 04 customer+driver / 12b device，共 5 条命名外键）==="
+expect_block "跨篇 FK：inbound_order.supplier_id 指向不存在的供应商" "INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,supplier_id,status,work_date) VALUES (8901,'INB-FK1',1,'PURCHASE','ERP','PO-FK1','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',999999,'RECEIVING','2026-10-15');" "fk_inb_supplier"
+expect_allow "跨篇 FK 正向：inbound_order.supplier_id = 501（父行在种子里）" "BEGIN; INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,supplier_id,status,work_date) VALUES (8902,'INB-FK2',1,'PURCHASE','ERP','PO-FK2','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',501,'RECEIVING','2026-10-15'); ROLLBACK;"
+expect_block "跨篇 FK：supplier_return.supplier_id 指向不存在的供应商" "INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (8903,'SRN-8903',1,999999,14,1,1,5000,'SLOW_MOVING','CT-FK',false,'DISCOUNT','FRESH',date_trunc('second', now() AT TIME ZONE 'UTC'),NULL,31);" "fk_srtn_supplier"
+expect_block "跨篇 FK：outbound_order.customer_id 指向不存在的客户" "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (8904,'OBT-FK1',1,'SALE','MALL','M-FK1','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',999999,'CREATED','2026-10-16');" "fk_obo_customer"
+expect_block "跨篇 FK：outbound_order.driver_id 指向不存在的司机" "INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,driver_id,status,work_date) VALUES (8905,'OBT-FK2',1,'SALE','MALL','M-FK2','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,999999,'CREATED','2026-10-16');" "fk_obo_driver"
+expect_block "跨篇 FK：user_device_binding.device_id 指向不存在的设备" "INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id,device_id) VALUES (8906,'DEV-FK1','PDA',101,1,999999);" "fk_udb_device"
+expect_allow "跨篇 FK 正向：user_device_binding.device_id 指向同事务内新建的设备" "BEGIN; INSERT INTO device (id,device_instance_id,device_type,warehouse_id) VALUES (8907,'D-FK-8907','PDA',1); INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id,device_id) VALUES (8908,'DEV-FK2','PDA',101,1,8907); ROLLBACK;"
+expect_allow "跨篇 FK 正向：user_device_binding.device_id = NULL（司机自有手机，设备列可空）" "BEGIN; INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id) VALUES (8916,'D-FK-8916','PDA',101,1); ROLLBACK;"
+# 镜鉴 r65 重要 I1：本笔 5 条命名外键补齐**第三件（变异）**，并配「删父行被拦 / 去掉外键后删父行通过」。
+# 变异 = 同一事务里 DROP 掉该外键后再执行原被拒语句；通过 = 证明拦它的确实是这条 FK（随后 ROLLBACK）。
+# 删父行断言的父行一律在本事务内自建（9501–9504），保证事务里只有本事务这一条子行 → 命中的外键唯一、断言不抖。
+mut_fk() { expect_allow "跨篇 FK 变异：去掉 $1 后，$2（随后回滚）" "BEGIN; ALTER TABLE $3 DROP CONSTRAINT $1; $4 ROLLBACK;"; }
+mut_fk_del() { expect_allow "跨篇 FK 变异：去掉 $1 后，$2（随后回滚）" "BEGIN; ALTER TABLE $3 DROP CONSTRAINT $1; $4 $5 DELETE FROM $6 WHERE id=$7; ROLLBACK;"; }
+_FKH="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+_FK_X_INB="INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,supplier_id,status,work_date) VALUES (8901,'INB-FK1',1,'PURCHASE','ERP','PO-FK1','$_FKH',999999,'RECEIVING','2026-10-15');"
+_FK_X_SRTN="INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (8903,'SRN-8903',1,999999,14,1,1,5000,'SLOW_MOVING','CT-FK',false,'DISCOUNT','FRESH',date_trunc('second', now() AT TIME ZONE 'UTC'),NULL,31);"
+_FK_X_OBO_C="INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (8904,'OBT-FK1',1,'SALE','MALL','M-FK1','$_FKH',999999,'CREATED','2026-10-16');"
+_FK_X_OBO_D="INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,driver_id,status,work_date) VALUES (8905,'OBT-FK2',1,'SALE','MALL','M-FK2','$_FKH',1,999999,'CREATED','2026-10-16');"
+_FK_X_UDB="INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id,device_id) VALUES (8906,'D-FK-8906','PDA',101,1,999999);"
+_FK_P_SUP="INSERT INTO supplier (id,code,name) VALUES (9501,'SUP9501','变异用父行');"
+_FK_P_CUS="INSERT INTO customer (id,code,name) VALUES (9502,'STORE9502','变异用门店');"
+_FK_P_DRV="INSERT INTO driver (id,name,phone) VALUES (9503,'变异司机','13900139001');"
+_FK_P_DEV="INSERT INTO device (id,device_instance_id,device_type,warehouse_id) VALUES (9504,'D-FK-9504','PDA',1);"
+_FK_C_INB="INSERT INTO inbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,supplier_id,status,work_date) VALUES (8911,'INB-FK3',1,'PURCHASE','ERP','PO-FK3','$_FKH',9501,'RECEIVING','2026-10-15');"
+_FK_C_SRTN="INSERT INTO supplier_return (id,code,warehouse_id,supplier_id,stock_id,sku_id,lot_id,qty_milli,reason_code,contract_ref,food_safety,disposition,temp_class,ready_at,pickup_deadline_at,created_by) VALUES (8912,'SRN-8912',1,9501,14,1,1,5000,'SLOW_MOVING','CT-FK',false,'DISCOUNT','FRESH',date_trunc('second', now() AT TIME ZONE 'UTC'),NULL,31);"
+_FK_C_OBO_C="INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,status,work_date) VALUES (8913,'OBT-FK3',1,'SALE','MALL','M-FK3','$_FKH',9502,'CREATED','2026-10-16');"
+_FK_C_OBO_D="INSERT INTO outbound_order (id,code,warehouse_id,order_type,source_system,source_order_no,source_hash,customer_id,driver_id,status,work_date) VALUES (8914,'OBT-FK4',1,'SALE','MALL','M-FK4','$_FKH',9502,9503,'CREATED','2026-10-16');"
+_FK_C_UDB="INSERT INTO user_device_binding (id,device_instance_id,client_type,user_id,warehouse_id,device_id) VALUES (8915,'D-FK-9504','PDA',101,1,9504);"
+mut_fk "fk_inb_supplier" "悬空 supplier_id 的入库单写入通过" "inbound_order" "$_FK_X_INB"
+mut_fk "fk_srtn_supplier" "悬空 supplier_id 的退供单写入通过" "supplier_return" "$_FK_X_SRTN"
+mut_fk "fk_obo_customer" "悬空 customer_id 的出库单写入通过" "outbound_order" "$_FK_X_OBO_C"
+mut_fk "fk_obo_driver" "悬空 driver_id 的出库单写入通过" "outbound_order" "$_FK_X_OBO_D"
+mut_fk "fk_udb_device" "悬空 device_id 的设备绑定写入通过" "user_device_binding" "$_FK_X_UDB"
+expect_block "跨篇 FK：删被 inbound_order 引用的供应商被拦" "BEGIN; $_FK_P_SUP $_FK_C_INB DELETE FROM supplier WHERE id=9501; ROLLBACK;" "fk_inb_supplier"
+mut_fk_del "fk_inb_supplier" "自建父行与子行后删供应商通过" "inbound_order" "$_FK_P_SUP" "$_FK_C_INB" "supplier" "9501"
+expect_block "跨篇 FK：删被 supplier_return 引用的供应商被拦" "BEGIN; $_FK_P_SUP $_FK_C_SRTN DELETE FROM supplier WHERE id=9501; ROLLBACK;" "fk_srtn_supplier"
+mut_fk_del "fk_srtn_supplier" "自建父行与子行后删供应商通过" "supplier_return" "$_FK_P_SUP" "$_FK_C_SRTN" "supplier" "9501"
+expect_block "跨篇 FK：删被 outbound_order 引用的门店被拦" "BEGIN; $_FK_P_CUS $_FK_C_OBO_C DELETE FROM customer WHERE id=9502; ROLLBACK;" "fk_obo_customer"
+mut_fk_del "fk_obo_customer" "自建父行与子行后删门店通过" "outbound_order" "$_FK_P_CUS" "$_FK_C_OBO_C" "customer" "9502"
+expect_block "跨篇 FK：删被 outbound_order 引用的司机被拦" "BEGIN; $_FK_P_CUS $_FK_P_DRV $_FK_C_OBO_D DELETE FROM driver WHERE id=9503; ROLLBACK;" "fk_obo_driver"
+mut_fk_del "fk_obo_driver" "自建父行与子行后删司机通过" "outbound_order" "$_FK_P_CUS $_FK_P_DRV" "$_FK_C_OBO_D" "driver" "9503"
+expect_block "跨篇 FK：删被 user_device_binding 引用的设备被拦" "BEGIN; $_FK_P_DEV $_FK_C_UDB DELETE FROM device WHERE id=9504; ROLLBACK;" "fk_udb_device"
+mut_fk_del "fk_udb_device" "自建父行与子行后删设备通过" "user_device_binding" "$_FK_P_DEV" "$_FK_C_UDB" "device" "9504"
 echo "=== 2t. docs/05 波次与拣货：本轮新增 12 个 CHECK / 8 个外键 / ix_pt_handover 的三件套（正向 / 按名拒绝 / 变异）==="
 # 变异 = 同一事务里去掉该约束再执行原被拒语句，必须变成通过，然后 ROLLBACK（证明拒绝确实来自该约束）
 mut05() { expect_allow "05 变异：去掉 $1 后，原被拒语句通过（随后回滚）" "BEGIN; ALTER TABLE $2 DROP CONSTRAINT $1; $3 ROLLBACK;"; }

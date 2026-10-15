@@ -353,7 +353,7 @@ CREATE TABLE supplier_return (
     id                  BIGINT          PRIMARY KEY,
     code                VARCHAR(64)     NOT NULL,      -- SRN-{仓}-{节点}-{作业日}-{序号}
     warehouse_id        BIGINT          NOT NULL,
-    supplier_id         BIGINT          NOT NULL,
+    supplier_id         BIGINT          NOT NULL CONSTRAINT fk_srtn_supplier REFERENCES supplier(id),   -- 跨篇 FK 收口
     stock_id            BIGINT          NOT NULL,
     sku_id              BIGINT          NOT NULL,
     lot_id              BIGINT          NOT NULL,

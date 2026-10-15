@@ -19,7 +19,7 @@ CREATE TABLE inbound_order (
     source_system   VARCHAR(24)  NOT NULL,
     source_order_no VARCHAR(64)  NOT NULL,
     source_hash     CHAR(64),                -- 上游推单内容哈希（00 §6.5），小写 hex；内部生成的单（拒收回仓、盲收）可空
-    supplier_id     BIGINT,
+    supplier_id     BIGINT       CONSTRAINT fk_inb_supplier REFERENCES supplier(id),   -- 跨篇 FK 收口（Chief 2026-10-16）
     status          VARCHAR(24)  NOT NULL DEFAULT 'CREATED',   -- 见 ck_inb_status
     work_date       DATE         NOT NULL,
     expected_at     TIMESTAMP,               -- 上游给的预计到货；预约到货 / 月台排班未定（03 §12 Q1），不建表

@@ -130,7 +130,7 @@ ALTER TABLE audit_log ADD CONSTRAINT fk_audit_approval FOREIGN KEY (approval_id)
 CREATE TABLE user_device_binding (
     id                  BIGINT       PRIMARY KEY,
     device_instance_id  VARCHAR(64)  NOT NULL,
-    device_id           BIGINT,                      -- 第 1 篇 device 台账；司机自有手机可为空
+    device_id           BIGINT          CONSTRAINT fk_udb_device REFERENCES device(id),   -- 第 1 篇 device 台账；司机自有手机可为空（跨篇 FK 收口）
     client_type         VARCHAR(16)  NOT NULL,       -- PDA / DRIVER_APP
     user_id             BIGINT       NOT NULL,
     warehouse_id        BIGINT       NOT NULL,

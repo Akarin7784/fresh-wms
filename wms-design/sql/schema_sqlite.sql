@@ -833,7 +833,7 @@ CREATE TABLE inbound_order (
     source_system   VARCHAR(24)  NOT NULL,
     source_order_no VARCHAR(64)  NOT NULL,
     source_hash     CHAR(64),                -- 上游推单内容哈希（00 §6.5），小写 hex；内部生成的单（拒收回仓、盲收）可空
-    supplier_id     BIGINT,
+    supplier_id     BIGINT       CONSTRAINT fk_inb_supplier REFERENCES supplier(id),   -- 跨篇 FK 收口（Chief 2026-10-16）
     status          VARCHAR(24)  NOT NULL DEFAULT 'CREATED',   -- 见 ck_inb_status
     work_date       DATE         NOT NULL,
     expected_at     TIMESTAMP,               -- 上游给的预计到货；预约到货 / 月台排班未定（03 §12 Q1），不建表
@@ -1235,7 +1235,7 @@ CREATE TABLE outbound_order (
     order_type              VARCHAR(24)     NOT NULL,
     source_system           VARCHAR(24)     NOT NULL,
     source_order_no         VARCHAR(64)     NOT NULL,
-    customer_id             BIGINT          NOT NULL,
+    customer_id             BIGINT          NOT NULL CONSTRAINT fk_obo_customer REFERENCES customer(id),   -- 跨篇 FK 收口
     route_code              VARCHAR(32),                 -- 波次聚合维度
     temperature_required    VARCHAR(16)     NOT NULL DEFAULT 'AMBIENT',
     required_delivery_date  TIMESTAMP,
@@ -1254,7 +1254,7 @@ CREATE TABLE outbound_order (
     total_amount            BIGINT          NOT NULL DEFAULT 0,
     picker_id               BIGINT,
     checker_id              BIGINT,
-    driver_id               BIGINT,
+    driver_id               BIGINT          CONSTRAINT fk_obo_driver REFERENCES driver(id),   -- 跨篇 FK 收口
     consignee_name          VARCHAR(64),                 -- 以下均为下单时快照
     consignee_phone         VARCHAR(32),
     address_snapshot        VARCHAR(512),
@@ -2233,7 +2233,7 @@ CREATE TABLE supplier_return (
     id                  BIGINT          PRIMARY KEY,
     code                VARCHAR(64)     NOT NULL,      -- SRN-{仓}-{节点}-{作业日}-{序号}
     warehouse_id        BIGINT          NOT NULL,
-    supplier_id         BIGINT          NOT NULL,
+    supplier_id         BIGINT          NOT NULL CONSTRAINT fk_srtn_supplier REFERENCES supplier(id),   -- 跨篇 FK 收口
     stock_id            BIGINT          NOT NULL,
     sku_id              BIGINT          NOT NULL,
     lot_id              BIGINT          NOT NULL,
@@ -2955,7 +2955,7 @@ CREATE TABLE approval_request (
 CREATE TABLE user_device_binding (
     id                  BIGINT       PRIMARY KEY,
     device_instance_id  VARCHAR(64)  NOT NULL,
-    device_id           BIGINT,                      -- 第 1 篇 device 台账；司机自有手机可为空
+    device_id           BIGINT          CONSTRAINT fk_udb_device REFERENCES device(id),   -- 第 1 篇 device 台账；司机自有手机可为空（跨篇 FK 收口）
     client_type         VARCHAR(16)  NOT NULL,       -- PDA / DRIVER_APP
     user_id             BIGINT       NOT NULL,
     warehouse_id        BIGINT       NOT NULL,

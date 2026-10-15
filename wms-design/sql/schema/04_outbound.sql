@@ -5,7 +5,7 @@ CREATE TABLE outbound_order (
     order_type              VARCHAR(24)     NOT NULL,
     source_system           VARCHAR(24)     NOT NULL,
     source_order_no         VARCHAR(64)     NOT NULL,
-    customer_id             BIGINT          NOT NULL,
+    customer_id             BIGINT          NOT NULL CONSTRAINT fk_obo_customer REFERENCES customer(id),   -- 跨篇 FK 收口
     route_code              VARCHAR(32),                 -- 波次聚合维度
     temperature_required    VARCHAR(16)     NOT NULL DEFAULT 'AMBIENT',
     required_delivery_date  TIMESTAMP,
@@ -24,7 +24,7 @@ CREATE TABLE outbound_order (
     total_amount            BIGINT          NOT NULL DEFAULT 0,
     picker_id               BIGINT,
     checker_id              BIGINT,
-    driver_id               BIGINT,
+    driver_id               BIGINT          CONSTRAINT fk_obo_driver REFERENCES driver(id),   -- 跨篇 FK 收口
     consignee_name          VARCHAR(64),                 -- 以下均为下单时快照
     consignee_phone         VARCHAR(32),
     address_snapshot        VARCHAR(512),
